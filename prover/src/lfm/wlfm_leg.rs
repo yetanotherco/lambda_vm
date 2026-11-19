@@ -215,7 +215,7 @@ pub fn emit_wlfm_leg_marked(
     let refs = airs.air_refs();
     let shapes = a.shapes(&airs);
     let (layouts, domains) = child_frame(a, &shapes)?;
-    let cap = batched_cap(&a.config)?.ok_or("a W-LFM child argues batched")?;
+    let cap = child_planning(&a.config)?;
     let mut at = 0u32;
 
     // ---- 1. the front: the public words, the roots (one a round-0 tree), the
@@ -535,7 +535,7 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
     let refs = airs.air_refs();
     let shapes = a.shapes(&airs);
     let (layouts, _) = child_frame(a, &shapes)?;
-    let cap = batched_cap(&a.config)?.ok_or("a W-LFM child argues batched")?;
+    let cap = child_planning(&a.config)?;
     if proof.public_words.len() != child.num_public_words {
         return Err(format!(
             "the proof publishes {} words and the child {}",
@@ -737,6 +737,23 @@ pub fn wlfm_leg_program(child: &WlfmChild) -> Result<LfmProgram, String> {
     finish_program(b)
 }
 
+/// A W-LFM child's batched planning: its argue batched, its GKR ladder one
+/// tree layer a step. The W-LFM levels prove under the pinned block format's
+/// argue ([`super::wlfm::wlfm_config`]); a child under another ladder is
+/// refused by name rather than verified as a format no level proves.
+pub(crate) fn child_planning(
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<super::whir_block::BatchedPlanning, String> {
+    let planning = batched_cap(config)?.ok_or("a W-LFM child argues batched")?;
+    if planning.ladder() != multilinear::whir_chain::GkrLadder::Single {
+        return Err(format!(
+            "a W-LFM child argues its GKR ladders one tree layer a step, not {:?}",
+            planning.ladder()
+        ));
+    }
+    Ok(planning)
+}
+
 /// Test only: the leg's mutations of its commit-time answers, one at a time,
 /// each of which a test must catch. Thread-local, so a test that sets one moves
 /// no other test's program.
@@ -776,5 +793,40 @@ pub(crate) mod faults {
         }
         let _restore = Restore(FAULT.with(|c| c.replace(fault)));
         f()
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::super::wlfm::{WlfmRate, wlfm_config};
+    use multilinear::whir_chain::{ArgueFormat, GkrLadder};
+
+    /// Every W-LFM level's config argues one tree layer a ladder step, and
+    /// the W-leg plans it; the same config on the two-layer ladder is
+    /// refused by name.
+    #[test]
+    fn a_wlfm_child_argues_one_layer_a_step() {
+        for rate in [
+            WlfmRate::Two,
+            WlfmRate::Four,
+            WlfmRate::Sixteen,
+            WlfmRate::SixtyFour,
+        ] {
+            let config = wlfm_config(rate, &[(3, 20), (2, 16)]);
+            assert_eq!(
+                config.format.argue,
+                ArgueFormat::BATCHED,
+                "{rate:?}: the pinned argue"
+            );
+            assert_eq!(
+                super::child_planning(&config).map(|p| p.ladder()),
+                Ok(GkrLadder::Single),
+                "{rate:?}"
+            );
+            let mut double = config;
+            double.format.argue = config.format.argue.with_ladder(GkrLadder::Double);
+            let refused = super::child_planning(&double).expect_err("refused");
+            assert!(refused.contains("one tree layer"), "{rate:?}: {refused}");
+        }
     }
 }
