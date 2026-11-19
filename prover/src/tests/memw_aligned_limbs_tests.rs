@@ -1034,7 +1034,8 @@ const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
         "Sum(32, 33)",
         "μ_q + μ_r, each a byte by ARE_BYTES at weight 1",
     ),
-    ("ECDAS", "Column(520)", "a bit column"),
+    // The limb form's μ (`ecdas::halves_cols::MU`), IS_BIT in its constraints.
+    ("ECDAS", "Column(514)", "a bit column"),
     ("ECREC", "Column(10)", "a bit column"),
     ("ECSM", "Column(666)", "a bit column"),
     ("EQ", "Column(11)", "a bit column"),

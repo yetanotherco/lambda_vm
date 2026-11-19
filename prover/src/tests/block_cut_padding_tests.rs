@@ -104,6 +104,7 @@ fn traces_as(
             .register_format(format.registers)
             .and_then(|b| b.memw_aligned_order(format.memw_aligned))
             .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+            .map(|b| b.ecdas_form(format.ecdas))
             .expect("the builder in the format's forms");
     }
     let mut builder = builder

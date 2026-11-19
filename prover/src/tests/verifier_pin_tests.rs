@@ -261,7 +261,7 @@ const OFF_DEFAULT: [(&str, &str); 12] = [
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
     ("BLOCK_WHIR_KECCAK_RND", "full"),
     ("BLOCK_WHIR_MEMW_A", "lt"),
-    ("BLOCK_WHIR_ECDAS", "halves"),
+    ("BLOCK_WHIR_ECDAS", "bytes"),
     ("BLOCK_WHIR_REGISTERS", "tokens32"),
     ("BLOCK_WHIR_MEMORY", "split"),
 ];
@@ -362,12 +362,12 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         harness.format.ecdas,
-        crate::tables::ecdas::EcdasForm::Halves,
+        crate::tables::ecdas::EcdasForm::Bytes,
         "the harness's ECDAS form follows its knob"
     );
     assert_eq!(
         production.ecdas,
-        crate::tables::ecdas::EcdasForm::Bytes,
+        crate::tables::ecdas::EcdasForm::Halves,
         "the prover's own production format reads no ECDAS knob"
     );
     assert_eq!(
@@ -419,7 +419,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         pinned.format.ecdas,
-        crate::tables::ecdas::EcdasForm::Bytes,
+        crate::tables::ecdas::EcdasForm::Halves,
         "the verifier's ECDAS form is its named constant, not the environment's"
     );
     assert_eq!(

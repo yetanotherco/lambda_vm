@@ -1160,7 +1160,11 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// machine.
 ///
 /// The pins move with any AIR whose constraint leg a leaf emits, with the
-/// block's format and with the mix: last moved by the registers checked in the
+/// block's format and with the mix: last moved by ECDAS's relations at 16-bit
+/// limb positions as the default (515 columns, 101 constraints, 242
+/// interactions; the mix's ECDAS groups now over leaves 0 and 2 of the lean
+/// check's 3; the byte form, `BLOCK_WHIR_ECDAS=bytes`, emits the leaves pinned
+/// before it, pinned below); before that by the registers checked in the
 /// CPU row as the default (the CPU's 42 columns and REG tokens, MEMW_R's slot
 /// one residual register table on the mix, REGISTER a register a row: one leaf
 /// fewer under either check; the format before it,
@@ -1184,29 +1188,29 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             LeafQuery::V1,
             GkrPack::PRODUCTION,
             4,
-            "0eb241d6d58cc1084eca014c911bfae4e65bf1e2c8fc6fd83e51d28dc158f170",
-            "cd63daed363e9bf8c77a487a0d0960399faf54b7ec8ef6bafb2944723ec5557e",
+            "6d58ec7eb4944f06d7f6a600e96ebaac6f18611c9c3a8c6cebb7c6d33d298687",
+            "1a8775e21a6deabe70cee2f0baface9d9104749878508bdab64f650f30702284",
         ),
         (
             LeafQuery::Lean,
             GkrPack::PRODUCTION,
             3,
-            "152026f346dcda0a11f473ae5a20746120705477ad6fffe01713018d287238e0",
-            "793d86dc97cf6389d93c636887f1d3949c601f37e2643e41875ef59ac35d6f3f",
+            "56014b0df6e7e7f7e73710c483231db2e3dbfbb50b69b4314e74a5ff32b99a51",
+            "daf1977172e26319dc51426a175fc4de35e4109ce31056e5ddf92019e7f39080",
         ),
         (
             LeafQuery::V1,
             GkrPack::Off,
             4,
-            "35282d8a6ae963712584d7ef13513dea80c0811806941d03a3804adae612a90a",
-            "1827fced92f4f03ee2e3a20205b34442c7e90aed4baa5a2db6c19d5876d1c644",
+            "990230136d3df152a1a27d76474075eeea230afd67b44488865fcff08060e67d",
+            "5745e443ee26f81f279041793263db08e65fcfec48c47009265ecf0044c2238b",
         ),
         (
             LeafQuery::Lean,
             GkrPack::Off,
             3,
-            "5c25f4d8ad9d2dd6b759fdefbc88198e8f12594a5708c91060c14f78e056162e",
-            "cb4fb5252d421e13c8550e5a3df933c8ad1a759e05cbec4940dd705f387d95a7",
+            "4590477f2bd5f01d8e1760afb64e167e7e451005ab0131866621bbb84d6b2bc4",
+            "2c9cfa5d0946a71a225f525da60383b77a3f9401078fea75ee163c9e2ef66c73",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1257,12 +1261,42 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         PINS[1].3,
         "the default's first leaf is the lean check's at the production packing"
     );
+    // ECDAS's byte form, the form before the limbs (`BLOCK_WHIR_ECDAS=bytes`),
+    // pinned too: over its own statement of the mix, it emits the leaves the
+    // lean check pinned before the flip.
+    let bytes = |format: BlockFormat| format.with_ecdas(crate::tables::ecdas::EcdasForm::Bytes);
+    let owned_bytes = median_statement(
+        elf_bytes,
+        &opts,
+        &bytes(at(LeafQuery::V1, GkrPack::PRODUCTION)),
+    );
+    let before = WhirBlockPlan::derive(
+        elf_bytes,
+        &opts,
+        &bytes(at(LeafQuery::Lean, GkrPack::PRODUCTION)),
+        owned_bytes.view(),
+        None,
+    )
+    .expect("the plan derives");
+    let n = before.partition().num_leaves();
+    let digest = |k: usize| program_digest(&before.leaf_program(k).expect("the leaf emits"));
+    assert_eq!(
+        (n, digest(0), digest(n - 1)),
+        (
+            3,
+            "152026f346dcda0a11f473ae5a20746120705477ad6fffe01713018d287238e0".to_string(),
+            "793d86dc97cf6389d93c636887f1d3949c601f37e2643e41875ef59ac35d6f3f".to_string()
+        ),
+        "ECDAS's byte form"
+    );
     // The register format before the in-row one (`BLOCK_WHIR_REGISTERS=tokens32`),
     // pinned too: over its own statement of the mix (MEMW_R's tables), it
     // emits the leaves the lean check pinned before the flip.
+    // (and ECDAS's byte form, the form of then).
     let tokens32 = |format: BlockFormat| BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        ecdas: crate::tables::ecdas::EcdasForm::Bytes,
         ..format
     };
     let owned_tokens32 = median_statement(
