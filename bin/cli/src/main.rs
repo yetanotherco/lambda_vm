@@ -448,12 +448,13 @@ enum Commands {
         #[arg(long, value_parser = ["split", "fused", "words"], default_value = "split")]
         memory: String,
 
-        /// How many pages a page table holds under `--memory words`: `0` (the
-        /// default: one table a page) or a count `k` in 1..=6, each run of
-        /// zero or private-input pages cut into aligned blocks of up to 2^k
-        /// pages, a table each. A format choice: `verify-block` must be given
-        /// the same one; the proof file does not carry it.
-        #[arg(long, value_parser = page_run_word, default_value = "0")]
+        /// How many pages a page table holds under `--memory words`: a count
+        /// `k` in 1..=6, each run of zero or private-input pages cut into
+        /// aligned blocks of up to 2^k pages, a table each (the default 4, runs
+        /// of 16 pages), or `0`, one table a page. The split and fused formats
+        /// cut no page whatever it says. A format choice: `verify-block` must
+        /// be given the same one; the proof file does not carry it.
+        #[arg(long, value_parser = page_run_word, default_value = "4")]
         page_run: String,
     },
 
@@ -523,8 +524,8 @@ enum Commands {
         memory: String,
 
         /// The page runs the block was proved with (`prove-block --page-run`,
-        /// default 0): the verifier's constant, never read from the proof.
-        #[arg(long, value_parser = page_run_word, default_value = "0")]
+        /// default 4): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = page_run_word, default_value = "4")]
         page_run: String,
     },
 
@@ -867,7 +868,7 @@ fn at_pinned_choices(c: &BlockChoices<'_>) -> bool {
         && c.leaf_query == "lean"
         && c.argue_pack == "22"
         && c.memory == "split"
-        && c.page_run == "0"
+        && c.page_run == "4"
 }
 
 struct BlockChoices<'a> {
@@ -3021,17 +3022,17 @@ mod tests {
             leaf_query: "lean",
             argue_pack: "22",
             memory,
-            page_run: "0",
+            page_run: "4",
         };
         assert!(at_pinned_choices(&choices("split")));
         assert!(!at_pinned_choices(&choices("words")));
         assert!(!at_pinned_choices(&choices("fused")));
     }
 
-    /// Both block commands take the page runs, 0 unless told otherwise, and
-    /// nothing but a count in 0..=6; each reads to the count it names, and
-    /// only 0 is at the pinned choices a compressed file is proved and
-    /// verified at.
+    /// Both block commands take the page runs, 4 (runs of 16 pages, the
+    /// presets') unless told otherwise, and nothing but a count in 0..=6; each
+    /// reads to the count it names, and only 4 is at the pinned choices a
+    /// compressed file is proved and verified at.
     #[test]
     fn the_block_commands_take_the_page_runs() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
@@ -3044,7 +3045,12 @@ mod tests {
                 ) => Some(page_run),
                 _ => None,
             };
-            assert_eq!(page_run(cmd).as_deref(), Some("0"), "the default");
+            assert_eq!(page_run(cmd).as_deref(), Some("4"), "the default");
+            assert_eq!(
+                block_page_run("4"),
+                Ok(prover::block_whir::BLOCK_PAGE_RUN_LOG2),
+                "the presets' runs"
+            );
             for k in 0..=6u8 {
                 let word = k.to_string();
                 let args = [cmd, &["--page-run", &word]].concat();
@@ -3067,8 +3073,8 @@ mod tests {
             memory: "split",
             page_run,
         };
-        assert!(at_pinned_choices(&choices("0")));
-        assert!(!at_pinned_choices(&choices("4")));
+        assert!(at_pinned_choices(&choices("4")));
+        assert!(!at_pinned_choices(&choices("0")));
         // `prove-block` sets the tree's format to the flag's run, the other
         // named choices with it.
         use prover::tables::fused_memory::MemoryFormat;

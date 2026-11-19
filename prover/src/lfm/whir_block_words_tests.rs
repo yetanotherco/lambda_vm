@@ -447,7 +447,8 @@ type Mix<'a> = &'a [(&'a str, &'a [(usize, usize)])];
 const RUNTIME_PAGE_BASE: u64 = 0x4000_0000;
 
 /// The block format these plans take: the production one over the Poseidon1
-/// base (the tree's), `memory`'s loads and stores, at `leaf_scale`.
+/// base (the tree's), `memory`'s loads and stores, at `leaf_scale`, its pages
+/// one table a page (the page-run tests name their runs).
 fn p1_format(memory: MemoryFormat, leaf_scale: LeafScale) -> BlockFormat {
     let production = BlockFormat::production();
     BlockFormat {
@@ -456,6 +457,7 @@ fn p1_format(memory: MemoryFormat, leaf_scale: LeafScale) -> BlockFormat {
             .with_base(stark::proof::options::BaseFormat::P1_WHIR),
         memory,
         leaf_scale,
+        page_run_log2: 0,
         ..production
     }
 }
@@ -1807,7 +1809,7 @@ fn empty_top() -> super::super::proof::LfmProof {
 /// verifier stacks).
 fn pinned_statement(memory: MemoryFormat, mix: Mix<'_>) -> OwnedBlockStatement {
     let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
-    let format = BlockFormat::pinned().with_memory(memory);
+    let format = BlockFormat::pinned().with_memory(memory).with_page_run(0);
     let opts = crate::lfm::proof::block_base_options_under(&format.zf);
     mix_statement(elf, &opts, &format, mix, 2, 1)
 }
@@ -1899,7 +1901,9 @@ fn the_tree_verifier_reads_a_file_under_its_named_memory_format() {
     }
     let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
     let verifier = verifier_plan_under(&words, MemoryFormat::Words).expect("the word plan");
-    let format = BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let format = BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let prover = WhirBlockPlan::derive(
         elf,
         &crate::lfm::proof::block_base_options_under(&format.zf),
@@ -2285,7 +2289,11 @@ fn the_tree_prover_refuses_to_compress_another_memory_format() {
 fn the_tree_prover_refuses_to_compress_another_page_run() {
     use super::super::whir_block_tree::compressed_memory_check;
     let pinned = BlockFormat::pinned();
-    assert_eq!(pinned.page_run_log2, 0, "the pinned page runs");
+    assert_eq!(
+        pinned.page_runs(),
+        0,
+        "the pinned format's memory cuts no page"
+    );
     for run in [1u8, 4, 6] {
         let refused = compressed_memory_check(pinned.memory, run, true).expect_err("refused");
         assert!(
