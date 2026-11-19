@@ -1855,6 +1855,8 @@ where
         H: WhirHash,
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
     {
+        // What this phase A commits of joint runs, and streams of them.
+        let runs_from = multilinear::gpu::joint_runs();
         let mut tables = Vec::new();
         let mut ood = Vec::new();
         let mut spilled: Vec<Option<Arc<Parked>>> = Vec::new();
@@ -2132,6 +2134,13 @@ where
         if let Some(spill) = &spill {
             spill.close_hand_off();
         }
+        let runs = multilinear::gpu::joint_runs();
+        eprintln!(
+            "BLOCK COMMIT LEAVES STREAMED: {} of {} joint runs committed to be retired ({} joint runs committed)",
+            runs.2.saturating_sub(runs_from.2),
+            runs.1.saturating_sub(runs_from.1),
+            runs.0.saturating_sub(runs_from.0),
+        );
         Ok(Self {
             tables,
             sizes,
@@ -2352,15 +2361,13 @@ where
     // Retired right below, so a joint run may be streamed into its tree
     // (`multilinear::gpu::streamed_joint_leaves`).
     let stacked = multilinear::stacked_eval::with_pairs_off_pool(true, || {
-        multilinear::gpu::retired_after_commit(|| {
-            StackedCommitment::<F, H>::commit_signalled(
-                layout,
-                columns,
-                resident.map(|(store, first)| (store, ColumnsAt::From(first))),
-                config,
-                on_room,
-            )
-        })
+        StackedCommitment::<F, H>::commit_to_retire(
+            layout,
+            columns,
+            resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+            config,
+            on_room,
+        )
     })?;
     let roots = stacked.roots();
     let commit = t.elapsed().as_secs_f64();

@@ -3429,7 +3429,7 @@ pub fn commit_joint_streamed(
     for k in 0..blocks {
         let codeword = encode(k).ok_or_else(crate::invalid_value)?;
         ensure!(
-            codeword.base && codeword.elements == elements,
+            codeword.base && codeword.elements == elements && codeword.buffer.len() >= elements,
             "a joint tree's codewords are base and of one length"
         );
         // The codeword's encode, and the step before this one, are done

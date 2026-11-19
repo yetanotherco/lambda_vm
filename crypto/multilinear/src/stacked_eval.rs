@@ -123,6 +123,32 @@ fn layout_chains<F: IsFFTField>(
     Ok(chains)
 }
 
+/// A group committed to be retired before it is opened
+/// ([`StackedCommitment::commit_to_retire`]): its roots, and its retire.
+/// Nothing else, since a joint run streamed into its leaves keeps no
+/// codeword to open.
+pub struct ToRetire<F: IsFFTField + IsPrimeField + 'static, H: WhirHash>(StackedCommitment<F, H>)
+where
+    FieldElement<F>: AsBytes + Sync + Send;
+
+impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static, H: WhirHash> ToRetire<F, H>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    pub fn roots(&self) -> Vec<Commitment> {
+        self.0.roots()
+    }
+
+    /// [`StackedCommitment::retire`].
+    pub fn retire(
+        self,
+        drop: crate::whir_commit::TreeDrop,
+        config: &ChainConfig,
+    ) -> Result<RetiredStack<F>, Error> {
+        self.0.retire(drop, config)
+    }
+}
+
 /// The stacked polynomials, committed. Base-field, like the trace they hold.
 pub struct StackedCommitment<F: IsFFTField + IsPrimeField + 'static, H: WhirHash>
 where
@@ -299,6 +325,34 @@ where
         config: &ChainConfig,
         on_room: &dyn Fn(),
     ) -> Result<Self, Error> {
+        Self::commit_inner(layout, columns, resident, config, on_room, false)
+    }
+
+    /// [`Self::commit_signalled`] for a group retired before it is opened —
+    /// the block prover's phase A: what comes back can give its roots and be
+    /// retired, nothing else, so a joint run may be streamed into its leaves
+    /// and keep no codeword ([`crate::gpu::streamed_joint_leaves`]).
+    pub fn commit_to_retire<C: HostColumn<F>>(
+        layout: StackedLayout,
+        columns: &[&C],
+        resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+        config: &ChainConfig,
+        on_room: &dyn Fn(),
+    ) -> Result<ToRetire<F, H>, Error> {
+        Self::commit_inner(layout, columns, resident, config, on_room, true).map(ToRetire)
+    }
+
+    /// The commit behind [`Self::commit_signalled`] and
+    /// [`Self::commit_to_retire`]: `retired` says the group is retired before
+    /// it is opened.
+    fn commit_inner<C: HostColumn<F>>(
+        layout: StackedLayout,
+        columns: &[&C],
+        resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+        config: &ChainConfig,
+        on_room: &dyn Fn(),
+        retired: bool,
+    ) -> Result<Self, Error> {
         if let Some((_, ColumnsAt::Map(map))) = resident
             && map.len() != columns.len()
         {
@@ -395,7 +449,12 @@ where
                 let (commitment, d) = if range.len() == 1 {
                     commit(&sources[range.start])?
                 } else {
-                    whir_chain::commit_joint_stacked::<F, H>(&sources[range], config, transient)?
+                    whir_chain::commit_joint_stacked_for::<F, H>(
+                        &sources[range],
+                        config,
+                        transient,
+                        retired,
+                    )?
                 };
                 commitments.push(commitment);
                 domain = Some(d);
