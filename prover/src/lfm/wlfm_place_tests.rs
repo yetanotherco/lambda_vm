@@ -434,3 +434,119 @@ fn the_overlap_planned_knob_is_named_and_on_by_default() {
     }
     assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }
+
+/// Restores this thread's upload-once knob, its planned-overlap knob and its
+/// phase-B faults.
+struct UploadOnceRestore;
+
+impl Drop for UploadOnceRestore {
+    fn drop(&mut self) {
+        super::wlfm::set_upload_once_for_test(None);
+        super::wlfm::set_overlap_planned_for_test(None);
+        super::wlfm::set_overlap_faults_for_test(Default::default());
+    }
+}
+
+/// [`streamed_planned`] (the planned overlap on, as by default) under the
+/// upload-once knob `on`.
+fn streamed_once(
+    program: &LfmProgram,
+    build: &WlfmBuild,
+    arenas: &[Vec<super::word::LfmWord>],
+    on: bool,
+    faults: stark::multilinear_block::OverlapFaults,
+) -> Result<(Vec<u8>, Vec<stark::multilinear_block::GroupStamps>), String> {
+    super::wlfm::set_upload_once_for_test(Some(on));
+    streamed_planned(program, build, arenas, true, faults)
+}
+
+/// ★ Putting a retired prepared stack's columns on the card once
+/// (`LAMBDA_VM_LEVELS_UPLOAD_ONCE`) moves no byte in any place: under both
+/// families, the level-shaped probe (two groups) proves the held build's
+/// bytes with the knob on and off; nothing is planned out or refused, and a
+/// store is used only where there is a card, a retired build and the knob.
+#[test]
+fn the_upload_once_proves_the_same_bytes_in_every_place() {
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let (_, _, build) = probe_placed(family, place);
+            for on in [false, true] {
+                let (got, groups) =
+                    streamed_once(&program, &build, &arenas, on, Default::default())
+                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+                assert!(
+                    got == want,
+                    "{family:?} {place:?} upload once {on}: the held bytes"
+                );
+                assert!(
+                    groups
+                        .iter()
+                        .all(|s| !s.upload_once.planned_out && !s.upload_once.refused),
+                    "{family:?} {place:?} {on}: nothing planned out or refused"
+                );
+                let used = groups.iter().filter(|s| s.upload_once.used).count();
+                if card && on && place == StackPlace::CardRetired {
+                    assert!(
+                        used > 0,
+                        "{family:?}: a retired stack's columns went up once"
+                    );
+                } else {
+                    assert_eq!(used, 0, "{family:?} {place:?} {on}: no store");
+                }
+            }
+        }
+    }
+}
+
+/// The upload once falls back to today's two copies, with the same bytes,
+/// where its plan refuses a group's store (a test's refusal): that group is
+/// stamped planned out and uses no store.
+#[test]
+fn a_refused_upload_once_copies_twice_with_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let (program, arenas, build) = probe_placed(WlfmFamily::B3, StackPlace::CardRetired);
+    let (want, _) = streamed_once(&program, &build, &arenas, false, Default::default())
+        .expect("the retired build proves");
+    for place in 0..2 {
+        let (got, groups) = streamed_once(
+            &program,
+            &build,
+            &arenas,
+            true,
+            OverlapFaults {
+                upload_once_refused_at: Some(place),
+                ..Default::default()
+            },
+        )
+        .expect("proves with the store refused");
+        assert!(got == want, "group {place} refused: the same bytes");
+        let s = &groups[place].upload_once;
+        // Both groups of the probe have a retired prepared stack: the refused
+        // one is planned out and uses no store.
+        assert!(
+            s.planned_out && !s.used && !s.refused,
+            "group {place}: planned out, two copies ({s:?})"
+        );
+    }
+}
+
+/// The upload-once knob's name; it is off by default, and only `1` turns it
+/// on.
+#[test]
+fn the_upload_once_knob_is_named_and_off_by_default() {
+    use super::wlfm::{UPLOAD_ONCE_ENV, upload_once};
+    assert_eq!(UPLOAD_ONCE_ENV, "LAMBDA_VM_LEVELS_UPLOAD_ONCE");
+    if std::env::var_os(UPLOAD_ONCE_ENV).is_none() {
+        assert!(!upload_once());
+    }
+}
