@@ -1295,6 +1295,15 @@ impl WhirBlockPlan {
     /// its words. Its arena is [`block_leaf_arena`]'s for leaf 0. Refused
     /// unless the plan is one leaf over every group.
     pub fn closed_block_program(&self) -> Result<LfmProgram, String> {
+        self.closed_block_program_admitted()
+            .map(super::validator::AdmittedProgram::into_program)
+    }
+
+    /// [`Self::closed_block_program`] keeping the validator's word: what the
+    /// levels verifier derives level 1 from (`levels::derive_levels_to`).
+    pub fn closed_block_program_admitted(
+        &self,
+    ) -> Result<super::validator::AdmittedProgram, String> {
         if self.partition.num_leaves() != 1 {
             return Err(format!(
                 "a closed block program covers every group in one leaf; the plan has {} leaves",
@@ -1311,7 +1320,8 @@ impl WhirBlockPlan {
             LeafChecks::ALL,
             None,
         )?;
-        finish(b)
+        emitter_fault(&mut b);
+        finish_admitted(b)
     }
 
     /// [`Self::closed_block_program`] with where its arena's parts end: the
@@ -1353,6 +1363,7 @@ impl WhirBlockPlan {
             LeafChecks::ALL,
             Some(&mut marks),
         )?;
+        emitter_fault(&mut b);
         let source = b.finish();
         let walk = t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
@@ -1856,9 +1867,45 @@ pub(crate) fn derived_of(
 }
 
 fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
-    let program = compile(b.finish());
-    super::validator::validate(&program).map_err(|e| format!("not admissible: {e:?}"))?;
-    Ok(program)
+    finish_admitted(b).map(super::validator::AdmittedProgram::into_program)
+}
+
+/// [`finish`] keeping the validator's word ([`super::validator::AdmittedProgram`]).
+fn finish_admitted(b: LfmBuilder) -> Result<super::validator::AdmittedProgram, String> {
+    super::validator::admit(compile(b.finish())).map_err(|e| format!("not admissible: {e:?}"))
+}
+
+/// [`finish_program`] keeping the validator's word.
+pub(crate) fn finish_program_admitted(
+    b: LfmBuilder,
+) -> Result<super::validator::AdmittedProgram, String> {
+    finish_admitted(b)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test's emitter fault: the level programs' emitters
+    /// ([`WhirBlockPlan::closed_block_program_admitted`],
+    /// [`WhirBlockPlan::closed_block_program_marked_timed`],
+    /// `wlfm_leg::wlfm_leg_program_admitted`) append a hint past their arena.
+    static HINT_PAST_ARENA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: [`HINT_PAST_ARENA`] on this thread set to `on`.
+#[cfg(test)]
+pub(crate) fn set_hint_past_arena_for_test(on: bool) {
+    HINT_PAST_ARENA.with(|c| c.set(on));
+}
+
+/// Under a test's [`HINT_PAST_ARENA`], one hint past arena 0 (an
+/// inadmissible program the validator must refuse); nothing otherwise.
+pub(crate) fn emitter_fault(b: &mut LfmBuilder) {
+    #[cfg(test)]
+    if HINT_PAST_ARENA.with(std::cell::Cell::get) {
+        let _ = b.hint_word(0, u32::MAX);
+    }
+    #[cfg(not(test))]
+    let _ = b;
 }
 
 /// A tree program's builder compiled and validated, as every program of the
