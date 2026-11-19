@@ -1394,6 +1394,40 @@ pub(crate) fn message<E: IsField>(
         .collect()
 }
 
+/// A bus term's share of a round's claim: `E^ρ·Σ_{t∈{0,1}} eq₁(ρ_j, t)·B(t)`.
+/// The claim a round carries in is the constraint's share plus every bus's,
+/// so `A(1)` is what the claim leaves once each is taken off.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn bus_sum<E: IsField>(
+    rho_j: &FieldElement<E>,
+    e_rho: &FieldElement<E>,
+    b: &[FieldElement<E>; 2],
+) -> FieldElement<E> {
+    let one = FieldElement::<E>::one();
+    e_rho * ((&one - rho_j) * &b[0] + rho_j * &b[1])
+}
+
+/// A round's message `g` with one more bus term added: `g(t) +
+/// E^{ρ'}·eq₁(ρ'_j, t)·B'(t)` at `t = 1..=g.len()`, `B'` linear from its value
+/// at `0` and `1` — a table's second bus (its local lookups) at its own point.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn with_bus<E: IsField>(
+    g: Vec<FieldElement<E>>,
+    rho_j: &FieldElement<E>,
+    e_rho: &FieldElement<E>,
+    b: &[FieldElement<E>; 2],
+) -> Vec<FieldElement<E>> {
+    let slope = &b[1] - &b[0];
+    g.into_iter()
+        .enumerate()
+        .map(|(k, v)| {
+            let node = FieldElement::<E>::from(k as u64 + 1);
+            let bt = &b[0] + &node * &slope;
+            v + e_rho * eq1(rho_j, &node) * bt
+        })
+        .collect()
+}
+
 /// S1-5's pass: `T(a, b) = Σ_{x''} eq(r_{>1}, x'')·C(a, b, x'')` over the grid
 /// `{0..d}²` and `U(b, c) = Σ_{x''} eq(ρ_{>1}, x'')·L(b, c, x'')` over
 /// `{0,1}²`, group `x''`'s rows being `a·N/2 + b·N/4 + x''`.
@@ -2192,6 +2226,88 @@ mod tests {
         assert_eq!(
             Constraints::<Gl>::from_extension(program.steps(), &[root], &[None], 1).unwrap_err(),
             Error::NotBaseField { step: 1 }
+        );
+    }
+
+    /// A second bus at its own point, in a round's message and in the claim
+    /// it carries: a degree-2 batch `eq(r)·f₀f₁ + eq(ρ)·L + eq(ρ')·L'` over
+    /// four variables, its round-0 polynomial summed by brute force, against
+    /// the parts — `A` at `0..=2`, `B` and `B'` at `0` and `1` — through
+    /// [`message`] and [`with_bus`]; and `A(1)` recovered from the claim with
+    /// both buses' shares ([`bus_sum`]) taken off.
+    #[test]
+    fn a_second_bus_adds_its_own_term_to_the_message_and_the_claim() {
+        let mut seed = 0x5eed_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            FX::from(seed)
+        };
+        let n = 4;
+        let size = 1usize << n;
+        let f0: Vec<FX> = (0..size).map(|_| next()).collect();
+        let f1: Vec<FX> = (0..size).map(|_| next()).collect();
+        let (a, a2): ([FX; 3], [FX; 3]) = ([next(), next(), next()], [next(), next(), next()]);
+        let (r, rho, rho2): (Vec<FX>, Vec<FX>, Vec<FX>) = (
+            (0..n).map(|_| next()).collect(),
+            (0..n).map(|_| next()).collect(),
+            (0..n).map(|_| next()).collect(),
+        );
+        let half = size / 2;
+        let at = |f: &[FX], t: &FX, x: usize| (FX::one() - t) * f[x] + t * f[half + x];
+        let bus =
+            |c: &[FX; 3], t: &FX, x: usize| c[0] + c[1] * at(&f0, t, x) + c[2] * at(&f1, t, x);
+        let (er, erho, erho2) = (eq_evals(&r[1..]), eq_evals(&rho[1..]), eq_evals(&rho2[1..]));
+        // The whole batch's round-0 polynomial at `t`.
+        let whole = |t: &FX| {
+            (0..half).fold(FX::zero(), |acc, x| {
+                acc + eq1(&r[0], t) * er[x] * at(&f0, t, x) * at(&f1, t, x)
+                    + eq1(&rho[0], t) * erho[x] * bus(&a, t, x)
+                    + eq1(&rho2[0], t) * erho2[x] * bus(&a2, t, x)
+            })
+        };
+        let node = |k: u64| FX::from(k);
+        let parts_a: Vec<FX> = (0..3u64)
+            .map(|k| {
+                (0..half).fold(FX::zero(), |acc, x| {
+                    acc + er[x] * at(&f0, &node(k), x) * at(&f1, &node(k), x)
+                })
+            })
+            .collect();
+        let sum_bus = |c: &[FX; 3], w: &[FX]| -> [FX; 2] {
+            core::array::from_fn(|k| {
+                (0..half).fold(FX::zero(), |acc, x| acc + w[x] * bus(c, &node(k as u64), x))
+            })
+        };
+        let (b, b2) = (sum_bus(&a, &erho), sum_bus(&a2, &erho2));
+        let one = FX::one();
+        let g = with_bus(
+            message(&r[0], &rho[0], &one, &one, &parts_a, &b, &node(3)),
+            &rho2[0],
+            &one,
+            &b2,
+        );
+        let want: Vec<FX> = (1..=3u64).map(|k| whole(&node(k))).collect();
+        assert_eq!(g, want, "the message with both buses");
+        // Without the second bus's term the message parts from the batch.
+        assert_ne!(
+            message(&r[0], &rho[0], &one, &one, &parts_a, &b, &node(3)),
+            want
+        );
+        // `A(1)` from the claim `g(0) + g(1)`, both buses' shares taken off.
+        let claim = whole(&node(0)) + whole(&node(1));
+        let a1 = (claim
+            - (one - r[0]) * parts_a[0]
+            - bus_sum(&rho[0], &one, &b)
+            - bus_sum(&rho2[0], &one, &b2))
+            * r[0].inv().unwrap();
+        assert_eq!(a1, parts_a[1]);
+        let without =
+            (claim - (one - r[0]) * parts_a[0] - bus_sum(&rho[0], &one, &b)) * r[0].inv().unwrap();
+        assert_ne!(
+            without, parts_a[1],
+            "the second bus's share is load-bearing"
         );
     }
 }
