@@ -470,7 +470,8 @@ pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryForma
 }
 
 /// `BLOCK_WHIR_PAGE_RUN`'s reading: unset is the pinned preset's
-/// ([`BlockFormat::pinned`], 0: one PAGE_W table a page); a count `k` in
+/// ([`BlockFormat::pinned`], 4: runs of 16 pages; `0` rolls back to one PAGE_W
+/// table a page); a count `k` in
 /// `0..=`[`MAX_PAGE_RUN_LOG2`](crate::tables::page_w::MAX_PAGE_RUN_LOG2) cuts
 /// each run of zero or private-input pages into blocks of up to `2^k` pages
 /// ([`BlockFormat::page_run_log2`]), under the word memory format alone. A
@@ -2671,12 +2672,12 @@ pub(crate) fn compressed_memory_check(
             pinned.memory
         ));
     }
-    if compress && page_run_log2 != pinned.page_run_log2 {
+    if compress && page_run_log2 != pinned.page_runs() {
         return Err(format!(
             "a compressed block is proved at page runs of 2^{} pages alone, not 2^{page_run_log2}: \
              turn compression off (LAMBDA_VM_BLOCK_COMPRESS=0) and ship the top's uncompressed \
              file to prove another page run",
-            pinned.page_run_log2
+            pinned.page_runs()
         ));
     }
     Ok(())
@@ -2718,7 +2719,7 @@ pub fn prove_whir_block_tree(
             format.registers
         ));
     }
-    compressed_memory_check(format.memory, format.page_run_log2, cfg.compress.is_some())?;
+    compressed_memory_check(format.memory, format.page_runs(), cfg.compress.is_some())?;
     sink.line(&posture_line());
     sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));

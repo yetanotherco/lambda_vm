@@ -1047,8 +1047,12 @@ fn statement_with_heap(format: &BlockFormat, heap: u64) -> (OwnedBlockStatement,
     (statement, tables)
 }
 
+/// The pinned format under the word memory format with runs off (one PAGE_W
+/// table a page); a test names its runs with `with_page_run`.
 fn words() -> BlockFormat {
-    BlockFormat::pinned().with_memory(MemoryFormat::Words)
+    BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0)
 }
 
 /// ★ The verifier frames a word statement at its own page run, its page
@@ -1168,23 +1172,54 @@ fn a_page_table_is_held_to_its_place_name_and_height() {
     assert!(check(named(&own[..own.len() - 1])).is_err());
 }
 
-/// Page runs are the word memory format's alone, and at most
-/// [`MAX_PAGE_RUN_LOG2`]: the verifier refuses either before framing.
+/// ★ Every block preset takes runs of 16 pages, and they cut the word memory
+/// format's pages alone: under the split format (the pinned one) and the fused
+/// format (the production one) a run is inert, every page a PAGE table of its
+/// own whatever the run says, so a split statement frames the same at the
+/// default and with runs off; under the word format the presets cut at 16.
+/// A run past [`MAX_PAGE_RUN_LOG2`] is refused before framing under any memory
+/// format.
 #[test]
-fn page_runs_need_the_word_format_and_stay_under_their_cap() {
-    let (statement, _) = statement_at(&words().with_page_run(2));
+fn every_preset_cuts_the_word_formats_pages_at_16_and_no_other_formats() {
+    assert_eq!(block_whir::BLOCK_PAGE_RUN_LOG2, 4);
+    for preset in [BlockFormat::pinned(), BlockFormat::production()] {
+        assert_eq!(preset.page_run_log2, block_whir::BLOCK_PAGE_RUN_LOG2);
+        assert_eq!(preset.page_runs(), 0, "{:?} cuts no page", preset.memory);
+        assert_eq!(preset.with_memory(MemoryFormat::Words).page_runs(), 4);
+        assert!(block_whir::check_memory_format(&preset).is_ok());
+    }
+    // A split statement frames alike at the default run and at runs off.
+    let split = BlockFormat::pinned();
+    let statement = super::word_memory_tests::words_statement(
+        &split.with_page_run(0),
+        &chip_free_counts(),
+        [0; 7],
+    );
+    let off = super::word_memory_tests::frame_of(&statement, &split.with_page_run(0))
+        .expect("the split statement frames with runs off");
+    let at_default =
+        super::word_memory_tests::frame_of(&statement, &split).expect("and at the default");
+    assert_eq!(off.page_tables, at_default.page_tables);
+    assert!(
+        at_default
+            .page_tables
+            .iter()
+            .all(|t| t.kind == PageTableKind::Page && t.pages() == 1)
+    );
+    // The word format at the presets' run cuts at 16 pages.
+    let words_at_default = BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let (statement, tables) = statement_at(&words_at_default);
+    assert!(tables.iter().any(|t| t.pages() == 16), "{tables:?}");
+    super::word_memory_tests::frame_of(&statement, &words_at_default).expect("frames at 16");
+    // Past the cap, under any memory format.
     for format in [
-        BlockFormat::pinned().with_page_run(2),
-        BlockFormat::pinned()
-            .with_memory(MemoryFormat::Fused)
-            .with_page_run(2),
         words().with_page_run(MAX_PAGE_RUN_LOG2 + 1),
+        BlockFormat::pinned().with_page_run(MAX_PAGE_RUN_LOG2 + 1),
     ] {
         assert!(block_whir::check_memory_format(&format).is_err());
         assert!(super::word_memory_tests::frame_of(&statement, &format).is_err());
     }
     assert!(block_whir::check_memory_format(&words().with_page_run(MAX_PAGE_RUN_LOG2)).is_ok());
-    assert!(block_whir::check_memory_format(&BlockFormat::pinned()).is_ok());
 }
 
 // =========================================================================
@@ -1218,9 +1253,13 @@ fn every_page_of_data_is_a_table_of_its_own_at_every_run() {
 /// `2^k` pages, so an honest statement may list more pages than it states
 /// tables. A heap of 1,024 zero pages at runs of 64 is 16 blocks, the
 /// statement some 40 tables: it frames, and with runs off the same pages (one
-/// table a page) are refused by the cap as before. The cap, `tables × 2^k`,
-/// still refuses before the page list is built: a range one page past it, and
-/// one of `2^62` pages.
+/// table a page) are refused by the cap as before. The cap is the page tables
+/// the statement can hold (its tables less every table its counts imply
+/// besides the pages) times `2^k`, and it refuses before the page list is
+/// built: a range one page past it, and one of `2^62` pages; at the cap
+/// exactly the list is built and the statement is refused by its table count
+/// instead. A statement whose counts imply more tables than it states is
+/// refused before any page is listed.
 #[test]
 fn a_statement_with_more_pages_than_tables_frames_under_page_runs() {
     let format = words().with_page_run(6);
@@ -1235,16 +1274,14 @@ fn a_statement_with_more_pages_than_tables_frames_under_page_runs() {
         .unwrap_or_else(|e| panic!("more pages than tables: {e:?}"));
     assert_eq!(frame.page_configs.len(), pages);
     assert_eq!(frame.page_tables, tables);
+    let room = tables.len();
+    assert_eq!(block_whir::max_block_pages(room, &format), room << 6);
     assert_eq!(
-        block_whir::max_block_pages(num_tables, &format),
-        num_tables << 6
+        block_whir::max_block_pages(room, &words().with_page_run(0)),
+        room
     );
-    assert_eq!(
-        block_whir::max_block_pages(num_tables, &words()),
-        num_tables
-    );
-    // Runs off: one table a page, the same page list past the table count.
-    let off = super::word_memory_tests::frame_of(&statement, &words());
+    // Runs off: one table a page, the same page list past the page tables.
+    let off = super::word_memory_tests::frame_of(&statement, &words().with_page_run(0));
     assert!(
         matches!(&off, Err(crate::Error::MalformedPageLayout(e)) if e.contains("needs more than")),
         "{:?}",
@@ -1253,7 +1290,7 @@ fn a_statement_with_more_pages_than_tables_frames_under_page_runs() {
     // Past the cap: refused by the cap, the range itself past it before any of
     // it is listed. At the cap exactly the list is built, and the statement is
     // refused by its table count instead (the pages need more tables).
-    let cap = (num_tables << 6) as u64;
+    let cap = (room << 6) as u64;
     let listed = pages as u64;
     for (count, by_cap) in [
         (cap - listed, false),
@@ -1271,6 +1308,73 @@ fn a_statement_with_more_pages_than_tables_frames_under_page_runs() {
         assert!(
             refused.is_err() && capped == by_cap,
             "{count}: {:?}",
+            refused.err()
+        );
+    }
+    // Fewer heights than the counts' own tables: refused before any page.
+    let mut short = statement.clone();
+    let others = num_tables - room;
+    short.table_num_vars.truncate(others - 1);
+    let refused = super::word_memory_tests::frame_of(&short, &format);
+    assert!(
+        matches!(&refused, Err(crate::Error::InvalidTableCounts(e)) if e.contains("besides its pages")),
+        "{:?}",
+        refused.err()
+    );
+}
+
+/// ★ The cap holds the page list to the pages the statement's page tables can
+/// hold, before it is built: a statement stating 2^18 tables, its counts a
+/// handful, may list up to those page tables' pages (one page short of the
+/// cap here, so the cut refuses it at once by the table count) and no more; a
+/// range of `2^62` pages is refused at once whatever it states. The line it
+/// prints is the page list's size and how long the frame took to refuse it
+/// (`#[ignore]`d: it lists up to 16 million pages; run it alone).
+#[test]
+#[ignore = "lists a page list of tens of millions of pages to measure it; run alone"]
+fn a_huge_stated_page_list_is_capped_and_measured() {
+    for run_log2 in [0u8, 4, 6] {
+        let format = words().with_page_run(run_log2);
+        let (statement, tables) = statement_with_heap(&format, 20);
+        let others = statement.table_num_vars.len() - tables.len();
+        // 2^18 stated tables: the counts' own and page tables for the rest.
+        let mut big = statement.clone();
+        big.table_num_vars.resize(others + (1 << 18), 15);
+        let room = big.table_num_vars.len() - others;
+        let cap = block_whir::max_block_pages(room, &format) as u64;
+        // A range filling the cap less the list's own pages and one: built,
+        // then refused by the table count.
+        let listed: u64 = tables.iter().map(|t| t.pages() as u64).sum();
+        let mut at_cap = big.clone();
+        at_cap.runtime_page_ranges.push(crate::RuntimePageRange {
+            base: 1 << 40,
+            count: cap - listed - 1,
+        });
+        let t = std::time::Instant::now();
+        let refused = super::word_memory_tests::frame_of(&at_cap, &format);
+        let secs = t.elapsed().as_secs_f64();
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(_))),
+            "{:?}",
+            refused.err()
+        );
+        let bytes = cap as usize * std::mem::size_of::<PageConfig>();
+        println!(
+            "PAGE LIST CAP 2^{run_log2}: {} stated tables · cap {cap} pages · page list {:.1} MiB \
+             ({} B a page) · framed and refused in {secs:.2} s",
+            big.table_num_vars.len(),
+            bytes as f64 / (1 << 20) as f64,
+            std::mem::size_of::<PageConfig>()
+        );
+        let mut huge = big.clone();
+        huge.runtime_page_ranges.push(crate::RuntimePageRange {
+            base: 1 << 40,
+            count: 1 << 62,
+        });
+        let refused = super::word_memory_tests::frame_of(&huge, &format);
+        assert!(
+            matches!(&refused, Err(crate::Error::MalformedPageLayout(e)) if e.contains("needs more than")),
+            "{:?}",
             refused.err()
         );
     }
@@ -1390,7 +1494,9 @@ fn the_dense_pages_are_the_same_at_every_page_run() {
 
 /// ★ A runtime range overlapping a page of the program, or another
 /// range, is refused by the page list's one-page-a-base check before any
-/// table is cut, at every run; and the rule refuses such a list itself.
+/// table is cut, at every run, the statement's page count unchanged (the
+/// ranges moved, not lengthened: one page more is the cap's to refuse); and
+/// the rule refuses such a list itself.
 #[test]
 fn an_overlapping_runtime_range_is_refused_at_every_run() {
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
@@ -1400,19 +1506,10 @@ fn an_overlapping_runtime_range_is_refused_at_every_run() {
     for run_log2 in [0u8, 2, 4] {
         let format = words().with_page_run(run_log2);
         let (statement, _) = statement_at(&format);
-        for overlap in [
-            crate::RuntimePageRange {
-                base: elf_page,
-                count: 1,
-            },
-            crate::RuntimePageRange {
-                base: 70 * PAGE,
-                count: 2,
-            },
-        ] {
-            let base = overlap.base;
+        // The heap moved onto the program's page; the stack's page into the heap.
+        for (range, base) in [(0usize, elf_page), (1, 70 * PAGE)] {
             let mut bad = statement.clone();
-            bad.runtime_page_ranges.push(overlap);
+            bad.runtime_page_ranges[range].base = base;
             let refused = super::word_memory_tests::frame_of(&bad, &format);
             assert!(
                 matches!(&refused, Err(crate::Error::MalformedPageLayout(e)) if e.contains("two page tables cover")),
@@ -1420,6 +1517,13 @@ fn an_overlapping_runtime_range_is_refused_at_every_run() {
                 refused.err()
             );
         }
+        // One page more than the statement's tables hold: the cap refuses it.
+        let mut longer = statement.clone();
+        longer.runtime_page_ranges.push(crate::RuntimePageRange {
+            base: elf_page,
+            count: 1 << (run_log2 + 6),
+        });
+        assert!(super::word_memory_tests::frame_of(&longer, &format).is_err());
     }
     let mut doubled = run(64 * PAGE, 4, PageConfig::zero_init);
     doubled.push(PageConfig::zero_init(65 * PAGE));

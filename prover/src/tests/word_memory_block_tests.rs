@@ -30,8 +30,12 @@ use crate::test_utils::asm_elf_bytes;
 use stark::multilinear_table::batched::VerifierChecks;
 use stark::proof::options::ProofOptions;
 
+/// The production format with `memory`'s loads and stores, its pages one
+/// table a page (the page-run tests below name their runs).
 fn format(memory: MemoryFormat) -> BlockFormat {
-    BlockFormat::production().with_memory(memory)
+    BlockFormat::production()
+        .with_memory(memory)
+        .with_page_run(0)
 }
 
 /// `elf` proved as a streamed block under `format`.

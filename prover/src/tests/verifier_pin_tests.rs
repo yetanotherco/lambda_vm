@@ -263,7 +263,7 @@ const OFF_DEFAULT: [(&str, &str); 12] = [
     ("BLOCK_WHIR_MEMW_A", "lt"),
     ("BLOCK_WHIR_REGISTERS", "tokens32"),
     ("BLOCK_WHIR_MEMORY", "split"),
-    ("BLOCK_WHIR_PAGE_RUN", "4"),
+    ("BLOCK_WHIR_PAGE_RUN", "2"),
 ];
 
 /// The memory words the child runs under: `split`, off the production
@@ -385,11 +385,12 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         "the prover's own production format reads no memory knob"
     );
     assert_eq!(
-        harness.format.page_run_log2, 4,
+        harness.format.page_run_log2, 2,
         "the harness's page runs follow their knob"
     );
     assert_eq!(
-        production.page_run_log2, 0,
+        production.page_run_log2,
+        crate::block_whir::BLOCK_PAGE_RUN_LOG2,
         "the prover's own production format reads no page-run knob"
     );
 
@@ -426,7 +427,8 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         "the verifier's memory format is its named constant, not the environment's"
     );
     assert_eq!(
-        pinned.format.page_run_log2, 0,
+        pinned.format.page_run_log2,
+        crate::block_whir::BLOCK_PAGE_RUN_LOG2,
         "the verifier's page runs are its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
