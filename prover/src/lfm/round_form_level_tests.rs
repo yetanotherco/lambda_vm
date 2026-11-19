@@ -20,7 +20,9 @@ use crate::block_whir::{B3Rounds, BlockFormat, BlockWhirProof};
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use crate::tables::types::{FE, GoldilocksExtension};
 use math::field::element::FieldElement;
-use multilinear::whir_chain::{ArgueFormat, FinalPoly, GroupFold, RoundOpenings, WhirFolds};
+use multilinear::whir_chain::{
+    ArgueFormat, FinalPoly, GkrLadder, GroupFold, RoundOpenings, WhirFolds,
+};
 use stark::proof::options::{BaseFormat, ProofOptions};
 
 type E = GoldilocksExtension;
@@ -1085,4 +1087,156 @@ fn the_round_form_driver_with_retired_stacks_proves_the_held_levels_bytes() {
         let last = run.proofs.last().expect("a last level");
         verify_levels(&run.plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
     }
+}
+
+// ─── Level 1 over a base whose GKR ladders step two tree layers ─────────────
+
+/// [`words_format`] under the round form with its batched argue's GKR ladder
+/// `ladder`.
+fn words_ladder(ladder: GkrLadder) -> BlockFormat {
+    let mut f = words_format(B3Rounds::WHIR3);
+    f.argue = f.argue.with_ladder(ladder);
+    f
+}
+
+/// One-value tampers of group 0's first bin's two-layer ladder: each of
+/// the eight values a two-layer tree sends at its first step past step 0,
+/// a value of that step's first degree-5 round, and step 0's first value.
+fn ladder_tampers(proof: &BlockWhirProof) -> Vec<(String, Tamper)> {
+    let ladder = &proof.argues[0].gkr[0];
+    let step = ladder
+        .layers
+        .iter()
+        .position(|l| {
+            l.sumcheck
+                .rounds
+                .first()
+                .is_some_and(|r| r.evaluations.len() == 5)
+        })
+        .expect("a degree-5 step with rounds in group 0's first bin");
+    let mut tampers: Vec<(String, Tamper)> = Vec::new();
+    for half in 0..2 {
+        for value in 0..4 {
+            tampers.push((
+                format!("step {step} half {half} value {value}"),
+                Box::new(move |p: &mut BlockWhirProof| {
+                    let h = &mut p.argues[0].gkr[0].layers[step].halves[half];
+                    *[&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value] +=
+                        FieldElement::<E>::one();
+                }),
+            ));
+        }
+    }
+    tampers.push((
+        format!("step {step}'s first round's last value"),
+        Box::new(move |p: &mut BlockWhirProof| {
+            p.argues[0].gkr[0].layers[step].sumcheck.rounds[0].evaluations[4] +=
+                FieldElement::<E>::one();
+        }),
+    ));
+    tampers.push((
+        "step 0's first value".to_string(),
+        Box::new(|p: &mut BlockWhirProof| {
+            p.argues[0].gkr[0].layers[0].halves[0].p_lo += FieldElement::<E>::one();
+        }),
+    ));
+    tampers
+}
+
+/// ★ Level 1 over a small BLAKE3 base whose GKR ladders step two tree layers
+/// at a time (the word memory format, the round form): the base proves and
+/// verifies on the host; level 1's closed program executes over its witness,
+/// its words claim the block, and group 0's program publishes the host's bus
+/// sum; a plan under one ladder takes no proof of the other; and one-value
+/// tampers of the two-layer ladder are refused in execution. Printed: the
+/// level's instructions and lean compressions against the one-layer ladder's
+/// over the same block.
+#[test]
+#[ignore = "proves two small BLAKE3 words bases; box tier"]
+fn level_1_executes_over_a_two_layer_blake3_base_and_refuses_its_tampers() {
+    let name = "test_commit_4";
+    let (single, double) = (
+        words_ladder(GkrLadder::Single),
+        words_ladder(GkrLadder::Double),
+    );
+    let (elf, one) = base_with(name, &single, words_options());
+    let (_, two) = base_with(name, &double, words_options());
+    let one_plan = plan(&elf, &one, &single);
+    let two_plan = plan(&elf, &two, &double);
+    let c_one = level_1_executes(&one_plan, &one);
+    let c_two = level_1_executes(&two_plan, &two);
+    assert_eq!(c_one.groups, c_two.groups, "the same groups");
+    println!(
+        "LEVEL 1 TWO-LAYER {name}: {} groups · instructions {} (one layer {}) · lean compressions \
+         {} (one layer {}) · group 0: instructions {} (one layer {}) · compressions {} (one layer \
+         {})",
+        c_two.groups,
+        c_two.instructions,
+        c_one.instructions,
+        c_two.compressions,
+        c_one.compressions,
+        c_two.first_instructions,
+        c_one.first_instructions,
+        c_two.first_compressions,
+        c_one.first_compressions,
+    );
+
+    // A plan under one ladder takes no proof of the other: its words are
+    // another count, or execution refuses them.
+    for (what, plan, proof) in [
+        ("a two-layer plan over a one-layer proof", &two_plan, &one),
+        ("a one-layer plan over a two-layer proof", &one_plan, &two),
+    ] {
+        let program = plan.closed_block_program().expect("emits");
+        let refused = block_leaf_arena(plan, proof, 0).map_or(true, |arenas| {
+            execute(&program, &arenas, &hasher(&program)).is_err()
+        });
+        assert!(refused, "{what}");
+    }
+
+    let program = two_plan.closed_block_program().expect("emits");
+    let hasher = hasher(&program);
+    for (what, edit) in ladder_tampers(&two) {
+        let mut proof = two.clone();
+        edit(&mut proof);
+        let arenas = block_leaf_arena(&two_plan, &proof, 0)
+            .unwrap_or_else(|e| panic!("{what}: the arena builds: {e}"));
+        let why = execute(&program, &arenas, &hasher);
+        println!("LEVEL 1 TWO-LAYER TAMPER {what}: {:?}", why.as_ref().err());
+        assert!(why.is_err(), "{what}: level 1 accepted it");
+    }
+}
+
+/// ★ Box tier: a small BLAKE3 words block under the round form whose GKR
+/// ladders step two tree layers, and its levels, proved; each level verifies
+/// against its own artifacts; the block's verifier, deriving every level
+/// itself, accepts the last; and a changed word is refused.
+#[test]
+#[ignore = "proves a small BLAKE3 words block and its levels; box tier"]
+fn the_two_layer_ladder_levels_prove_a_small_words_block_to_its_last_level() {
+    use super::levels::{derive_levels, prove_levels, verify_levels};
+    use super::wlfm::verify_wlfm;
+    let format = words_ladder(GkrLadder::Double);
+    let (elf, proof) = base_with("test_commit_4", &format, words_options());
+    let plan = plan(&elf, &proof, &format);
+    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    let (proofs, secs) = prove_levels(&plan, &levels, &proof).expect("every level proves");
+    for (k, (level, p)) in levels.iter().zip(&proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+        println!(
+            "LEVEL WORDS TWO-LAYER {}: {} groups · {} instructions · {} lean compressions · \
+             prove {:.3}s",
+            k + 1,
+            level.build.artifacts.sizes.len(),
+            level.program.instrs.len(),
+            level.program.groups.b3l.real_rows,
+            secs[k].prove
+        );
+    }
+    let last = proofs.last().expect("a last level");
+    verify_levels(&plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
+    let mut forged = last.clone();
+    forged.public_words[0].1[0] += FE::one();
+    assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
 }
