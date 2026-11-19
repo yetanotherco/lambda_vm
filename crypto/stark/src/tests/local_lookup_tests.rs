@@ -52,11 +52,11 @@ use crate::traits::AIR;
 
 use super::phase_b_overlap_tests::config_for;
 
-type FE = FieldElement<Fp>;
-type EE = FieldElement<Ext>;
-type Air = AirWithBuses<Fp, Ext, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
-type H = KeccakWhir;
-type T = <H as WhirHash>::Sponge;
+pub(super) type FE = FieldElement<Fp>;
+pub(super) type EE = FieldElement<Ext>;
+pub(super) type Air = AirWithBuses<Fp, Ext, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
+pub(super) type H = KeccakWhir;
+pub(super) type T = <H as WhirHash>::Sponge;
 
 /// `(x, y, x ⊕ y)` over two-bit `x, y`.
 const LOCAL_XOR: u64 = 46;
@@ -64,10 +64,10 @@ const LOCAL_XOR: u64 = 46;
 const LOCAL_PAIR: u64 = 47;
 /// A global bus each SEND row balances by itself.
 const GLOBAL: u64 = 5;
-const BUSES: [u64; 2] = [LOCAL_XOR, LOCAL_PAIR];
+pub(super) const BUSES: [u64; 2] = [LOCAL_XOR, LOCAL_PAIR];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Cpu,
     Add,
     Mul,
@@ -76,7 +76,7 @@ enum Kind {
 }
 
 /// CPU ADD MUL | SEND RECV | SEND SEND RECV.
-const KINDS: [Kind; 8] = [
+pub(super) const KINDS: [Kind; 8] = [
     Kind::Cpu,
     Kind::Add,
     Kind::Mul,
@@ -86,9 +86,9 @@ const KINDS: [Kind; 8] = [
     Kind::Send,
     Kind::Recv,
 ];
-const SIZES: [usize; 3] = [3, 2, 3];
+pub(super) const SIZES: [usize; 3] = [3, 2, 3];
 /// The RECV's fixed columns: `X, Y, X ⊕ Y`.
-const FIXED: usize = 3;
+pub(super) const FIXED: usize = 3;
 
 fn felts(values: &[u64]) -> Vec<FE> {
     values.iter().map(|v| FE::from(*v)).collect()
@@ -166,7 +166,7 @@ fn air(columns: usize, interactions: Vec<BusInteraction>) -> Air {
 
 /// One AIR a kind; group 1's SEND (table 3) has its own, which carries the
 /// constant sends when there are constants.
-struct Airs {
+pub(super) struct Airs {
     cpu: Air,
     add: Air,
     mul: Air,
@@ -179,7 +179,7 @@ struct Airs {
 const FIRST_SEND: usize = 3;
 
 impl Airs {
-    fn new(constants: Option<[i64; 3]>) -> Self {
+    pub(super) fn new(constants: Option<[i64; 3]>) -> Self {
         let options = ProofOptions::default_test_options();
         Self {
             cpu: new_cpu_air_with_lookup(&options),
@@ -192,7 +192,7 @@ impl Airs {
     }
 
     /// Table `t`'s AIR.
-    fn of(&self, t: usize) -> &Air {
+    pub(super) fn of(&self, t: usize) -> &Air {
         match KINDS[t] {
             Kind::Cpu => &self.cpu,
             Kind::Add => &self.add,
@@ -278,14 +278,14 @@ fn example_columns() -> [Vec<Vec<FE>>; 3] {
 /// A block: every table's columns, and whether the verifier holds the RECVs'
 /// first three columns as fixed (preprocessed) — the digests follow it.
 #[derive(Clone)]
-struct Block {
-    columns: Vec<Vec<Vec<FE>>>,
-    fixed: bool,
+pub(super) struct Block {
+    pub(super) columns: Vec<Vec<Vec<FE>>>,
+    pub(super) fixed: bool,
 }
 
 impl Block {
     /// The honest block.
-    fn honest() -> Self {
+    pub(super) fn honest() -> Self {
         Self::with(|_| {})
     }
 
@@ -334,18 +334,18 @@ fn recount(columns: &mut [Vec<Vec<FE>>], fixed: &[Vec<FE>]) {
     }
 }
 
-fn num_vars(columns: &[Vec<FE>]) -> usize {
+pub(super) fn num_vars(columns: &[Vec<FE>]) -> usize {
     columns[0].len().trailing_zeros() as usize
 }
 
 /// The block's config: the batched argue at `bin_log_cells`, packed by
 /// `pack`.
-fn config(bin_log_cells: u8, pack: GkrPack) -> ChainConfig {
+pub(super) fn config(bin_log_cells: u8, pack: GkrPack) -> ChainConfig {
     config_with(bin_log_cells, pack, GkrLadder::Single)
 }
 
 /// [`config`] with the GKR ladder `ladder`.
-fn config_with(bin_log_cells: u8, pack: GkrPack, ladder: GkrLadder) -> ChainConfig {
+pub(super) fn config_with(bin_log_cells: u8, pack: GkrPack, ladder: GkrLadder) -> ChainConfig {
     config_for(
         ArgueFormat::Batched {
             bin_log_cells,
@@ -356,13 +356,13 @@ fn config_with(bin_log_cells: u8, pack: GkrPack, ladder: GkrLadder) -> ChainConf
     )
 }
 
-fn production() -> ChainConfig {
+pub(super) fn production() -> ChainConfig {
     config_for(ArgueFormat::BATCHED, GroupFold::PerPoly)
 }
 
 /// Every table's digest, as the verifier holds the tables (`fixed`), the
 /// constants in or (a mutant) out.
-fn digests(airs: &Airs, block: &Block, constants: bool) -> Vec<[u8; 32]> {
+pub(super) fn digests(airs: &Airs, block: &Block, constants: bool) -> Vec<[u8; 32]> {
     KINDS
         .iter()
         .zip(&block.columns)
@@ -384,7 +384,7 @@ fn digests(airs: &Airs, block: &Block, constants: bool) -> Vec<[u8; 32]> {
         .collect()
 }
 
-fn local(airs: &Airs, block: &Block) -> BlockLocal {
+pub(super) fn local(airs: &Airs, block: &Block) -> BlockLocal {
     BlockLocal {
         buses: BUSES.to_vec(),
         digests: digests(airs, block, true),
@@ -393,7 +393,7 @@ fn local(airs: &Airs, block: &Block) -> BlockLocal {
 
 /// The block proved under `config`, with local lookups `local` (or today's
 /// format), group `deviation.group` arguing as `deviation` says.
-fn prove(
+pub(super) fn prove(
     airs: &Airs,
     block: &Block,
     config: &ChainConfig,
@@ -446,7 +446,7 @@ fn prove(
 }
 
 /// The honest prover on the host, with this group's faults.
-fn faulted(group: usize, faults: ProverFaults) -> ArgueDeviation {
+pub(super) fn faulted(group: usize, faults: ProverFaults) -> ArgueDeviation {
     ArgueDeviation {
         group: Some(group),
         faults,
@@ -454,7 +454,7 @@ fn faulted(group: usize, faults: ProverFaults) -> ArgueDeviation {
     }
 }
 
-fn honest() -> ArgueDeviation {
+pub(super) fn honest() -> ArgueDeviation {
     ArgueDeviation {
         at: Where::Host,
         ..ArgueDeviation::default()
@@ -462,7 +462,7 @@ fn honest() -> ArgueDeviation {
 }
 
 /// The groups' stacks, as both sides rebuild them.
-fn stacks(block: &Block, config: &ChainConfig) -> Vec<StackedLayout> {
+pub(super) fn stacks(block: &Block, config: &ChainConfig) -> Vec<StackedLayout> {
     let shapes: Vec<(usize, usize)> = block
         .columns
         .iter()
@@ -544,7 +544,7 @@ fn verify(
 }
 
 /// [`verify`] with every check, under the honest digests.
-fn verify_local(
+pub(super) fn verify_local(
     airs: &Airs,
     block: &Block,
     config: &ChainConfig,
@@ -560,7 +560,7 @@ fn verify_local(
     )
 }
 
-fn bytes(proved: &BlockProved<Fp, Ext>) -> Vec<u8> {
+pub(super) fn bytes(proved: &BlockProved<Fp, Ext>) -> Vec<u8> {
     bincode::serialize(&(&proved.0, &proved.1, &proved.2, &proved.4, &proved.5)).expect("serialize")
 }
 
@@ -578,7 +578,7 @@ fn flip_first_pair(columns: &mut [Vec<Vec<FE>>]) {
 
 /// [`flip_first_pair`] with the RECV counting honestly: the false tuple
 /// matches no row.
-fn false_tuple() -> Block {
+pub(super) fn false_tuple() -> Block {
     Block::with(flip_first_pair)
 }
 

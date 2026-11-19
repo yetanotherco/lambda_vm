@@ -66,6 +66,7 @@ fn commit_probed<'a>(
         None,
         None,
         probe.clone(),
+        None,
     )
     .expect("phase A")
 }
