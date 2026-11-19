@@ -232,6 +232,11 @@ pub struct GroupStamps {
     /// included). Bytes; 0 without a device.
     pub commit_base: u64,
     pub commit_reserved: u64,
+    /// The real card beside that ledger: what the memory pool held just before
+    /// the group's commit and just after it
+    /// (`multilinear::gpu::pool_reserved_now`). Bytes; 0 without a device.
+    pub commit_pool_before: u64,
+    pub commit_pool_after: u64,
     /// The group's columns were to go up beside the previous group's commit
     /// and the ledger refused them; they went up after it.
     pub ahead_refused: bool,
@@ -1955,6 +1960,7 @@ where
             let layout = global_layout(&shapes, config.format.stack)?;
             stamp.polys = layout.num_polys();
             stamp.commit_base = multilinear::gpu::ledger_reserved();
+            stamp.commit_pool_before = multilinear::gpu::pool_reserved_now();
             multilinear::gpu::reset_reserved_window();
             // Handles, not field elements: a table held narrow is read on the
             // host only by a host fallback.
@@ -2049,6 +2055,7 @@ where
             stamp.ood_counts = committed.ood_counts;
             ood.push(committed.ood);
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
+            stamp.commit_pool_after = multilinear::gpu::pool_reserved_now();
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
             if upload_ahead && let Some(packed) = packing.take() {

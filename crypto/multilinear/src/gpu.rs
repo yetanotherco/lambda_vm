@@ -1265,6 +1265,24 @@ pub fn pool_reserved_high() -> u64 {
     0
 }
 
+/// What the default memory pool holds of the card now; 0 without a device. It
+/// moves no high-water mark (unlike [`card_window_start`]), so a reading
+/// taken beside another window's leaves it whole. With the pool keeping every
+/// freed block, the value only rises, so readings before and after a step
+/// show what that step (and whatever ran beside it) made the pool take from
+/// the card. A report.
+#[cfg(feature = "cuda")]
+pub fn pool_reserved_now() -> u64 {
+    math_cuda::device::pool_reserved_bytes()
+        .map(|(now, _)| now)
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pool_reserved_now() -> u64 {
+    0
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn card_window_start() {}
 
