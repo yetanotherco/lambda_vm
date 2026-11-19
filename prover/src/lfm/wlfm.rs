@@ -2813,7 +2813,9 @@ pub fn overlap_planned() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !super::wlfm_knobs::knob_word_off(std::env::var(OVERLAP_PLANNED_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(
+            super::wlfm_knobs::env_word(OVERLAP_PLANNED_ENV).as_deref(),
+        )
     })
 }
 
@@ -2840,7 +2842,7 @@ pub const PREPARE_PAR_ENV: &str = "LAMBDA_VM_LEVELS_PREPARE_PAR";
 pub fn prepare_par() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(PREPARE_PAR_ENV).ok().as_deref())
+        super::wlfm_knobs::knob_word_on(super::wlfm_knobs::env_word(PREPARE_PAR_ENV).as_deref())
     })
 }
 
