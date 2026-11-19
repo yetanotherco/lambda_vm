@@ -1588,6 +1588,50 @@ fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
     assert!(verify(&proof, &elf, &format), "64-bit");
 }
 
+/// ★ The rest's header handed on early ([`Deviations::early_rest_header`])
+/// moves no byte: the same partition, tables and counts, a proof that
+/// verifies, and the same bytes under the deterministic grind (run alone).
+#[test]
+fn the_early_rest_header_moves_no_byte() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |early: bool| {
+        let (proof, _) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                early_rest_header: Some(early),
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "early {early}");
+        proof
+    };
+    let late = proved(false);
+    let early = proved(true);
+    assert_eq!(late.groups, early.groups, "the partition");
+    assert_eq!(late.table_num_vars, early.table_num_vars);
+    assert_eq!(
+        format!("{:?}", late.table_counts),
+        format!("{:?}", early.table_counts)
+    );
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&late), bytes(&early), "the proof's bytes");
+    }
+}
+
 /// ★ Phase B's order moves no byte (D-WHIR-NODISK §2.3): each group proves on
 /// its own fork `S_post ‖ g`, so taking the groups reversed or odd ones first
 /// proves the bytes of group order under the deterministic grind, with the
