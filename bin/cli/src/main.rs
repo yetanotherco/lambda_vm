@@ -868,7 +868,27 @@ fn at_pinned_choices(c: &BlockChoices<'_>) -> bool {
         && c.leaf_query == "lean"
         && c.argue_pack == "22"
         && c.memory == "split"
-        && c.page_run == "4"
+        && at_pinned_page_run(c)
+}
+
+/// Whether `c`'s page run cuts `c`'s memory format's pages as the pinned
+/// presets' run does: the runs cut the word format's pages alone
+/// (`prover::block_whir::BlockFormat::page_runs`), so under any other memory
+/// format every run is the presets'.
+fn at_pinned_page_run(c: &BlockChoices<'_>) -> bool {
+    let pinned = prover::block_whir::BlockFormat::pinned();
+    match (block_memory(c.memory), block_page_run(c.page_run)) {
+        (Ok(memory), Ok(page_run_log2)) => {
+            let presets = prover::block_whir::BlockFormat { memory, ..pinned };
+            prover::block_whir::BlockFormat {
+                page_run_log2,
+                ..presets
+            }
+            .page_runs()
+                == presets.page_runs()
+        }
+        _ => false,
+    }
 }
 
 struct BlockChoices<'a> {
@@ -3036,8 +3056,8 @@ mod tests {
 
     /// Both block commands take the page runs, 4 (runs of 16 pages, the
     /// presets') unless told otherwise, and nothing but a count in 0..=6; each
-    /// reads to the count it names, and only 4 is at the pinned choices a
-    /// compressed file is proved and verified at.
+    /// reads to the count it names. A compressed file is proved and verified
+    /// at the pinned choices, whose split format any run leaves as it is.
     #[test]
     fn the_block_commands_take_the_page_runs() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
@@ -3078,8 +3098,23 @@ mod tests {
             memory: "split",
             page_run,
         };
-        assert!(at_pinned_choices(&choices("4")));
-        assert!(!at_pinned_choices(&choices("0")));
+        // Under the pinned split format the runs cut nothing: every run is
+        // the pinned format, as the tree prover's compressed guard reads it.
+        for k in ["0", "1", "4", "6"] {
+            assert!(at_pinned_choices(&choices(k)), "--page-run {k} under split");
+        }
+        // Under the word format only the presets' run is theirs.
+        let words = |page_run| BlockChoices {
+            memory: "words",
+            ..choices(page_run)
+        };
+        assert!(at_pinned_page_run(&words("4")));
+        assert!(!at_pinned_page_run(&words("0")));
+        assert!(!at_pinned_page_run(&words("6")));
+        assert!(
+            !at_pinned_choices(&words("4")),
+            "the word format is not pinned"
+        );
         // `prove-block` sets the tree's format to the flag's run, the other
         // named choices with it.
         use prover::tables::fused_memory::MemoryFormat;
