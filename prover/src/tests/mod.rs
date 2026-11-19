@@ -64,6 +64,9 @@ pub mod copy_tests;
 #[cfg(test)]
 pub mod cpu32_tests;
 #[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod cpu_row_lean_block_tests;
+#[cfg(test)]
 pub mod cpu_tests;
 #[cfg(test)]
 pub mod cpu_timestamp_tests;

@@ -83,6 +83,8 @@ mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
 #[cfg(test)]
+mod cpu_row_lean_tests;
+#[cfg(test)]
 mod fused_memory_tests;
 #[cfg(test)]
 pub(crate) mod in_row_forgery_tests;
