@@ -2990,6 +2990,36 @@ fn the_rest_regenerator_refuses_what_it_did_not_rebuild() {
     }
 }
 
+/// Phase A commits every group to be retired before it is opened
+/// (`StackedCommitment::commit_to_retire`), so a joint run may be streamed
+/// into its leaves (`multilinear::gpu::streamed_joint_leaves`): a block under
+/// one tree a run commits joint runs, each of them to be retired. Run alone:
+/// the counters are the process's.
+#[test]
+fn phase_a_commits_its_joint_runs_to_be_retired() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    // One chain a run of the group's polynomials, so one round-0 tree a run.
+    let format = BlockFormat {
+        group: multilinear::whir_chain::GroupFold::Indexed,
+        ..many_groups()
+    };
+    assert_eq!(
+        format.zf.whir_trees,
+        multilinear::whir_chain::Round0Trees::One,
+        "one tree a run"
+    );
+    let (all, to_retire, _) = multilinear::gpu::joint_runs();
+    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let (now_all, now_to_retire, _) = multilinear::gpu::joint_runs();
+    assert!(now_all > all, "no joint run committed");
+    assert_eq!(
+        now_to_retire - to_retire,
+        now_all - all,
+        "a joint run committed that may be opened whole"
+    );
+    assert!(verify(&proof, &elf, &format));
+}
+
 /// The streamed chunks laid out on three threads are packed in the inline
 /// order all the same: the same groups and table counts as laid out on one
 /// thread, and the proof verifies.

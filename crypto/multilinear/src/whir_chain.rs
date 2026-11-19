@@ -2050,6 +2050,25 @@ where
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
+    commit_joint_stacked_for(polys, config, transient, false)
+}
+
+/// [`commit_joint_stacked`] for a run whose commitment is retired before it
+/// is opened (`retired`): then, with [`crate::gpu::streamed_joint_leaves`]
+/// on, the run is streamed into its leaves one codeword at a time and the
+/// commitment keeps no codeword. A commitment that may be opened whole
+/// (`retired` false) is never streamed.
+pub fn commit_joint_stacked_for<F, H>(
+    polys: &[Stacked<'_, F>],
+    config: &ChainConfig,
+    transient: bool,
+    retired: bool,
+) -> Result<(CodewordCommitment<F, H>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
     let Some(num_vars) = polys.first().map(Stacked::num_vars).filter(|&n| {
@@ -2072,7 +2091,9 @@ where
     // holds one of the run's codewords, not all of them. The same tree; the
     // commitment keeps no codeword and is retired before it is opened. A card
     // that declines any of it commits as below.
-    if crate::gpu::streamed_joint_leaves_here()
+    crate::gpu::note_joint_run(retired);
+    if retired
+        && crate::gpu::streamed_joint_leaves()
         && let Some((tree, root)) = crate::gpu::commit_joint_streamed(
             polys.len(),
             num_vars + config.log_blowup,

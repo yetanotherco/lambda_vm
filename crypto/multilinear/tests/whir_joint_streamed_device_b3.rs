@@ -161,24 +161,36 @@ impl Stack {
     ) -> Result<Proved, multilinear::Error> {
         let refs: Vec<&Mle<F>> = self.columns.iter().collect();
         let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
-        let committed = gpu::retired_after_commit(|| {
-            StackedCommitment::<F, H>::commit(
-                self.layout.clone(),
-                &borrow(&self.columns),
-                Some((&store, 0)),
-                cfg,
-            )
-        })?;
-        let roots = committed.roots();
-        let stacked = match drop {
-            None => committed,
-            Some(drop) => committed
-                .retire(TreeDrop::uniform(drop), cfg)?
-                .revive::<H, _>(
+        // Opened whole: committed as any commitment. Retired first: committed
+        // to be retired (`commit_to_retire`), which may stream a joint run.
+        let (roots, stacked) = match drop {
+            None => {
+                let committed = StackedCommitment::<F, H>::commit(
+                    self.layout.clone(),
+                    &borrow(&self.columns),
+                    Some((&store, 0)),
+                    cfg,
+                )?;
+                (committed.roots(), committed)
+            }
+            Some(drop) => {
+                let committed = StackedCommitment::<F, H>::commit_to_retire(
+                    self.layout.clone(),
                     &borrow(&self.columns),
                     Some((&store, ColumnsAt::From(0))),
                     cfg,
-                )?,
+                    &|| {},
+                )?;
+                let roots = committed.roots();
+                let revived = committed
+                    .retire(TreeDrop::uniform(drop), cfg)?
+                    .revive::<H, _>(
+                        &borrow(&self.columns),
+                        Some((&store, ColumnsAt::From(0))),
+                        cfg,
+                    )?;
+                (roots, revived)
+            }
         };
         let proof = prove::<F, Ext, _, H, _>(
             &stacked,
@@ -232,11 +244,40 @@ fn joint_runs(stack: &Stack, cfg: &ChainConfig) -> u64 {
         .count() as u64
 }
 
+/// The joint runs streamed: every one, when a codeword's fold block is at
+/// least 8 values (a whole number of 64-byte blocks of the leaf's chain);
+/// none below, where the batched commit runs.
+fn streamed_runs(stack: &Stack, cfg: &ChainConfig) -> u64 {
+    let first = cfg
+        .schedule(stack.layout.n_stack())
+        .first()
+        .copied()
+        .unwrap_or(0);
+    if first >= 3 {
+        joint_runs(stack, cfg)
+    } else {
+        0
+    }
+}
+
 /// The configurations the trees are built under: First6 at blowups 2 and 4,
 /// uniform folds of 4 (a 16-value block), each under one tree a run and one
-/// tree a polynomial.
+/// tree a polynomial; and under one tree a run, first folds of 3 (8 values,
+/// the least that streams: one 64-byte block a codeword) and 2 (4 values:
+/// never streamed, the batched commit runs), and the natural leaf order.
 fn configs() -> Vec<(String, ChainConfig)> {
     let mut out = Vec::new();
+    for first in [3u8, 2] {
+        let mut cfg = config(Round0Trees::One);
+        cfg.format.folds = WhirFolds::First(FirstFold::new(first as usize).unwrap());
+        out.push((format!("One, first{first}, blowup 2^2"), cfg));
+    }
+    let mut natural = config(Round0Trees::One);
+    natural.format.leaves = LeafOrder::Natural;
+    out.push((
+        "One, first6, natural leaf order, blowup 2^2".to_string(),
+        natural,
+    ));
     for round0 in [Round0Trees::One, Round0Trees::Each] {
         for log_blowup in [1, 2] {
             out.push((
@@ -282,8 +323,8 @@ fn a_streamed_joint_tree_has_the_hosts_roots_and_bytes_in_every_shape() {
             assert_eq!(gpu::host_fallbacks(), fallbacks, "{label}: no host commit");
             assert_eq!(
                 gpu::joint_streamed_builds() - streamed,
-                joint_runs(&stack, &cfg),
-                "{label}: each joint run streamed once"
+                streamed_runs(&stack, &cfg),
+                "{label}: each joint run streamed once (none under a fold block of 4)"
             );
             assert_eq!(roots, host_roots, "{label}: roots");
             stack.verify(&roots, &proof, &cfg, &label);
@@ -295,8 +336,8 @@ fn a_streamed_joint_tree_has_the_hosts_roots_and_bytes_in_every_shape() {
     }
 }
 
-/// With the knob on, a commit made outside `retired_after_commit` — one that
-/// may be opened whole — is not streamed, and proves the host's bytes opened
+/// With the knob on, a commit that may be opened whole (not
+/// `commit_to_retire`) is not streamed, and proves the host's bytes opened
 /// whole.
 #[test]
 fn a_commit_opened_whole_is_never_streamed() {
@@ -346,14 +387,13 @@ fn a_streamed_run_of_four_promises_three_codewords_less() {
         let _knob = gpu::force_streamed_joint_leaves(on);
         gpu::reset_reserved_window();
         let base = gpu::ledger_reserved();
-        let committed = gpu::retired_after_commit(|| {
-            StackedCommitment::<F, H>::commit(
-                stack.layout.clone(),
-                &borrow(&stack.columns),
-                Some((&store, 0)),
-                &cfg,
-            )
-        })
+        let committed = StackedCommitment::<F, H>::commit_to_retire(
+            stack.layout.clone(),
+            &borrow(&stack.columns),
+            Some((&store, ColumnsAt::From(0))),
+            &cfg,
+            &|| {},
+        )
         .unwrap();
         let grew = gpu::reserved_window_peak().saturating_sub(base);
         (grew, committed.roots())
@@ -380,4 +420,39 @@ fn a_streamed_run_of_four_promises_three_codewords_less() {
         "the streamed commit grew the ledger {one_at_a_time} B, the batched {batched} B"
     );
     assert_eq!(roots, batched_roots, "roots");
+}
+
+/// A card that declines after the first codeword (the encode of codeword 1,
+/// 2 or 3 of a run of four refused): the partial tree is let go, nothing is
+/// streamed, the batched commit runs on the card (no host commit), and the
+/// roots and the proof are the host's.
+#[test]
+fn a_streamed_run_declined_after_its_first_codeword_commits_batched_with_the_hosts_bytes() {
+    let _serial = serial();
+    let cfg = config(Round0Trees::One);
+    let stack = Stack::new("a run of four", &[18; 4], 18);
+    let (host_roots, host_proof) = stack.on_the_host(&cfg);
+    for step in 1..4 {
+        let label = format!("declined at codeword {step}");
+        let streamed = gpu::joint_streamed_builds();
+        let fallbacks = gpu::host_fallbacks();
+        let (roots, proof) = {
+            let _on = gpu::force_streamed_joint_leaves(true);
+            let _decline = gpu::force_streamed_decline_at(Some(step));
+            stack.try_prove(&cfg, Some(4))
+        }
+        .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        assert_eq!(
+            gpu::joint_streamed_builds(),
+            streamed,
+            "{label}: nothing streamed"
+        );
+        assert_eq!(gpu::host_fallbacks(), fallbacks, "{label}: no host commit");
+        assert_eq!(roots, host_roots, "{label}: roots");
+        stack.verify(&roots, &proof, &cfg, &label);
+        assert!(
+            bytes(&proof) == bytes(&host_proof),
+            "{label}: the host's bytes"
+        );
+    }
 }
