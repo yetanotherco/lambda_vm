@@ -920,3 +920,114 @@ fn a_re_ranking_that_is_not_a_permutation_is_refused() {
         }
     }
 }
+
+/// ★ The planned overlap (retired prepared stacks, the overlap otherwise off)
+/// moves no byte: under either argue format, the block whose prepared stacks
+/// are retired, opened group by group beside the next group's argue where the
+/// plan fits (always, without a card), proves the bytes phase B proves one
+/// group at a time, and verifies; every group but the last opened beside, and
+/// none was planned out. Off (the default), every group opens alone.
+#[test]
+fn the_planned_overlap_under_retired_stacks_proves_the_same_bytes() {
+    let n = SIZES.len();
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for planned in [false, true] {
+            let (proved, _) = prove_block_placed(
+                &config(argue),
+                PhaseBOverlap::Off,
+                &in_order(),
+                OverlapFaults::default(),
+                &|block| block.set_phase_b_overlap_planned(planned),
+                None,
+                true,
+            );
+            let proved = proved.unwrap_or_else(|e| panic!("{argue:?} {planned}: {e:?}"));
+            assert_eq!(
+                digest(&proved),
+                before,
+                "{argue:?} {planned}: the held bytes"
+            );
+            verify(argue, &proved).unwrap_or_else(|e| panic!("{argue:?} {planned}: {e:?}"));
+            let s = stamps(&proved);
+            assert!(
+                s.iter().all(|g| !g.overlap_planned_out),
+                "{argue:?}: none planned out"
+            );
+            let beside = s.iter().filter(|g| g.overlapped).count();
+            assert_eq!(
+                beside,
+                if planned { n - 1 } else { 0 },
+                "{argue:?} {planned}"
+            );
+        }
+    }
+}
+
+/// The planned overlap's fallbacks prove the same bytes: a transition the plan
+/// refuses opens alone (that group only); a transition in which the card
+/// refused a promise turns the rest of phase B serial (its own opening stands);
+/// an opening that fails beside an argue is the prove's error, never a panic.
+#[test]
+fn the_planned_overlaps_fallbacks_prove_the_same_bytes() {
+    let argue = ARGUES[0];
+    let before = BEFORE_THE_OVERLAP[0];
+    let planned = |faults: OverlapFaults| {
+        prove_block_placed(
+            &config(argue),
+            PhaseBOverlap::Off,
+            &in_order(),
+            faults,
+            &|block| block.set_phase_b_overlap_planned(true),
+            None,
+            true,
+        )
+        .0
+    };
+    // The plan refuses group 1's (a retired prepared stack's) transition.
+    let proved = planned(OverlapFaults {
+        overlap_refused_at: Some(1),
+        ..Default::default()
+    })
+    .expect("proves with a transition planned out");
+    assert_eq!(
+        digest(&proved),
+        before,
+        "a planned-out transition: the same bytes"
+    );
+    let s = stamps(&proved);
+    assert!(
+        s[1].overlap_planned_out && !s[1].overlapped,
+        "group 1 opened alone"
+    );
+    assert!(
+        s[0].overlapped && s[2].overlapped && s[4].overlapped,
+        "only group 1 alone"
+    );
+    // The card refused a promise in the transition that argues group 3 (group
+    // 2's openings beside it): group 2's opening stands, every later group
+    // opens alone.
+    let proved = planned(OverlapFaults {
+        refusal_at: Some(3),
+        ..Default::default()
+    })
+    .expect("proves after a refusal");
+    assert_eq!(digest(&proved), before, "after a refusal: the same bytes");
+    let s = stamps(&proved);
+    assert!(
+        s[0].overlapped && s[1].overlapped && s[2].overlapped,
+        "before the refusal: beside"
+    );
+    assert!(
+        s[3..].iter().all(|g| !g.overlapped),
+        "after the refusal: alone"
+    );
+    // Group 1's openings fail on the opening thread beside group 2's argue.
+    assert!(
+        planned(OverlapFaults {
+            open_fails: Some(1),
+            ..Default::default()
+        })
+        .is_err(),
+        "a failed opening beside an argue is the prove's error"
+    );
+}
