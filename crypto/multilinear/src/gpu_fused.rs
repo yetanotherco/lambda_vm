@@ -47,6 +47,16 @@ pub struct FusedInput<'a, B: IsField, E: IsField> {
     /// (`gpu::argue_no_lift`, D-BATCH M1-2): the rounds read them when no
     /// lifted factors were made.
     pub columns: Option<&'a crate::gpu::ColumnFactors>,
+    /// A second bus at its own claim point (a table's local lookups): its two
+    /// rules are the batch's fourth and fifth, at `λ³` and `λ⁴`.
+    pub second: Option<SecondInput<'a, E>>,
+}
+
+/// A second bus's interactions and its GKR input-layer claim point (whose
+/// last `num_vars` coordinates are its `ρ'`).
+pub struct SecondInput<'a, E: IsField> {
+    pub interactions: &'a [Interaction<E>],
+    pub claim_point: &'a [FieldElement<E>],
 }
 
 /// What the fused rounds read their factors through: the lifted factors, or
@@ -603,6 +613,9 @@ pub struct FusedStepper<'f, E: IsField> {
     claim: FieldElement<E>,
     e_r: FieldElement<E>,
     e_rho: FieldElement<E>,
+    /// A second bus: its `ρ'`, its grid sums `U'` and its weight's product so
+    /// far.
+    second: Option<SecondState<E>>,
     /// The challenges bound so far.
     bound: Vec<FieldElement<E>>,
     /// The message of the round under way, once asked for.
@@ -611,6 +624,14 @@ pub struct FusedStepper<'f, E: IsField> {
     queued: Option<usize>,
     started: std::time::Instant,
     times: FusedTimes,
+}
+
+/// [`FusedStepper`]'s second bus.
+#[cfg(feature = "cuda")]
+struct SecondState<E: IsField> {
+    rho: Vec<FieldElement<E>>,
+    u: [[FieldElement<E>; 2]; 2],
+    e_rho: FieldElement<E>,
 }
 
 #[cfg(feature = "cuda")]
@@ -637,7 +658,9 @@ where
         use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
         use std::time::Instant;
 
-        if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() || lambdas.len() != 3 {
+        // Three rules, or five with a second bus.
+        let rules = if input.second.is_some() { 5 } else { 3 };
+        if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() || lambdas.len() != rules {
             return None;
         }
         let started = Instant::now();
@@ -684,6 +707,21 @@ where
             terms[0] = (slot, a + FieldElement::<E>::one());
             bus = BusColumn::from_parts(bus.constant().clone(), terms);
         }
+        // The second bus's column at `λ³, λ⁴`, and its `ρ'`.
+        let second = match &input.second {
+            None => None,
+            Some(second) => {
+                if second.claim_point.len() < num_vars {
+                    return None;
+                }
+                let (point, rho) = second
+                    .claim_point
+                    .split_at(second.claim_point.len() - num_vars);
+                let column =
+                    BusColumn::new(second.interactions, point, &lambdas[3], &lambdas[4]).ok()?;
+                Some((column, rho.to_vec()))
+            }
+        };
         let keep = faults().keep_corners;
         let check_corners = check_corners && !keep;
         let points: Vec<(u32, u32)> = (0..=d as u32)
@@ -691,8 +729,9 @@ where
             .filter(|&(a, b)| check_corners || keep || !(a < 2 && b < 2))
             .collect();
         let walked: Vec<u32> = core::iter::once(0).chain(2..=d as u32).collect();
+        let bus_rows = if second.is_some() { 5 } else { 3 };
         if points.len() > math_cuda::argue_fused::MAX_ROWS
-            || walked.len() + 3 > math_cuda::argue_fused::MAX_ROWS
+            || walked.len() + bus_rows > math_cuda::argue_fused::MAX_ROWS
         {
             return None;
         }
@@ -736,6 +775,40 @@ where
             coeffs: &coeffs,
             constant: raw(bus.constant())?,
         };
+        // The second bus's terms, as the first's.
+        let second_parts = match &second {
+            None => None,
+            Some((column, rho2)) => {
+                let slots: Vec<u32> = column
+                    .terms()
+                    .iter()
+                    .map(|(slot, _)| u32::try_from(*slot).ok())
+                    .collect::<Option<_>>()?;
+                if slots.iter().any(|&s| s as usize >= device.width) {
+                    return None;
+                }
+                let coeffs = flat(
+                    &column
+                        .terms()
+                        .iter()
+                        .map(|(_, a)| a.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                Some((slots, coeffs, raw(column.constant())?, flat(&rho2[2..])?))
+            }
+        };
+        let second_bus = second_parts
+            .as_ref()
+            .map(
+                |(slots, coeffs, constant, rho_tail)| math_cuda::argue_fused::SecondBus {
+                    bus: math_cuda::argue_fused::FusedBus {
+                        slots,
+                        coeffs,
+                        constant: *constant,
+                    },
+                    rho_tail,
+                },
+            );
         let mut session = match math_cuda::argue_fused::FusedZerocheck::new(
             device,
             program,
@@ -744,6 +817,7 @@ where
             &rho_tail,
             points.len(),
             walked.len() + 2,
+            second_bus,
         ) {
             Ok(Some(session)) => session,
             _ => return None,
@@ -781,6 +855,21 @@ where
         let u: [[FieldElement<E>; 2]; 2] = core::array::from_fn(|b| {
             core::array::from_fn(|c| from(&u_sums[(2 * b + c) * 3..(2 * b + c) * 3 + 3]))
         });
+        let second = match second {
+            None => None,
+            Some((_, rho2)) => {
+                let Ok(Some(u2)) = session.second_grid() else {
+                    return None;
+                };
+                Some(SecondState {
+                    rho: rho2,
+                    u: core::array::from_fn(|b| {
+                        core::array::from_fn(|c| from(&u2[(2 * b + c) * 3..(2 * b + c) * 3 + 3]))
+                    }),
+                    e_rho: FieldElement::one(),
+                })
+            }
+        };
         let times = FusedTimes {
             grid: tick.elapsed().as_secs_f64(),
             roots: constraints.roots().len(),
@@ -803,6 +892,7 @@ where
             claim: claim.clone(),
             e_r: FieldElement::one(),
             e_rho: FieldElement::one(),
+            second,
             bound: Vec::with_capacity(there),
             pending: None,
             queued: None,
@@ -865,7 +955,17 @@ where
                 let b0: [FieldElement<E>; 2] = core::array::from_fn(|b| {
                     (&one - &rho[1]) * &self.u[b][0] + &rho[1] * &self.u[b][1]
                 });
-                fused::message(&r[0], &rho[0], &self.e_r, &self.e_rho, &a0, &b0, &self.big)
+                let g = fused::message(&r[0], &rho[0], &self.e_r, &self.e_rho, &a0, &b0, &self.big);
+                match &self.second {
+                    None => g,
+                    Some(second) => {
+                        let (rho2, u2) = (&second.rho, &second.u);
+                        let b2: [FieldElement<E>; 2] = core::array::from_fn(|b| {
+                            (&one - &rho2[1]) * &u2[b][0] + &rho2[1] * &u2[b][1]
+                        });
+                        fused::with_bus(g, &rho2[0], &second.e_rho, &b2)
+                    }
+                }
             }
             1 => {
                 let s0 = &self.bound[0];
@@ -878,7 +978,16 @@ where
                     .collect();
                 let b1: [FieldElement<E>; 2] =
                     core::array::from_fn(|c| (&one - s0) * &self.u[0][c] + s0 * &self.u[1][c]);
-                fused::message(&r[1], &rho[1], &self.e_r, &self.e_rho, &a1, &b1, &self.big)
+                let g = fused::message(&r[1], &rho[1], &self.e_r, &self.e_rho, &a1, &b1, &self.big);
+                match &self.second {
+                    None => g,
+                    Some(second) => {
+                        let u2 = &second.u;
+                        let b2: [FieldElement<E>; 2] =
+                            core::array::from_fn(|c| (&one - s0) * &u2[0][c] + s0 * &u2[1][c]);
+                        fused::with_bus(g, &second.rho[1], &second.e_rho, &b2)
+                    }
+                }
             }
             _ => {
                 let tick = std::time::Instant::now();
@@ -903,9 +1012,19 @@ where
                     from(&sums[nb * 3..nb * 3 + 3]),
                     from(&sums[nb * 3 + 3..nb * 3 + 6]),
                 ];
+                // The second bus's two sums follow the first's.
+                let b2: Option<[FieldElement<E>; 2]> = self.second.as_ref().map(|_| {
+                    [
+                        from(&sums[(nb + 2) * 3..(nb + 2) * 3 + 3]),
+                        from(&sums[(nb + 3) * 3..(nb + 3) * 3 + 3]),
+                    ]
+                });
                 let (r_j, rho_j) = (&r[j], &rho[j]);
                 let divisor = &self.e_r * r_j;
-                let bus_part = &self.e_rho * ((&one - rho_j) * &b[0] + rho_j * &b[1]);
+                let mut bus_part = fused::bus_sum(rho_j, &self.e_rho, &b);
+                if let (Some(second), Some(b2)) = (&self.second, &b2) {
+                    bus_part += fused::bus_sum(&second.rho[j], &second.e_rho, b2);
+                }
                 a[1] = match divisor.inv() {
                     Ok(inverse) => {
                         (&self.claim - &self.e_r * (&one - r_j) * &a[0] - bus_part) * inverse
@@ -918,7 +1037,13 @@ where
                     },
                 };
                 self.times.rounds += tick.elapsed().as_secs_f64();
-                fused::message(r_j, rho_j, &self.e_r, &self.e_rho, &a, &b, &self.big)
+                let g = fused::message(r_j, rho_j, &self.e_r, &self.e_rho, &a, &b, &self.big);
+                match (&self.second, b2) {
+                    (Some(second), Some(b2)) => {
+                        fused::with_bus(g, &second.rho[j], &second.e_rho, &b2)
+                    }
+                    _ => g,
+                }
             }
         };
         self.pending = Some(g.clone());
@@ -939,6 +1064,9 @@ where
         self.claim = crate::sumcheck::interpolate(&all, s);
         self.e_r = &self.e_r * fused::eq1(&self.r[j], s);
         self.e_rho = &self.e_rho * fused::eq1(&self.rho[j], s);
+        if let Some(second) = self.second.as_mut() {
+            second.e_rho = &second.e_rho * fused::eq1(&second.rho[j], s);
+        }
         self.bound.push(s.clone());
         match j {
             0 => {}
@@ -1000,10 +1128,14 @@ where
                     .map_err(|_| failed("fused factor values"))?,
             );
         }
-        for (scale, tail) in [
+        let mut weights = vec![
             (&self.e_r, &self.r[self.there..]),
             (&self.e_rho, &self.rho[self.there..]),
-        ] {
+        ];
+        if let Some(second) = &self.second {
+            weights.push((&second.e_rho, &second.rho[self.there..]));
+        }
+        for (scale, tail) in weights {
             let table: Vec<FieldElement<E>> = crate::eq::eq_evals(tail)
                 .into_iter()
                 .map(|v| v * scale)
