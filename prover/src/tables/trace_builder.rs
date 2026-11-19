@@ -7116,7 +7116,11 @@ fn for_each_keccak_lookup(
         } else {
             emit_permute_lookups(kop, &mut emit);
         }
-        emit_round_lookups(kop, form, &mut emit);
+        // Local byte lookups are received by each group's LOCAL_BYTES table,
+        // never by BITWISE.
+        if !form.byte_lookups_local() {
+            emit_round_lookups(kop, form, &mut emit);
+        }
     }
 }
 
@@ -7206,11 +7210,30 @@ fn emit_round_lookups(
     form: KeccakRndForm,
     emit: &mut impl FnMut(BitwiseOperation),
 ) {
+    emit_keccak_rnd_rounds(&kop.input, form, 0..24, emit);
+}
+
+/// The byte lookups KECCAK_RND's rows `rounds` (of the 24) send for one
+/// permutation of `input`, each as the BITWISE operation it names, its rounds
+/// replayed: what a row of round `r` sends is emitted as round `r` is.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn emit_keccak_rnd_rounds(
+    input: &[u64; 25],
+    form: KeccakRndForm,
+    rounds: std::ops::Range<usize>,
+    sink: &mut impl FnMut(BitwiseOperation),
+) {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
     {
         // Replay keccak round computation to extract bitwise lookups
-        let mut state = kop.input;
+        let mut state = *input;
         for round in 0..24 {
+            let live = rounds.contains(&round);
+            let mut emit = |op: BitwiseOperation| {
+                if live {
+                    sink(op)
+                }
+            };
             // --- theta: Cxz chain BYTE_ALU[XOR] (160) ---
             let mut cxz = [[[0u8; 8]; 4]; 5];
             for x in 0..5 {
