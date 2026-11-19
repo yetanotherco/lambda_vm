@@ -251,6 +251,25 @@ fn stacks_forced() -> Result<Option<StackPlace>, String> {
 #[cfg(test)]
 static STACKS_FOR_TEST: std::sync::Mutex<Option<Option<StackPlace>>> = std::sync::Mutex::new(None);
 
+/// Test only: the real-block harness's memory-keeping probe
+/// (`RTA_KEEP_MEMORY=1`). When set, [`prove_block_levels`] keeps what the
+/// process already holds before its clock starts: it skips the allocator's
+/// purge and the card pool's trim, so a second block reuses the first's pages
+/// and the pool's blocks. A production build has no such switch.
+#[cfg(test)]
+pub(crate) static KEEP_MEMORY_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn keep_memory() -> bool {
+    KEEP_MEMORY_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+const fn keep_memory() -> bool {
+    false
+}
+
 /// Sets [`STACKS_FOR_TEST`] until the guard drops.
 #[cfg(test)]
 pub(crate) fn set_stacks_for_test(place: Option<StackPlace>) -> StacksForTest {
@@ -1396,14 +1415,24 @@ pub fn prove_block_levels(
     // What the process freed before this block (an earlier block, its
     // verification) goes back to the OS first, so the peak this block's base
     // reads starts from what is live, not from pages the allocator keeps.
-    let purge_at_start = crate::alloc_purge::purge_now();
+    let keep = keep_memory();
+    if keep {
+        eprintln!(
+            "LEVELS KEEP MEMORY: the purge and the card trim before the clock skipped (a test probe)"
+        );
+    }
+    let purge_at_start = if keep {
+        None
+    } else {
+        crate::alloc_purge::purge_now()
+    };
     card_pad_bytes()?;
     card_budget_pct()?;
     let _pad = PadRelease;
     let _budget = BudgetRelease;
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
-    let at_start = card_settle("start");
+    let at_start = if keep { None } else { card_settle("start") };
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
     type Statement = (

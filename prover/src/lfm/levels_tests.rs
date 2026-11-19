@@ -946,6 +946,10 @@ fn rta_a_real_block_through_its_levels() {
     let levels: usize =
         std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
     let runs: usize = std::env::var("RTA_RUNS").map_or(1, |v| v.trim().parse().expect("RTA_RUNS"));
+    // A pricing probe: keep the process's memory between blocks (see
+    // `KEEP_MEMORY_FOR_TEST`); off unless `RTA_KEEP_MEMORY=1`.
+    let keep = std::env::var("RTA_KEEP_MEMORY").is_ok_and(|v| v.trim() == "1");
+    super::levels::KEEP_MEMORY_FOR_TEST.store(keep, std::sync::atomic::Ordering::Relaxed);
     let opts = super::proof::block_base_options();
     println!(
         "RTA CONFIG: base {:?} · tag {} · group polys {} · family {family:?} · levels {levels} · \
@@ -992,6 +996,24 @@ fn rta_a_real_block_through_its_levels() {
     println!("RTA DONE");
 }
 
+/// This process's minor and major faults and its user and system seconds,
+/// from `/proc/self/stat` (Linux; `None` elsewhere or on a parse miss).
+fn self_usage() -> Option<(u64, u64, f64, f64)> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The fields after the command's closing parenthesis, from field 3 on.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let num = |k: usize| f.get(k - 3)?.parse::<u64>().ok();
+    // `sysconf(_SC_CLK_TCK)` is 100 on the boxes' Linux.
+    let tick = 100.0;
+    Some((
+        num(10)?,
+        num(12)?,
+        num(14)? as f64 / tick,
+        num(15)? as f64 / tick,
+    ))
+}
+
 /// One run of [`rta_a_real_block_through_its_levels`]: proved, printed,
 /// verified.
 #[allow(clippy::too_many_arguments)]
@@ -1008,6 +1030,7 @@ fn rta_one_run(
     use super::levels::prove_block_levels;
     let (elf, input) = (elf.to_vec(), input.to_vec());
     let opts = opts.clone();
+    let usage_before = self_usage();
     // A panic anywhere under the driver (a card that ran out where a path
     // has no fallback, say) is a refused block on its own line too, never a
     // run that just stops.
@@ -1038,6 +1061,16 @@ fn rta_one_run(
         println!("RTA REFUSED: {e}");
         panic!("{e}")
     });
+    if let (Some(a), Some(b)) = (usage_before, self_usage()) {
+        println!(
+            "RTA USAGE: minor faults {} · major faults {} · user {:.2}s · system {:.2}s (the driver's call, \
+             its purge and trim before the clock included)",
+            b.0.saturating_sub(a.0),
+            b.1.saturating_sub(a.1),
+            b.2 - a.2,
+            b.3 - a.3
+        );
+    }
     let t = &run.times;
     let s = &run.base_stamps;
     println!(
