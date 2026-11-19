@@ -1044,6 +1044,9 @@ fn rta_one_run(
         "RTA BASE: end {:.3}s · execute {:.3}s · build {:.3}s · phase A {:.3}s · phase B {:.3}s",
         t.base, s.execute, s.build, s.phase_a, s.phase_b
     );
+    // The base's own stamp report (BLOCK SHAPE, a BLOCK GROUP line a group, BLOCK PHASE-B SPAN,
+    // BLOCK PHASES, …), as the CLI prints it: printed after the run, outside every timed span.
+    eprint!("{}", s.report());
     // The base's groups, in the order phase B proves them: each its index,
     // table count and first table's name, so a late group can be named.
     let names = run.plan.table_names();
