@@ -540,6 +540,47 @@ fn a_refused_upload_once_copies_twice_with_the_same_bytes() {
     }
 }
 
+/// The upload once's real plan falls back to today's two copies, with the
+/// same bytes, where the card's ledger cannot hold a store beside the revive's
+/// promises (a test's margin larger than any card): on a card every retired
+/// group is stamped planned out with what it needed above what was free, and
+/// none uses a store; without a card nothing reaches the plan.
+#[test]
+fn an_upload_once_the_card_cannot_hold_copies_twice_with_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    let (program, arenas, build) = probe_placed(WlfmFamily::B3, StackPlace::CardRetired);
+    let (want, _) = streamed_once(&program, &build, &arenas, false, Default::default())
+        .expect("the retired build proves");
+    let (got, groups) = streamed_once(
+        &program,
+        &build,
+        &arenas,
+        true,
+        OverlapFaults {
+            upload_once_margin: Some(1 << 50),
+            ..Default::default()
+        },
+    )
+    .expect("proves with every store planned out");
+    assert!(got == want, "planned out: the same bytes");
+    for (g, s) in groups.iter().enumerate() {
+        let u = &s.upload_once;
+        assert!(!u.used && !u.refused, "group {g}: no store ({u:?})");
+        if card {
+            assert!(
+                u.planned_out && u.need > u.free,
+                "group {g}: the plan said no ({u:?})"
+            );
+        } else {
+            assert!(!u.planned_out, "group {g}: no card, no plan ({u:?})");
+        }
+    }
+}
+
 /// The upload-once knob's name; it is off by default, and only `1` turns it
 /// on.
 #[test]
