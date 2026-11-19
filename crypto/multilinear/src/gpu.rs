@@ -4845,13 +4845,38 @@ pub fn upload_columns<F>(columns: &[&crate::mle::Mle<F>]) -> Option<ResidentColu
 where
     F: math::field::traits::IsField + 'static,
 {
+    upload_columns_on(columns, true)
+}
+
+/// [`upload_columns`] for a retired prepared stack's store, read by its revive
+/// and its opening: a refusal is not counted as an argue device fallback
+/// (`math_cuda::columns::DeviceColumns::upload_store`).
+#[cfg(feature = "cuda")]
+pub fn upload_store_columns<F>(columns: &[&crate::mle::Mle<F>]) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    upload_columns_on(columns, false)
+}
+
+/// Whether `LAMBDA_VM_NO_GPU_COLUMNS` keeps every column store off the card
+/// (read once a process).
+pub fn columns_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some())
+}
+
+#[cfg(feature = "cuda")]
+fn upload_columns_on<F>(columns: &[&crate::mle::Mle<F>], argue: bool) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
     use math::field::goldilocks::GoldilocksField;
 
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
         return None;
     }
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some()) {
+    if columns_disabled() {
         return None;
     }
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
@@ -4861,7 +4886,11 @@ where
             core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
         })
         .collect();
-    math_cuda::columns::DeviceColumns::upload(&raw).map(ResidentColumns)
+    if argue {
+        math_cuda::columns::DeviceColumns::upload(&raw).map(ResidentColumns)
+    } else {
+        math_cuda::columns::DeviceColumns::upload_store(&raw).map(ResidentColumns)
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -4871,6 +4900,23 @@ where
 {
     None
 }
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_store_columns<F>(_columns: &[&crate::mle::Mle<F>]) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// Openings whose message was staged from host columns (no store held them on
+/// the card), this process: what a test reads to see that an opening took the
+/// store it was handed. Zero without a device.
+pub fn openings_staged_from_host() -> u64 {
+    OPEN_STAGED_FROM_HOST.load(Ordering::Relaxed)
+}
+
+static OPEN_STAGED_FROM_HOST: AtomicU64 = AtomicU64::new(0);
 
 /// A table's columns as they go to the card: field elements, packed narrow
 /// ([`crate::narrow::NarrowColumns`]) and widened there, or the records the
@@ -7613,11 +7659,14 @@ where
     // narrow table's are widened there otherwise.
     let host_parts: Vec<(&[u64], usize)> = match message.resident {
         Some(_) => Vec::new(),
-        None => message
-            .parts
-            .iter()
-            .map(|(column, offset)| (raw(column.host()), *offset))
-            .collect(),
+        None => {
+            OPEN_STAGED_FROM_HOST.fetch_add(1, Ordering::Relaxed);
+            message
+                .parts
+                .iter()
+                .map(|(column, offset)| (raw(column.host()), *offset))
+                .collect()
+        }
     };
     let overlay = match overlay {
         Some(overlay) if overlay.point.len() == n_stack && !overlay.partial.is_empty() => {
