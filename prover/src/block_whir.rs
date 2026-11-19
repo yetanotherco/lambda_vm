@@ -396,6 +396,26 @@ pub const BLOCK_PAGE_RUN_LOG2: u8 = 4;
 /// groups is pinned by `block_wide_logup_at_the_group_maximum_is_pinned`.
 pub const BLOCK_MAX_GROUPS: usize = 1024;
 
+/// The most tables a block statement may state: a verifier constant, never in
+/// the transcript. The large block states under 700 tables at runs off, and a
+/// 200 Mgas block, by the estimate behind [`BLOCK_MAX_GROUPS`], some 13
+/// thousand. The frame
+/// builds an AIR for every stated table before any root is read, so the bound
+/// caps what a statement can make the verifier build: [`block_frame`] refuses
+/// a statement with more before it loads the program, and the prover refuses
+/// an AIR set with more, so a block the verifier would refuse is not proved.
+pub const BLOCK_MAX_TABLES: usize = 1 << 16;
+
+/// Refuses `tables` over [`BLOCK_MAX_TABLES`].
+pub(crate) fn check_table_count(tables: usize) -> Result<(), Error> {
+    if tables > BLOCK_MAX_TABLES {
+        return Err(Error::InvalidTableCounts(format!(
+            "{tables} tables — a block states at most {BLOCK_MAX_TABLES}"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses `groups` over `max_groups` ([`BlockFormat::max_groups`]). The
 /// verifier refuses a statement with more ([`block_frame`]), and the prover
 /// refuses as its groups close, so a block the verifier would refuse is not
@@ -6036,6 +6056,7 @@ pub(crate) fn prove_traces(
         )?;
     }
     check_page_traces(&airs, traces.pages.len())?;
+    check_table_count(airs.air_refs().len())?;
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
@@ -7276,6 +7297,7 @@ fn lay_out_rest<'a>(
     });
     built?;
     check_page_traces(airs, traces.pages.len())?;
+    check_table_count(airs.air_refs().len())?;
     marks.push(("airs", at()));
     let prepared = if prepared_now {
         let prepared = prepared_tables(airs, &traces.page_configs, format)?;
@@ -7564,6 +7586,7 @@ fn lay_out_rest_streamed<'a>(
             airs
         });
         built?;
+        check_table_count(airs.air_refs().len())?;
         Ok(airs)
     };
     let mut timed: Vec<(usize, f64)> = Vec::new();
@@ -10143,6 +10166,8 @@ pub(crate) fn block_frame(
     format: &BlockFormat,
 ) -> Result<BlockFrame, Error> {
     check_memory_format(format)?;
+    // At most the tables a block states, before anything is built from them.
+    check_table_count(statement.table_num_vars.len())?;
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     validate_block_counts(statement.table_counts)?;
