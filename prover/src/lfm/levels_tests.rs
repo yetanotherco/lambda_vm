@@ -679,6 +679,13 @@ fn the_blake3_driver_validating_late_proves_the_same_level_bytes() {
     };
     let (secs, _) = run.times.validated_late.expect("level 1 validated late");
     assert!(secs > 0.0 && run.times.validated_beside.is_none());
+    // The run holds level 1's program released, heights kept, as off the knob:
+    // the late check handed it back.
+    let level1 = &run.levels[0].program;
+    assert!(
+        level1.instrs.is_empty() && !level1.arena_schema.lens.is_empty(),
+        "level 1's program handed back released, not a placeholder"
+    );
     let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
     let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
     assert_eq!(proofs.len(), run.proofs.len());
@@ -960,8 +967,7 @@ fn the_admitted_derivation_is_the_derivation_byte_for_byte() {
     let plan = b3_plan(&elf, &base, &format);
     let admitted = plan
         .closed_block_program_admitted()
-        .expect("the plan's program is admitted")
-        .into_program();
+        .expect("the plan's program is admitted");
     let (emitted, _, _) = plan
         .closed_block_program_marked_timed(false)
         .expect("the plan's program emits");
@@ -976,25 +982,38 @@ fn the_admitted_derivation_is_the_derivation_byte_for_byte() {
         (instrs.len(), h.finish())
     };
     assert_eq!(
-        digest(&admitted.instrs),
+        digest(&admitted.program().instrs),
         digest(&emitted.instrs),
         "the admitted program is the emitted one, instruction for instruction"
     );
     let direct = build_level(admitted, WlfmFamily::B3, level_rounds(&plan), true)
         .expect("a level built from the admitted program");
     let derived = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
-    let first = &derived[0].build.artifacts;
-    assert_eq!(
-        first.program_id, direct.build.artifacts.program_id,
-        "the derived level 1's program id"
-    );
-    assert_eq!(
-        format!("{first:?}"),
-        format!("{:?}", direct.build.artifacts),
-        "the derived level 1's artifacts"
-    );
+    assert!(derived.len() >= 2, "a level 2 to pin");
+    let same = |k: usize, direct: &super::levels::Level| {
+        let got = &derived[k].build.artifacts;
+        assert_eq!(
+            got.program_id,
+            direct.build.artifacts.program_id,
+            "the derived level {}'s program id",
+            k + 1
+        );
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", direct.build.artifacts),
+            "the derived level {}'s artifacts",
+            k + 1
+        );
+    };
+    same(0, &direct);
+    // Level 2: the leg over level 1, admitted, built directly.
+    let child = super::levels::child_of(&plan, &derived[0]);
+    let leg = super::wlfm_leg::wlfm_leg_program_admitted(&child).expect("the leg is admitted");
+    let direct2 = build_level(leg, WlfmFamily::B3, child.artifacts.rounds, true)
+        .expect("level 2 built from the admitted leg");
+    same(1, &direct2);
     println!(
-        "LEVELS ADMITTED DERIVATION: level 1 program id equal · artifacts equal · {} levels derived",
+        "LEVELS ADMITTED DERIVATION: levels 1 and 2 program ids and artifacts equal · {} levels derived",
         derived.len()
     );
 }
@@ -1398,8 +1417,13 @@ fn rta_one_run(
         ),
         None => match t.validated_late {
             Some((secs, at)) => println!(
-                "RTA LEVEL1 VALIDATE: late · {secs:.3}s · done by {at:.3}s · level 1 proved at {:.3}s",
-                t.levels.first().map_or(0.0, |l| l.end)
+                "RTA LEVEL1 VALIDATE: late · {secs:.3}s · done by {at:.3}s · level 1 proved at {:.3}s · \
+                 purge after the join {}",
+                t.levels.first().map_or(0.0, |l| l.end),
+                match &t.late_purge {
+                    Some(p) => format!("{:.3}s", p.secs),
+                    None => "none".to_string(),
+                }
             ),
             None => println!("RTA LEVEL1 VALIDATE: beside off"),
         },
