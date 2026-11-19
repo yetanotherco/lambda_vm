@@ -898,7 +898,7 @@ fn padding_byte_checks(
         } else {
             0
         };
-    let keccak_rnd_padding = skip.keccak_rnd_form.are_bytes_per_row()
+    let keccak_rnd_padding = skip.keccak_rnd_form.bitwise_are_bytes_per_row()
         * keccak_rnd_padding_rows(keccak_ops, skip.keccak_rnd_rows, skip.cut_padding);
     (shift_padding + keccak_rnd_padding) as u64
 }
