@@ -1140,6 +1140,18 @@ fn the_two_layer_leg_is_the_host_and_its_closed_form() {
                         steps.iter().any(|s| s.degree == 5),
                         "{what}: a degree-5 step"
                     );
+                    // In one bin, a mixed step: a two-layer tree beside an odd
+                    // tree taking one layer to its input, which leaves at
+                    // `(c₁, ρ)`.
+                    use multilinear::gkr_lockstep::Relation;
+                    assert!(
+                        cap == 0
+                            || steps.iter().any(|s| {
+                                s.relations.iter().any(|(_, r)| *r == Relation::Double)
+                                    && s.relations.iter().any(|(_, r)| *r == Relation::Single)
+                            }),
+                        "{what}: a mixed step"
+                    );
                     assert!(
                         run.argue.gkr.iter().flat_map(|l| &l.layers).any(|l| l
                             .sumcheck
