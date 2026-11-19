@@ -256,6 +256,9 @@ pub struct GroupStamps {
     pub zc_b: f64,
     /// Phase B: the merge probe after the group's argue ([`CsProbe::merge`]).
     pub merge: MergeStamp,
+    /// Phase B: each bin's seconds in the batched argue (its trees built and
+    /// its ladder run), in plan order; empty under the per-table argue.
+    pub bins_b: Vec<f64>,
 }
 
 /// ⛔ A MEASUREMENT KNOB, never a proof's: phase A runs each group's
@@ -304,9 +307,37 @@ pub enum CsProbeMode {
     /// On a lane of its own beside phase A ([`zc_lane`]): each committed
     /// group's columns held on the card as a job, the jobs run oldest first on
     /// background streams, never started while a commit runs, and stopped at
-    /// phase A's end; the constraint sumcheck alone, the bus weighted 0
+    /// phase A's end; what each job runs is [`LaneWork`].
+    Lane(LaneWork),
+}
+
+/// What a lane job runs ([`CsProbeMode::Lane`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaneWork {
+    /// The constraint sumcheck alone, the bus weighted 0
     /// (`LAMBDA_VM_PHASE_A_CS_PROBE=queue`).
-    Lane,
+    #[default]
+    Zc,
+    /// The group's fraction trees and GKR ladders, one bin of the batched
+    /// argue's plan at a time, on throwaway challenges
+    /// (`LAMBDA_VM_PHASE_A_CS_PROBE=ladders`).
+    Ladders,
+    /// The ladders, then the constraint sumcheck alone
+    /// (`LAMBDA_VM_PHASE_A_CS_PROBE=ladders+zc`).
+    LaddersZc,
+}
+
+impl LaneWork {
+    /// Whether a job runs the group's ladders.
+    pub fn ladders(self) -> bool {
+        matches!(self, Self::Ladders | Self::LaddersZc)
+    }
+
+    /// Whether a job runs the constraint sumcheck.
+    pub fn zc(self) -> bool {
+        matches!(self, Self::Zc | Self::LaddersZc)
+    }
 }
 
 /// The environment variable that sets phase A's probe ([`CsProbe::mode`]).
@@ -327,18 +358,22 @@ impl CsProbe {
     }
 
     /// [`Self::from_env`]'s reading of its variables: phase A's unset, empty
-    /// or `0` off, `1` [`CsProbeMode::AfterCommit`], `queue`
-    /// [`CsProbeMode::Lane`]; phase B's unset, empty or `0` off, `1` on.
-    /// Anything else is refused.
+    /// or `0` off, `1` [`CsProbeMode::AfterCommit`], `queue`, `ladders` and
+    /// `ladders+zc` [`CsProbeMode::Lane`] with [`LaneWork::Zc`],
+    /// [`LaneWork::Ladders`] and [`LaneWork::LaddersZc`]; phase B's unset,
+    /// empty or `0` off, `1` on. Anything else is refused.
     pub fn from_values(phase_a: Option<&str>, merge: Option<&str>) -> Result<Self, String> {
         let mode = match phase_a.map(str::trim) {
             None | Some("" | "0") => CsProbeMode::Off,
             Some("1") => CsProbeMode::AfterCommit,
-            Some("queue") => CsProbeMode::Lane,
+            Some("queue") => CsProbeMode::Lane(LaneWork::Zc),
+            Some("ladders") => CsProbeMode::Lane(LaneWork::Ladders),
+            Some("ladders+zc") => CsProbeMode::Lane(LaneWork::LaddersZc),
             Some(v) => {
                 return Err(format!(
-                    "{CS_PROBE_ENV}={v}: 0 (off, the default), 1 (after each commit) or queue \
-                     (a lane beside phase A)"
+                    "{CS_PROBE_ENV}={v}: 0 (off, the default), 1 (after each commit), or a lane \
+                     beside phase A: queue (the constraint sumcheck), ladders (the GKR ladders) \
+                     or ladders+zc (both)"
                 ));
             }
         };
@@ -495,6 +530,7 @@ where
     let ArgueFormat::Batched {
         bin_log_cells,
         pack,
+        ..
     } = config.format.argue
     else {
         return CsProbeStamp::default();
@@ -2177,7 +2213,7 @@ where
         H: WhirHash,
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
     {
-        let lane = (probe.mode == CsProbeMode::Lane && upload_ahead)
+        let lane = (matches!(probe.mode, CsProbeMode::Lane(_)) && upload_ahead)
             .then(|| zc_lane::ZcLane::<F, E>::new(&probe, config))
             .flatten();
         let Some(lane) = lane else {
@@ -2382,7 +2418,7 @@ where
                             let _ = room_tx.send(());
                         };
                         if let Some(lane) = lane {
-                            lane.commit_begins();
+                            lane.commit_begins(group_index);
                         }
                         let committed = commit_and_retire::<F, E, H, T, _>(
                             group_index,
@@ -3954,6 +3990,7 @@ where
         let mut proofs: Vec<TableProof<E>> = Vec::new();
         let mut batched_argue: Option<BatchedArgue<E>> = None;
         let mut zc_b = 0.0f64;
+        let mut bins_b: Vec<f64> = Vec::new();
         let mut merged = MergeStamp::default();
         let all: &[CommittedTable<'_, F, E>] = &tables;
         let group_ref = &all[at..at + size];
@@ -4038,6 +4075,7 @@ where
                                 argue.at,
                             )?;
                             zc_b = batched::take_last_zc_secs();
+                            bins_b = batched::take_last_bin_secs();
                             if let Some(host) = merge_probe {
                                 // A measurement on a throwaway copy of the
                                 // fork: the proof is the same.
@@ -4094,6 +4132,7 @@ where
         };
         argue_result?;
         stamps[g].zc_b = zc_b;
+        stamps[g].bins_b = bins_b;
         stamps[g].merge = merged;
         stamps[g].argue = argue_end.saturating_duration_since(t).as_secs_f64();
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
