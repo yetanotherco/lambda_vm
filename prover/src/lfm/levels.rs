@@ -602,15 +602,15 @@ fn prepare_next(child: WlfmChild, family: WlfmFamily) -> Result<PreparedNext, St
 /// [`prepare_next`]'s level: its program, its prebuild and its arena's marks.
 type PreparedNext = (LfmProgram, WlfmPrebuild, Vec<u32>);
 
-/// `LAMBDA_VM_LEVELS_STREAM_NEXT=1`: level 2's execution streams over level 1's
+/// `LAMBDA_VM_LEVELS_STREAM_NEXT`: level 2's execution streams over level 1's
 /// prove, beside it: the arena's front lands as soon as level 1 has opened its
 /// first group, each group's words as level 1 opens that group
 /// ([`super::wlfm::prove_wlfm_traces_observed`],
 /// [`super::wlfm_leg::wlfm_leg_group`]), each running the instructions that
 /// read it; level 2 fills at its last piece. Without it, level 2 executes over
 /// the arena written from level 1's whole proof once that proof is done. The
-/// same words, so the same execution and proofs. Off by default (and for any
-/// word but `1`); read once a process.
+/// same words, so the same execution and proofs. On by default; only `0` turns
+/// it off. Read once a process.
 pub const STREAM_NEXT_ENV: &str = "LAMBDA_VM_LEVELS_STREAM_NEXT";
 
 std::thread_local! {
@@ -632,7 +632,7 @@ pub fn stream_next() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(STREAM_NEXT_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(STREAM_NEXT_ENV).ok().as_deref())
     })
 }
 
