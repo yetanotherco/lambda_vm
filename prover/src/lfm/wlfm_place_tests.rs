@@ -422,13 +422,15 @@ fn a_refused_planned_overlap_falls_back_to_the_same_bytes() {
     );
 }
 
-/// The planned-overlap knob's name; it is off by default, and only `1` turns
-/// it on.
+/// The planned-overlap knob's name; it is on by default, and only `0` turns
+/// it off.
 #[test]
-fn the_overlap_planned_knob_is_named_and_off_by_default() {
+fn the_overlap_planned_knob_is_named_and_on_by_default() {
     use super::wlfm::{OVERLAP_PLANNED_ENV, overlap_planned};
+    use super::wlfm_knobs::knob_word_off;
     assert_eq!(OVERLAP_PLANNED_ENV, "LAMBDA_VM_LEVELS_OVERLAP_PLANNED");
     if std::env::var_os(OVERLAP_PLANNED_ENV).is_none() {
-        assert!(!overlap_planned());
+        assert!(overlap_planned());
     }
+    assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }

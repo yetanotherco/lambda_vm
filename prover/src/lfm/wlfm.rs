@@ -2751,13 +2751,13 @@ pub(crate) fn program_prep_groups(program: &LfmProgram) -> Vec<Cow<'_, ColumnGro
     out
 }
 
-/// `LAMBDA_VM_LEVELS_OVERLAP_PLANNED=1`: a W-LFM prove whose prepared stacks are
+/// `LAMBDA_VM_LEVELS_OVERLAP_PLANNED`: a W-LFM prove whose prepared stacks are
 /// retired (phase B's overlap otherwise off, [`phase_b_overlap`]) opens each
 /// group beside the next group's argue where the plan says the card holds both
 /// ([`multilinear_block::BlockCommitted::with_phase_b_overlap_planned`]), and
 /// alone where it does not. The overlap moves no byte. Only the W-LFM prover
-/// (the levels') reads it; the base's block prover never sets it. Off by
-/// default (and for any word but `1`); read once a process.
+/// (the levels') reads it; the base's block prover never sets it. On by
+/// default; only `0` turns it off. Read once a process.
 pub const OVERLAP_PLANNED_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_PLANNED";
 
 thread_local! {
@@ -2782,7 +2782,7 @@ pub fn overlap_planned() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(OVERLAP_PLANNED_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(OVERLAP_PLANNED_ENV).ok().as_deref())
     })
 }
 
