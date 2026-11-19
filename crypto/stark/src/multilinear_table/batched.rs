@@ -835,28 +835,28 @@ where
 
     // The faults `balance_with` and `diagonal`: the numerator that balances
     // the bus, from every true output, and how far it is from the true one.
-    let fake_output: Option<(usize, FieldElement<E>)> = match faults.balance_with.or(faults.diagonal)
-    {
-        None => None,
-        Some(target) => {
-            let mut outputs = Vec::with_capacity(lists.len());
-            for (i, list) in lists.iter().enumerate() {
-                let t = table_of_tree(&plan, i);
-                let layers = host_tree(list, &tables[t].trace)?;
-                outputs.push(gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(
-                    &layers,
-                )));
-            }
-            let target = plan.first_tree(target);
-            let mut rest = FieldElement::<E>::zero();
-            for (i, (p, q)) in outputs.iter().enumerate() {
-                if i != target {
-                    rest += p * q.inv().expect("q != 0");
+    let fake_output: Option<(usize, FieldElement<E>)> =
+        match faults.balance_with.or(faults.diagonal) {
+            None => None,
+            Some(target) => {
+                let mut outputs = Vec::with_capacity(lists.len());
+                for (i, list) in lists.iter().enumerate() {
+                    let t = table_of_tree(&plan, i);
+                    let layers = host_tree(list, &tables[t].trace)?;
+                    outputs.push(gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(
+                        &layers,
+                    )));
                 }
+                let target = plan.first_tree(target);
+                let mut rest = FieldElement::<E>::zero();
+                for (i, (p, q)) in outputs.iter().enumerate() {
+                    if i != target {
+                        rest += p * q.inv().expect("q != 0");
+                    }
+                }
+                Some((target, -(rest * &outputs[target].1)))
             }
-            Some((target, -(rest * &outputs[target].1)))
-        }
-    };
+        };
     let mut split = ArgueSplit {
         ledger_start: multilinear::gpu::ledger_reserved(),
         ..ArgueSplit::default()
