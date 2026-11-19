@@ -805,6 +805,12 @@ pub(crate) struct VmAirs {
     pub bytewises: Vec<VmAir>,
     pub stores: Vec<VmAir>,
     pub cpu32s: Vec<VmAir>,
+    /// The block format's LOCAL_BYTES tables (`tables::local_bytes`), one a
+    /// group that holds a local sender, after every other table in
+    /// [`Self::air_refs`] order; none outside the format's local lookups.
+    /// They have no trace of their own in [`Traces`]: the block's prover
+    /// builds each from its group's counts.
+    pub local_bytes: Vec<VmAir>,
     /// The fused memory format's MEM_LOAD and MEM_STORE tables
     /// ([`Self::with_fused_memory`]); none under the split format, and none
     /// in any proof but a block's.
@@ -1350,6 +1356,9 @@ impl VmAirs {
         for air in &self.cpu32s {
             refs.push(air.as_ref());
         }
+        for air in &self.local_bytes {
+            refs.push(air.as_ref());
+        }
 
         refs
     }
@@ -1714,10 +1723,25 @@ impl VmAirs {
             bytewises,
             stores,
             cpu32s,
+            local_bytes: Vec::new(),
             mem_loads: Vec::new(),
             mem_stores: Vec::new(),
             word_tables: std::array::from_fn(|_| Vec::new()),
         }
+    }
+
+    /// The block format's `count` LOCAL_BYTES tables, named `LOCAL_BYTES[j]`,
+    /// after every other table in [`Self::air_refs`] order.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn with_local_bytes(&mut self, opts: &ProofOptions, count: usize) {
+        self.local_bytes = (0..count)
+            .map(|j| {
+                Box::new(
+                    crate::test_utils::create_local_bytes_air(opts)
+                        .with_name(&format!("LOCAL_BYTES[{j}]")),
+                ) as VmAir
+            })
+            .collect();
     }
 
     /// The fused memory format's tables in this set: `counts[0]` MEM_LOAD and
