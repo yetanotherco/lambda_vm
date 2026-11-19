@@ -698,15 +698,17 @@ fn the_blake3_driver_with_level_2_streamed_proves_the_same_level_bytes() {
     }
 }
 
-/// The level-2 streaming knob's name; it is off by default, and only `1`
-/// turns it on.
+/// The level-2 streaming knob's name; it is on by default, and only `0`
+/// turns it off.
 #[test]
-fn the_stream_next_knob_is_named_and_off_by_default() {
+fn the_stream_next_knob_is_named_and_on_by_default() {
     use super::levels::{STREAM_NEXT_ENV, stream_next};
+    use super::wlfm_knobs::knob_word_off;
     assert_eq!(STREAM_NEXT_ENV, "LAMBDA_VM_LEVELS_STREAM_NEXT");
     if std::env::var_os(STREAM_NEXT_ENV).is_none() {
-        assert!(!stream_next());
+        assert!(stream_next());
     }
+    assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }
 
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
