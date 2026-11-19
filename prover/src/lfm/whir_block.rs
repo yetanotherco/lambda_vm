@@ -1023,6 +1023,13 @@ impl WhirBlockPlan {
         cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
         let base = &format.zf.base;
+        // The leaf verifies no group's local argue: a base under local
+        // lookups is proved with no recursion over it.
+        if format.local_lookups() {
+            return Err(
+                "the recursion does not verify local lookups: prove that base alone".to_string(),
+            );
+        }
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
