@@ -1786,6 +1786,8 @@ impl VmAirs {
     /// COPY or COPY_W, KECCAK or KECCAK_W, ECREC or ECREC_W (as `memory` has
     /// them), ECSM, HINT, BLAKE3 — rebuilt under it, each under its own name.
     /// Called after the memory format's swaps ([`Self::with_word_memory`]).
+    /// Refuses a program with an ECALL entry the lean row's argument does not
+    /// cover ([`decode::check_lean_ecall_entries`]).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn with_cpu_row(
         &mut self,
@@ -1794,12 +1796,17 @@ impl VmAirs {
         registers: tables::register::RegisterFormat,
         memory: tables::fused_memory::MemoryFormat,
         inputs: &BlockAirInputs,
-    ) {
+    ) -> Result<(), Error> {
         use crate::test_utils as tu;
         use tables::{cpu, decode};
         if form == cpu::CpuRowForm::Full {
-            return;
+            return Ok(());
         }
+        decode::check_lean_ecall_entries(
+            decode::DecodeTable::from_instructions(&self.decode_instructions).entries_all(),
+            form,
+        )
+        .map_err(Error::Prover)?;
         let heights = &inputs.cpu_heights;
         self.cpus = heights
             .iter()
@@ -1883,6 +1890,7 @@ impl VmAirs {
             })
             .collect();
         self.blake3 = Box::new(tu::create_blake3_air_for(opts, form).with_name("BLAKE3"));
+        Ok(())
     }
 
     /// The fused memory format's tables in this set: `counts[0]` MEM_LOAD and

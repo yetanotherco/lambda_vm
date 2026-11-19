@@ -52,6 +52,11 @@ const PROGRAMS: [&str; 9] = [
 /// `program`'s run built under the word memory format and in-row registers
 /// (the block's), its CPU row in `form`.
 fn build(program: &Elf, logs: &[Log], form: CpuRowForm) -> Traces {
+    build_in(program, logs, form, MemoryFormat::Words)
+}
+
+/// [`build`] under the memory format `memory`.
+fn build_in(program: &Elf, logs: &[Log], form: CpuRowForm, memory: MemoryFormat) -> Traces {
     let keccak_rnd = crate::block_whir::BlockFormat::production().keccak_rnd;
     let mut traces = windowed(program, logs, &MaxRowsConfig::small(), 1000, &|b| {
         b.register_format(RegisterFormat::InRow)
@@ -59,7 +64,7 @@ fn build(program: &Elf, logs: &[Log], form: CpuRowForm) -> Traces {
             .memw_aligned_order(MemwAlignedOrder::Limbs)
             .expect("before any window")
             .keccak_rnd_form(keccak_rnd)
-            .memory_format(MemoryFormat::Words)
+            .memory_format(memory)
             .expect("before any window")
             .cpu_row_form(form)
             .expect("before any window")
@@ -70,6 +75,11 @@ fn build(program: &Elf, logs: &[Log], form: CpuRowForm) -> Traces {
 
 /// The block's AIR set for `traces` under `form`, as the verifier builds it.
 fn airs(program: &Elf, traces: &Traces, form: CpuRowForm) -> VmAirs {
+    airs_in(program, traces, form, MemoryFormat::Words)
+}
+
+/// [`airs`] under the memory format `memory`.
+fn airs_in(program: &Elf, traces: &Traces, form: CpuRowForm, memory: MemoryFormat) -> VmAirs {
     let options = ProofOptions::default_test_options();
     let inputs = crate::BlockAirInputs::new(
         &options,
@@ -79,7 +89,7 @@ fn airs(program: &Elf, traces: &Traces, form: CpuRowForm) -> VmAirs {
     )
     .expect("the block's inputs");
     let format = crate::block_whir::BlockFormat::production()
-        .with_memory(MemoryFormat::Words)
+        .with_memory(memory)
         .with_cpu_row(form);
     let mut airs = crate::block_airs(
         program,
@@ -92,9 +102,12 @@ fn airs(program: &Elf, traces: &Traces, form: CpuRowForm) -> VmAirs {
         format.registers,
     );
     airs.with_fused_memory(&options, traces.fused_counts());
-    airs.with_word_memory(&options, traces.word_counts(), &traces.page_configs)
-        .expect("the word format's set");
-    airs.with_cpu_row(&options, form, format.registers, format.memory, &inputs);
+    if memory == MemoryFormat::Words {
+        airs.with_word_memory(&options, traces.word_counts(), &traces.page_configs)
+            .expect("the word format's set");
+    }
+    airs.with_cpu_row(&options, form, format.registers, format.memory, &inputs)
+        .expect("the lean row's set");
     airs
 }
 
@@ -204,27 +217,48 @@ fn set(t: &mut Table, row: usize, col: usize, value: FE) {
 /// nothing is left on the ECALL bus.
 #[test]
 fn every_inner_bus_balances_under_both_rows() {
-    for name in PROGRAMS {
-        let (program, logs) = run(name);
-        for form in [CpuRowForm::Full, CpuRowForm::Lean] {
-            let mut traces = build(&program, &logs, form);
-            let airs = airs(&program, &traces, form);
-            let left = left(&airs, &mut traces);
-            assert!(
-                left.is_empty(),
-                "{name} under {form:?}: buses {:?} left over: {:?}",
-                buses(&left),
-                left.values().flatten().take(6).collect::<Vec<_>>()
-            );
-            if form == CpuRowForm::Lean {
-                for air in airs.air_refs() {
-                    assert!(
-                        air.bus_interactions()
-                            .iter()
-                            .all(|i| i.bus_id != BusId::Ecall as u64),
-                        "{name}: {} still uses the ECALL bus under the lean row",
-                        air.name()
-                    );
+    // The word memory format proves the halt, COPY's, keccak256's and ECREC's
+    // calls; the fused (the production format a base-only run takes without
+    // a memory word) and the split formats every syscall chip's.
+    const CHIPS: [&str; 5] = [
+        "test_keccak",
+        "test_ecsm",
+        "test_blake3",
+        "test_blake3_absorb",
+        "test_private_input_spin",
+    ];
+    for memory in [
+        MemoryFormat::Words,
+        MemoryFormat::Fused,
+        MemoryFormat::Split,
+    ] {
+        let programs = PROGRAMS.iter().chain(if memory == MemoryFormat::Words {
+            &[][..]
+        } else {
+            &CHIPS[..]
+        });
+        for &name in programs {
+            let (program, logs) = run(name);
+            for form in [CpuRowForm::Full, CpuRowForm::Lean] {
+                let mut traces = build_in(&program, &logs, form, memory);
+                let airs = airs_in(&program, &traces, form, memory);
+                let left = left(&airs, &mut traces);
+                assert!(
+                    left.is_empty(),
+                    "{name} under {form:?}, {memory:?}: buses {:?} left over: {:?}",
+                    buses(&left),
+                    left.values().flatten().take(6).collect::<Vec<_>>()
+                );
+                if form == CpuRowForm::Lean {
+                    for air in airs.air_refs() {
+                        assert!(
+                            air.bus_interactions()
+                                .iter()
+                                .all(|i| i.bus_id != BusId::Ecall as u64),
+                            "{name}, {memory:?}: {} still uses the ECALL bus under the lean row",
+                            air.name()
+                        );
+                    }
                 }
             }
         }
@@ -799,9 +833,18 @@ fn memory_and_ecall_on_one_row_is_refused() {
     use crate::constraints::cpu::{CpuLeanConstraints, NUM_CPU_CONSTRAINTS};
     let mut forged = ecall_row("test_commit_4");
     forged[cpu_cols::MEMORY] = FE::one();
+    assert_eq!(
+        nonzero(&constraint_values(&CpuLeanConstraints, &forged)),
+        vec![NUM_CPU_CONSTRAINTS],
+        "MEMORY·ECALL = 0 refuses it, and nothing else does"
+    );
     assert!(
-        nonzero(&constraint_values(&CpuLeanConstraints, &forged)).contains(&NUM_CPU_CONSTRAINTS),
-        "MEMORY·ECALL = 0 refuses it"
+        nonzero(&constraint_values(
+            &crate::constraints::cpu::CpuConstraints,
+            &forged
+        ))
+        .is_empty(),
+        "the control: without MEMORY·ECALL every constraint holds on it"
     );
 }
 
@@ -832,4 +875,224 @@ fn the_tag_names_the_lean_row_only() {
     assert_eq!(BlockFormat::pinned().cpu_row, CpuRowForm::Full);
     assert_eq!(BlockFormat::production().cpu_row, CpuRowForm::Full);
     let _ = cpu::DECODE_BYTE_COLUMNS;
+}
+
+/// Every syscall chip, every memory receiver: a block's AIR set with one
+/// table of every family (the pinned LogUp census's counts), under each
+/// memory and register format. Under the lean row no AIR uses the ECALL bus;
+/// under both rows the CPU tables are `MemoryOp`'s only senders (the sole
+/// sender argument a syscall chip's presence rests on); and under the lean
+/// row every CPU interaction that reads a decode byte column has a
+/// multiplicity that a word row zeroes — `1 − word_instr`, a register flag,
+/// `MEMORY + ECALL`, `branch_cond`, `ALU` — except the CPU32 send, the one
+/// reader of `half_instruction_length` on a word row, whose CPU32 lookup binds
+/// it to CPU32's DECODE.
+#[test]
+fn every_lean_set_moves_the_ecall_off_its_bus_and_keeps_the_sole_sender() {
+    use crate::tables::register::RegisterFormat;
+    use stark::lookup::Multiplicity;
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        copy: 1,
+        blake3: 1,
+        is_wh: 1,
+        ecrec: 1,
+    };
+    let pages =
+        Traces::page_configs_from_elf_and_runtime(&program, &[], 0, 1 << 20).expect("pages");
+    let inputs = crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("inputs");
+    let pinned = crate::block_whir::BlockFormat::pinned();
+    let byte_columns = cpu::DECODE_BYTE_COLUMNS;
+    let gated = |m: &Multiplicity| match m {
+        Multiplicity::Negated(c) => *c == cpu_cols::WORD_INSTR,
+        Multiplicity::Column(c) => [
+            cpu_cols::READ_REGISTER1,
+            cpu_cols::READ_REGISTER2,
+            cpu_cols::WRITE_REGISTER,
+            cpu_cols::BRANCH_COND,
+            cpu_cols::ALU,
+            cpu_cols::WORD_INSTR,
+        ]
+        .contains(c),
+        Multiplicity::Sum(a, b) => (*a, *b) == (cpu_cols::MEMORY, cpu_cols::ECALL),
+        _ => false,
+    };
+    for registers in [RegisterFormat::InRow, RegisterFormat::Tokens32] {
+        for memory in [
+            MemoryFormat::Split,
+            MemoryFormat::Fused,
+            MemoryFormat::Words,
+        ] {
+            for form in [CpuRowForm::Full, CpuRowForm::Lean] {
+                let mut airs = crate::block_airs(
+                    &program,
+                    &opts,
+                    &pages,
+                    &counts,
+                    &inputs,
+                    pinned.keccak_rnd,
+                    pinned.memw_aligned,
+                    registers,
+                );
+                match memory {
+                    MemoryFormat::Split => {}
+                    MemoryFormat::Fused => airs.with_fused_memory(&opts, [1, 1]),
+                    MemoryFormat::Words => airs
+                        .with_word_memory(&opts, [1; 7], &pages)
+                        .expect("the word tables"),
+                }
+                airs.with_cpu_row(&opts, form, registers, memory, &inputs)
+                    .expect("the set");
+                let what = format!("{form:?}, {memory:?}, {registers:?}");
+                let mut syscall_receivers = 0;
+                for air in airs.air_refs() {
+                    let name = air.name();
+                    for i in air.bus_interactions() {
+                        if i.bus_id == BusId::Ecall as u64 {
+                            assert_eq!(form, CpuRowForm::Full, "{what}: {name} on the ECALL bus");
+                        }
+                        if i.bus_id == BusId::MemoryOp as u64 && i.is_sender {
+                            assert!(name.starts_with("CPU["), "{what}: {name} sends on MemoryOp");
+                        }
+                        let tagged = i.values.len() == 9
+                            && format!("{:?}", i.values[6])
+                                == format!("{:?}", BusValue::constant(ECALL_MEMORY_OP_TAG));
+                        if i.bus_id == BusId::MemoryOp as u64 && !i.is_sender && tagged {
+                            syscall_receivers += 1;
+                        }
+                    }
+                    if form == CpuRowForm::Lean && name.starts_with("CPU[") {
+                        for i in air.bus_interactions() {
+                            let reads = i.columns_read();
+                            let byte = byte_columns.iter().any(|c| reads.contains(c));
+                            if !byte {
+                                continue;
+                            }
+                            let cpu32_half = i.bus_id == BusId::Cpu32 as u64;
+                            assert!(
+                                gated(&i.multiplicity) || cpu32_half,
+                                "{what}: a CPU interaction on bus {} reads a decode byte at \
+                                 multiplicity {:?}",
+                                i.bus_id,
+                                i.multiplicity
+                            );
+                        }
+                    }
+                }
+                if form == CpuRowForm::Lean {
+                    assert!(
+                        syscall_receivers >= 6,
+                        "{what}: {syscall_receivers} tagged receivers"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The ECALL's DECODE entry the lean row's ADD argument rests on: it reads
+/// `rs1 = 17` and nothing else, has no immediate and sets no other flag. The
+/// lean table refuses an ECALL entry outside that (an immediate, an rs2 read,
+/// another class flag), and takes the honest one.
+#[test]
+fn the_ecall_entry_is_the_one_the_lean_row_covers() {
+    use crate::tables::decode::check_lean_ecall_entries;
+    use crate::tables::types::{DecodeEntry, ShrunkDecode};
+    use executor::vm::instruction::decoding::Instruction;
+    let f = ShrunkDecode::from_instruction(Instruction::EcallEbreak, 4);
+    let expected = ShrunkDecode {
+        rs1: 17,
+        read_register1: true,
+        ecall: true,
+        half_instruction_length: 2,
+        ..Default::default()
+    };
+    assert_eq!(f, expected, "the ECALL's fields");
+    let honest = DecodeEntry::from_instruction(0x1000, Instruction::EcallEbreak, 4);
+    assert_eq!(honest.imm, 0, "the ECALL's immediate");
+    assert!(check_lean_ecall_entries([&honest], CpuRowForm::Lean).is_ok());
+    let mut with_imm = honest.clone();
+    with_imm.imm = 4;
+    let mut reads_rs2 = honest.clone();
+    reads_rs2.fields.read_register2 = true;
+    let mut writes = honest.clone();
+    writes.fields.write_register = true;
+    let mut also_memory = honest.clone();
+    also_memory.fields.memory = true;
+    for (what, e) in [
+        ("an immediate", &with_imm),
+        ("an rs2 read", &reads_rs2),
+        ("a register write", &writes),
+        ("another class flag", &also_memory),
+    ] {
+        assert!(
+            check_lean_ecall_entries([e], CpuRowForm::Lean).is_err(),
+            "{what}: refused"
+        );
+        assert!(
+            check_lean_ecall_entries([e], CpuRowForm::Full).is_ok(),
+            "{what}: today's row"
+        );
+    }
+}
+
+/// The prover's refusals: the CPU row's form set after a window, or after the
+/// card took the CPU chunks' decode, and a BITWISE take-back below zero.
+#[test]
+fn the_prover_refuses_the_lean_row_where_it_cannot_hold() {
+    use crate::tables::trace_builder::WindowedTraceBuilder;
+    let (program, logs) = run("sub");
+    let mut walked =
+        WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small()).expect("the builder");
+    assert!(logs.len() > 2, "a run past its first cycle");
+    let _ = walked.push(&logs[..1]).expect("a window");
+    assert!(
+        walked.cpu_row_form(CpuRowForm::Lean).is_err(),
+        "after a window"
+    );
+    let carded = WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small())
+        .and_then(|b| b.drop_streamed_ops())
+        .and_then(|b| b.card_fill_streamed(std::sync::Arc::new(|_| true), true, false))
+        .expect("the builder");
+    assert!(
+        carded.cpu_row_form(CpuRowForm::Lean).is_err(),
+        "after the card took the decode"
+    );
+    let removed = vec![(
+        crate::tables::bitwise::BitwiseOperation::byte_op(
+            crate::tables::bitwise::BitwiseOperationType::AreBytes,
+            1,
+            2,
+        ),
+        1,
+    )];
+    assert!(
+        super::finish::without_removed(
+            crate::tables::bitwise::BitwiseHistogram::new(),
+            Some(&removed)
+        )
+        .is_err(),
+        "a take-back of a lookup never counted"
+    );
 }

@@ -1003,7 +1003,9 @@ impl<'a> WindowedTraceBuilder<'a> {
                 "cpu_row_form after a window was walked or the card took the decode".to_string(),
             ));
         }
-        self.decode = Arc::new(self.decode.under(form));
+        if form != crate::tables::cpu::CpuRowForm::Full {
+            self.decode = Arc::new(self.decode.under(form).map_err(Error::Prover)?);
+        }
         self.emitted.cpu_row_form = form;
         Ok(self)
     }
@@ -5353,8 +5355,6 @@ impl RegenBuilder {
         Ok(self)
     }
 
-    /// [`WindowedTraceBuilder::memory_format`], for the chunks this
-    /// regenerates. Before the first window only.
     /// The CPU row's form (phase A's, [`WindowedTraceBuilder::cpu_row_form`]):
     /// the walk decodes by its DECODE table. Before the first window and
     /// before [`Self::keep_cpu_logs`].
@@ -5364,10 +5364,14 @@ impl RegenBuilder {
                 "cpu_row_form after a window was walked or the CPU logs were kept".to_string(),
             ));
         }
-        self.decode = Arc::new(self.decode.under(form));
+        if form != crate::tables::cpu::CpuRowForm::Full {
+            self.decode = Arc::new(self.decode.under(form).map_err(Error::Prover)?);
+        }
         Ok(self)
     }
 
+    /// [`WindowedTraceBuilder::memory_format`], for the chunks this
+    /// regenerates. Before the first window only.
     pub fn memory_format(mut self, format: MemoryFormat) -> Result<Self, Error> {
         if self.cycles > 0 {
             return Err(Error::Prover(

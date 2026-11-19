@@ -3499,7 +3499,10 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     // pinned format's table forms and the given register format: each AIR's
     // name, interactions a row and longest message.
     let pinned = BlockFormat::pinned();
-    let census = |memory: MemoryFormat, registers| -> Vec<(String, usize, usize)> {
+    let census = |memory: MemoryFormat,
+                  registers,
+                  row: crate::tables::cpu::CpuRowForm|
+     -> Vec<(String, usize, usize)> {
         let mut airs = crate::block_airs(
             &program,
             &opts,
@@ -3530,6 +3533,8 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
                     .collect()
             }
         };
+        airs.with_cpu_row(&opts, row, registers, memory, &inputs)
+            .expect("the CPU row's set");
         let refs = airs.air_refs();
         for table in &held {
             assert!(
@@ -3554,23 +3559,31 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         airs.iter()
             .fold((0, 0), |(f, l), (_, f2, l2)| (f.max(*f2), l.max(*l2)))
     };
-    for registers in [
-        pinned.registers,
+    for (registers, row) in [
+        crate::tables::register::RegisterFormat::InRow,
         crate::tables::register::RegisterFormat::Tokens32,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|r| {
+        [
+            crate::tables::cpu::CpuRowForm::Full,
+            crate::tables::cpu::CpuRowForm::Lean,
+        ]
+        .map(|row| (r, row))
+    }) {
         for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
             assert_eq!(
-                most(&census(memory, registers)),
+                most(&census(memory, registers, row)),
                 (1475, 208),
-                "the census under the {memory:?} memory format, {registers:?}: fractions a \
-                 row, message length"
+                "the census under the {memory:?} memory format, {registers:?}, {row:?}: \
+                 fractions a row, message length"
             );
         }
-        let words = census(MemoryFormat::Words, registers);
+        let words = census(MemoryFormat::Words, registers, row);
         assert_eq!(
             most(&words),
             (1475, 217),
-            "the census under the word memory format, {registers:?}"
+            "the census under the word memory format, {registers:?}, {row:?}"
         );
         // The 217 is KECCAK_W's sponge link alone.
         let longer: Vec<&str> = words
@@ -3581,7 +3594,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         assert_eq!(
             longer,
             [format!("{}[0]", crate::tables::keccak_w::NAME)],
-            "the word set's AIRs with a message longer than 208, {registers:?}"
+            "the word set's AIRs with a message longer than 208, {registers:?}, {row:?}"
         );
     }
     let bits = |groups: usize, len: usize| {

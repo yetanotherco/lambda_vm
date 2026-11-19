@@ -349,18 +349,68 @@ fn packed_under(packed: u64, form: super::cpu::CpuRowForm) -> u64 {
     }
 }
 
+/// The entries the lean row's ECALL argument covers ([`entry_under`]): every
+/// ECALL entry reads `rs1 = 17` (a7) and nothing else, has no immediate, and
+/// sets no flag but `read_register1` and ECALL (no rs2 read, no register
+/// write, no ALU, ADD, SUB, MEMORY, BRANCH or word flag, both flag bytes 0).
+/// Then the ADD fast path gives `res = rv1 + rv2 + imm = a7`. An entry outside
+/// that set refuses the lean row instead of giving it a table its argument
+/// does not cover. `Ok` under today's row whatever the entries.
+pub fn check_lean_ecall_entries<'a>(
+    entries: impl IntoIterator<Item = &'a DecodeEntry>,
+    form: super::cpu::CpuRowForm,
+) -> Result<(), String> {
+    if !form.ecall_on_memory_op() {
+        return Ok(());
+    }
+    for e in entries {
+        let f = &e.fields;
+        if !f.ecall {
+            continue;
+        }
+        let covered = e.imm == 0
+            && f.read_register1
+            && f.rs1 == 17
+            && !f.read_register2
+            && !f.write_register
+            && !f.word_instr
+            && !f.alu
+            && !f.add
+            && !f.sub
+            && !f.memory
+            && !f.branch
+            && f.alu_flags == 0
+            && f.mem_flags == 0;
+        if !covered {
+            return Err(format!(
+                "the ECALL at pc {:#x} is not the entry the lean CPU row covers \
+                 (imm {}, fields {:?})",
+                e.pc, e.imm, f
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl DecodeTable {
+    /// Every entry, in pc order (the CPU padding entry not among them).
+    pub fn entries_all(&self) -> &[DecodeEntry] {
+        &self.entries
+    }
+
     /// This table under the CPU row's `form` ([`entry_under`] of each entry;
-    /// the rows and runs are the same).
-    pub fn under(&self, form: super::cpu::CpuRowForm) -> Self {
-        Self {
+    /// the rows and runs are the same), or a refusal of an ECALL entry the
+    /// lean row does not cover ([`check_lean_ecall_entries`]).
+    pub fn under(&self, form: super::cpu::CpuRowForm) -> Result<Self, String> {
+        check_lean_ecall_entries(&self.entries, form)?;
+        Ok(Self {
             entries: self
                 .entries
                 .iter()
                 .map(|e| entry_under(e.clone(), form))
                 .collect(),
             runs: self.runs.clone(),
-        }
+        })
     }
 
     /// The table of `instructions`, each decoded as the DECODE trace decodes

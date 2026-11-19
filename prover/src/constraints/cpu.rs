@@ -257,21 +257,21 @@ pub fn emit_next_pc_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExt
 // =========================================================================
 
 /// The CPU table's transition constraints as a single [`ConstraintSet`]
-/// ([`NUM_CPU_CONSTRAINTS`] = 39 constraints, all base-field):
-/// - idx 0..11:  IS_BIT (unconditional) on each of [`BIT_FLAG_COLUMNS`];
-/// - idx 12,13:  ADD fast-path carry pair (conditional on `ADD`);
-/// - idx 14,15:  SUB fast-path carry pair (conditional on `SUB`);
-/// - idx 16..21: `word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER,
+/// ([`NUM_CPU_CONSTRAINTS`] = 38 constraints, all base-field):
+/// - idx 0..10:  IS_BIT (unconditional) on each of [`BIT_FLAG_COLUMNS`];
+/// - idx 11,12:  ADD fast-path carry pair (conditional on `ADD`);
+/// - idx 13,14:  SUB fast-path carry pair (conditional on `SUB`);
+/// - idx 15..20: `word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER,
 ///   READ_REGISTER1, READ_REGISTER2} = 0`;
-/// - idx 22,23:  `arg2` multiplex (words 0, 1);
-/// - idx 24..27: register zero-forcing (`rv1[0..1]`, `rv2[0..1]`);
-/// - idx 28,29:  `rvd = cast(res, WL)` (words 0, 1);
-/// - idx 30,31:  BRANCH ⇒ `rvd = pc + instruction_length` carry pair;
-/// - idx 32:     `branch_cond`;
-/// - idx 33,34:  `next_pc = pc + instruction_length` carry pair;
-/// - idx 35:     `MEMORY · BRANCH = 0`;
-/// - idx 36,37:  `arg2` exclusivity (`imm_0`, `imm_1`);
-/// - idx 38:     `IS_BIT(mem_flags)` on non-MEMORY rows.
+/// - idx 21,22:  `arg2` multiplex (words 0, 1);
+/// - idx 23..26: register zero-forcing (`rv1[0..1]`, `rv2[0..1]`);
+/// - idx 27,28:  `rvd = cast(res, WL)` (words 0, 1);
+/// - idx 29,30:  BRANCH ⇒ `rvd = pc + instruction_length` carry pair;
+/// - idx 31:     `branch_cond`;
+/// - idx 32,33:  `next_pc = pc + instruction_length` carry pair;
+/// - idx 34:     `MEMORY · BRANCH = 0`;
+/// - idx 35,36:  `arg2` exclusivity (`imm_0`, `imm_1`);
+/// - idx 37:     `IS_BIT(mem_flags)` on non-MEMORY rows.
 #[derive(Clone, Copy)]
 pub struct CpuConstraints;
 

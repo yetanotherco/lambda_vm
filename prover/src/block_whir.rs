@@ -5774,7 +5774,7 @@ pub(crate) fn prove_traces(
         format.registers,
         format.memory,
         &inputs,
-    );
+    )?;
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
@@ -7004,13 +7004,15 @@ fn lay_out_rest<'a>(
         if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
             built = airs.with_word_memory(opts, words, &traces.page_configs);
         }
-        airs.with_cpu_row(
-            opts,
-            format.cpu_row,
-            format.registers,
-            format.memory,
-            &inputs,
-        );
+        if built.is_ok() {
+            built = airs.with_cpu_row(
+                opts,
+                format.cpu_row,
+                format.registers,
+                format.memory,
+                &inputs,
+            );
+        }
         airs
     });
     built?;
@@ -7290,7 +7292,9 @@ fn lay_out_rest_streamed<'a>(
             if memory == crate::tables::fused_memory::MemoryFormat::Words {
                 built = airs.with_word_memory(opts, words, &header.page_configs);
             }
-            airs.with_cpu_row(opts, cpu_row, registers, memory, &inputs);
+            if built.is_ok() {
+                built = airs.with_cpu_row(opts, cpu_row, registers, memory, &inputs);
+            }
             airs
         });
         built?;
@@ -9952,7 +9956,7 @@ pub(crate) fn block_frame(
         format.registers,
         format.memory,
         &inputs,
-    );
+    )?;
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
     let air_refs = airs.air_refs();

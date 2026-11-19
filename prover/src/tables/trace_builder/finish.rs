@@ -900,7 +900,7 @@ fn lean_removed_bitwise(
 /// `histogram` without `removed` ([`lean_removed_bitwise`]): a lookup taken
 /// back that was never counted refuses the build, since the counts and the
 /// rows would then disagree.
-fn without_removed(
+pub(super) fn without_removed(
     mut histogram: bitwise::BitwiseHistogram,
     removed: Option<&[(bitwise::BitwiseOperation, u64)]>,
 ) -> Result<bitwise::BitwiseHistogram, Error> {
