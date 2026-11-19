@@ -460,6 +460,16 @@ pub enum BusId {
     /// bound to the authenticated cell), read by `LEAN_CAP_READ` rows
     /// (`lfm::lean_cap`). ID 45: the next free one after the lean buses.
     CapLookup = 45,
+
+    // =========================================================================
+    // Local lookups: argued per group against the group's own LOCAL_BYTES
+    // table (`tables::local_bytes`), under the group's own challenges
+    // =========================================================================
+    /// A byte pair `(x, y)`, as `AreBytes`, received by LOCAL_BYTES.
+    LocalAreBytes = 46,
+    /// A byte operation `(op, x, y, z)`, as `ByteAlu` (AND, XOR), received by
+    /// LOCAL_BYTES.
+    LocalByteAlu = 47,
 }
 
 impl BusId {
@@ -502,6 +512,8 @@ impl BusId {
             BusId::B3lXor => "B3lXor",
             BusId::B3lRound => "B3lRound",
             BusId::CapLookup => "CapLookup",
+            BusId::LocalAreBytes => "LocalAreBytes",
+            BusId::LocalByteAlu => "LocalByteAlu",
         }
     }
 }
@@ -547,6 +559,8 @@ impl TryFrom<u64> for BusId {
             43 => Ok(BusId::B3lXor),
             44 => Ok(BusId::B3lRound),
             45 => Ok(BusId::CapLookup),
+            46 => Ok(BusId::LocalAreBytes),
+            47 => Ok(BusId::LocalByteAlu),
             other => Err(other),
         }
     }

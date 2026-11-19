@@ -6024,7 +6024,7 @@ pub(crate) fn split_keccak_rnd(
             0,
             0,
         ),
-        (left_out * form.are_bytes_per_row()) as u64,
+        (left_out * form.bitwise_are_bytes_per_row()) as u64,
     )
 }
 
@@ -13415,7 +13415,7 @@ mod rest_airs_beside_tests {
                 let misnamed = early(i + 1, form);
                 assert!(same_air(misnamed.as_ref(), refs[position]).is_err());
                 let other = match form {
-                    KeccakRndForm::Lean => KeccakRndForm::Full,
+                    KeccakRndForm::Lean | KeccakRndForm::LeanLocal => KeccakRndForm::Full,
                     KeccakRndForm::Full => KeccakRndForm::Lean,
                 };
                 assert!(
