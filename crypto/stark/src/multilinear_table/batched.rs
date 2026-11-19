@@ -276,7 +276,7 @@ pub struct BatchedArgue<E: IsField> {
     pub reduces: Vec<Option<claim_reduce::ReduceProof<E>>>,
 }
 
-/// ★ A group's local argue (local lookups argued per group): the local class's
+/// A group's local argue (local lookups argued per group): the local class's
 /// phase G on the group's own transcript, under the group's own `(z_g, α_g)`
 /// — every local tree's bus output, then one ladder a bin of the local plan.
 /// Its outputs must sum to zero over the group; its claims enter the
@@ -438,9 +438,9 @@ pub struct ProverFaults {
 pub struct LocalBinding {
     /// The group's roots.
     pub roots: bool,
-    /// The group's commit-time answers .
+    /// The group's commit-time answers.
     pub answers: bool,
-    /// The label and every table's digest .
+    /// The label and every table's digest.
     pub digests: bool,
 }
 
@@ -504,7 +504,7 @@ pub struct VerifierChecks {
     /// Under local lookups: what each group's local transcript binds.
     pub local_binding: LocalBinding,
     /// Under local lookups: each group's fork absorbs its local transcript's
-    /// state first (step B0).
+    /// state before anything else.
     pub local_state: bool,
 }
 
@@ -740,7 +740,7 @@ impl<E: IsField> TablePairs<'_, E> {
 /// (the `eq` weights after the zerocheck's, in order).
 type TableRules<'a, E> = (Vec<Rule<'a, E>>, Vec<usize>, Vec<Vec<FieldElement<E>>>);
 
-/// ★ A table's rules, one function for both sides: the zerocheck at `λ^0`
+/// A table's rules, one function for both sides: the zerocheck at `λ^0`
 /// over the weight slot `eq(ξ)`; then, when present, the global bus's two
 /// rules at `λ^1, λ^2` and the local bus's two at `λ^3, λ^4`, each pair at
 /// the next weight slot, its bus claimed at its claim point. Today's table
@@ -810,7 +810,7 @@ pub(crate) fn table_weights<E: IsField>(
 /// group order, and each one's interactions in it. A table with no
 /// interaction in a class has no tree in it.
 ///
-/// ★ THE CLASS IS A PURE FUNCTION OF THE BUS ID ([`Self::split`]): a bus is
+/// THE CLASS IS A PURE FUNCTION OF THE BUS ID ([`Self::split`]): a bus is
 /// wholly local or wholly global, so the two classes never share a bus and
 /// each balances on its own.
 #[doc(hidden)]
@@ -1620,7 +1620,7 @@ struct Laddered<E: IsField> {
     claims: Vec<GkrClaim<E>>,
 }
 
-/// ★ Phase G over one class: per bin of `plan` (over the class's members,
+/// Phase G over one class: per bin of `plan` (over the class's members,
 /// `class[k]` the group's table behind plan entry `k`), its trees built
 /// from `lists` (one a tree), their outputs absorbed, then one lockstep
 /// ladder; each member's claim after its bin. The same code for the global
@@ -2901,7 +2901,7 @@ where
     Ok(reduced_claims)
 }
 
-/// ★ Phase G's verifying half over one class: per bin of `plan`, its outputs
+/// Phase G's verifying half over one class: per bin of `plan`, its outputs
 /// absorbed, its ladder checked, each member's claim after its bin (a cut
 /// table's chunks combined at its `s'`).
 fn verify_ladders<E, T>(
@@ -2957,7 +2957,7 @@ where
         .ok_or(MlError::ArgueShapeMismatch { part: "bins" })
 }
 
-/// ★ A group's local argue (step L6), on the group's local transcript after
+/// A group's local argue, on the group's local transcript after
 /// its `(z_g, α_g)`: phase G over the local class of `local_buses` under
 /// those challenges, with the format's bin cap and packing — the same
 /// ladders as the global class's, on another sponge. Returns the argue and
@@ -3032,7 +3032,7 @@ where
     Ok((LocalArgue { bus_outputs, gkr }, local))
 }
 
-/// ★ A group's local argue checked (steps L6 and the local balance), on the
+/// A group's local argue checked (its ladders and the local balance), on the
 /// group's local transcript after its `(z_g, α_g)`: the local plan derived
 /// from the statements, `local_buses` and the verifier's cap and packing —
 /// never the proof — every ladder verified, and the local outputs summed:
@@ -3098,7 +3098,7 @@ where
     Ok(local)
 }
 
-/// ★★ THE SOUNDNESS-BEARING STATIC CHECK of local lookups: every receiver on
+/// THE SOUNDNESS-BEARING STATIC CHECK of local lookups: every receiver on
 /// a local bus reads its values from the table's preprocessed columns only
 /// (and constants), so the local class's receivers are a set the verifier
 /// fixes and checks (`check_preprocessed`), and a group's own challenges
