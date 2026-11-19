@@ -8302,7 +8302,7 @@ fn prove_streamed(
             multilinear::gpu::SERIAL_ENCODES_ENV
         );
         eprintln!(
-            "★ BLOCK COMMIT LEAVES: {} ({})",
+            "★ BLOCK COMMIT LEAVES: {} ({}; what phase A streamed: BLOCK COMMIT LEAVES STREAMED)",
             if multilinear::gpu::streamed_joint_leaves() {
                 "a joint run's codewords streamed into its leaves one at a time"
             } else {

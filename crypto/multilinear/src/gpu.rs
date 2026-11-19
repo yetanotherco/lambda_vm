@@ -9099,6 +9099,16 @@ pub(crate) fn commit_joint_streamed(
     if hash != math_cuda::DeviceHash::Blake3 || log_folding < 3 {
         return None;
     }
+    // The quiet declines every card commit checks first
+    // ([`encode_resident`]): nothing is allocated for a commit that would not
+    // run on the card.
+    if (1usize << log_elements) < COMMIT_THRESHOLD
+        || whir_commit_declined()
+        || math_cuda::device::backend().is_err()
+    {
+        return None;
+    }
+    let decline_at = STREAMED_DECLINE_AT.load(Ordering::Relaxed);
     let mut declined = false;
     let built = math_cuda::whir::commit_joint_streamed(
         blocks,
@@ -9106,7 +9116,7 @@ pub(crate) fn commit_joint_streamed(
         log_folding,
         hash,
         placement(leaves),
-        |k| match encode(k) {
+        |k| match (k as u64 != decline_at).then(|| encode(k)).flatten() {
             Some(codeword) => Some(codeword.0),
             None => {
                 declined = true;
@@ -9122,11 +9132,48 @@ pub(crate) fn commit_joint_streamed(
         Err(err) => {
             // An encode that declined was counted where it declined.
             if !declined {
-                note_commit_error("joint, streamed", log_elements, 0, &err);
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                let (reserved, budget) = (ledger_reserved(), reserve_budget());
+                note_device_error(&COMMIT_ERRORS, "commit errors", || {
+                    format!(
+                        "device streamed joint commit of {blocks} codewords of 2^{log_elements} \
+                         failed: {err:?}; the batched commit is next (ledger {:.2} of {:.2} GiB \
+                         promised)",
+                        gib(reserved),
+                        gib(budget)
+                    )
+                });
             }
             None
         }
     }
+}
+
+/// Test only: the streamed commit's encode of codeword `k` declines (`u64::MAX`:
+/// none) — a card out of room after step 0.
+#[cfg(feature = "cuda")]
+static STREAMED_DECLINE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Restores the previous [`force_streamed_decline_at`] when dropped.
+#[doc(hidden)]
+#[must_use = "the decline lasts while the guard lives"]
+pub struct StreamedDeclineGuard(#[cfg_attr(not(feature = "cuda"), allow(dead_code))] u64);
+
+impl Drop for StreamedDeclineGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        STREAMED_DECLINE_AT.store(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Test only, not for production callers: the streamed joint commit's encode
+/// of codeword `step` declines (`None`: none does) until the guard drops. For
+/// a test that runs alone in its process.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_streamed_decline_at(step: Option<usize>) -> StreamedDeclineGuard {
+    let at = step.map_or(u64::MAX, |s| s as u64);
+    StreamedDeclineGuard(STREAMED_DECLINE_AT.swap(at, Ordering::Relaxed))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -9163,8 +9210,9 @@ static STREAMED_LEAVES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::
 /// leaves' chains and let go before the next, so the commit holds one of the
 /// run's codewords instead of all of them. The same tree, root and proof;
 /// the commitment keeps no codeword ([`crate::whir_commit::Codeword::Streamed`]),
-/// so only a commit made inside [`retired_after_commit`] streams — what the
-/// block prover's phase A is. Off by default (`LAMBDA_VM_COMMIT_STREAMED_LEAVES=1`);
+/// so only a group committed to be retired before it is opened streams
+/// (`crate::stacked_eval::StackedCommitment::commit_to_retire`, the block
+/// prover's phase A). Off by default (`LAMBDA_VM_COMMIT_STREAMED_LEAVES=1`);
 /// read once.
 pub fn streamed_joint_leaves() -> bool {
     match STREAMED_LEAVES_FORCED.load(Ordering::Relaxed) {
@@ -9176,31 +9224,27 @@ pub fn streamed_joint_leaves() -> bool {
     *ON.get_or_init(|| streamed_leaves_setting(std::env::var(STREAMED_LEAVES_ENV).ok().as_deref()))
 }
 
-std::thread_local! {
-    /// Whether this thread's commits are retired before they are opened
-    /// ([`retired_after_commit`]).
-    static RETIRED_AFTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+/// Joint runs committed: all of them, and those committed to be retired
+/// before they are opened (`crate::stacked_eval::StackedCommitment::commit_to_retire`).
+static JOINT_RUNS: AtomicU64 = AtomicU64::new(0);
+static JOINT_RUNS_TO_RETIRE: AtomicU64 = AtomicU64::new(0);
 
-/// Runs `commit` with this thread's commits marked as retired before they
-/// are opened — what the block prover does with every group — so a joint run
-/// may be streamed into its tree ([`streamed_joint_leaves`]); a commitment
-/// opened whole needs its codewords, and is never streamed.
-pub fn retired_after_commit<R>(commit: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            RETIRED_AFTER.with(|cell| cell.set(self.0));
-        }
+pub(crate) fn note_joint_run(retired: bool) {
+    JOINT_RUNS.fetch_add(1, Ordering::Relaxed);
+    if retired {
+        JOINT_RUNS_TO_RETIRE.fetch_add(1, Ordering::Relaxed);
     }
-    let _restore = Restore(RETIRED_AFTER.with(|cell| cell.replace(true)));
-    commit()
 }
 
-/// Whether this thread's next grouped commit streams its joint run: the knob
-/// on, inside [`retired_after_commit`].
-pub(crate) fn streamed_joint_leaves_here() -> bool {
-    streamed_joint_leaves() && RETIRED_AFTER.with(std::cell::Cell::get)
+/// `(joint runs committed, of them committed to be retired, of them streamed
+/// into their leaves)`: what the block prints after phase A
+/// (`BLOCK COMMIT LEAVES STREAMED`).
+pub fn joint_runs() -> (u64, u64, u64) {
+    (
+        JOINT_RUNS.load(Ordering::Relaxed),
+        JOINT_RUNS_TO_RETIRE.load(Ordering::Relaxed),
+        joint_streamed_builds(),
+    )
 }
 
 /// [`streamed_joint_leaves`]' reading of its knob: only `1` turns it on.

@@ -2317,6 +2317,53 @@ mod tests {
         (cw, domain)
     }
 
+    /// A joint commitment streamed into its leaves keeps no codeword: every
+    /// read of its values is an error, never values (here with no tree, so
+    /// its paths and its retire are errors too).
+    #[test]
+    fn a_streamed_joint_commitment_gives_no_values() {
+        type B3 = crate::whir_hash::Blake3Whir;
+        let commitment = CodewordCommitment::<F, B3> {
+            tree: Tree::<F, B3>::from_root([7u8; 32]),
+            codeword: Codeword::Streamed { elements: 1 << 8 },
+            log_folding: 4,
+            log_domain_size: 8,
+            leaves: LeafOrder::Coset,
+            top: None,
+            others: vec![Codeword::Streamed { elements: 1 << 8 }],
+            joint_tree: None,
+        };
+        let gone = |r: Result<(), Error>, what: &str| {
+            assert!(
+                matches!(r, Err(Error::DeviceFailed { .. })),
+                "{what}: {r:?}"
+            );
+        };
+        gone(
+            commitment
+                .gather_from(&commitment.codeword, &[0, 3])
+                .map(|_| ()),
+            "gather",
+        );
+        gone(
+            commitment.gather(&[0, 3]).map(|_| ()),
+            "gather a joint leaf",
+        );
+        gone(commitment.open(1).map(|_| ()), "open");
+        gone(commitment.open_many(&[1, 2]).map(|_| ()), "open many");
+        assert!(commitment.codeword.host().is_none() && commitment.codeword.device().is_none());
+        assert_eq!(commitment.codeword.len(), 1 << 8);
+        gone(
+            commitment
+                .retire(
+                    TreeDrop::uniform(2),
+                    crypto::merkle_tree::cap::CapPolicy::Auto,
+                )
+                .map(|_| ()),
+            "retire with no tree",
+        );
+    }
+
     /// A retired tree drops its codeword's own depth of levels — the card's
     /// or the host's — and never into the tallest cap it may be asked for:
     /// a shallow tree keeps at least its cap.
