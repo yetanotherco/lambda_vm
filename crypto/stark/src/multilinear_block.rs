@@ -740,7 +740,7 @@ pub const TABLE_DIGEST_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_TABLE_DIGEST";
 /// A local lookup is an equation over the group's columns and the table
 /// definitions it reads, and nothing else: every column it reads is in the
 /// group's stack (the roots), each committed word stands for one codeword
-/// (the answers, as W-10's binding of the main transcript), and every
+/// (the answers, as the roots block binds them before the block's own challenges), and every
 /// definition it reads — tuples, multiplicities, constants, heights, widths
 /// — is in a digest. Everything that spans groups (the global buses, every
 /// statement-dependent expected value) is still drawn from the main
