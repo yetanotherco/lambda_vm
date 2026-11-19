@@ -442,6 +442,7 @@ struct UploadOnceRestore;
 impl Drop for UploadOnceRestore {
     fn drop(&mut self) {
         super::wlfm::set_upload_once_for_test(None);
+        super::wlfm::set_overlap_resident_for_test(None);
         super::wlfm::set_overlap_planned_for_test(None);
         super::wlfm::set_overlap_faults_for_test(Default::default());
     }
@@ -578,6 +579,51 @@ fn an_upload_once_the_card_cannot_hold_copies_twice_with_the_same_bytes() {
         } else {
             assert!(!u.planned_out, "group {g}: no card, no plan ({u:?})");
         }
+    }
+}
+
+/// Pricing the planned overlap over the upload once's store
+/// (`LAMBDA_VM_LEVELS_OVERLAP_RESIDENT`) moves no byte: in every place and
+/// under both families, with the upload once on, the level-shaped probe
+/// proves the held build's bytes with the pricing on and off, and nothing is
+/// refused.
+#[test]
+fn the_overlap_priced_resident_proves_the_same_bytes_in_every_place() {
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let (_, _, build) = probe_placed(family, place);
+            for on in [false, true] {
+                super::wlfm::set_overlap_resident_for_test(Some(on));
+                let (got, groups) =
+                    streamed_once(&program, &build, &arenas, true, Default::default())
+                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+                assert!(
+                    got == want,
+                    "{family:?} {place:?} priced resident {on}: the held bytes"
+                );
+                assert!(
+                    groups.iter().all(|s| !s.upload_once.refused),
+                    "{family:?} {place:?} {on}: no store refused"
+                );
+            }
+        }
+    }
+}
+
+/// The resident-pricing knob's name; it is off by default, and only `1`
+/// turns it on.
+#[test]
+fn the_overlap_resident_knob_is_named_and_off_by_default() {
+    use super::wlfm::{OVERLAP_RESIDENT_ENV, overlap_resident};
+    assert_eq!(OVERLAP_RESIDENT_ENV, "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT");
+    if std::env::var_os(OVERLAP_RESIDENT_ENV).is_none() {
+        assert!(!overlap_resident());
     }
 }
 
