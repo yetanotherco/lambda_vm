@@ -1503,6 +1503,9 @@ fn verify(
 /// byte form's proof of the same program.
 #[test]
 fn a_limb_form_block_proves_and_each_form_refuses_the_other() {
+    // test_ecrec beside the ECREC forging test: hold its lock to read, so the
+    // forgery switch stays off while these blocks are built.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for guest in ["test_ecsm", "test_ecrec"] {
         let elf = crate::test_utils::asm_elf_bytes(guest);
         let halves = block_format(EcdasForm::Halves);
