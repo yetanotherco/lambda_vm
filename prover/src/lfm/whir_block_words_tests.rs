@@ -480,6 +480,30 @@ fn mix_statement(
     runtime_pages: usize,
     private_pages: usize,
 ) -> OwnedBlockStatement {
+    mix_statement_split(
+        elf_bytes,
+        opts,
+        format,
+        mix,
+        runtime_pages,
+        private_pages,
+        None,
+    )
+}
+
+/// [`mix_statement`] with every table of family `alone` (when given) taken
+/// out of its packed group into a group of its own, in table order (each
+/// group still a run of consecutive tables), before the LOCAL_BYTES tables
+/// close the local groups.
+fn mix_statement_split(
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    format: &BlockFormat,
+    mix: Mix<'_>,
+    runtime_pages: usize,
+    private_pages: usize,
+    alone: Option<&str>,
+) -> OwnedBlockStatement {
     use crate::tables::word_cpu::WORD_TABLES;
     let elf = executor::elf::Elf::load(elf_bytes).expect("load the ELF");
     let count = |family: &str| -> usize {
@@ -617,6 +641,31 @@ fn mix_statement(
             g
         })
         .collect();
+    if let Some(alone) = alone {
+        let refs = airs.air_refs();
+        let of_family = |i: u32| {
+            let name = refs[i as usize].name();
+            name.split('[').next().unwrap_or(name) == alone
+        };
+        let mut split = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut run: Vec<u32> = Vec::new();
+            for i in group {
+                if of_family(i) {
+                    if !run.is_empty() {
+                        split.push(std::mem::take(&mut run));
+                    }
+                    split.push(vec![i]);
+                } else {
+                    run.push(i);
+                }
+            }
+            if !run.is_empty() {
+                split.push(run);
+            }
+        }
+        groups = split;
+    }
     // Under local lookups, one LOCAL_BYTES table of 2^16 rows after every
     // other table, closing each group that holds a local sender, in group
     // order (the frame's `check_local_groups`). Under any other format the
@@ -3362,15 +3411,13 @@ fn every_local_sender_of_a_local_air_set_is_keccak_rnd() {
     );
 }
 
-/// ★ Each local group's class split, taken once at derive and shared by groups
-/// of one definition, is the split of its own tables: for every group of a
-/// hand-built local statement with several KECCAK_RND groups, the plan's
-/// classes equal a fresh `Shapes::classes` over the group (members and plans,
-/// and each member's interactions in the class), two groups share a split
-/// exactly when their definitions (their class keys) are equal, and a group
-/// with no local lookup has none.
-#[test]
-fn the_plans_local_class_splits_are_each_groups_own() {
+/// What [`the_plans_local_class_splits_are_each_groups_own`] reads of a plan
+/// derived under `fault`: each local group's split against a fresh split of
+/// its tables, and the sharing rule against the true keys. Returns the
+/// mismatches found, the local groups, and how many pairs of local groups
+/// have one family list at different heights (the pairs a key without the
+/// digests would merge).
+fn class_split_findings(fault: super::local_faults::Fault) -> (Vec<String>, Vec<usize>, usize) {
     let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
     let format = BlockFormat {
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
@@ -3378,22 +3425,32 @@ fn the_plans_local_class_splits_are_each_groups_own() {
     };
     let opts = super::super::proof::block_base_options_under(&format.zf);
     let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
-    // KECCAK_RND tables tall enough that the packer gives each a group.
-    let rnd: &[(usize, usize)] = &[(1 << 16, 8)];
+    // KECCAK_RND tables at two heights, two of each, each in a group of its
+    // own: groups of one family list (KECCAK_RND, LOCAL_BYTES) whose splits
+    // differ by their tables' heights only, and groups of one definition that
+    // share a split.
+    let rnd: &[(usize, usize)] = &[(1 << 16, 2), (1 << 15, 2)];
     let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
     mix.push(("KECCAK", keccak));
     mix.push(("KECCAK_RND", rnd));
-    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let owned = mix_statement_split(elf, &opts, &format, &mix, 2, 0, Some("KECCAK_RND"));
     let groups = owned.groups.len();
-    let plan = WhirBlockPlan::derive(elf, &opts, &format, owned.view(), Some(groups))
-        .expect("the local plan derives");
+    let derived = super::local_faults::with(fault, || {
+        WhirBlockPlan::derive(elf, &opts, &format, owned.view(), Some(groups))
+    });
+    let plan = match derived {
+        Ok(plan) => plan,
+        Err(e) => return (vec![format!("derive refused: {e}")], Vec::new(), 0),
+    };
     let planning = super::batched_cap(&plan.frame.config)
         .expect("a config")
         .expect("batched");
     let local = plan.local.as_ref().expect("a local plan");
     let refs = plan.frame.airs.air_refs();
+    let mut found = Vec::new();
     let mut locals = Vec::new();
     let mut keys = Vec::new();
+    let mut outline = Vec::new();
     for g in 0..plan.num_groups() {
         let sends = plan.groups[g].iter().any(|&t| {
             refs[t]
@@ -3402,10 +3459,14 @@ fn the_plans_local_class_splits_are_each_groups_own() {
                 .any(|i| local.buses.contains(&i.bus_id))
         });
         let Some(classes) = plan.local_classes(g) else {
-            assert!(!sends, "group {g} argues local lookups and has no classes");
+            if sends {
+                found.push(format!("group {g} argues local lookups and has no classes"));
+            }
             continue;
         };
-        assert!(sends, "group {g} has classes and argues no local lookup");
+        if !sends {
+            found.push(format!("group {g} has classes and argues no local lookup"));
+        }
         let shapes = Shapes::build(&refs, &plan.frame.shapes, &plan.groups[g]).expect("shapes");
         let fresh = shapes
             .classes(&local.buses, planning)
@@ -3414,46 +3475,101 @@ fn the_plans_local_class_splits_are_each_groups_own() {
             ("global", &classes.global, &fresh.global),
             ("local", &classes.local, &fresh.local),
         ] {
-            assert_eq!(mine.members, theirs.members, "group {g} {name} members");
-            assert_eq!(mine.plan, theirs.plan, "group {g} {name} plan");
-            assert_eq!(
-                mine.buses.iter().map(Vec::len).collect::<Vec<_>>(),
-                theirs.buses.iter().map(Vec::len).collect::<Vec<_>>(),
-                "group {g} {name} interactions"
-            );
+            if mine.members != theirs.members {
+                found.push(format!("group {g} {name} members"));
+            }
+            if mine.plan != theirs.plan {
+                found.push(format!("group {g} {name} plan"));
+            }
+            if mine.buses.iter().map(Vec::len).collect::<Vec<_>>()
+                != theirs.buses.iter().map(Vec::len).collect::<Vec<_>>()
+            {
+                found.push(format!("group {g} {name} interactions"));
+            }
         }
         let start: usize = plan.groups[..g].iter().map(Vec::len).sum();
+        // The true key, outside the fault.
         let key = super::class_key(
             &plan.groups[g],
             &refs,
             &shapes,
             &local.digests[start..start + plan.groups[g].len()],
         );
+        let families: Vec<String> = plan.groups[g]
+            .iter()
+            .map(|&t| refs[t].name().split('[').next().unwrap_or("").to_string())
+            .collect();
+        let heights: Vec<usize> = plan.groups[g]
+            .iter()
+            .map(|&t| plan.frame.shapes[t].1)
+            .collect();
+        outline.push((g, families, heights));
         keys.push((g, key));
         locals.push(g);
     }
-    println!(
-        "LOCAL CLASS SPLITS: {} groups, local {locals:?}",
-        plan.num_groups()
-    );
-    assert!(
-        locals.len() >= 2,
-        "the statement holds several local groups: {locals:?}"
-    );
     // One split a definition: two groups share their split exactly when
     // their keys are equal.
-    let mut equal_pairs = 0;
     for (i, (g, key)) in keys.iter().enumerate() {
         for (h, other) in &keys[i + 1..] {
             let same = std::sync::Arc::ptr_eq(
                 plan.local_classes(*g).expect("classes"),
                 plan.local_classes(*h).expect("classes"),
             );
-            assert_eq!(same, key == other, "groups {g} and {h}");
-            equal_pairs += usize::from(same);
+            if same != (key == other) {
+                found.push(format!(
+                    "groups {g} and {h}: share {same}, keys equal {}",
+                    key == other
+                ));
+            }
         }
     }
-    println!("LOCAL CLASS SPLITS: {equal_pairs} pairs share a split");
+    println!("LOCAL CLASS SPLITS outline (group, families, heights): {outline:?}");
+    let mut two_heights = 0;
+    for (i, (_, families, heights)) in outline.iter().enumerate() {
+        for (_, f, h) in &outline[i + 1..] {
+            two_heights += usize::from(f == families && h != heights);
+        }
+    }
+    (found, locals, two_heights)
+}
+
+/// ★ Each local group's class split, taken once at derive and shared by groups
+/// of one definition, is the split of its own tables: for every group of a
+/// hand-built local statement with KECCAK_RND groups at two heights, the
+/// plan's classes equal a fresh `Shapes::classes` over the group (members and
+/// plans, and each member's interactions in the class), two groups share a
+/// split exactly when their definitions (their class keys) are equal, and a
+/// group with no local lookup has none. The statement holds local groups of
+/// one family list at different heights, and with the key's digests left out
+/// (the test's fault) the plan does not derive (its probe of the shared,
+/// wrong split refuses), so the key's digest is what keeps their splits
+/// apart.
+#[test]
+fn the_plans_local_class_splits_are_each_groups_own() {
+    use super::local_faults::Fault as LocalFault;
+    let (found, locals, two_heights) = class_split_findings(LocalFault::None);
+    println!(
+        "LOCAL CLASS SPLITS: local groups {locals:?}, {two_heights} pairs of one family list at two heights"
+    );
+    assert!(found.is_empty(), "the honest plan's splits: {found:?}");
+    assert!(
+        locals.len() >= 2,
+        "the statement holds several local groups: {locals:?}"
+    );
+    assert!(
+        two_heights >= 1,
+        "the statement holds two local groups of one family list at different heights"
+    );
+    let (faulted, _, _) = class_split_findings(LocalFault::KeyWithoutDigest);
+    println!("LOCAL CLASS SPLITS (key without digests): {faulted:?}");
+    // A split shared across heights: the derive's own probe of the wrong
+    // split refuses, or the split differs from the group's fresh one.
+    assert!(
+        faulted
+            .iter()
+            .any(|f| f.starts_with("derive refused") || f.ends_with(" plan")),
+        "a key without the digests shares a split across heights: {faulted:?}"
+    );
 }
 
 /// PROBE (not a gate; relative stamps inside one process on a shared box):
