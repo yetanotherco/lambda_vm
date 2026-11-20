@@ -2388,7 +2388,9 @@ fn the_public_levels_verifier_runs_at_the_pinned_format() {
             &[],
             &opts,
             &format,
-            &small_block_options(),
+            // The pinned format's KECCAK_RND lean byte checks need the
+            // windowed build.
+            &streamed_options(),
             &crate::block_whir::Deviations::default(),
         )
     })
