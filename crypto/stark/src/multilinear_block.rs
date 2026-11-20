@@ -2431,14 +2431,21 @@ where
     /// (`VerifierChecks::commit_ood`). Returns whether there was an answer.
     #[doc(hidden)]
     pub fn fault_commit_ood(&mut self, fault: OodFault) -> bool {
-        let Some(first) = self
+        self.fault_commit_ood_at(fault, 0, 0)
+    }
+
+    /// [`Self::fault_commit_ood`] on group `group`'s answer `poly` instead of
+    /// the first group's first. Returns whether there was that answer.
+    #[doc(hidden)]
+    pub fn fault_commit_ood_at(&mut self, fault: OodFault, group: usize, poly: usize) -> bool {
+        let Some(answer) = self
             .ood
-            .first_mut()
-            .and_then(|claims| claims.answers.first_mut())
+            .get_mut(group)
+            .and_then(|claims| claims.answers.get_mut(poly))
         else {
             return false;
         };
-        *first += FieldElement::<E>::one();
+        *answer += FieldElement::<E>::one();
         self.ood_unbound = fault == OodFault::FalseUnbound;
         true
     }

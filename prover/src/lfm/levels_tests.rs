@@ -442,13 +442,48 @@ fn the_blake3_levels_driver_proves_a_small_block() {
         verify_wlfm(&level.build.artifacts, p, &p.public_words)
             .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
     }
+    let last = run.proofs.last().expect("a last level");
     let plan = b3_plan(&elf, &run.base_proof, &format);
-    verify_levels(
-        &plan,
+    verify_levels(&plan, WlfmFamily::B3, last)
+        .expect("the block's own verifier accepts the last level");
+    // The public entry derives its own plan, prepared roots committed on the
+    // host, and accepts the same proof.
+    super::levels::verify_block_levels(
+        &elf,
+        &opts,
+        &format,
+        run.base_proof.statement(),
         WlfmFamily::B3,
-        run.proofs.last().expect("a last level"),
+        LevelStop::DEFAULT,
+        last,
     )
-    .expect("the block's own verifier accepts the last level");
+    .expect("the public entry accepts the last level");
+    // A plan given one flipped prepared root (as a prover or a file could
+    // hand it): the plan-taking call checks the proof against the programs
+    // that plan defines, so its verdict follows the caller's roots — this
+    // proof is refused there only because it was proved for the true ones.
+    // The public entry takes no plan, so no caller's roots reach it.
+    let mut roots: Vec<(usize, Vec<multilinear::whir_commit::Commitment>)> = plan
+        .prepared()
+        .iter()
+        .map(|p| (p.group, p.roots.clone()))
+        .collect();
+    assert!(!roots.is_empty(), "the block has prepared stacks");
+    roots[0].1[0][0] ^= 1;
+    let flipped = level_plan(
+        &elf,
+        &opts,
+        &format,
+        run.base_proof.statement(),
+        WlfmFamily::B3,
+        Some(&roots),
+    )
+    .expect("a plan takes the caller's roots, checking only their groups and count");
+    assert_eq!(flipped.prepared()[0].roots, roots[0].1, "the caller's root");
+    assert!(
+        verify_levels(&flipped, WlfmFamily::B3, last).is_err(),
+        "the flipped plan defines other programs"
+    );
     let t = &run.times;
     println!(
         "LEVELS DRIVER B3: base {:.3}s · planned {:.3}s · emitted {:.3}s · pieces {} · waves \
@@ -1580,8 +1615,11 @@ fn rta_one_run(
     for (level, p) in run.levels.iter().zip(&run.proofs) {
         ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
     }
-    let ok_last = super::levels::verify_levels_to(
-        &run.plan,
+    let ok_last = super::levels::verify_block_levels(
+        &elf,
+        &opts,
+        &cfg.format,
+        run.base_proof.statement(),
         family,
         LevelStop::Levels(levels),
         run.proofs.last().expect("a last level"),

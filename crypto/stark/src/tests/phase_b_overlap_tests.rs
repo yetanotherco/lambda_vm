@@ -160,10 +160,10 @@ fn prepared_columns() -> Vec<Vec<Mle<Fp>>> {
 }
 
 /// Each prepared stack committed over its columns.
-fn prepared_commitments(
+fn prepared_commitments<Hh: WhirHash>(
     columns: &[Vec<Mle<Fp>>],
     config: &ChainConfig,
-) -> Vec<StackedCommitment<Fp, H>> {
+) -> Vec<StackedCommitment<Fp, Hh>> {
     PREPARED
         .iter()
         .zip(columns)
@@ -171,7 +171,7 @@ fn prepared_commitments(
             let shapes: Vec<(usize, usize)> =
                 tables.iter().map(|&(t, n)| (n, num_vars(t))).collect();
             let layout = global_layout(&shapes, config.format.stack).expect("a layout");
-            StackedCommitment::<Fp, H>::commit(
+            StackedCommitment::<Fp, Hh>::commit(
                 layout,
                 &multilinear::stacking::borrow(columns),
                 None,
@@ -218,14 +218,25 @@ fn prove_block_reordered(
     fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
     reorder: Option<&PhaseBReorder<'_>>,
 ) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
-    prove_block_placed(config, overlap, order, faults, fault, reorder, false)
+    prove_block_placed::<H>(config, overlap, order, faults, fault, reorder, false)
+}
+
+/// [`prove_block`] under the hash `Hh`.
+pub(super) fn prove_block_under<Hh: WhirHash>(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block_placed::<Hh>(config, overlap, order, faults, fault, None, false)
 }
 
 /// [`prove_block_reordered`] with the prepared stacks held (as committed) or,
 /// when `retired`, committed and let go ([`PreparedCommitment::Retired`]):
 /// each revived at its group's opening, after the group's own codewords have
 /// gone.
-fn prove_block_placed(
+fn prove_block_placed<Hh: WhirHash>(
     config: &ChainConfig,
     overlap: PhaseBOverlap,
     order: &[usize],
@@ -237,7 +248,7 @@ fn prove_block_placed(
     let airs = airs();
     let config = *config;
     let columns = prepared_columns();
-    let mut commitments = prepared_commitments(&columns, &config);
+    let mut commitments = prepared_commitments::<Hh>(&columns, &config);
     let retired_stacks: Vec<multilinear::stacked_eval::RetiredStack<Fp>> = if retired {
         commitments
             .drain(..)
@@ -250,7 +261,7 @@ fn prove_block_placed(
         .iter()
         .map(|c| multilinear::stacking::borrow(c))
         .collect();
-    let prepared: Vec<BlockPrepared<'_, Fp, H>> = PREPARED
+    let prepared: Vec<BlockPrepared<'_, Fp, Hh>> = PREPARED
         .iter()
         .enumerate()
         .zip(&borrowed)
@@ -266,7 +277,7 @@ fn prove_block_placed(
             packed: None,
         })
         .collect();
-    let mut block = BlockCommitted::commit::<H, <H as WhirHash>::Sponge>(
+    let mut block = BlockCommitted::commit::<Hh, <Hh as WhirHash>::Sponge>(
         tables(&airs),
         &SIZES,
         &config,
@@ -294,8 +305,8 @@ fn prove_block_placed(
             .unwrap_or_else(|e| e.into_inner())
             .push((opened.group, share));
     };
-    let mut transcript = H::sponge();
-    let proved = multilinear_block::block_prove_in_order::<Fp, Ext, _, H>(
+    let mut transcript = Hh::sponge();
+    let proved = multilinear_block::block_prove_in_order::<Fp, Ext, _, Hh>(
         block,
         &config,
         &mut transcript,
@@ -326,6 +337,16 @@ fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlErr
 /// [`verify`] under `config`, reading `commit_ood` as the proof's commit-time
 /// answers, with the verifier's `checks`.
 pub(super) fn verify_block(
+    config: &ChainConfig,
+    proved: &BlockProved<Fp, Ext>,
+    commit_ood: &[FieldElement<Ext>],
+    checks: VerifierChecks,
+) -> Result<(), MlError> {
+    verify_block_under::<H>(config, proved, commit_ood, checks)
+}
+
+/// [`verify_block`] under the hash `Hh`.
+pub(super) fn verify_block_under<Hh: WhirHash>(
     config: &ChainConfig,
     proved: &BlockProved<Fp, Ext>,
     commit_ood: &[FieldElement<Ext>],
@@ -375,7 +396,7 @@ pub(super) fn verify_block(
         .map(|layout| Domain::new(layout.n_stack() + config.log_blowup).expect("a domain"))
         .collect();
     let prepared = prepared_columns();
-    let commitments = prepared_commitments(&prepared, &config);
+    let commitments = prepared_commitments::<Hh>(&prepared, &config);
     let roots: Vec<Vec<multilinear::whir_commit::Commitment>> =
         commitments.iter().map(StackedCommitment::roots).collect();
     let prepared_checks: Vec<BlockPreparedCheck<'_, Fp>> = PREPARED
@@ -392,8 +413,8 @@ pub(super) fn verify_block(
             },
         )
         .collect();
-    let mut transcript = H::sponge();
-    multilinear_block::block_verify_with::<Fp, Ext, _, H>(
+    let mut transcript = Hh::sponge();
+    multilinear_block::block_verify_with::<Fp, Ext, _, Hh>(
         &proved.0,
         commit_ood,
         &proved.1,
@@ -555,7 +576,7 @@ fn retired_prepared_stacks_prove_the_held_stacks_bytes() {
             ("beside, in order", in_order(), PhaseBOverlap::On),
             ("beside, reversed", reversed.clone(), PhaseBOverlap::On),
         ] {
-            let (proved, _) = prove_block_placed(
+            let (proved, _) = prove_block_placed::<H>(
                 &config(argue),
                 overlap,
                 &order,
@@ -598,7 +619,7 @@ fn uploads_at_each_groups_turn_prove_the_same_bytes() {
     for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
         for retired in [false, true] {
             for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On] {
-                let (proved, _) = prove_block_placed(
+                let (proved, _) = prove_block_placed::<H>(
                     &config(argue),
                     overlap,
                     &in_order(),
@@ -979,7 +1000,7 @@ fn the_planned_overlap_under_retired_stacks_proves_the_same_bytes() {
     let n = SIZES.len();
     for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
         for planned in [false, true] {
-            let (proved, _) = prove_block_placed(
+            let (proved, _) = prove_block_placed::<H>(
                 &config(argue),
                 PhaseBOverlap::Off,
                 &in_order(),
@@ -1019,7 +1040,7 @@ fn the_planned_overlaps_fallbacks_prove_the_same_bytes() {
     let argue = ARGUES[0];
     let before = BEFORE_THE_OVERLAP[0];
     let planned = |faults: OverlapFaults| {
-        prove_block_placed(
+        prove_block_placed::<H>(
             &config(argue),
             PhaseBOverlap::Off,
             &in_order(),
