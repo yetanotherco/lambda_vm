@@ -2375,6 +2375,7 @@ fn prove_traces_under<H: WhirHash>(
                     .with_phase_b_overlap_planned(overlap_planned())
                     .with_prepared_upload_once(upload_once())
                     .with_overlap_priced_resident(overlap_resident())
+                    .with_overlap_next_columns_priced(overlap_next_columns())
                     .with_overlap_faults(overlap_faults_for_test())
             })
         }
@@ -2885,8 +2886,9 @@ pub fn upload_once() -> bool {
 /// the plan moves: a group whose openings now fit opens beside the next argue.
 /// Nothing without the upload once. The same proof. Only the W-LFM prover
 /// reads it. Off by default (and for any word but `1`): the plan it tightens
-/// does not yet price the next group's columns, which go up beside the argue
-/// it plans for. Read once a process.
+/// covered the next group's columns, which go up beside the argue it plans
+/// for, only with the cushion it removes; [`OVERLAP_NEXT_COLUMNS_ENV`] prices
+/// them. Read once a process.
 pub const OVERLAP_RESIDENT_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT";
 
 thread_local! {
@@ -2909,6 +2911,47 @@ pub fn overlap_resident() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         overlap_resident_word(super::wlfm_knobs::env_word(OVERLAP_RESIDENT_ENV).as_deref())
+    })
+}
+
+/// `LAMBDA_VM_LEVELS_OVERLAP_NEXT_COLUMNS` (on unless `0`): phase B's planned
+/// overlap adds the next group's columns to a transition's need when they are
+/// not on the card yet
+/// ([`multilinear_block::BlockCommitted::with_overlap_next_columns_priced`]).
+/// Over retired stacks they go up at that group's own turn, after the plan and
+/// before the openings start beside its argue, so neither the ledger nor the
+/// commit's growth the plan reads holds them. Only the plan moves: a group
+/// whose openings no longer fit beside them opens alone. The same proof. Only
+/// the W-LFM prover reads it. On by default; only `0` turns it off (today's
+/// plan, which covers them with its slack). Read once a process.
+pub const OVERLAP_NEXT_COLUMNS_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_NEXT_COLUMNS";
+
+/// [`OVERLAP_NEXT_COLUMNS_ENV`]'s word: on unless it is `0`.
+pub fn overlap_next_columns_word(word: Option<&str>) -> bool {
+    !super::wlfm_knobs::knob_word_off(word)
+}
+
+thread_local! {
+    /// A test's [`overlap_next_columns`] on this thread.
+    static OVERLAP_NEXT_COLUMNS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`overlap_next_columns`] forced on this thread (`None`
+/// restores the knob).
+#[doc(hidden)]
+pub fn set_overlap_next_columns_for_test(on: Option<bool>) {
+    OVERLAP_NEXT_COLUMNS_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`OVERLAP_NEXT_COLUMNS_ENV`] is on, as it is unless `0` (or this
+/// thread's test override).
+pub fn overlap_next_columns() -> bool {
+    if let Some(on) = OVERLAP_NEXT_COLUMNS_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        overlap_next_columns_word(super::wlfm_knobs::env_word(OVERLAP_NEXT_COLUMNS_ENV).as_deref())
     })
 }
 
