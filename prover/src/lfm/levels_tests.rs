@@ -2315,7 +2315,10 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         }
     }
     let links = [
-        ("verify_block_levels_pinned", "check_process_format("),
+        (
+            "verify_block_levels_pinned",
+            "check_process_format(family)?;",
+        ),
         ("verify_block_levels_pinned", "verifier_level_plan("),
         ("verifier_level_plan", "verifier_level_plan_with("),
         ("verifier_level_plan_with", "level_plan_with("),
@@ -2326,6 +2329,18 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         ("child_of_build", "cap_mux: plan.cap_mux()"),
         ("check_process_format", "check_format_knobs("),
     ];
+    // The argument-less entry's constants: its pinned choices.
+    for constant in [
+        "BlockFormat::pinned_with(GroupFold::Indexed)",
+        "B3Rounds::Fri",
+        "LevelStop::DEFAULT",
+        "CapMux::Packed",
+    ] {
+        assert!(
+            body("verify_block_levels").contains(constant),
+            "verify_block_levels passes {constant}"
+        );
+    }
     for (function, call) in links {
         assert!(
             body(function).contains(call),
@@ -2390,25 +2405,33 @@ fn the_levels_verifier_refuses_format_knobs_off_their_pinned_values() {
 
 /// The scenarios [`the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults`]
 /// runs in processes of their own: an environment, and its child test's name.
-const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 2] = [
+const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 3] = [
     (
         "cap",
         &[
             ("LAMBDA_VM_B3_BASE_CAP", "5"),
             ("LAMBDA_VM_B3_BASE_GROUP", "3"),
             ("LAMBDA_VM_B3_BASE_GKR", "single"),
-            ("LAMBDA_VM_LFM_CAP_MUX", "plain"),
-            ("LFM_WHIR_SHARE_INVERSE", "0"),
             ("LAMBDA_VM_LFM_HASH_SPLIT", "1"),
         ],
     ),
     ("final", &[("LAMBDA_VM_B3_BASE_FINAL", "off")]),
+    (
+        "malformed",
+        &[
+            ("LAMBDA_VM_B3_BASE_CAP", "banana"),
+            ("LAMBDA_VM_B3_BASE_FINAL", "sometimes"),
+            ("LAMBDA_VM_LFM_HASH_SPLIT", "maybe"),
+        ],
+    ),
 ];
 
 /// ★ In processes whose knobs are off the defaults, the public entries'
 /// pins hold: the family pin keeps the BLAKE3 base's own group size and GKR
 /// ladder, and the format check refuses the cap, the final polynomial and
-/// (under Poseidon1) the hash split by name. Each scenario runs
+/// (under Poseidon1) the hash split by name, and a malformed word of any of
+/// the three is an `Err` under either family, never an abort or a panic.
+/// Each scenario runs
 /// [`the_levels_pins_hold_under_knobs_off_the_default`] in a child process.
 #[test]
 fn the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults() {
@@ -2464,6 +2487,16 @@ fn the_levels_pins_hold_under_knobs_off_the_default() {
             assert!(refused.contains("LAMBDA_VM_B3_BASE_FINAL"), "{refused}");
             super::levels::check_process_format_for_tests(WlfmFamily::P1)
                 .expect("the Poseidon1 base reads no BLAKE3 knob");
+        }
+        "malformed" => {
+            for family in [WlfmFamily::B3, WlfmFamily::P1] {
+                let refused = super::levels::check_process_format_for_tests(family)
+                    .expect_err("a malformed knob word");
+                assert!(
+                    refused.contains("LAMBDA_VM_B3_BASE_CAP"),
+                    "{family:?}: {refused}"
+                );
+            }
         }
         other => panic!("no scenario {other}"),
     }
@@ -2522,17 +2555,17 @@ fn a_levels_verifier_pins_its_familys_base() {
     }
 }
 
-/// ★ A public entry executed: a small block's BLAKE3 base proved at the
-/// format `verify_block_levels` pins (the tree's pinned format on the BLAKE3
-/// base) under the options it derives, then `verify_block_levels` itself run
-/// over it. Its whole derivation runs — the family pin, the format check, the
-/// plan with its roots on the host, every level's programs and artifacts —
-/// and only the last proof, another program's, is refused, at the last
-/// level's verify. And the plan the entry derives carries the named cap check,
-/// and no level program has a hash row a split could cut.
+/// ★ A public entry accepts: a small block proved at the format
+/// `verify_block_levels` pins (the tree's pinned format on the BLAKE3 base),
+/// under the options it derives, through its two levels, and the last level
+/// verified by `verify_block_levels` itself — so the entry's own constants
+/// (the format, the round form, the cap check, the stop) are the ones an
+/// honest proof is made at. Another program's last proof is refused at the
+/// last level's verify, after the whole derivation. And no level program the
+/// entry's plan derives has a hash row a split could cut.
 #[test]
-#[ignore = "proves a small BLAKE3 base at the pinned format and derives its levels; box tier"]
-fn the_public_levels_verifier_runs_at_the_pinned_format() {
+#[ignore = "proves a small BLAKE3 block and its levels at the pinned format; box tier"]
+fn the_public_levels_verifier_accepts_at_the_pinned_format() {
     use crate::block_whir::{B3Rounds, BlockFormat};
     use multilinear::whir_chain::GroupFold;
     let format = super::levels::pin_family(
@@ -2543,24 +2576,26 @@ fn the_public_levels_verifier_runs_at_the_pinned_format() {
     .expect("the pin");
     let opts = super::proof::block_base_options_under(&format.zf);
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
-    let base = crate::base_only::with_blake3_levels(|| {
-        crate::block_whir::prove_block_whir_with(
-            &elf,
-            &[],
-            &opts,
-            &format,
-            // The pinned format's KECCAK_RND lean byte checks need the
-            // windowed build.
-            &streamed_options(),
-            &crate::block_whir::Deviations::default(),
-        )
-    })
-    .expect("the BLAKE3 base proves at the pinned format")
-    .0;
+    // The pinned format's KECCAK_RND lean byte checks need the windowed build.
+    let run = super::levels::prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &streamed_options(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
+    .expect("the block proves to its last level at the pinned format");
+    let last = run.proofs.last().expect("a last level");
+    super::levels::verify_block_levels(&elf, run.base_proof.statement(), WlfmFamily::B3, last)
+        .expect("the public entry accepts the honest last level");
     let plan = super::levels::verifier_level_plan(
         &elf,
         &format,
-        base.statement(),
+        run.base_proof.statement(),
         WlfmFamily::B3,
         super::merkle_cap::CapMux::Packed,
     )
@@ -2569,11 +2604,10 @@ fn the_public_levels_verifier_runs_at_the_pinned_format() {
     let levels = derive_levels_to(&plan, WlfmFamily::B3, LevelStop::DEFAULT, true)
         .expect("the levels derive");
     for (k, level) in levels.iter().enumerate() {
-        let rows = level.program.groups.hash.real_rows;
         assert_eq!(
-            super::chunking::HashChunking::for_rows(rows),
-            super::chunking::HashChunking::unbounded(),
-            "level {}: {rows} hash rows, which a split would cut",
+            level.program.groups.hash.real_rows,
+            0,
+            "level {}: a BLAKE3 level program's hash rows",
             k + 1
         );
     }
@@ -2589,9 +2623,13 @@ fn the_public_levels_verifier_runs_at_the_pinned_format() {
         commit_ood: Vec::new(),
         public_words: Vec::new(),
     };
-    let refused =
-        super::levels::verify_block_levels(&elf, base.statement(), WlfmFamily::B3, &foreign)
-            .expect_err("another program's proof");
+    let refused = super::levels::verify_block_levels(
+        &elf,
+        run.base_proof.statement(),
+        WlfmFamily::B3,
+        &foreign,
+    )
+    .expect_err("another program's proof");
     assert!(
         refused.starts_with("the last level does not verify"),
         "the derivation ran to the last level's verify: {refused}"
