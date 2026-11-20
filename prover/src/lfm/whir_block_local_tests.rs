@@ -635,14 +635,25 @@ fn each_formats_plan_refuses_the_others_base() {
     let local_plan = plan_under(&local, local_proof.statement()).expect("the local plan");
     let lean_plan = plan_under(&lean, todays.statement()).expect("today's plan");
     run_leaf(&lean_plan, &todays, 0).expect("today's leaf executes today's base");
-    assert!(
-        plan_under(&lean, local_proof.statement()).is_err(),
-        "today's plan over a local statement"
-    );
-    assert!(
-        plan_under(&local, todays.statement()).is_err(),
-        "a local plan over today's statement"
-    );
+    // Each refused by the frame, by its own message.
+    for (what, refused) in [
+        (
+            "today's plan over a local statement",
+            plan_under(&lean, local_proof.statement()).err(),
+        ),
+        (
+            "a local plan over today's statement",
+            plan_under(&local, todays.statement()).err(),
+        ),
+    ] {
+        println!("LOCAL REC FORMAT {what}: {refused:?}");
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|e| e.starts_with("statement:")),
+            "{what}: {refused:?}"
+        );
+    }
     assert!(
         block_leaf_arena(&local_plan, &local_proof.clone().with_local(()), 0).is_err(),
         "a local plan over a local proof stripped of its local argues"
@@ -723,7 +734,9 @@ fn the_local_bytes_closed_form_is_its_columns_extension() {
 /// ★ THE STATIC RECEIVER CHECK at derive time: a LOCAL_BYTES whose
 /// `LocalAreBytes` receiver reads a committed column (its own `MU_AND`) is
 /// refused by the plan's group check — a group's own challenges could argue
-/// any false lookup into such a receiver — and LOCAL_BYTES itself passes.
+/// any false lookup into such a receiver — and LOCAL_BYTES itself passes
+/// under its route's four checked columns, and is refused under a route that
+/// checks fewer columns than its receivers read.
 /// Not blind: with the check dropped, the dynamic receiver passes.
 #[test]
 fn a_dynamic_local_receiver_is_refused_by_the_plans_static_check() {
@@ -744,20 +757,33 @@ fn a_dynamic_local_receiver_is_refused_by_the_plans_static_check() {
         vec![direct(cols::X), direct(cols::MU_AND)],
     );
     let dynamic = crate::test_utils::create_local_bytes_air_with(&opts, interactions);
+    // `checked`: the columns the table's route checks (LOCAL_BYTES' four).
+    let check_under = |air: &dyn AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >,
+                       checked: usize| {
+        let refs = [air];
+        let shapes = [(air.trace_layout().0, local_bytes::LOG_ROWS)];
+        let owned = super::whir_block::Shapes::build(&refs, &shapes, &[0]).expect("the shapes");
+        owned.check_local_receivers(&[checked], &LOCAL_BUSES)
+    };
     let check = |air: &dyn AIR<
         Field = crate::tables::types::GoldilocksField,
         FieldExtension = GoldilocksExtension,
         PublicInputs = (),
-    >| {
-        let refs = [air];
-        let shapes = [(air.trace_layout().0, local_bytes::LOG_ROWS)];
-        let owned = super::whir_block::Shapes::build(&refs, &shapes, &[0]).expect("the shapes");
-        owned.check_local_receivers(&refs, &LOCAL_BUSES)
-    };
+    >| check_under(air, local_bytes::NUM_PRECOMPUTED_COLS);
     assert_eq!(
         check(&fixed),
         Ok(()),
         "LOCAL_BYTES reads fixed columns only"
+    );
+    // The predicate is the route's count: under a route that leaves Y
+    // unchecked, LOCAL_BYTES itself is refused.
+    assert!(
+        check_under(&fixed, cols::Y).is_err_and(|e| e.contains("LocalReceiverNotFixed")),
+        "a route that leaves Y unchecked"
     );
     let refused = check(&dynamic);
     println!("LOCAL REC DYNAMIC RECEIVER: {refused:?}");
@@ -771,5 +797,128 @@ fn a_dynamic_local_receiver_is_refused_by_the_plans_static_check() {
         local_faults::with(Fault::NoReceiverCheck, || check(&dynamic)),
         Ok(()),
         "the mutant check passes it"
+    );
+}
+
+/// ★ The local transcript reads the FRONT's root and answer cells — the
+/// cells the main transcript absorbed and the opening checks — never a copy
+/// of its own: the leaf hints exactly the words the base's arena holds (a
+/// hinted copy would lengthen it), and the mutant that reads hinted copies
+/// needs one word more per root word and per answer of each local group.
+/// Fed the honest copies, that mutant executes the honest base — nothing in
+/// the program ties its copies to the committed words, which is why a copy
+/// would let a prover choose its local challenges' inputs apart from what it
+/// committed — and fed one changed copy it does not (its challenges move).
+#[test]
+#[ignore = "proves a small block under local lookups; box tier"]
+fn the_local_transcript_reads_the_fronts_cells_not_hints() {
+    let format = b3_local();
+    let proof = honest(&format);
+    let plan = plan_under(&format, proof.statement()).expect("the plan derives");
+    let g = local_groups(&proof)[0];
+    let k = leaf_of(&plan, g);
+    let real = leaf_under(&plan, k, Fault::None);
+    let arena = block_leaf_arena(&plan, &proof, k).expect("the arena");
+    assert_eq!(real.arena_schema.lens, vec![arena[0].len() as u32]);
+    let mutant = leaf_under(&plan, k, Fault::HintedLocalCells);
+    let frame =
+        block_whir::block_frame(proof.statement(), &elf(), &opts(), &format).expect("the frame");
+    let config = &frame.config;
+    let trees = |l: &multilinear::stacking::StackedLayout| {
+        multilinear::stacked_eval::round0_trees(l.num_polys(), config).len()
+    };
+    let locals: Vec<usize> = plan
+        .partition()
+        .leaf(k)
+        .iter()
+        .copied()
+        .filter(|h| !proof.local[*h].is_empty())
+        .collect();
+    // Each local group's copies, at the start of its words.
+    let (_, marks) = plan.leaf_program_marked(k).expect("the marks");
+    let copies = |h: usize, bump: bool| -> Vec<LfmWord> {
+        let layout = &frame.stack_layouts[h];
+        let root_at: usize = frame.stack_layouts[..h].iter().map(trees).sum();
+        let answer_at: usize = frame.stack_layouts[..h].iter().map(|l| l.num_polys()).sum();
+        let mut words: Vec<LfmWord> = proof.proof.roots[root_at..root_at + trees(layout)]
+            .iter()
+            .flat_map(|root| super::proof_arena::commitment_words_for(root, plan.wrap_hash()))
+            .collect();
+        words.extend(
+            proof.commit_ood[answer_at..answer_at + layout.num_polys()]
+                .iter()
+                .map(super::word::ext_word),
+        );
+        if bump {
+            words[0][0] += FE::one();
+        }
+        words
+    };
+    let extra: usize = locals.iter().map(|&h| copies(h, false).len()).sum();
+    assert_eq!(
+        mutant.arena_schema.lens,
+        vec![(arena[0].len() + extra) as u32],
+        "the mutant hints a copy of each local group's roots and answers"
+    );
+    let with_copies = |bump: bool| -> Vec<Vec<LfmWord>> {
+        let mut words = arena[0][..marks[0] as usize].to_vec();
+        for (i, &h) in plan.partition().leaf(k).iter().enumerate() {
+            if locals.contains(&h) {
+                words.extend(copies(h, bump));
+            }
+            words.extend_from_slice(&arena[0][marks[i] as usize..marks[i + 1] as usize]);
+        }
+        vec![words]
+    };
+    let run = |arenas: &[Vec<LfmWord>]| {
+        execute(
+            &mutant,
+            arenas,
+            &mutant.hasher(<BlockFamily as ProofFamily>::SOCKET),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+    };
+    run(&with_copies(false)).expect("the mutant over the honest copies executes");
+    assert!(
+        run(&with_copies(true)).is_err(),
+        "a changed copy moves the mutant's local challenges"
+    );
+}
+
+/// ★ The local balance's shares are `p · (1/q)` whatever the leaves' share
+/// knob: under the quotient form (`share_inverse` off) the leaf emits the
+/// same local balance as under the inverse form, and the mutant whose local
+/// shares follow the knob emits one product fewer per local tree there —
+/// a quotient share is free at `p = q = 0`. Under the inverse form the
+/// mutant is the leaf.
+#[test]
+#[ignore = "proves a small block under local lookups; box tier"]
+fn the_local_balance_divides_p_by_q_whatever_the_share_knob() {
+    let format = b3_local();
+    let proof = honest(&format);
+    let plan = plan_under(&format, proof.statement()).expect("the plan derives");
+    let g = local_groups(&proof)[0];
+    let k = leaf_of(&plan, g);
+    let trees: usize = plan
+        .partition()
+        .leaf(k)
+        .iter()
+        .map(|&h| proof.local[h].bus_outputs.len())
+        .sum();
+    assert!(trees > 0);
+    let quotient = plan.with_share_inverse(false);
+    let real = leaf_under(&quotient, k, Fault::None);
+    let knob = leaf_under(&quotient, k, Fault::LocalShareKnob);
+    assert_eq!(
+        real.instrs.len(),
+        knob.instrs.len() + trees,
+        "one product (p · 1/q) a local tree that the knob's quotient form drops"
+    );
+    let inverse = quotient.with_share_inverse(true);
+    assert_eq!(
+        leaf_under(&inverse, k, Fault::None).instrs.len(),
+        leaf_under(&inverse, k, Fault::LocalShareKnob).instrs.len(),
+        "under the inverse form the mutant is the leaf"
     );
 }
