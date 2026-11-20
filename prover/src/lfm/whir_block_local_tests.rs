@@ -236,7 +236,7 @@ fn the_leaves_of_a_local_base_execute_and_close_the_bus() {
         let plan = plan_under(&format, proof.statement()).expect("the plan derives");
         let (loads, front) = plan.chip_loads();
         println!("LOCAL REC FRONT {label}: {front:?}");
-        for g in 0..plan.num_groups() {
+        for (g, load) in loads.iter().enumerate() {
             println!(
                 "LOCAL REC GROUP {label} {g}: local {} · tables {} · cost {} (argue {}, opening {}, prepared {}) · rows {:?} · local trees {} · local ladders {}",
                 locals.contains(&g),
@@ -245,7 +245,7 @@ fn the_leaves_of_a_local_base_execute_and_close_the_bus() {
                 plan.cost_parts()[g][0],
                 plan.cost_parts()[g][1],
                 plan.cost_parts()[g][2],
-                loads[g],
+                load,
                 proof.local[g].bus_outputs.len(),
                 proof.local[g].gkr.len(),
             );
@@ -526,27 +526,22 @@ fn faulted_and_tampered_local_argues_are_refused() {
     let honest = honest(&format);
     let g = local_groups(&honest)[0];
     let mut sites: Vec<(String, BlockWhirProof<LocalArgues>)> = Vec::new();
-    for (what, faults) in [(
-        "a local claim absorbed off by one",
-        ProverFaults {
-            local_tamper_claim: Some(0),
-            ..ProverFaults::default()
-        },
-    )] {
-        let proof = prove_local(
-            &format,
-            &Deviations {
-                argue: stark::multilinear_block::ArgueDeviation {
-                    group: Some(g),
-                    faults,
-                    ..Default::default()
+    let faulted = prove_local(
+        &format,
+        &Deviations {
+            argue: stark::multilinear_block::ArgueDeviation {
+                group: Some(g),
+                faults: ProverFaults {
+                    local_tamper_claim: Some(0),
+                    ..ProverFaults::default()
                 },
-                ..Deviations::default()
+                ..Default::default()
             },
-        )
-        .expect("the faulted base proves");
-        sites.push((what.to_string(), proof));
-    }
+            ..Deviations::default()
+        },
+    )
+    .expect("the faulted base proves");
+    sites.push(("a local claim absorbed off by one".into(), faulted));
     let mut p = honest.clone();
     p.local[g].bus_outputs[0].0 += FEE::one();
     sites.push(("a local tree's output".into(), p));
