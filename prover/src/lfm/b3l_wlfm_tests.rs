@@ -1043,3 +1043,72 @@ fn the_next_level_streamed_beside_the_prove_is_the_same_level() {
         assert!(err.contains("stopped"), "{family:?}: {err}");
     }
 }
+
+/// The head's block-byte pair lookups are what tie a felt block's hashed bytes
+/// to the felt the memory bus reads. The same 64 columns feed the
+/// little-endian message words the rounds hash and the big-endian felts the
+/// bus reads; only the 32 pair lookups make them bytes. A head row whose
+/// "bytes" are `b0 + 256·δ`, `b1 − δ` keeps message word 0 (so the digest)
+/// and moves felt 0 by `δ·(2^64 − 2^48)`, to any value: here memory holds
+/// `v_mem` while the compression runs over `v_hash`'s bytes, felt 0's
+/// canonicity witnesses set over the moved bytes. The pair lookup finds no
+/// row for the moved bytes, so the verifier refuses it on the bus balance;
+/// with the pair lookups and their counts both dropped the same proof
+/// verifies (run by hand, not kept as a switch).
+#[test]
+fn a_felt_block_hashed_off_its_felt_is_refused_by_the_byte_pair_lookup() {
+    let _fast = test_format::set(Some(2));
+    let _wide = super::b3l_tables::test_hold::set(super::b3l_tables::B3lHold::Wide);
+    let v_mem = 0x0123_4567_89AB_CDEFu64;
+    let v_hash = 5u64;
+    let mut b = LfmBuilder::new();
+    let w0 = b
+        .digest_const([
+            FE::from(v_mem),
+            FE::from(7u64),
+            FE::from(8u64),
+            FE::from(9u64),
+        ])
+        .as_cell();
+    let w1 = b.digest_const([FE::from(10u64); 4]).as_cell();
+    b.b3_compress(B3Cv::Iv, B3Block::Felts([w0, w1]), 64, 11);
+    let program = compile(b.finish());
+    let mut exec = execute(&program, &[], &HASHER).expect("executes");
+    assert_eq!(exec.records.b3l[0].block[..8], v_mem.to_be_bytes());
+    exec.records.b3l[0].block[..8].copy_from_slice(&v_hash.to_be_bytes());
+    let mut filled =
+        super::proof::lfm_fill_executed_under(&program, exec, HASHER, 0.0, &Vec::new());
+    let t = filled.b3l_mut().expect("lean tables").heads[0]
+        .wide_mut()
+        .expect("held wide");
+    // δ·(2^64 − 2^48) = v_mem − v_hash: the felt the bus reads moves to v_mem,
+    // message word 0 stays v_hash's.
+    let two64 = FE::from(1u64 << 32) * FE::from(1u64 << 32);
+    let delta = (FE::from(v_mem) - FE::from(v_hash))
+        * (two64 - FE::from(1u64 << 48)).inv().expect("nonzero");
+    let b0 = *t.main_table.get(0, head::MB);
+    let b1 = *t.main_table.get(0, head::MB + 1);
+    t.main_table.set(0, head::MB, b0 + FE::from(256u64) * delta);
+    t.main_table.set(0, head::MB + 1, b1 - delta);
+    // Felt 0's canonicity witnesses over the moved "bytes": its high half is
+    // not 2^32 − 1, so Z = 0 and GINV = 1 / (2^32 − 1 − hi).
+    let hi = (0..4).fold(FE::zero(), |acc, k| {
+        acc + *t.main_table.get(0, head::MB + k) * FE::from(1u64 << (8 * (3 - k)))
+    });
+    let g = FE::from(0xFFFF_FFFFu64) - hi;
+    t.main_table.set(0, head::CZ, FE::zero());
+    t.main_table.set(
+        0,
+        head::CG,
+        g.inv().expect("the moved high half is not 2^32 - 1"),
+    );
+    let build = build(&program);
+    let proof = prove_wlfm_traces(&build, filled, true).expect("the prover does not check");
+    let verdict = verify_wlfm(&build.artifacts, &proof, &proof.public_words);
+    println!("FELT BLOCK HASHED OFF ITS FELT: verifier says {verdict:?}");
+    assert_eq!(
+        verdict,
+        Err("BusImbalance".to_string()),
+        "the byte-pair lookup refuses a felt block hashed off its felt, on the bus balance"
+    );
+}
