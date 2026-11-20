@@ -624,6 +624,19 @@ where
         room.saturating_add(codeword.saturating_mul(self.layout.num_polys() as u64))
     }
 
+    /// [`Self::revive_card_bytes`] over a resident store of the columns, as
+    /// the upload once revives a stack: on coset leaves with coset openings in
+    /// effect, its room alone.
+    pub fn revive_over_store_card_bytes(&self, config: &ChainConfig) -> u64 {
+        self.revive_card_bytes(config, true)
+    }
+
+    /// [`Self::revive_card_bytes`] over the host's columns: its room and every
+    /// codeword re-encoded.
+    pub fn revive_whole_card_bytes(&self, config: &ChainConfig) -> u64 {
+        self.revive_card_bytes(config, false)
+    }
+
     /// The group openable again: every codeword recomputed from `columns` —
     /// the group's columns, in the order they were committed — with no tree
     /// built. `resident` names them on the card as at the commit.
