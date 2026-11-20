@@ -3275,6 +3275,12 @@ pub struct JointTree {
     stream: Arc<CudaStream>,
     num_leaves: usize,
     hash: crate::DeviceHash,
+    /// The ledger's promise for the nodes, while the tree lives: a streamed
+    /// tree's is its last codeword's, cut to the nodes' bytes
+    /// ([`commit_joint_streamed`]). `None` for the batched tree, which its
+    /// group's room covers while it commits.
+    #[allow(dead_code)]
+    room: Option<crate::device::DeviceReservation>,
 }
 
 impl JointTree {
@@ -3422,6 +3428,7 @@ pub fn commit_joint(
             stream,
             num_leaves,
             hash,
+            room: None,
         },
         root,
     ))
@@ -3439,26 +3446,30 @@ pub fn joint_streamed_builds() -> u64 {
 /// promise `R`: codeword `k` of `blocks` comes from `encode(k, carried)`,
 /// `absorb` reads it, and before codeword `k + 1` is encoded `let_go` frees
 /// its values and hands back its promise, which is `carried` into that encode.
-/// The last codeword goes whole (values and promise) after its step, and an
-/// error at any step drops what is held, promise included.
+/// The last codeword's promise comes back to the caller (the tree's,
+/// [`commit_joint_streamed`]); an error at any step drops what is held,
+/// promise included.
 pub(crate) fn stream_codewords<C, R, E>(
     blocks: usize,
     mut encode: impl FnMut(usize, Option<R>) -> std::result::Result<C, E>,
     mut absorb: impl FnMut(usize, &C) -> std::result::Result<(), E>,
     mut let_go: impl FnMut(C) -> Option<R>,
-) -> std::result::Result<(), E> {
+) -> std::result::Result<Option<R>, E> {
     let mut carried = None;
     for k in 0..blocks {
         let codeword = encode(k, carried.take())?;
         absorb(k, &codeword)?;
-        carried = if k + 1 < blocks {
-            let_go(codeword)
-        } else {
-            drop(codeword);
-            None
-        };
+        carried = let_go(codeword);
     }
-    Ok(())
+    Ok(carried)
+}
+
+/// Whether a streamed step reads a codeword (`base`, `elements` values in a
+/// buffer of `buffer_len`) as one of a run of `want`-value codewords: a base
+/// codeword of that length whose buffer holds all of it, since the step
+/// kernel reads `want` values from the buffer whatever it was allocated at.
+const fn joint_step_takes(base: bool, elements: usize, buffer_len: usize, want: usize) -> bool {
+    base && elements == want && buffer_len >= want
 }
 
 /// A codeword's values freed and its promise handed back
@@ -3507,7 +3518,10 @@ mod stream_codewords_tests {
 
     /// Runs the loop over `blocks` codewords whose encode takes the carried
     /// promise when one comes, and fails at step `fail_at`.
-    fn run(blocks: usize, fail_at: Option<usize>) -> (Result<(), ()>, Rc<RefCell<Ledger>>) {
+    fn run(
+        blocks: usize,
+        fail_at: Option<usize>,
+    ) -> (Result<Option<Promise>, ()>, Rc<RefCell<Ledger>>) {
         let ledger = Rc::new(RefCell::new(Ledger::default()));
         let result = stream_codewords(
             blocks,
@@ -3525,18 +3539,23 @@ mod stream_codewords_tests {
     /// From the first encode to the last step the run holds one codeword's
     /// promise, never none: each encode after the first finds the previous
     /// codeword's promise still held and takes it, so the ledger is asked
-    /// once a run. After the last step nothing is held.
+    /// once a run. After the last step that one promise comes back (the
+    /// tree's), and nothing else is held.
     #[test]
     fn a_streamed_run_holds_one_promise_from_its_first_encode_to_its_last_step() {
         for blocks in 2..=4 {
             let (result, ledger) = run(blocks, None);
-            assert!(result.is_ok());
-            let l = ledger.borrow();
-            let mut expected = vec![1; blocks];
-            expected[0] = 0;
-            assert_eq!(l.at_encode, expected, "{blocks}: held at each encode");
-            assert_eq!(l.asked, 1, "{blocks}: one promise asked for");
-            assert_eq!(l.held, 0, "{blocks}: nothing held after the last step");
+            let last = result.expect("the run").expect("the last promise");
+            {
+                let l = ledger.borrow();
+                let mut expected = vec![1; blocks];
+                expected[0] = 0;
+                assert_eq!(l.at_encode, expected, "{blocks}: held at each encode");
+                assert_eq!(l.asked, 1, "{blocks}: one promise asked for");
+                assert_eq!(l.held, 1, "{blocks}: the last promise, the tree's");
+            }
+            drop(last);
+            assert_eq!(ledger.borrow().held, 0, "{blocks}: nothing held after");
         }
     }
 
@@ -3551,13 +3570,29 @@ mod stream_codewords_tests {
         }
     }
 
+    /// A step reads a codeword only when it is base, of the run's length, and
+    /// its buffer holds that many values: a short buffer is refused even when
+    /// the codeword says it is of the run's length.
+    #[test]
+    fn a_step_refuses_a_codeword_whose_buffer_is_short() {
+        use super::joint_step_takes as takes;
+        assert!(takes(true, 1 << 20, 1 << 20, 1 << 20));
+        assert!(takes(true, 1 << 20, (1 << 20) + 8, 1 << 20));
+        assert!(
+            !takes(true, 1 << 20, (1 << 20) - 1, 1 << 20),
+            "short buffer"
+        );
+        assert!(!takes(false, 1 << 20, 1 << 20, 1 << 20), "not base");
+        assert!(!takes(true, 1 << 19, 1 << 20, 1 << 20), "another length");
+    }
+
     /// A promise `let_go` cannot hand back (shared) is not carried: the next
     /// encode asks for its own.
     #[test]
     fn a_promise_not_handed_back_is_not_carried() {
         let ledger = Rc::new(RefCell::new(Ledger::default()));
         let mut kept = Vec::new();
-        let result: Result<(), ()> = stream_codewords(
+        let result: Result<Option<Promise>, ()> = stream_codewords(
             3,
             |_, carried: Option<Promise>| {
                 assert!(carried.is_none());
@@ -3569,7 +3604,7 @@ mod stream_codewords_tests {
                 None
             },
         );
-        assert!(result.is_ok());
+        assert!(result.expect("the run").is_none());
         assert_eq!(ledger.borrow().asked, 3);
         drop(kept);
         assert_eq!(ledger.borrow().held, 0);
@@ -3585,7 +3620,8 @@ mod stream_codewords_tests {
 /// codeword `k`'s reservation is `carried` into codeword `k + 1`'s encode
 /// ([`encode_codeword_resident_carrying`]), so the run holds one codeword's
 /// promise from its first encode to its last step, and no other caller can
-/// take that room between two steps ([`stream_codewords`]). The same tree and root as [`commit_joint`] over the same codewords,
+/// take that room between two steps ([`stream_codewords`]); the tree then
+/// keeps the last promise, cut to its nodes' bytes, while it lives. The same tree and root as [`commit_joint`] over the same codewords,
 /// with one codeword alive at a time instead of the run's. BLAKE3 only, and a
 /// fold block of at least 8 values (a codeword's block a whole number of
 /// 64-byte blocks).
@@ -3626,12 +3662,17 @@ pub fn commit_joint_streamed(
     let cfg = crate::blake3_whir::launch_cfg(num_leaves as u64);
     let (blocks_u64, num_leaves_u64, log_block_u32) =
         (blocks as u64, num_leaves as u64, log_folding as u32);
-    stream_codewords(
+    let last = stream_codewords(
         blocks,
         |k, carried| encode(k, carried).ok_or_else(crate::invalid_value),
         |k, codeword: &DeviceCodeword| {
             ensure!(
-                codeword.base && codeword.elements == elements && codeword.buffer.len() >= elements,
+                joint_step_takes(
+                    codeword.base,
+                    codeword.elements,
+                    codeword.buffer.len(),
+                    elements
+                ),
                 "a joint tree's codewords are base and of one length"
             );
             // The codeword's encode, and the step before this one, are done
@@ -3656,6 +3697,14 @@ pub fn commit_joint_streamed(
         },
         codeword_promise_of,
     )?;
+    // The last codeword's promise, cut to the nodes' bytes (from a fold block
+    // of 8 values up a codeword is at least that), is the tree's while it
+    // lives: the group's room covers the nodes during the commit, but not
+    // after the room is given back, before the tree's retire. Until then the
+    // nodes are promised twice, the safe side, and the commit's peak (its
+    // last step) is unchanged.
+    let node_bytes = (total_nodes * 32) as u64;
+    let room = last.inspect(|room| room.shrink(room.bytes().saturating_sub(node_bytes)));
     LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
     TREE_BUILDS.fetch_add(1, Ordering::Relaxed);
@@ -3672,6 +3721,7 @@ pub fn commit_joint_streamed(
             stream,
             num_leaves,
             hash,
+            room,
         },
         root,
     ))
