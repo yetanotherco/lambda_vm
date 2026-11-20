@@ -6764,8 +6764,13 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
 {
     let mut digests = Vec::new();
-    // Tables of one AIR and shape share a digest: hashed once.
-    let mut seen: Vec<((usize, usize, usize), [u8; 32])> = Vec::new();
+    // Tables of one definition share a digest: hashed once. The key is the
+    // digest's every input — the interaction list (its address and its
+    // length: every table with no interaction shares the one empty list),
+    // the height, the width and the preprocessed count — so two tables
+    // share a digest only when their digests are the same.
+    type Key = (usize, usize, usize, usize, usize);
+    let mut seen: Vec<(Key, [u8; 32])> = Vec::new();
     for group in groups {
         let airs: Vec<AirRef<'r>> = group
             .iter()
@@ -6789,7 +6794,13 @@ where
             } else {
                 0
             };
-            let key = (air.bus_interactions().as_ptr() as usize, num_vars, width);
+            let key = (
+                air.bus_interactions().as_ptr() as usize,
+                air.bus_interactions().len(),
+                num_vars,
+                width,
+                preprocessed,
+            );
             let digest = match seen.iter().find(|(k, _)| *k == key) {
                 Some((_, digest)) => *digest,
                 None => {
