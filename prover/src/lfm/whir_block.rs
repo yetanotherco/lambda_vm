@@ -830,6 +830,17 @@ fn local_state_first() -> bool {
     }
 }
 
+/// The local balance's share form: `p · (1/q)` always, whatever the leaves'
+/// share knob `knob` says — but under a test's mutant, which follows it.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn local_share_inverse(knob: bool) -> bool {
+    #[cfg(test)]
+    if local_faults::get() == local_faults::Fault::LocalShareKnob {
+        return knob;
+    }
+    true
+}
+
 /// A plan's local lookups: the format's local buses
 /// (`tables::local_bytes::LOCAL_BUSES`) and every table's digest
 /// (`stark::multilinear_block::table_digest`), in the proof's table order —
@@ -1163,12 +1174,6 @@ impl WhirBlockPlan {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
             let entry = SpongeEntry::fresh_for(wrap_hash);
-            if let Some(local) = &local {
-                let airs: Vec<&DynAir<'_>> = list.iter().map(|&t| refs[t]).collect();
-                owned
-                    .check_local_receivers(&airs, &local.buses)
-                    .map_err(|e| format!("group {g}: {e}"))?;
-            }
             let local_group = match &local {
                 Some(local) if owned.is_local(&local.buses) => Some(local),
                 _ => None,
@@ -1288,6 +1293,22 @@ impl WhirBlockPlan {
             id,
             local,
         };
+        // Under local lookups, the static receiver check over every group, by
+        // the routes the leaves check the fixed columns with.
+        if let Some(local) = &plan.local {
+            let refs = plan.frame.airs.air_refs();
+            let first_page = first_page_index(&plan.frame.airs).map_err(|e| format!("{e:?}"))?;
+            for (g, list) in plan.groups.iter().enumerate() {
+                let owned = Shapes::build(&refs, &plan.frame.shapes, list)?;
+                let checked: Vec<usize> = list
+                    .iter()
+                    .map(|&t| route_of(&plan, refs[t], t, first_page).map(|r| r.columns_checked()))
+                    .collect::<Result<_, _>>()?;
+                owned
+                    .check_local_receivers(&checked, &local.buses)
+                    .map_err(|e| format!("group {g}: {e}"))?;
+            }
+        }
         // Every chip's rows by group, emitted; the partition bounds them all,
         // at the format's leaf scale (a fixed leaf count, the tests', bounds
         // none).
@@ -1366,6 +1387,14 @@ impl WhirBlockPlan {
     /// `derive_blake3_with_share`'s `cap_mux`), if any.
     pub(crate) fn cap_mux(&self) -> Option<super::merkle_cap::CapMux> {
         self.cap_mux
+    }
+
+    /// Test only: this plan with its leaves' share form `inverse`
+    /// ([`emit_share`]) instead of the process's knob.
+    #[cfg(test)]
+    pub(crate) fn with_share_inverse(mut self, inverse: bool) -> Self {
+        self.share_inverse = inverse;
+        self
     }
 
     /// Test only: this plan with its BLAKE3 compressions lowered to
@@ -2419,32 +2448,39 @@ impl<'a> Shapes<'a> {
     }
 
     /// THE SOUNDNESS-BEARING STATIC CHECK of local lookups, over these
-    /// tables (`airs`, their AIRs in order): every receiver of a local bus
-    /// reads its values from the table's preprocessed columns only — the
-    /// host's `check_local_receivers`, called, over statements stating each
-    /// AIR's preprocessed count — else a group's own challenges could argue a
-    /// lookup into a committed column. The groups partition the tables, so
-    /// over every group it is the host verifier's check over the AIR set.
+    /// tables: every receiver of a local bus reads its values from columns
+    /// the leaf fixes only — the first `checked[t]` of table `t`'s, the
+    /// columns its route checks ([`Route::columns_checked`]), since in a leaf
+    /// a column is fixed by its route — else a group's own challenges could
+    /// argue a lookup into a committed column. The host's
+    /// `check_local_receivers`, called, over statements stating those
+    /// counts. The groups partition the tables, so over every group it is
+    /// the host verifier's check over the AIR set.
     pub(crate) fn check_local_receivers(
         &self,
-        airs: &[&DynAir<'_>],
+        checked: &[usize],
         buses: &[u64],
     ) -> Result<(), String> {
         if local_fault!(NoReceiverCheck) {
             return Ok(());
         }
+        if checked.len() != self.layouts.len() {
+            return Err(format!(
+                "{} route counts for {} tables",
+                checked.len(),
+                self.layouts.len()
+            ));
+        }
         let statements: Vec<_> = self
             .layouts
             .iter()
-            .zip(airs)
-            .map(|(layout, air)| stark::multilinear_table::TableStatement {
-                num_preprocessed: if air.is_preprocessed() {
-                    air.num_precomputed_columns()
-                } else {
-                    0
+            .zip(checked)
+            .map(
+                |(layout, &checked)| stark::multilinear_table::TableStatement {
+                    num_preprocessed: checked,
+                    ..layout.statement()
                 },
-                ..layout.statement()
-            })
+            )
             .collect();
         stark::multilinear_table::batched::check_local_receivers(&statements, buses)
             .map_err(|e| format!("local lookups: {e:?}"))
@@ -2541,8 +2577,8 @@ impl GroupClasses {
 /// The plan's local lookups over `frame` and the statement's `groups`
 /// ([`PlanLocal`]): every table's digest by the host verifier's function,
 /// under the base's transcript hash. The static receiver check is the
-/// group's ([`Shapes::check_local_receivers`], in the cost pass over every
-/// group).
+/// group's ([`Shapes::check_local_receivers`], over every group once the
+/// plan's routes exist).
 fn plan_local(
     frame: &BlockFrame,
     groups: &[Vec<u32>],
@@ -3279,6 +3315,24 @@ fn emit_local_argue(
     arena: super::instr::ArenaId,
     at: &mut u32,
 ) -> Result<LocalLeaf, String> {
+    // A test's mutant reads the local transcript's roots and answers from
+    // hints of its own instead of the front's cells.
+    #[cfg(test)]
+    let hinted: Option<(Vec<Cell>, Vec<Ext>)> = local_fault!(HintedLocalCells).then(|| {
+        let mut take = || {
+            let cell = b.hint_word(arena, *at);
+            *at += 1;
+            cell
+        };
+        let roots: Vec<Cell> = (0..roots.len()).map(|_| take()).collect();
+        let answers: Vec<Ext> = (0..answers.len()).map(|_| take().as_ext()).collect();
+        (roots, answers)
+    });
+    #[cfg(test)]
+    let (roots, answers): (&[Cell], &[Ext]) = match &hinted {
+        Some((r, a)) => (r, a),
+        None => (roots, answers),
+    };
     let LocalChallenges {
         point,
         mut own,
@@ -3303,7 +3357,7 @@ fn emit_local_argue(
     // `p = q = 0`.
     let mut sum: Option<Ext> = None;
     for (p, q) in &store.bus_outputs {
-        let share = emit_share(b, *p, *q, true);
+        let share = emit_share(b, *p, *q, local_share_inverse(plan.share_inverse));
         sum = Some(match sum {
             None => share,
             Some(running) => b.eadd(running, share),
@@ -4310,6 +4364,11 @@ pub(crate) mod local_faults {
         LocalBytesXorAsOr,
         /// The plan derives without the static receiver check.
         NoReceiverCheck,
+        /// The local transcript reads its roots and answers from hints of
+        /// its own (the group's first words), not the front's cells.
+        HintedLocalCells,
+        /// The local balance's shares follow the process's share knob.
+        LocalShareKnob,
     }
 
     std::thread_local! {
