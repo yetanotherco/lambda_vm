@@ -112,6 +112,39 @@ pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
              the field's two-adic subgroup"
         )
     })?;
+    let ood_c = view.trace_ood_evaluations();
+    let ood_n = view.trace_ood_next_evaluations();
+    // The shape is the AIR's at this trace length; the proof is checked against
+    // it, never read into it.
+    let shape = TableChallengeShape::derive(air, index, num_tables, trace_length);
+    let proved = (
+        view.lde_trace_aux_merkle_root().is_some(),
+        view.bus_table_contribution().is_some(),
+        (ood_c.width(), ood_c.height()),
+        (ood_n.width(), ood_n.height()),
+        view.composition_poly_parts_ood_evaluation().len(),
+    );
+    let derived = (
+        shape.has_aux_root,
+        shape.has_contribution,
+        shape.ood_current_dims,
+        shape.ood_next_dims,
+        shape.num_parts,
+    );
+    // Before the replay below reads the blocks row by row: their stated
+    // dimensions must also match their data.
+    if !(ood_c.dimensions_consistent() && ood_n.dimensions_consistent()) {
+        return Err(format!(
+            "table {index}: an OOD block's dimensions disagree with its data"
+        ));
+    }
+    if proved != derived {
+        return Err(format!(
+            "table {index}: the proof's aux root, L, OOD blocks and part count are the AIR's: \
+             {proved:?} != {derived:?}"
+        ));
+    }
+
     let layout = Verifier::<Gl, Ext3, (), Fam>::ood_layout(air);
     let challenges = Verifier::<Gl, Ext3, (), Fam>::replay_rounds_after_round_1(
         air,
@@ -132,32 +165,6 @@ pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
     // `γ` is the second term of the DEEP coefficient run, which starts at one —
     // the same recovery `constraint_tests::deep_shape` makes.
     let gamma = challenges.trace_term_coeffs[1][0];
-
-    let ood_c = view.trace_ood_evaluations();
-    let ood_n = view.trace_ood_next_evaluations();
-    // The shape is the AIR's at this trace length; the proof is checked against
-    // it, never read into it.
-    let shape = TableChallengeShape::derive(air, index, num_tables, trace_length);
-    let proved = (
-        view.lde_trace_aux_merkle_root().is_some(),
-        view.bus_table_contribution().is_some(),
-        (ood_c.width(), ood_c.height()),
-        (ood_n.width(), ood_n.height()),
-        view.composition_poly_parts_ood_evaluation().len(),
-    );
-    let derived = (
-        shape.has_aux_root,
-        shape.has_contribution,
-        shape.ood_current_dims,
-        shape.ood_next_dims,
-        shape.num_parts,
-    );
-    if proved != derived {
-        return Err(format!(
-            "table {index}: the proof's aux root, L, OOD blocks and part count are the AIR's: \
-             {proved:?} != {derived:?}"
-        ));
-    }
 
     Ok(HostTable {
         shape,

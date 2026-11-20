@@ -1947,14 +1947,19 @@ pub(crate) fn compute_commit_bus_offset(
 /// is rejected. At the default format every layout is row pairs and this is
 /// the row-pair root, byte for byte what was absorbed before.
 ///
-/// `None` = a preprocessed table has no root for its layout (never recomputed): the
-/// caller rejects, exactly as the STARK verifier would.
+/// `None` = a preprocessed table has no root for its layout (never recomputed),
+/// or a sub-proof claims a trace length no proof can have
+/// (`stark::domain::trace_length_in_range`, checked before the layout is
+/// derived from it): the caller rejects, exactly as the STARK verifier would.
 pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proofs: impl ProofViewSource<'p, F, E, ()>,
     transcript: &mut impl IsTranscript<E>,
 ) -> Option<(FieldElement<E>, FieldElement<E>)> {
     for (air, proof) in airs.iter().zip(proofs.view_iter()) {
+        if !stark::domain::trace_length_in_range(*air, proof.trace_length()) {
+            return None;
+        }
         if air.is_preprocessed() {
             let layout = stark::leaf_layout::table_leaf_layout(*air, proof.trace_length());
             transcript.append_bytes(&air.precomputed_commitment_for(layout)?);
