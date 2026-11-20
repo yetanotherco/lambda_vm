@@ -35,6 +35,12 @@ lemma natCast_inj_of_lt {a b : ℕ} (ha : a < p) (hb : b < p) (h : (a : F p) = (
 lemma val_eq_of_eq_natCast {x : F p} {n : ℕ} (h : x = (n : F p)) (hn : n < 2^40) : x.val = n := by
   rw [h]; exact val_natCast_of_lt_two_pow_40 hn
 
+/-- A value carried in two 16-bit limbs: the field sum has the natural sum as its value. The
+same three-line proof stood at every limb site in `Lt.lean`, `Eq.lean` and `Shift.lean`. -/
+lemma val_limb {a b : F p} (h : a.val + 65536 * b.val < 2^40) :
+    (a + 65536 * b).val = a.val + 65536 * b.val :=
+  val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) h
+
 /-- 64-bit value of a `(lo32, hi32)` pair. -/
 def dword (lo hi : F p) : ℕ := lo.val + 2^32 * hi.val
 

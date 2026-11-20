@@ -138,10 +138,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       -- the halves of diff as words
       have hval_lo : (input_diff0 + 65536 * input_diff1).val
           = input_diff0.val + 65536 * input_diff1.val :=
-        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+        val_limb (by omega)
       have hval_hi : (input_diff2 + 65536 * input_diff3).val
           = input_diff2.val + 65536 * input_diff3.val :=
-        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+        val_limb (by omega)
       -- the carry identities, on naturals
       obtain ⟨e0, e1⟩ := Add.carries_lift hb0 hb1 (by omega) (by omega) ha0 ha1 hc0 hc1 hc0b hc1b
       rw [hval_lo] at e0
@@ -170,7 +170,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- the flag byte, read as a natural
     have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_⟩
     · -- the LT clause does not apply: opsel(EQ) + 64·i ≠ opsel(LT) + 32·s + 64·i'
       intro s i hs hi hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
@@ -178,6 +178,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · -- nor the SHIFT clause
       intro w s d hw hs hd hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
+    swap
+    · -- nor the MIN clause
+      intro hflags
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselMIN] at hflags; omega
     intro i hi hflags ha0 ha1 hb0 hb1
     rw [hflagsV] at hflags; simp only [opselEQ] at hflags
     rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
@@ -196,10 +200,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- an active row; the halves of diff as words
     have hval_lo : (input_diff0 + 65536 * input_diff1).val
         = input_diff0.val + 65536 * input_diff1.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     have hval_hi : (input_diff2 + 65536 * input_diff3).val
         = input_diff2.val + 65536 * input_diff3.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     -- the honest carries
     have hr0 : (input_diff0 + 65536 * input_diff1).val < 2^32 := by omega
     have hr1 : (input_diff2 + 65536 * input_diff3).val < 2^32 := by omega

@@ -54,8 +54,68 @@ jobs:
       - name: Fetch Mathlib binaries
         run: lake exe cache get
 
-      - name: Build
-        run: lake build
+      # `lake build` only *warns* on a `sorry`, so without this check a sorry anywhere in the
+      # library merges green, including in declarations the axiom gate below does not reach.
+      - name: Build, and no sorry anywhere in the library
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/build.log"
+          lake build 2>&1 | tee "$log"
+          if grep -q "declaration uses 'sorry'" "$log"; then
+            echo "::error::a declaration uses sorry"
+            grep -n "declaration uses 'sorry'" "$log"
+            exit 1
+          fi
+
+      # `LambdaVM/Axioms.lean` is a list of `#print axioms` lines, one per modelled circuit and
+      # per ensemble theorem. It is not part of the library, so `lake build` does not see it.
+      - name: No sorry, no axioms beyond the standard three
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP:-/tmp}/axioms.txt"
+          # The `sed` below needs the opening `[` and the closing `]` of an axiom list on the
+          # same line to see it at all. `-Dformat.width` is kept as a precaution for a future
+          # toolchain, not because it is what holds the line together: `#print axioms` ignores
+          # it on v4.35.0, and emits the same 111-column lines at width 1 as at width 1000.
+          # The parse check further down is the guard that actually holds.
+          lake env lean -Dformat.width=1000 LambdaVM/Axioms.lean | tee "$report"
+
+          # One report per `#print axioms` line: a renamed or deleted declaration fails here
+          # instead of quietly dropping out of the check.
+          expected=$(grep -c '^#print axioms ' LambdaVM/Axioms.lean || true)
+          got=$(grep -c 'depends on axioms\|does not depend on any axioms' "$report" || true)
+          if [ "$expected" -ne "$got" ]; then
+            echo "::error::expected $expected axiom reports, got $got"
+            exit 1
+          fi
+
+          # `-Dformat.width` above is a width, not a guarantee: a long enough axiom list still
+          # wraps, and then the `sed` below finds no closing `]` and extracts nothing, while the
+          # count above still matches because the phrase sits on the report's first line. So
+          # require that every report with an axiom list was actually parsed.
+          withaxioms=$(grep -c 'depends on axioms' "$report" || true)
+          parsed=$(sed -n 's/.*depends on axioms: \[\(.*\)\]/\1/p' "$report" | wc -l | tr -d ' ')
+          if [ "$withaxioms" -ne "$parsed" ]; then
+            echo "::error::$withaxioms reports carry an axiom list but only $parsed fit on one line; raise -Dformat.width"
+            exit 1
+          fi
+
+          if grep -q 'sorryAx' "$report"; then
+            echo "::error::a modelled circuit or ensemble theorem depends on sorry"
+            exit 1
+          fi
+
+          unexpected=$(
+            sed -n 's/.*depends on axioms: \[\(.*\)\]/\1/p' "$report" \
+              | tr ',' '\n' | sed 's/[[:space:]]//g; /^$/d' | sort -u \
+              | grep -vxF -e propext -e Classical.choice -e Quot.sound || true
+          )
+          if [ -n "$unexpected" ]; then
+            echo "::error::axioms outside propext, Classical.choice, Quot.sound: $(echo $unexpected)"
+            exit 1
+          fi
+
+          echo "$expected declarations checked, no sorry, no extra axioms"
 
       - name: Export is up to date
         run: |
