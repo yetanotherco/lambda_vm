@@ -793,6 +793,34 @@ pub struct WhirBlockPlan {
     /// A digest of the statement run: the block's identity, published by every
     /// leaf and node.
     id: [u8; 32],
+    /// Local lookups ([`BlockFormat::local_lookups`]), the deriver's own: the
+    /// format's local buses and every table's digest, or `None` for a format
+    /// without them. The leaf's format is the deriver's, never the proof's.
+    local: Option<PlanLocal>,
+}
+
+/// Whether the test fault `local_faults::Fault::$name` is on: never outside
+/// the tests.
+macro_rules! local_fault {
+    ($name:ident) => {{
+        #[cfg(test)]
+        let on = local_faults::get() == local_faults::Fault::$name;
+        #[cfg(not(test))]
+        let on = false;
+        on
+    }};
+}
+
+/// A plan's local lookups: the format's local buses
+/// (`tables::local_bytes::LOCAL_BUSES`) and every table's digest
+/// (`stark::multilinear_block::table_digest`), in the proof's table order —
+/// computed by the deriver from its own AIRs at the stated heights
+/// (`block_whir::local_digests`, the host verifier's function), never read
+/// from a proof. A leaf absorbs them as program constants, as it does the
+/// commit-time prefix.
+struct PlanLocal {
+    buses: Vec<u64>,
+    digests: Vec<[u8; 32]>,
 }
 
 /// Every program of a block's tree with its artifacts and derived shape, level
@@ -989,15 +1017,16 @@ impl WhirBlockPlan {
         wrap_hash: super::edsl::WrapHash,
     ) -> Result<Self, String> {
         let base = &format.zf.base;
-        // The leaf verifies no group's local argue: a base under local
-        // lookups is proved with no recursion over it.
-        if format.local_lookups() {
-            return Err(
-                "the recursion does not verify local lookups: prove that base alone".to_string(),
-            );
-        }
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
+        // Local lookups by the deriver's format: the static receiver check
+        // (every receiver of a local bus reads fixed columns only), then every
+        // table's digest from the deriver's own AIRs.
+        let local = if format.local_lookups() {
+            Some(plan_local(&frame, statement.groups, base)?)
+        } else {
+            None
+        };
         let elf_digest = crate::statement::elf_digest(elf_bytes);
         let tag = crate::block_whir::block_format_tag(format);
         let statement_bytes =
@@ -1084,19 +1113,65 @@ impl WhirBlockPlan {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
             let entry = SpongeEntry::fresh_for(wrap_hash);
-            let tables: usize = match batched_cap(config)? {
-                None => shapes
-                    .iter()
-                    .map(|shape| table_verify_cost(shape, entry).perms())
-                    .sum(),
-                Some(planning) => super::whir_batch::batched_argue_cost(
-                    &shapes,
-                    &owned.argue_plan(planning),
-                    planning.ladder(),
-                    entry,
-                )
-                .perms(),
+            if let Some(local) = &local {
+                let airs: Vec<&DynAir<'_>> = list.iter().map(|&t| refs[t]).collect();
+                owned
+                    .check_local_receivers(&airs, &local.buses)
+                    .map_err(|e| format!("group {g}: {e}"))?;
+            }
+            let local_group = match &local {
+                Some(local) if owned.is_local(&local.buses) => Some(local),
+                _ => None,
             };
+            let (tables, local_perms): (usize, Option<usize>) =
+                match (batched_cap(config)?, local_group) {
+                    (None, None) => (
+                        shapes
+                            .iter()
+                            .map(|shape| table_verify_cost(shape, entry).perms())
+                            .sum(),
+                        None,
+                    ),
+                    (Some(planning), None) => (
+                        super::whir_batch::batched_argue_cost(
+                            &shapes,
+                            &owned.argue_plan(planning),
+                            planning.ladder(),
+                            entry,
+                        )
+                        .perms(),
+                        None,
+                    ),
+                    (Some(planning), Some(local)) => {
+                        let classes = owned.classes(&local.buses, planning)?;
+                        let start = groups[..g].iter().map(Vec::len).sum::<usize>();
+                        let layout = &frame.stack_layouts[g];
+                        let own = local_transcript_perms(
+                            wrap_hash,
+                            multilinear::stacked_eval::round0_trees(layout.num_polys(), config)
+                                .len(),
+                            layout.num_polys(),
+                            local.digests[start..start + list.len()].len(),
+                            &classes.local.plan,
+                            planning.ladder(),
+                        );
+                        (
+                            super::whir_batch::batched_argue_cost_classed(
+                                &shapes,
+                                &owned.argue_plan(planning),
+                                &classes.global.plan,
+                                &classes.cost_pairs(),
+                                planning.ladder(),
+                                entry,
+                            )
+                            .perms(),
+                            Some(own),
+                        )
+                    }
+                    (None, Some(_)) => {
+                        return Err("local lookups are argued batched alone".to_string());
+                    }
+                };
             let group_shapes: Vec<(usize, usize)> = list.iter().map(|&t| frame.shapes[t]).collect();
             let (_, group_of) = group_columns(&group_shapes);
             let layout = &frame.stack_layouts[g];
@@ -1104,11 +1179,15 @@ impl WhirBlockPlan {
                 query: format.leaf_query,
                 ..ChainShape::for_hash(config, layout.n_stack(), wrap_hash)
             };
+            // A local group's commit-time transcript is continued by its local
+            // argue: its cost is the whole local transcript's.
             let opening = stacked_verify_cost_ood(layout, &group_of, &chain, entry, true).perms()
-                + commit_ood_point_perms(
-                    wrap_hash,
-                    multilinear::stacked_eval::round0_trees(layout.num_polys(), config).len(),
-                );
+                + local_perms.unwrap_or_else(|| {
+                    commit_ood_point_perms(
+                        wrap_hash,
+                        multilinear::stacked_eval::round0_trees(layout.num_polys(), config).len(),
+                    )
+                });
             let prepared_perms: usize = prepared
                 .iter()
                 .filter(|p| p.group == g)
@@ -1154,6 +1233,7 @@ impl WhirBlockPlan {
             one_top: format.leaf_scale == LeafScale::DoubledOneTop,
             fan_in,
             id,
+            local,
         };
         // Every chip's rows by group, emitted; the partition bounds them all,
         // at the format's leaf scale (a fixed leaf count, the tests', bounds
@@ -2264,6 +2344,205 @@ impl<'a> Shapes<'a> {
             .collect();
         stark::multilinear_table::argue_plan_packed(&shapes, planning.bin_log_cells, planning.pack)
     }
+
+    /// The tables' statements, as their layouts state them.
+    fn statements(
+        &self,
+    ) -> Vec<stark::multilinear_table::TableStatement<'_, GoldilocksField, GoldilocksExtension>>
+    {
+        self.layouts.iter().map(TableLayout::statement).collect()
+    }
+
+    /// THE SOUNDNESS-BEARING STATIC CHECK of local lookups, over these
+    /// tables (`airs`, their AIRs in order): every receiver of a local bus
+    /// reads its values from the table's preprocessed columns only — the
+    /// host's `check_local_receivers`, called, over statements stating each
+    /// AIR's preprocessed count — else a group's own challenges could argue a
+    /// lookup into a committed column. The groups partition the tables, so
+    /// over every group it is the host verifier's check over the AIR set.
+    pub(crate) fn check_local_receivers(
+        &self,
+        airs: &[&DynAir<'_>],
+        buses: &[u64],
+    ) -> Result<(), String> {
+        if local_fault!(NoReceiverCheck) {
+            return Ok(());
+        }
+        let statements: Vec<_> = self
+            .layouts
+            .iter()
+            .zip(airs)
+            .map(|(layout, air)| stark::multilinear_table::TableStatement {
+                num_preprocessed: if air.is_preprocessed() {
+                    air.num_precomputed_columns()
+                } else {
+                    0
+                },
+                ..layout.statement()
+            })
+            .collect();
+        stark::multilinear_table::batched::check_local_receivers(&statements, buses)
+            .map_err(|e| format!("local lookups: {e:?}"))
+    }
+
+    /// Whether these tables argue local lookups on `buses`: any has an
+    /// interaction on one — the host's `group_is_local`, called.
+    pub(crate) fn is_local(&self, buses: &[u64]) -> bool {
+        stark::multilinear_block::group_is_local(&self.statements(), buses)
+    }
+
+    /// The tables' two LogUp classes under `buses` — the host's
+    /// `ClassTables::split`, called — each with its members' interactions in
+    /// it as the leg reads them and its plan, the host's `argue_plan_packed`
+    /// over the members' class statements at the format's cap and packing.
+    pub(crate) fn classes(
+        &self,
+        buses: &[u64],
+        planning: BatchedPlanning,
+    ) -> Result<GroupClasses, String> {
+        let statements = self.statements();
+        let class = |local: bool| -> Result<super::whir_batch::ClassShapes, String> {
+            let split =
+                stark::multilinear_table::batched::ClassTables::split(&statements, buses, local);
+            let class_statements = split
+                .statements(&statements)
+                .map_err(|e| format!("a class's statements: {e:?}"))?;
+            let shapes: Vec<stark::multilinear_table::ArgueShape> = class_statements
+                .iter()
+                .map(stark::multilinear_table::ArgueShape::of)
+                .collect();
+            let plan = stark::multilinear_table::argue_plan_packed(
+                &shapes,
+                planning.bin_log_cells,
+                planning.pack,
+            );
+            let buses = split
+                .members
+                .iter()
+                .zip(&split.buses)
+                .map(|(&t, interactions)| {
+                    let slots = self.layouts[t].slot_of();
+                    stark::multilinear_logup::interaction_shapes(
+                        interactions,
+                        slots.len(),
+                        |column| {
+                            slots.get(column).copied().ok_or(
+                                multilinear::Error::UnknownPolynomial {
+                                    index: column,
+                                    len: slots.len(),
+                                },
+                            )
+                        },
+                    )
+                    .map_err(|e| format!("a class's bus: {e:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(super::whir_batch::ClassShapes {
+                members: split.members,
+                buses,
+                plan,
+            })
+        };
+        Ok(GroupClasses {
+            tables: self.layouts.len(),
+            global: class(false)?,
+            local: class(true)?,
+        })
+    }
+}
+
+/// A local group's two LogUp classes ([`Shapes::classes`]).
+pub(crate) struct GroupClasses {
+    tables: usize,
+    pub(crate) global: super::whir_batch::ClassShapes,
+    pub(crate) local: super::whir_batch::ClassShapes,
+}
+
+impl GroupClasses {
+    /// Each table's pairs, as the cost reads them.
+    pub(crate) fn cost_pairs(&self) -> Vec<super::whir_batch::CostPairs<'_>> {
+        (0..self.tables)
+            .map(|t| super::whir_batch::CostPairs {
+                global: self
+                    .global
+                    .member(t)
+                    .map(|k| self.global.buses[k].as_slice()),
+                local: self.local.member(t).map(|k| self.local.buses[k].as_slice()),
+            })
+            .collect()
+    }
+}
+
+/// The plan's local lookups over `frame` and the statement's `groups`
+/// ([`PlanLocal`]): every table's digest by the host verifier's function,
+/// under the base's transcript hash. The static receiver check is the
+/// group's ([`Shapes::check_local_receivers`], in the cost pass over every
+/// group).
+fn plan_local(
+    frame: &BlockFrame,
+    groups: &[Vec<u32>],
+    base: &stark::proof::options::BaseFormat,
+) -> Result<PlanLocal, String> {
+    let refs = frame.airs.air_refs();
+    let buses = crate::tables::local_bytes::LOCAL_BUSES.to_vec();
+    let air_of = |i: usize| refs.get(i).copied();
+    let digests =
+        if *base == stark::proof::options::BaseFormat::B3_WHIR {
+            crate::block_whir::local_digests::<
+                <multilinear::whir_hash::Blake3Whir as multilinear::whir_hash::WhirHash>::Sponge,
+            >(groups, &frame.shapes, air_of)
+        } else {
+            (|| {
+                crate::with_block_hash!(*base, |H| {
+                    crate::block_whir::local_digests::<
+                        <H as multilinear::whir_hash::WhirHash>::Sponge,
+                    >(groups, &frame.shapes, air_of)
+                })
+            })()
+        }
+        .map_err(|e| format!("local digests: {e:?}"))?;
+    if digests.len() != frame.order.len() {
+        return Err(format!(
+            "{} digests for {} tables",
+            digests.len(),
+            frame.order.len()
+        ));
+    }
+    Ok(PlanLocal { buses, digests })
+}
+
+/// PERMUTATIONS a local group's own transcript costs: the commit-time
+/// transcript ([`commit_ood_point_perms`]: the prefix, `roots` roots, `z0`),
+/// continued by `answers` answers, the label and `digests` digests (one
+/// `append_bytes` each), `(z_g, α_g)`, the local ladders over `plan`, and the
+/// state the fork absorbs.
+pub(crate) fn local_transcript_perms(
+    hash: super::edsl::WrapHash,
+    roots: usize,
+    answers: usize,
+    digests: usize,
+    plan: &stark::multilinear_table::ArguePlan,
+    ladder: multilinear::whir_chain::GkrLadder,
+) -> usize {
+    let mut schedule = super::whir_transcript::SpongeSchedule::new(SpongeEntry::fresh_for(hash));
+    let length = usize::from(hash == super::edsl::WrapHash::Poseidon1);
+    schedule.absorb(length + COMMIT_OOD_PREFIX_BYTES / 8);
+    for _ in 0..roots {
+        schedule.absorb_root();
+    }
+    schedule.draw_ext();
+    for _ in 0..answers {
+        schedule.absorb(super::whir_transcript::COORDINATES_PER_EXT);
+    }
+    for _ in 0..1 + digests {
+        // The label and each digest: 32 bytes, one `append_bytes`.
+        schedule.absorb_root();
+    }
+    schedule.draw_ext();
+    schedule.draw_ext();
+    let mut cost = super::whir_batch::local_ladders_cost(plan, ladder, schedule);
+    cost.schedule.state();
+    cost.perms()
 }
 
 /// The batched argue's planning constants when the block's format batches its
@@ -2321,6 +2600,8 @@ enum Route {
     },
     /// A CPU table's TIMESTAMP, by its closed form.
     Timestamp,
+    /// A LOCAL_BYTES table's four columns, by their closed form.
+    LocalBytes,
 }
 
 impl Route {
@@ -2333,6 +2614,7 @@ impl Route {
             Route::ConstMle(columns) | Route::Page(columns) => columns.len(),
             Route::Prepared { settled, .. } => *settled,
             Route::Timestamp => crate::tables::cpu::NUM_PRECOMPUTED_COLS,
+            Route::LocalBytes => crate::tables::local_bytes::NUM_PRECOMPUTED_COLS,
         }
     }
 
@@ -2526,6 +2808,14 @@ fn route_for(
         return page_table_columns(plan.memory, page, &plan.frame.page_configs, air.name())
             .map(Route::Page);
     }
+    // A LOCAL_BYTES table — every table from the frame's local base on, which
+    // the frame holds to LOCAL_BYTES at 2^16 rows — by its closed form, by
+    // place: never materialised.
+    if let Some(base) = plan.frame.local_base
+        && table >= base
+    {
+        return Ok(Route::LocalBytes);
+    }
     // A CPU table's TIMESTAMP is checked by its closed form, by name and with its
     // AIR's one preprocessed column: never materialised (2^21 rows a table).
     if air.name().starts_with(super::whir_epoch::CPU_NAME_PREFIX)
@@ -2582,6 +2872,10 @@ fn preprocessed_plan<'a>(
         Route::Timestamp => PreprocessedPlan {
             settled: 0,
             route: PreprocessedRoute::Timestamp { num_vars },
+        },
+        Route::LocalBytes => PreprocessedPlan {
+            settled: 0,
+            route: PreprocessedRoute::LocalBytes,
         },
     }
 }
@@ -2739,6 +3033,18 @@ pub(crate) fn emit_commit_ood_point(
     n_stack: usize,
     log_size: usize,
 ) -> Vec<Ext> {
+    emit_commit_ood_transcript(b, prefix, roots, n_stack, log_size).0
+}
+
+/// [`emit_commit_ood_point`] and the sponge it was drawn from, which a group's
+/// local transcript continues (`multilinear_block::commit_ood_transcript`).
+pub(crate) fn emit_commit_ood_transcript(
+    b: &mut LfmBuilder,
+    prefix: &[u8],
+    roots: &[Cell],
+    n_stack: usize,
+    log_size: usize,
+) -> (Vec<Ext>, WhirTranscript) {
     assert!(n_stack <= log_size, "the stack lies inside its domain");
     let mut transcript = WhirTranscript::for_builder(b);
     transcript.absorb_const_bytes(prefix);
@@ -2756,7 +3062,203 @@ pub(crate) fn emit_commit_ood_point(
     let one = b.ext_const(&FEE::one());
     super::whir_chain::emit_require_out_of_domain(b, powers[log_size], one);
     powers.truncate(n_stack);
-    powers
+    (powers, transcript)
+}
+
+/// A group's local challenges, emitted ([`emit_local_challenges`]): its
+/// commit-time point, its local transcript after the draws, and
+/// `(z_g, α_g)`.
+struct LocalChallenges {
+    point: Vec<Ext>,
+    own: WhirTranscript,
+    z: Ext,
+    alpha: Ext,
+}
+
+/// ★ `multilinear_block::local_challenges`, emitted: group `g`'s commit-time
+/// transcript ([`emit_commit_ood_transcript`]: the prefix, its `roots` — the
+/// front's cells — and `z0`, refused in the domain) continued by its
+/// commit-time `answers` (the front's cells, polynomial order),
+/// [`LOCAL_LOGUP_LABEL`] and every table's digest (the plan's constants, one
+/// `append_bytes` each), then `z_g` and `α_g` — after the roots, the answers
+/// and the digests, so a prover fixes every committed word and every table
+/// definition before it learns the challenges.
+///
+/// [`LOCAL_LOGUP_LABEL`]: stark::multilinear_block::LOCAL_LOGUP_LABEL
+fn emit_local_challenges(
+    b: &mut LfmBuilder,
+    plan: &WhirBlockPlan,
+    g: usize,
+    local: &PlanLocal,
+    roots: &[Cell],
+    answers: &[Ext],
+) -> LocalChallenges {
+    let config = &plan.frame.config;
+    let layout = &plan.frame.stack_layouts[g];
+    let prefix = stark::multilinear_block::commit_ood_prefix(g, layout, config);
+    let (point, mut own) = emit_commit_ood_transcript(
+        b,
+        &prefix,
+        roots,
+        layout.n_stack(),
+        layout.n_stack() + config.log_blowup,
+    );
+    if local_fault!(NoLocalRoots) {
+        own = WhirTranscript::for_builder(b);
+        own.absorb_const_bytes(&prefix);
+        let _ = own.sample_ext(b);
+    }
+    let start = plan.group_start(g);
+    let digests = &local.digests[start..start + plan.groups[g].len()];
+    let early = local_fault!(LocalDrawsFirst).then(|| (own.sample_ext(b), own.sample_ext(b)));
+    if !local_fault!(NoLocalAnswers) {
+        for answer in answers {
+            own.absorb_ext(b, *answer);
+        }
+    }
+    if !local_fault!(NoLocalDigests) {
+        own.absorb_const_bytes(stark::multilinear_block::LOCAL_LOGUP_LABEL);
+        for digest in digests {
+            own.absorb_const_bytes(digest);
+        }
+    }
+    let (z, alpha) = match early {
+        Some(drawn) => drawn,
+        None => {
+            let z = own.sample_ext(b);
+            let alpha = own.sample_ext(b);
+            (z, alpha)
+        }
+    };
+    LocalChallenges {
+        point,
+        own,
+        z,
+        alpha,
+    }
+}
+
+/// Test only: the front, then group `g`'s local challenges, publishing
+/// `(z_g, α_g)` — what a test compares against the host's
+/// `local_challenges`. Its arena is the front's alone (every root, then
+/// every commit-time answer). Refused for a group that argues no local
+/// lookup.
+#[cfg(test)]
+pub(crate) fn local_challenges_program(
+    plan: &WhirBlockPlan,
+    g: usize,
+) -> Result<LfmProgram, String> {
+    let local = plan.local.as_ref().ok_or("a plan without local lookups")?;
+    let refs = plan.frame.airs.air_refs();
+    let owned = Shapes::build(&refs, &plan.frame.shapes, &plan.groups[g])?;
+    if !owned.is_local(&local.buses) {
+        return Err(format!("group {g} argues no local lookup"));
+    }
+    let mut b = plan.leaf_builder();
+    let arena = b.declare_arena(0);
+    let mut at = 0u32;
+    let front = emit_front(&mut b, plan, arena, &mut at);
+    let layout = &plan.frame.stack_layouts[g];
+    let dw = plan.digest_words();
+    let root_at = plan.root_start(g);
+    let answer_at = plan.answer_start(g);
+    let roots = &front.carried[dw * root_at..dw * (root_at + plan.trees(layout).len())];
+    let answers = &front.answers[answer_at..answer_at + layout.num_polys()];
+    let drawn = emit_local_challenges(&mut b, plan, g, local, roots, answers);
+    for e in [drawn.z, drawn.alpha] {
+        b.public(e.as_cell());
+    }
+    b.set_arena_len(arena, at);
+    Ok(compile(b.finish()))
+}
+
+/// What a group's local argue leaves the rest of its walk
+/// ([`emit_local_argue`]).
+struct LocalLeaf {
+    /// The group's commit-time point, for its opening.
+    point: Vec<Ext>,
+    /// The local transcript's state, which the fork absorbs first.
+    state: super::edsl::WrapDigest,
+    /// `(z_g, α_g)`.
+    z: Ext,
+    alpha: Ext,
+    /// Per table, its local claim (`None` off the local class).
+    claims: Vec<Option<(Vec<Ext>, Ext, Ext)>>,
+    classes: GroupClasses,
+}
+
+/// ★ `multilinear_block::local_challenges` and `batched::verify_local`,
+/// emitted, for group `g` under local lookups: the group's commit-time
+/// transcript ([`emit_commit_ood_transcript`]: the prefix, its roots — the
+/// front's cells — and `z0`, refused in the domain) continued by its
+/// commit-time answers (the front's cells), [`LOCAL_LOGUP_LABEL`] and every
+/// table's digest (the plan's constants), then `z_g` and `α_g`; the local
+/// class's ladders on that transcript (its plan the host's); and THE LOCAL
+/// BALANCE — `Σ p/q` over every local tree asserted zero here, in the leaf
+/// that holds the group (the host's `LocalImbalance`): no other check sees a
+/// local lookup the group's fixed table does not hold. Returns the point, the
+/// transcript's state for the fork, `(z_g, α_g)` and every table's local
+/// claim. The local argue's words are hinted first in the group's arena.
+///
+/// [`LOCAL_LOGUP_LABEL`]: stark::multilinear_block::LOCAL_LOGUP_LABEL
+#[allow(clippy::too_many_arguments)]
+fn emit_local_argue(
+    b: &mut LfmBuilder,
+    plan: &WhirBlockPlan,
+    g: usize,
+    local: &PlanLocal,
+    owned: &Shapes<'_>,
+    planning: BatchedPlanning,
+    roots: &[Cell],
+    answers: &[Ext],
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+) -> Result<LocalLeaf, String> {
+    let LocalChallenges {
+        point,
+        mut own,
+        z,
+        alpha,
+    } = emit_local_challenges(b, plan, g, local, roots, answers);
+    let classes = owned.classes(&local.buses, planning)?;
+    let store =
+        super::whir_batch::hint_local_shaped(b, arena, at, &classes.local.plan, planning.ladder());
+    let (member_claims, _) = super::whir_batch::emit_ladders(
+        b,
+        &mut own,
+        &store.bus_outputs,
+        &store.gkr,
+        &classes.local.plan,
+        planning.ladder(),
+    );
+    // The local balance, over every local tree's output (a cut table's chunks
+    // each), as the host sums them.
+    let mut sum: Option<Ext> = None;
+    for (p, q) in &store.bus_outputs {
+        let share = emit_share(b, *p, *q, plan.share_inverse);
+        sum = Some(match sum {
+            None => share,
+            Some(running) => b.eadd(running, share),
+        });
+    }
+    let sum = sum.ok_or_else(|| format!("group {g} argues local lookups with no local tree"))?;
+    if !local_fault!(NoLocalBalance) {
+        let zero = b.ext_const(&FEE::zero());
+        b.assert_eq_ext(sum, zero);
+    }
+    let state = own.state_digest(b);
+    let mut claims: Vec<Option<(Vec<Ext>, Ext, Ext)>> = vec![None; plan.groups[g].len()];
+    for (&t, claim) in classes.local.members.iter().zip(member_claims) {
+        claims[t] = Some(claim);
+    }
+    Ok(LocalLeaf {
+        point,
+        state,
+        z,
+        alpha,
+        claims,
+        classes,
+    })
 }
 
 /// PERMUTATIONS [`emit_commit_ood_point`] costs a group of `polys` roots: its
@@ -2906,6 +3408,21 @@ fn emit_leaf_over(
                 crate::tables::bitwise::NUM_VARS
             ));
         }
+        if let Some(shape) = routes
+            .iter()
+            .zip(&shapes)
+            .find(|(route, shape)| {
+                matches!(route, Route::LocalBytes)
+                    && shape.num_vars != crate::tables::local_bytes::LOG_ROWS
+            })
+            .map(|(_, shape)| shape)
+        {
+            return Err(format!(
+                "group {g}: LOCAL_BYTES at 2^{} rows — its table is 2^{}",
+                shape.num_vars,
+                crate::tables::local_bytes::LOG_ROWS
+            ));
+        }
         let views: Vec<Vec<&[FE]>> = routes.iter().map(Route::view).collect();
         let plans: Vec<PreprocessedPlan<'_>> = routes
             .iter()
@@ -2921,10 +3438,92 @@ fn emit_leaf_over(
             .unwrap_or(1);
         let ladder = super::whir_poly::emit_challenge_powers(b, alpha, ladder_len);
 
+        let layout = &frame.stack_layouts[g];
+        let dw = plan.digest_words();
+        let root_at = plan.root_start(g);
+        let answer_at = plan.answer_start(g);
+        let trees = plan.trees(layout);
+        let group_roots = &carried[dw * root_at..dw * (root_at + trees.len())];
+        // A group under local lookups argues its local class first, on its
+        // own transcript: its commit-time one, continued.
+        let local = match (&plan.local, batched_cap(config)?) {
+            (Some(local), Some(planning)) if owned.is_local(&local.buses) => {
+                Some(emit_local_argue(
+                    b,
+                    plan,
+                    g,
+                    local,
+                    &owned,
+                    planning,
+                    group_roots,
+                    &answers[answer_at..answer_at + layout.num_polys()],
+                    arena,
+                    &mut at,
+                )?)
+            }
+            (Some(local), None) if owned.is_local(&local.buses) => {
+                return Err("local lookups are argued batched alone".to_string());
+            }
+            _ => None,
+        };
+
         let mut fork = transcript.clone();
         fork.absorb_const_bytes(&(g as u64).to_le_bytes());
-        let walk = match batched_cap(config)? {
-            None => {
+        // The local argue's state, before anything else on the fork: it binds
+        // the local argue into the group's global one.
+        let state_first = !local_fault!(NoLocalState) && !local_fault!(LocalStateLast);
+        if let Some(local) = &local
+            && state_first
+        {
+            fork.absorb_root(b, local.state);
+        }
+        let walk = match (batched_cap(config)?, &local) {
+            (Some(planning), Some(local)) => {
+                let argue_plan = owned.argue_plan(planning);
+                let store = super::whir_batch::hint_batched_classed(
+                    b,
+                    arena,
+                    &mut at,
+                    &shapes,
+                    &argue_plan,
+                    &local.classes.global.plan,
+                    planning.ladder(),
+                );
+                let alpha_powers = super::whir_poly::emit_challenge_powers(
+                    b,
+                    local.alpha,
+                    local
+                        .classes
+                        .local
+                        .buses
+                        .iter()
+                        .map(|bus| super::whir_bus::alpha_powers_read(bus))
+                        .max()
+                        .unwrap_or(1),
+                );
+                super::whir_batch::emit_batched_walk_classed(
+                    b,
+                    &mut fork,
+                    &store,
+                    &shapes,
+                    &argue_plan,
+                    &local.classes.global,
+                    &super::whir_batch::LocalPairs {
+                        claims: &local.claims,
+                        class: &local.classes.local,
+                        z: local.z,
+                        alpha_powers: &alpha_powers,
+                    },
+                    planning.ladder(),
+                    &plans,
+                    &slots,
+                    z,
+                    &ladder,
+                    beta,
+                )
+            }
+            (None, Some(_)) => unreachable!("a local group argues batched"),
+            (None, None) => {
                 let store: Vec<TableWires> = shapes
                     .iter()
                     .map(|shape| hint_table_wires_shaped(b, arena, &mut at, shape))
@@ -2936,7 +3535,7 @@ fn emit_leaf_over(
                 )
             }
             // The group's tables in one batched argue, its bins the host's.
-            Some(planning) => {
+            (Some(planning), None) => {
                 let argue_plan = owned.argue_plan(planning);
                 let store = super::whir_batch::hint_batched_shaped(
                     b,
@@ -2962,22 +3561,26 @@ fn emit_leaf_over(
             }
         };
 
+        if let Some(local) = &local
+            && local_fault!(LocalStateLast)
+        {
+            fork.absorb_root(b, local.state);
+        }
+
         // The group's opening, against its own carried roots, its answers
         // carried at its own commit-time point — the front's root and answer
-        // cells, never a second copy.
-        let layout = &frame.stack_layouts[g];
-        let dw = plan.digest_words();
-        let root_at = plan.root_start(g);
-        let answer_at = plan.answer_start(g);
-        let trees = plan.trees(layout);
-        let group_roots = &carried[dw * root_at..dw * (root_at + trees.len())];
-        let point = emit_commit_ood_point(
-            b,
-            &stark::multilinear_block::commit_ood_prefix(g, layout, config),
-            group_roots,
-            layout.n_stack(),
-            layout.n_stack() + config.log_blowup,
-        );
+        // cells, never a second copy. A local group drew its point before its
+        // local argue, from the same transcript.
+        let point = match local {
+            Some(local) => local.point,
+            None => emit_commit_ood_point(
+                b,
+                &stark::multilinear_block::commit_ood_prefix(g, layout, config),
+                group_roots,
+                layout.n_stack(),
+                layout.n_stack() + config.log_blowup,
+            ),
+        };
         #[cfg(test)]
         let fresh: Vec<Ext> = match ood_faults::get() {
             ood_faults::Fault::FreshAnswerHint => (0..layout.num_polys())
@@ -3152,9 +3755,9 @@ fn emit_leaf_over(
 /// Leaf `k`'s arena from the block proof — the witness — in the order
 /// [`emit_block_leaf`] hints it. Refuses a proof whose argument does not have
 /// the shapes the plan derived (a count the leaf would misread).
-pub fn block_leaf_arena(
+pub fn block_leaf_arena<L: crate::block_whir::LocalPart>(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
     let groups = block_leaf_groups(plan, proof, k)?;
@@ -3169,11 +3772,27 @@ pub fn block_leaf_arena(
 /// Leaf `k`'s groups' words from the block proof, in the leaf's group order
 /// ([`group_arena_words`] each): [`block_leaf_arena`]'s arena is the roots and
 /// their commit-time answers, then these. Refuses what it refuses.
-pub fn block_leaf_groups(
+pub fn block_leaf_groups<L: crate::block_whir::LocalPart>(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
+    // The plan's format decides whether a proof carries local argues, never
+    // the proof: the other kind is refused.
+    let local = match (plan.local.is_some(), proof.local.local_argues()) {
+        (true, Some(argues)) if argues.len() == plan.groups.len() => Some(argues),
+        (false, None) => None,
+        (true, other) => {
+            return Err(format!(
+                "a plan under local lookups over a proof carrying {} local argues for {} groups",
+                other.map_or("no".to_string(), |a| a.len().to_string()),
+                plan.groups.len()
+            ));
+        }
+        (false, Some(_)) => {
+            return Err("a proof carrying local argues under a plan without local lookups".into());
+        }
+    };
     let mut groups = Vec::with_capacity(plan.partition.leaf(k).len());
     for &g in plan.partition.leaf(k) {
         let start = plan.group_start(g);
@@ -3204,6 +3823,7 @@ pub fn block_leaf_groups(
             g,
             tables,
             proof.argues.get(g),
+            local.map(|argues| &argues[g]),
             opening,
             prepared,
         )?);
@@ -3238,9 +3858,9 @@ pub fn leaf_arena(
 /// program over `k` groups: the front (every root and its commit-time
 /// answers, as leaf 0's), then the first `k` groups' words.
 #[cfg(test)]
-pub(crate) fn first_groups_arena(
+pub(crate) fn first_groups_arena<L: crate::block_whir::LocalPart>(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
     plan.first_groups(k)?;
@@ -3259,9 +3879,9 @@ pub(crate) fn first_groups_arena(
 /// or each batched argue's), as one published word: what
 /// [`WhirBlockPlan::first_groups_program_marked`]'s program publishes last.
 #[cfg(test)]
-pub(crate) fn first_groups_bus_sum(
+pub(crate) fn first_groups_bus_sum<L>(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     k: usize,
 ) -> Result<LfmWord, String> {
     use stark::multilinear_table::contribution;
@@ -3314,15 +3934,20 @@ pub fn leaf_arena_under(
 }
 
 /// Group `g`'s words of a leaf's arena, from its share of the proof alone: its
-/// tables' proofs (the per-table format) or its batched argue, its opening and
+/// tables' proofs (the per-table format) or its local argue (under local
+/// lookups, a group that argues them) then its batched argue, its opening and
 /// its prepared opening. A group's words depend on nothing else, so a leaf can
 /// be fed each group as phase B finishes it. Refuses the shapes the plan does
-/// not derive, as [`block_leaf_arena`] does.
+/// not derive, as [`block_leaf_arena`] does: under local lookups a local
+/// group's local argue of the plan's shape, an empty one for any other group;
+/// none at all without them.
+#[allow(clippy::too_many_arguments)]
 pub fn group_arena_words(
     plan: &WhirBlockPlan,
     g: usize,
     tables: &[stark::multilinear_table::TableProof<GoldilocksExtension>],
     argue: Option<&stark::multilinear_table::BatchedArgue<GoldilocksExtension>>,
+    local: Option<&stark::multilinear_table::batched::LocalArgue<GoldilocksExtension>>,
     opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
     prepared: Option<
         &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
@@ -3352,16 +3977,67 @@ pub fn group_arena_words(
         Some(planning) => {
             let argue = argue.ok_or("the proof is short of batched argues")?;
             let shapes = owned.table_shapes();
-            let expected = super::whir_batch::batched_words(
+            // A local group's local argue first, then its global class's
+            // argue; any other group argues as today, with an empty local
+            // argue under local lookups.
+            let global_plan = match (&plan.local, local) {
+                (None, None) => None,
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "group {g} carries a local argue under a plan without local lookups"
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(format!(
+                        "group {g} carries no local argue under local lookups"
+                    ));
+                }
+                (Some(plan_local), Some(local)) if owned.is_local(&plan_local.buses) => {
+                    let classes = owned.classes(&plan_local.buses, planning)?;
+                    let expected =
+                        super::whir_batch::local_words(&classes.local.plan, planning.ladder());
+                    if local.bus_outputs.len() != classes.local.plan.trees()
+                        || local.gkr.len() != classes.local.plan.bins.len()
+                    {
+                        return Err(format!(
+                            "group {g}'s local argue carries {} trees and {} ladders, its plan {} and {}",
+                            local.bus_outputs.len(),
+                            local.gkr.len(),
+                            classes.local.plan.trees(),
+                            classes.local.plan.bins.len()
+                        ));
+                    }
+                    super::whir_batch::push_local_words(&mut words, local);
+                    if words.len() != expected {
+                        return Err(format!(
+                            "group {g}'s local argue carries {} words, its plan {expected}",
+                            words.len()
+                        ));
+                    }
+                    Some(classes.global.plan)
+                }
+                (Some(_), Some(local)) => {
+                    if !local.is_empty() {
+                        return Err(format!(
+                            "group {g} argues no local lookup and carries a local argue"
+                        ));
+                    }
+                    None
+                }
+            };
+            let before = words.len();
+            let argue_plan = owned.argue_plan(planning);
+            let expected = super::whir_batch::batched_words_classed(
                 &shapes,
-                &owned.argue_plan(planning),
+                &argue_plan,
+                global_plan.as_ref().unwrap_or(&argue_plan),
                 planning.ladder(),
             );
             super::whir_batch::push_batched_words(&mut words, argue);
-            if words.len() != expected {
+            if words.len() - before != expected {
                 return Err(format!(
                     "group {g}'s batched argue carries {} words, its shapes {expected}",
-                    words.len()
+                    words.len() - before
                 ));
             }
         }
@@ -3506,6 +4182,63 @@ pub(crate) mod ood_faults {
         /// Each group's walk reads its answers from a fresh hint, not the
         /// front's cells.
         FreshAnswerHint,
+    }
+
+    std::thread_local! {
+        static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    }
+
+    pub(crate) fn get() -> Fault {
+        FAULT.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` under `fault`, restoring the previous one after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(Fault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULT.with(|c| c.replace(fault)));
+        f()
+    }
+}
+
+/// Test only: the leaf's mutations of a group's local argue, one at a time,
+/// each of which a test must catch (or, for the forgeries, each of which must
+/// accept what the real check refuses). Thread-local, as [`ood_faults`].
+#[cfg(test)]
+pub(crate) mod local_faults {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        #[default]
+        None,
+        /// The leaf asserts nothing of a group's local outputs' sum.
+        NoLocalBalance,
+        /// The local transcript skips the group's roots: the prefix, then
+        /// `z0` drawn, then the rest (the host's binding without roots).
+        NoLocalRoots,
+        /// The local transcript skips the group's commit-time answers.
+        NoLocalAnswers,
+        /// The local transcript skips the label and the digests.
+        NoLocalDigests,
+        /// The local transcript draws `(z_g, α_g)` before the answers, the
+        /// label and the digests, and absorbs them after.
+        LocalDrawsFirst,
+        /// The fork does not absorb the local transcript's state.
+        NoLocalState,
+        /// The fork absorbs the local state after the group index's draw
+        /// position moves: after the global ladders, not before them.
+        LocalStateLast,
+        /// A local group's tables weighed `λ^{3t}`, today's stride.
+        TodaysWeights,
+        /// LOCAL_BYTES' fixed columns checked by nothing.
+        NoLocalBytesRoute,
+        /// LOCAL_BYTES' closed form takes OR's column in XOR's place.
+        LocalBytesXorAsOr,
+        /// The plan derives without the static receiver check.
+        NoReceiverCheck,
     }
 
     std::thread_local! {

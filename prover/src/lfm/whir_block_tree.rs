@@ -22,7 +22,7 @@
 
 use multilinear::whir_chain::{ArgueFormat, GkrLadder, GkrPack, GroupFold, LeafOrder, Round0Trees};
 
-use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
+use crate::block_whir::{self, BlockFormat, BlockOptions};
 use crate::tables::ecdas::EcdasForm;
 use crate::tables::fused_memory::MemoryFormat;
 use crate::tables::keccak_rnd::KeccakRndForm;
@@ -1029,6 +1029,11 @@ pub(crate) struct GroupMsg {
         Vec<stark::multilinear_table::TableProof<crate::tables::types::GoldilocksExtension>>,
     pub(crate) argue:
         Option<stark::multilinear_table::BatchedArgue<crate::tables::types::GoldilocksExtension>>,
+    /// The group's local argue under local lookups (empty for a group with
+    /// none), or `None`.
+    pub(crate) local: Option<
+        stark::multilinear_table::batched::LocalArgue<crate::tables::types::GoldilocksExtension>,
+    >,
     pub(crate) opening: multilinear::stacked_eval::StackedProof<
         crate::tables::types::GoldilocksField,
         crate::tables::types::GoldilocksExtension,
@@ -2204,7 +2209,7 @@ pub(crate) fn wait_all<'r, R>(kids: &[&'r Published<R>]) -> Result<Vec<&'r R>, S
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn prove_tree_pipelined(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &block_whir::AnyBlockWhirProof,
     leaves: Vec<Published<ProgramSlot>>,
     budget: Option<&TreeBudget>,
     siblings: usize,
@@ -2701,7 +2706,7 @@ pub struct WhirTreeRun {
     /// The base proof (the harness verifies it, and the early leaf's arena
     /// against it, off the clock).
     #[cfg(test)]
-    pub(crate) base_proof: BlockWhirProof,
+    pub(crate) base_proof: block_whir::AnyBlockWhirProof,
     #[cfg(test)]
     pub(crate) plan: WhirBlockPlan,
     #[cfg(test)]
@@ -2889,6 +2894,7 @@ pub fn prove_whir_block_tree(
                 commit_ood: opened.commit_ood.to_vec(),
                 tables: opened.tables.to_vec(),
                 argue: opened.argue.cloned(),
+                local: opened.local.cloned(),
                 opening: opened.opening.clone(),
                 prepared: opened.prepared.cloned(),
                 at: t0.elapsed().as_secs_f64(),
@@ -3085,6 +3091,7 @@ pub fn prove_whir_block_tree(
                             g,
                             &msg.tables,
                             msg.argue.as_ref(),
+                            msg.local.as_ref(),
                             &msg.opening,
                             msg.prepared.as_ref(),
                         )?);
@@ -3296,16 +3303,37 @@ pub fn prove_whir_block_tree(
                 early,
             ))
         });
-        let proved = block_whir::prove_block_whir_observed_led(
-            elf,
-            input,
-            &opts,
-            &format,
-            options,
-            &observe,
-            &on_group,
-            leaf_first.then_some(&lead),
-        );
+        // A format that argues local lookups proves a proof of its own kind
+        // (it carries every group's local argue): either kind is held as
+        // one type from here on.
+        let proved = if format.local_lookups() {
+            block_whir::prove_block_whir_local_observed_led(
+                elf,
+                input,
+                &opts,
+                &format,
+                options,
+                &observe,
+                &on_group,
+                leaf_first.then_some(&lead),
+            )
+            .map(|(mut proof, stamps)| {
+                let local = std::mem::take(&mut proof.local);
+                (proof.with_local(Some(local)), stamps)
+            })
+        } else {
+            block_whir::prove_block_whir_observed_led(
+                elf,
+                input,
+                &opts,
+                &format,
+                options,
+                &observe,
+                &on_group,
+                leaf_first.then_some(&lead),
+            )
+            .map(|(proof, stamps)| (proof.with_local(None), stamps))
+        };
         // A prover that failed before stating must not leave the planner waiting.
         *sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *group_sender.lock().unwrap_or_else(|e| e.into_inner()) = None;

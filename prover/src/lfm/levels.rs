@@ -1144,10 +1144,10 @@ pub struct LevelSecs {
 /// ★ Proves every level over `base`: level 1 over the base proof's witness,
 /// each next level over the previous level's proof. Returns every level's
 /// proof, the last first-class (the one a verifier checks).
-pub fn prove_levels(
+pub fn prove_levels<L: crate::block_whir::LocalPart>(
     plan: &WhirBlockPlan,
     levels: &[Level],
-    base: &BlockWhirProof,
+    base: &BlockWhirProof<L>,
 ) -> Result<(Vec<WlfmProof>, Vec<LevelSecs>), String> {
     let mut proofs: Vec<WlfmProof> = Vec::with_capacity(levels.len());
     let mut secs = Vec::with_capacity(levels.len());
@@ -1311,7 +1311,8 @@ pub struct LevelBuild {
 
 /// A block proved to its last level.
 pub struct LevelsRun {
-    pub base_proof: BlockWhirProof,
+    /// The base proof, of either kind (`None` local argues in today's format).
+    pub base_proof: crate::block_whir::AnyBlockWhirProof,
     pub base_stamps: crate::block_whir::BlockStamps,
     pub plan: WhirBlockPlan,
     pub levels: Vec<Level>,
@@ -1456,6 +1457,11 @@ pub fn prove_block_levels(
         Vec<crate::tables::types::FEE>,
         Vec<stark::multilinear_table::TableProof<crate::tables::types::GoldilocksExtension>>,
         Option<stark::multilinear_table::BatchedArgue<crate::tables::types::GoldilocksExtension>>,
+        Option<
+            stark::multilinear_table::batched::LocalArgue<
+                crate::tables::types::GoldilocksExtension,
+            >,
+        >,
         multilinear::stacked_eval::StackedProof<
             crate::tables::types::GoldilocksField,
             crate::tables::types::GoldilocksExtension,
@@ -1477,6 +1483,7 @@ pub fn prove_block_levels(
                 opened.commit_ood.to_vec(),
                 opened.tables.to_vec(),
                 opened.argue.cloned(),
+                opened.local.cloned(),
                 opened.opening.clone(),
                 opened.prepared.cloned(),
             ));
@@ -1627,7 +1634,7 @@ pub fn prove_block_levels(
             } else {
                 Box::new(prx.iter().collect::<Vec<_>>().into_iter())
             };
-            for (g, roots, answers, tables, argue, opening, prepared) in parts {
+            for (g, roots, answers, tables, argue, local, opening, prepared) in parts {
                 landing.arrivals.push((g, now()));
                 if !landed[0] {
                     let front = super::whir_block::leaf_arena_under(
@@ -1652,6 +1659,7 @@ pub fn prove_block_levels(
                     g,
                     &tables,
                     argue.as_ref(),
+                    local.as_ref(),
                     &opening,
                     prepared.as_ref(),
                 )?;
@@ -1767,16 +1775,36 @@ pub fn prove_block_levels(
                 landing,
             ))
         });
+        // A format that argues local lookups proves a proof of its own kind
+        // (it carries every group's local argue), held as either kind.
         let prove_base = || {
-            crate::block_whir::prove_block_whir_observed_groups(
-                elf,
-                input,
-                base_options,
-                format,
-                options,
-                &observe,
-                &on_group,
-            )
+            if format.local_lookups() {
+                crate::block_whir::prove_block_whir_local_observed_led(
+                    elf,
+                    input,
+                    base_options,
+                    format,
+                    options,
+                    &observe,
+                    &on_group,
+                    None,
+                )
+                .map(|(mut proof, stamps)| {
+                    let local = std::mem::take(&mut proof.local);
+                    (proof.with_local(Some(local)), stamps)
+                })
+            } else {
+                crate::block_whir::prove_block_whir_observed_groups(
+                    elf,
+                    input,
+                    base_options,
+                    format,
+                    options,
+                    &observe,
+                    &on_group,
+                )
+                .map(|(proof, stamps)| (proof.with_local(None), stamps))
+            }
         };
         // A BLAKE3 base is admitted for its own levels' prove alone: the
         // recursion over it is BLAKE3 too.

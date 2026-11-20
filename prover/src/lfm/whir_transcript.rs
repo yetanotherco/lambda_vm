@@ -839,6 +839,23 @@ impl SpongeSchedule {
 const NONCE_FELTS: usize = 1;
 
 impl SpongeSchedule {
+    /// `state()`: the buffer hashed, and left alone ([`WhirTranscript::state_digest`]).
+    pub fn state(&mut self) {
+        if let Some((t, compressions)) = &mut self.bytes {
+            *compressions += byte_hash_compressions(t.segment);
+            return;
+        }
+        if let Some((p, perms)) = &mut self.p1 {
+            if p.pending > 0 {
+                *perms += 1;
+            }
+            return;
+        }
+        self.hashes.push(SpongeHash::State(self.buffered));
+    }
+}
+
+impl SpongeSchedule {
     /// The hashes performed, in order — what a leg's schedule half is summed
     /// from.
     pub fn hashes(&self) -> &[SpongeHash] {

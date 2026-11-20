@@ -60,7 +60,7 @@ fn streamed_options() -> crate::block_whir::BlockOptions {
 
 /// Level 1's BLAKE3 plan, as a verifier derives it (prepared roots on the
 /// host).
-fn b3_plan(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> WhirBlockPlan {
+fn b3_plan<L>(elf: &[u8], proof: &BlockWhirProof<L>, format: &BlockFormat) -> WhirBlockPlan {
     level_plan(
         elf,
         &ProofOptions::default_test_options(),
@@ -1447,9 +1447,9 @@ struct FirstGroupsRun {
 /// prover runs a level: emitted, its prepared stacks built where `stacks`
 /// says (as the levels' prover places them when `None`), executed over the
 /// base proof's witness, filled, and proved streamed. Not verified here.
-fn prove_first_groups(
+fn prove_first_groups<L: crate::block_whir::LocalPart>(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     family: WlfmFamily,
     k: usize,
     stacks: Option<StackPlace>,
