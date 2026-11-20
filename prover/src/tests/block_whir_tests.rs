@@ -6080,9 +6080,15 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
                     "{name}, {workers} workers, cpu {cpu} memw_r {memw_r} keccak_rnd {keccak_rnd}"
                 );
                 // Regeneration is off here, and parked records need it: kept.
+                // KECCAK_RND built at the finish, as the host's run: its
+                // records are then the rest's (`records_rest`, which `held`
+                // counts) and the partition is the host's. Handed out during
+                // the windows (the default where the card fills it) its tables
+                // would be records `held` does not count, in groups of their own.
                 let (card, stamps) = proved(Deviations {
                     card_fill: Some(keccak_rnd),
                     records_keep: Some(true),
+                    stream_keccak_rnd: Some(false),
                     ..streamed_records(cpu, memw_r)
                 });
                 let c = stamps.windows.card_fill;
