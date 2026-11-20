@@ -1,0 +1,48 @@
+=== PART 1: BV full-round variant (Hwsl -> linear identity) ===
+  ('main', 5) -> unsat
+  ('main', 3) -> unsat
+  ('main', 0) -> unsat
+  ('main', 8) -> unsat
+  ('main', 4) -> unsat
+  ('main', 9) -> unsat
+  ('main', 7) -> unsat
+  ('main', 2) -> unsat
+  ('main', 1) -> unsat
+  ('main', 6) -> unsat
+  ('main', 11) -> unsat
+  ('main', 10) -> unsat
+  ('main', 15) -> unsat
+  ('main', 16) -> unsat
+  ('main', 12) -> unsat
+  ('ctrl', 'theta_no_rot') -> sat
+  ('ctrl', 'rho_swap') -> sat
+  ('ctrl', 'chi_no_not') -> sat
+  ('main', 14) -> unsat
+  ('ctrl', 'chi_swap') -> sat
+  ('ctrl', 'iota_no_rc') -> sat
+  ('main', 13) -> unsat
+  ('main', 19) -> unsat
+  ('main', 18) -> unsat
+  ('main', 17) -> unsat
+  ('main', 20) -> unsat
+  ('main', 21) -> unsat
+  ('main', 22) -> unsat
+  ('main', 23) -> unsat
+
+  MAIN all-24 UNSAT: True
+  round-logic controls all SAT: True
+
+=== PART 2: FIELD (mod p) bound-necessity controls ===
+  rho rnc=12  bounds present -> unsat  (want unsat: unique/pinned)
+  rho rnc=12  DROP right bound -> sat  (want sat: ambiguous)
+  theta rnc=1 IS_BIT present -> unsat  (want unsat: carry pinned)
+  theta rnc=1 DROP IS_BIT   -> sat  (want sat: ambiguous)
+
+================ SUMMARY ================
+  equivalent under rewrite (all bounds present): YES
+  round-logic negative controls SAT: True
+  DROP right-range -> SAT (ambiguous): True
+  DROP IS_BIT -> SAT (now load-bearing): True
+  bounds-present -> pinned (rho unsat=True, theta unsat=True)
+
+  OVERALL: REWRITE VALID + BOUNDS NECESSARY (as predicted)

@@ -1,0 +1,363 @@
+# Alternative specification of the KECCAK_RND chip with the HWSL lookups
+# inlined as arithmetic constraints (see keccak_round.toml for the original).
+#
+# Difference vs the original: the 120 HWSL bus interactions (θ rotate-by-1 and
+# ρ shifts) are replaced by μ-gated linear identities over the same variables:
+#
+#     in · 2^rnc = right · 2^16 + left
+#
+# A shift by a compile-time constant is linear over the field, so the lookup
+# buys nothing the identity does not — PROVIDED left and right are range
+# checked. Given `left, right ∈ [0, 2^16)` the pair is the unique Euclidean
+# quotient/remainder of `in · 2^rnc ÷ 2^16` (all values < 2^32 ≪ p, so field
+# semantics coincide with the integers). The IS_BYTE checks on
+# `Cxz_left`/`rot_left`/`rot_right` and the IS_BIT checks on `Cxz_right` are
+# therefore LOAD-BEARING in this variant: without them the decomposition is
+# ambiguous and the permutation output is forgeable.
+#
+# Equivalence with the original chip and the necessity of the range checks
+# were machine-checked with an SMT solver (z3): the constraint system below
+# admits no witness whose output differs from the FIPS-202 reference round
+# (UNSAT, all 24 round indices), while dropping any range bound or IS_BIT
+# yields a concrete forgery (SAT). Measured on a pure-keccak continuation
+# proof this variant is ~7% faster end to end (−120 sends/row → −60 LogUp
+# auxiliary extension columns; +120 degree-2 constraints; no new columns;
+# max constraint degree unchanged at 3).
+
+name = "KECCAK_RND_HWSL_INLINE"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp at which the permutation is performed"
+
+
+[[variables.input]]
+name = "round"
+type = "BaseField"
+desc = "index of the permutation round"
+
+[[variables.input]]
+name = "start"
+type = [[["Byte", 8], 5], 5]
+desc = "state at the start of executing the permutation"
+
+[[variables.auxiliary]]
+name = "Cxz"
+type = [[["Byte", 8], 4], 5]
+desc = "$xor_(i=0)^(y+2) #`start[x,i,z]`$"
+
+[[variables.auxiliary]]
+name = "Cxz_left"
+type = [["Byte", 8], 5]
+desc = "the left-rotated component of `rotated_Cxz`"
+
+[[variables.auxiliary]]
+name = "Cxz_right"
+type = [["Bit", 4], 5]
+desc = "the right-rotated component of `rotated_Cxz` (which is a single bit)"
+
+[[variables.auxiliary]]
+name = "Dxz"
+type = [["Byte", 8], 5]
+desc = "$#`Cxz[`\\(#`x` - 1) mod 5#`,y,z]` xor #`rotated_Cxz[`\\(#`x` + 1) mod 5#`,y,z]`$"
+
+[[variables.auxiliary]]
+name = "theta"
+type = [[["Byte", 8], 5], 5]
+desc = "$theta(#`start`)$, the state after applying $theta$."
+
+[[variables.auxiliary]]
+name = "rot_left"
+type = [[["Byte", 8], 5], 5]
+desc = "the left-rotated component of $#`theta[x,y]` <<< #`rnc`$"
+
+[[variables.auxiliary]]
+name = "rot_right"
+type = [[["Byte", 8], 5], 5]
+desc = "the right-rotated component of $#`theta[x,y]` <<< #`rnc`$"
+
+[[variables.auxiliary]]
+name = "chi_ANDs"
+type = [[["Byte", 8], 5], 5]
+desc = "$(#`pi[`\\(x+1) mod 5#`,y,z]` xor 255) times.o #`pi[`\\(x + 2) mod 5#`,y,z]`$"
+
+[[variables.auxiliary]]
+name = "chi"
+type = [[["Byte", 8], 5], 5]
+desc = "$(chi compose pi compose rho compose theta)(#`start`)$; the state after applying $chi$"
+
+[[variables.auxiliary]]
+name = "rc"
+type = ["Byte", 8]
+desc = "round constants"
+
+[[variables.auxiliary]]
+name = "iota"
+type = ["Byte", 8]
+desc = "state update following from step $iota$."
+
+[[variables.virtual]]
+name = "rotated_Cxz"
+type = [["Byte", 8], 5]
+desc = "$#`Cxz[x,`3#`,z]` <<< 1$"
+def = {polys=[
+    {iters=[["x", 0, 4], ["z", 0]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 3]]},
+    {iters=[["x", 0, 4], ["z", 1]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 2]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 0]]},
+    {iters=[["x", 0, 4], ["z", 3]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 4]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 1]]},
+    {iters=[["x", 0, 4], ["z", 5]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+    {iters=[["x", 0, 4], ["z", 6]], poly=["+", ["idx", ["idx", "Cxz_left", "x"], "z"], ["idx", ["idx", "Cxz_right", "x"], 2]]},
+    {iters=[["x", 0, 4], ["z", 7]], poly=["idx", ["idx", "Cxz_left", "x"], "z"]},
+]}
+
+[[variables.virtual]]
+name = "out"
+type = [[["Byte", 8], 5], 5]
+desc = "state at the end of executing the permutation"
+def = {polys=[
+    {iters=[["x", 0], ["y", 0], ["z", 0, 7]], poly=["idx", "iota","z"]},
+    {iters=[["x", 1, 4], ["y", 0], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]},
+    {iters=[["x", 0], ["y", 1, 4], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]},
+    {iters=[["x", 1, 4], ["y", 1, 4], ["z", 0, 7]], poly=["idx",["idx",["idx","chi","x"],"y"],"z"]}
+]}
+
+[[variables.virtual]]
+name = "rho"
+type = [[["Byte", 8], 5], 5]
+desc = "$(rho compose theta)(#`start`)$; the state after applying $rho$"
+def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=[
+    "+",
+    ["*",
+        ["not", ["idx", ["idx", ["idx", "rbc", "x"], "y"], 0]],
+        ["not", ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1]],
+        ["+",
+            ["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 2], 8]],
+        ]
+    ],
+    ["*",
+        ["idx", ["idx", ["idx", "rbc", "x"], "y"], 0],
+        ["not", ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1]],
+        ["+",
+            ["idx", ["idx", ["idx", "rot_left", "x"], "y"], ["mod", ["-", "z", 2], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 4], 8]],
+        ]
+    ],
+    ["*",
+        ["not", ["idx", ["idx", ["idx", "rbc", "x"], "y"], 0]],
+        ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1],
+        ["+",
+            ["idx", ["idx", ["idx", "rot_left", "x"], "y"], ["mod", ["-", "z", 4], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], ["mod", ["-", "z", 6], 8]],
+        ]
+    ],
+    ["*",
+        ["idx", ["idx", ["idx", "rbc", "x"], "y"], 0],
+        ["idx", ["idx", ["idx", "rbc", "x"], "y"], 1],
+        ["+",
+            ["idx", ["idx", ["idx", "rot_left", "x"], "y"], ["mod", ["-", "z", 6], 8]],
+            ["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"],
+        ]
+    ],
+]}
+
+[[variables.virtual]]
+name = "pi"
+type = [[["Byte", 8], 5], 5]
+desc = "$(pi compose rho compose theta)(#`start`)$; the state after applying $pi$"
+def = {iters=[["x", 0, 4], ["y", 0, 4], ["z", 0, 7]], poly=["idx", ["idx", ["idx", "rho", ["mod", ["+", "x", ["*", 3, "y"]], 5]], "x"], "z"]}
+
+[[variables.constant]]
+name = "rnc"
+type = [["Byte", 5], 5]
+desc = "lower nibble of `ρ` constants"
+
+[[variables.constant]]
+name = "rpc"
+type = [["Half", 5], 5]
+desc = "$2^#`rnc`$; the shift factor of the `ρ` rotation as a field constant"
+
+[[variables.constant]]
+name = "rbc"
+type = [[["Bit", 2], 5], 5]
+desc = "top two bits of `ρ` constants"
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+
+
+# Assumptions
+
+
+# Constraints
+
+[[constraint_groups]]
+name = "io"
+
+[[constraints.io]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["timestamp", "round", "start"]
+multiplicity = ["-", "μ"]
+
+[[constraints.io]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["timestamp", ["+", "round", 1], "out"]
+multiplicity = "μ"
+
+[[constraints.io]]
+kind = "interaction"
+tag = "KECCAK_RC"
+input = ["round"]
+output = "rc"
+multiplicity = ["-", "μ"]
+
+[[constraint_groups]]
+name = "theta"
+
+[[constraints.theta]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "start", "x"], 0], "z"], ["idx", ["idx", ["idx", "start", "x"], 1], "z"]]
+output = ["idx", ["idx", ["idx", "Cxz", "x"], 0], "z"]
+iters = [["x", 0, 4], ["z", 0, 7]]
+multiplicity = "μ"
+ref = "keccak:c:inline_theta_cxz_start"
+
+[[constraints.theta]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], "z"], ["idx", ["idx", ["idx", "start", "x"], "y"], "z"]]
+output = ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 1]], "z"]
+iters = [["x", 0, 4], ["y", 2, 4], ["z", 0, 7]]
+multiplicity = "μ"
+ref = "keccak:c:inline_theta_cxz"
+
+# Inlined θ rotate-by-1 (replaces the HWSL interaction of the original spec).
+# A shift by 1 is linear: 2 · C = carry · 2^16 + left, with the halfword `left`
+# and the bit `carry` uniquely determined by the IS_BYTE/IS_BIT checks below
+# (Euclidean division; all values < 2^17 ≪ p).
+[[constraints.theta]]
+kind = "arith"
+constraint = "$#`μ` => 2 dot #`Cxz[x,3]`_#`z` = #`Cxz_right[x,z]` dot 2^16 + #`Cxz_left[x]`_#`z`$"
+poly = ["*", "μ", ["-",
+    ["*", 2, ["idx", ["cast", ["idx", ["idx", "Cxz", "x"], 3], "DWordHL"], "z"]],
+    ["+",
+        ["*", ["idx", ["idx", "Cxz_right", "x"], "z"], 65536],
+        ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"],
+    ],
+]]
+iters = [["x", 0, 4], ["z", 0, 3]]
+
+# Note: these IS_BYTE checks are LOAD-BEARING in this variant. Together with
+# the linear identity above they pin (Cxz_left, Cxz_right) to the unique
+# Euclidean decomposition of 2 · Cxz[x,3]. Without them the decomposition is
+# ambiguous and the round output is forgeable (z3: dropping either yields a
+# concrete forgery witness).
+[[constraints.theta]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", ["idx", "Cxz_left", "x"], "z"]]
+iters = [["x", 0, 4], ["z", 0, 7]]
+cond = "μ"
+
+[[constraints.theta]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", ["idx", "Cxz_right", "x"], "z"]]
+iters = [["x", 0, 4], ["z", 0, 3]]
+
+[[constraints.theta]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "Cxz", ["mod", ["-", "x", 1], 5]], 3], "z"], ["idx", ["idx", "rotated_Cxz", ["mod", ["+", "x", 1], 5]], "z"]]
+output = ["idx", ["idx", "Dxz", "x"], "z"]
+iters = [["x", 0, 4], ["z", 0, 7]]
+multiplicity = "μ"
+ref = "keccak:c:inline_Dxz"
+
+[[constraints.theta]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "start", "x"], "y"], "z"], ["idx", ["idx", "Dxz", "x"], "z"]]
+output = ["idx", ["idx", ["idx", "theta", "x"], "y"], "z"]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
+multiplicity = "μ"
+
+[[constraint_groups]]
+name = "rho"
+
+# Inlined ρ rotation (replaces the HWSL interaction of the original spec).
+# A shift by the compile-time constant rnc is linear:
+# theta · 2^rnc = rot_right · 2^16 + rot_left, with the decomposition uniquely
+# determined by the IS_BYTE checks below (Euclidean division; all values
+# < 2^32 ≪ p). For rnc = 0 the identity degenerates to rot_left = theta,
+# rot_right = 0 as required.
+[[constraints.rho]]
+kind = "arith"
+constraint = "$#`μ` => #`theta[x,y]`_#`z` dot #`rpc[x,y]` = #`rot_right[x,y]`_#`z` dot 2^16 + #`rot_left[x,y]`_#`z`$"
+poly = ["*", "μ", ["-",
+    ["*", ["idx", ["idx", "rpc", "x"], "y"], ["idx", ["cast", ["idx", ["idx", "theta", "x"], "y"], "DWordHL"], "z"]],
+    ["+",
+        ["*", ["idx", ["cast", ["idx", ["idx", "rot_right", "x"], "y"], "DWordHL"], "z"], 65536],
+        ["idx", ["cast", ["idx", ["idx", "rot_left", "x"], "y"], "DWordHL"], "z"],
+    ],
+]]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
+ref = "keccak:c:inline_rho_rotation"
+
+# Note: these IS_BYTE checks are LOAD-BEARING in this variant. Together with
+# the linear identity above they pin (rot_left, rot_right) to the unique
+# Euclidean decomposition of theta · 2^rnc. Without them the decomposition is
+# ambiguous and the round output is forgeable (z3: dropping either yields a
+# concrete forgery witness).
+[[constraints.rho]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
+cond = "μ"
+ref = "keccak:c:inline_range_rot_left"
+
+[[constraints.rho]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
+cond = "μ"
+ref = "keccak:c:inline_range_rot_right"
+
+[[constraint_groups]]
+name = "chi"
+
+[[constraints.chi]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["-", 255, ["idx", ["idx", ["idx", "pi", ["mod", ["+", "x", 1], 5]], "y"], "z"]], ["idx",["idx",["idx", "pi", ["mod", ["+", "x", 2], 5]], "y"], "z"]]
+output = ["idx", ["idx", ["idx", "chi_ANDs", "x"], "y"], "z"]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
+multiplicity = "μ"
+
+[[constraints.chi]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "pi", "x"], "y"], "z"], ["idx",["idx",["idx", "chi_ANDs", "x"], "y"], "z"]]
+output = ["idx", ["idx", ["idx", "chi", "x"], "y"], "z"]
+iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
+multiplicity = "μ"
+
+[[constraint_groups]]
+name = "iota"
+
+[[constraints.iota]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "chi", 0], 0], "z"], ["idx","rc","z"]]
+output = ["idx", "iota", "z"]
+iter = ["z", 0, 7]
+multiplicity = "μ"

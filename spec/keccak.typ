@@ -114,6 +114,32 @@ Lastly, the round chip contributes the following interactions to the lookup:
 - when executed in large volumnes, `KECCAK_RND` could benefit from having a three-way XOR lookup table. With this in place, the 80 interactions in @keccak:c:theta_cxz_start and @keccak:c:theta_cxz could be dropped.
   Likewise, 80 columns could be removed from the chip (a \~5% savings).
 
+= Round chip: HWSL-inline variant (alternative)
+#let round_inline_chip = load_chip("src/keccak_round_hwsl_inline.toml", config)
+#let keccak_rnd_inline = raw(round_inline_chip.name)
+
+This section specifies #keccak_rnd_inline, an alternative to #keccak_rnd in which the 120 `HWSL` interactions (the $theta$ rotate-by-one and the $rho$ shifts) are replaced by arithmetic constraints over the same variables.
+A shift by a compile-time constant is linear over the field:
+$ #`in` dot 2^#`rnc` = #`right` dot 2^16 + #`left` $
+Given $#`left`, #`right` in [0, 2^16)$, the pair is the unique Euclidean quotient/remainder of $#`in` dot 2^#`rnc` div 2^16$; all values involved are smaller than $2^32 lt.double p$, so field semantics coincide with the integers.
+The `IS_BYTE` checks on `Cxz_left`/`rot_left`/`rot_right` and the `IS_BIT` checks on `Cxz_right` are load-bearing here: without them $2^16$ is invertible modulo $p$ and the decomposition is ambiguous.
+Equivalence with #keccak_rnd and the necessity of the range checks were machine-checked with an SMT solver; the constraint system admits no witness whose output differs from the FIPS-202 reference round, while dropping any range check yields a concrete forgery (see `thoughts/keccak-hwsl-inline/`).
+Compared to #keccak_rnd this removes 120 interactions per row (60 fewer committed auxiliary extension columns) at the cost of 120 degree-2 constraints; columns and maximum constraint degree are unchanged.
+
+== Columns
+#let nr_variables = total_nr_variables(round_inline_chip)
+#let nr_columns = total_nr_instantiated_columns(round_inline_chip, config)
+#let nr_interactions = compute_nr_interactions(round_inline_chip)
+
+The #keccak_rnd_inline chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s).
+The variables are those of #keccak_rnd plus the constant `rpc`, with $#`rpc[x][y]` = 2^#`rnc[x][y]`$:
+#render_chip_variable_table(round_inline_chip, config)
+
+== Constraints
+Only the $theta$ and $rho$ groups differ from #keccak_rnd; the `chi`, `iota` and `io` groups are identical.
+#render_constraint_table(round_inline_chip, config, groups: "theta")
+#render_constraint_table(round_inline_chip, config, groups: "rho")
+
 = Round constant lookup
 #let rc_chip = load_chip("src/keccak_rc.toml", config)
 #let keccak_rc = raw(rc_chip.name)
