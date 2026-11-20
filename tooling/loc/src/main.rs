@@ -21,10 +21,13 @@ const EXCLUDED: &[&str] = &[
     "*fuzz*",
     "*programs*",
     "*program_artifacts*",
+    // Formal-verification harnesses (z3/QF-BV gates, …): not Rust, not part of
+    // the zkVM itself — counted as their own standalone report section.
+    "formal_verification",
 ];
 
 /// Directories counted separately (not as crates).
-const CRATE_SKIPPED: &[&str] = &["tooling", "bin"];
+const CRATE_SKIPPED: &[&str] = &["tooling", "bin", "formal_verification"];
 
 fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
     let top_level_crate_dirs = std::fs::read_dir(crates_path)
@@ -98,6 +101,42 @@ fn count_tools_loc(bin_path: &PathBuf, config: &Config) -> Vec<(String, usize)> 
     tools_loc
 }
 
+fn count_formal_verification_loc(fv_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
+    if !fv_path.exists() {
+        return Vec::new();
+    }
+
+    let gate_dirs = std::fs::read_dir(fv_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect::<Vec<DirEntry>>();
+
+    let mut fv_loc: Vec<(String, usize)> = gate_dirs
+        .into_iter()
+        .filter_map(|gate_dir_entry| {
+            let gate_path = gate_dir_entry.path();
+
+            // Only count directories (one per verified chip/gate)
+            if !gate_path.is_dir() {
+                return None;
+            }
+
+            let gate_name = gate_path.file_name().unwrap().to_str().unwrap().to_owned();
+
+            // The harnesses are not Rust (python/z3 today, possibly Lean or SMT
+            // later), so sum code lines across every language tokei recognizes.
+            let mut languages = Languages::new();
+            languages.get_statistics(&[gate_path], &[], config);
+            let gate_loc: usize = languages.values().map(|language| language.code).sum();
+            (gate_loc > 0).then_some((gate_name, gate_loc))
+        })
+        .collect();
+
+    fv_loc.sort_by_key(|(_gate_name, loc)| *loc);
+    fv_loc.reverse();
+    fv_loc
+}
+
 fn main() {
     let opts = LinesOfCodeReporterOptions::parse();
 
@@ -110,11 +149,14 @@ fn main() {
         .unwrap();
     let repo_crates_path = repo_path.join(""); // TODO: change to "crates" when crates directory exists
     let repo_bin_path = repo_path.join("bin");
+    let repo_formal_verification_path = repo_path.join("formal_verification");
     let config = Config::default();
 
     let lambda_vm_loc = count_loc(repo_path.clone(), &config).unwrap();
     let crates_loc = count_crates_loc(&repo_crates_path, &config);
     let tools_loc = count_tools_loc(&repo_bin_path, &config);
+    let formal_verification_loc =
+        count_formal_verification_loc(&repo_formal_verification_path, &config);
 
     spinner.success("Lines of code calculated!");
 
@@ -124,6 +166,7 @@ fn main() {
         lambda_vm: lambda_vm_loc.code,
         crates: crates_loc,
         tools: tools_loc,
+        formal_verification: formal_verification_loc,
     };
 
     if opts.detailed {
