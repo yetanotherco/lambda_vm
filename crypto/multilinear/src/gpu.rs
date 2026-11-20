@@ -8237,22 +8237,39 @@ fn note_card_decline(reason: impl FnOnce() -> String) {
     }
 }
 
+/// [`OPEN_HOST_REENCODE_NANOS`] so far: the host re-encodes' nanoseconds.
+pub(crate) fn open_host_reencode_nanos() -> u64 {
+    OPEN_HOST_REENCODE_NANOS.load(Ordering::Relaxed)
+}
+
+/// The host fallback line's reason: the card rung that declined, with the
+/// card's own error when it left one ([`note_card_decline`]). Never empty.
+pub(crate) fn reencode_reason(declined: &str, card: Option<String>) -> String {
+    match card {
+        Some(error) => format!("{declined}: {error}"),
+        None => declined.to_string(),
+    }
+}
+
 /// Counts a round-0 opening the host re-encoded and prints one line for it:
-/// how many stacks of what shape, the seconds, why the card declined and the
-/// ledger beside it — so a card fault does not read as a full card.
+/// how many stacks of what shape, the seconds, which card rung declined and
+/// why, and the ledger beside it — so a card fault does not read as a full
+/// card.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn note_open_host_reencode(stacks: usize, shape: (usize, usize), seconds: f64) {
+pub(crate) fn note_open_host_reencode(
+    stacks: usize,
+    shape: (usize, usize),
+    seconds: f64,
+    declined: &str,
+) {
     let trees = OPEN_HOST_REENCODE_TREES.fetch_add(1, Ordering::Relaxed) + 1;
     OPEN_HOST_REENCODE_STACKS.fetch_add(stacks as u64, Ordering::Relaxed);
     OPEN_HOST_REENCODE_NANOS.fetch_add((seconds * 1e9) as u64, Ordering::Relaxed);
     #[cfg(feature = "cuda")]
-    let reason = CARD_DECLINE
-        .lock()
-        .ok()
-        .and_then(|mut last| last.take())
-        .unwrap_or_else(|| "no reason recorded".to_string());
+    let card = CARD_DECLINE.lock().ok().and_then(|mut last| last.take());
     #[cfg(not(feature = "cuda"))]
-    let reason = "no card".to_string();
+    let card = None;
+    let reason = reencode_reason(declined, card);
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     eprintln!(
         "[whir] a round-0 opening re-encoded {stacks} stack(s) of 2^{} at blowup 2^{} on the HOST in \
@@ -8799,7 +8816,7 @@ impl DeviceCodeword {
                 placement(leaves),
             )
             .ok()?;
-        nodes_in_place(bytes)
+        nodes_in_place(bytes).map(short_subtrees_for_test)
     }
 
     /// Whether the tree this codeword builds puts its leaves in `leaves`.
@@ -9632,6 +9649,78 @@ mod streamed_add_back_tests {
     }
 }
 
+#[cfg(test)]
+mod reencode_reason_tests {
+    /// The host fallback's line always names the card rung that declined, and
+    /// the card's error beside it when one was left.
+    #[test]
+    fn the_host_reencode_line_always_names_what_declined() {
+        use super::reencode_reason as r;
+        assert_eq!(
+            r("the card declined the re-encode", None),
+            "the card declined the re-encode"
+        );
+        assert_eq!(
+            r(
+                "the card declined the re-encode",
+                Some("OUT_OF_MEMORY".into())
+            ),
+            "the card declined the re-encode: OUT_OF_MEMORY"
+        );
+        assert!(!r("x", None).is_empty());
+    }
+}
+
+/// The streamed commit's quiet declines come before the card is asked: a run
+/// under the commit threshold, the card forced off for commits, and no device
+/// each return `None` without an encode, a node buffer or a counted error.
+#[cfg(all(test, feature = "cuda"))]
+mod streamed_quiet_decline_tests {
+    use super::{CarriedRoom, DeviceCodeword, commit_errors, commit_joint_streamed};
+    use crate::whir_commit::LeafOrder;
+    use crate::whir_hash::{Blake3Whir, WhirHash};
+
+    fn never(_: usize, _: Option<CarriedRoom>) -> Option<DeviceCodeword> {
+        panic!("a quiet decline encoded a codeword")
+    }
+
+    /// Clears the forced host commit when dropped.
+    struct HostCommits;
+
+    impl Drop for HostCommits {
+        fn drop(&mut self) {
+            super::force_host_whir_commit(false);
+        }
+    }
+
+    /// Run alone (`--exact`): it forces commits off the card for a moment.
+    #[test]
+    fn a_streamed_commit_declines_quietly_before_the_card_is_asked() {
+        let hash = Blake3Whir::DEVICE;
+        let errors = commit_errors();
+        let below = super::COMMIT_THRESHOLD.trailing_zeros() as usize - 1;
+        assert!(
+            commit_joint_streamed(4, below, 4, hash, LeafOrder::Coset, never).is_none(),
+            "under the threshold"
+        );
+        {
+            super::force_host_whir_commit(true);
+            let _clear = HostCommits;
+            assert!(
+                commit_joint_streamed(4, 20, 4, hash, LeafOrder::Coset, never).is_none(),
+                "commits forced off the card"
+            );
+        }
+        if math_cuda::device::backend().is_err() {
+            assert!(
+                commit_joint_streamed(4, 20, 4, hash, LeafOrder::Coset, never).is_none(),
+                "no device"
+            );
+        }
+        assert_eq!(commit_errors(), errors, "no counted error");
+    }
+}
+
 /// Restores [`streamed_joint_leaves`]' previous override when dropped.
 #[doc(hidden)]
 #[must_use = "the override lasts while the guard lives"]
@@ -9689,7 +9778,43 @@ pub(crate) fn joint_block_subtrees(
         placement(leaves),
     )
     .ok()?;
-    nodes_in_place(bytes)
+    nodes_in_place(bytes).map(short_subtrees_for_test)
+}
+
+/// Test only: the card's block subtrees come back one node short
+/// ([`force_short_block_subtrees`]), as from a faulty card.
+#[cfg(feature = "cuda")]
+static SHORT_SUBTREES_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "cuda")]
+fn short_subtrees_for_test(mut nodes: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
+    if SHORT_SUBTREES_FOR_TEST.load(Ordering::Relaxed) {
+        nodes.pop();
+    }
+    nodes
+}
+
+/// Restores [`force_short_block_subtrees`]' previous setting when dropped.
+#[doc(hidden)]
+#[must_use = "the fault lasts while the guard lives"]
+pub struct ShortSubtreesGuard(#[cfg_attr(not(feature = "cuda"), allow(dead_code))] bool);
+
+impl Drop for ShortSubtreesGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        SHORT_SUBTREES_FOR_TEST.store(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Test only, not for production callers: the card's block subtrees (a
+/// tree's and a joint tree's) come back one node short until the guard
+/// drops, as from a card that answered wrongly. For a test that runs alone in
+/// its process.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_short_block_subtrees(on: bool) -> ShortSubtreesGuard {
+    ShortSubtreesGuard(SHORT_SUBTREES_FOR_TEST.swap(on, Ordering::Relaxed))
 }
 
 #[cfg(not(feature = "cuda"))]
