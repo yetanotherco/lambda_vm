@@ -8,7 +8,10 @@
 //!
 //! Under each of the leaf's query checks: V1 on a small chain, and V1 and
 //! lean on the production's chain shape (first fold 6, the automatic 4-ary
-//! cap, coset leaves, enough queries that the lean check's tail rounds run).
+//! cap, coset leaves, enough queries that the lean check's tail rounds run);
+//! and on that shape with one round-0 tree a run (joint leaves, how
+//! production commits a group of two or more), under either query check and
+//! under the WHIR round form.
 
 use crypto::fiat_shamir::p1_transcript::P1Transcript;
 use multilinear::mle::Mle;
@@ -16,7 +19,8 @@ use multilinear::stacked_eval::{Claimed, OodClaims, StackedCommitment, StackedPr
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, WhirFolds,
+    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, Round0Trees,
+    RoundForm, WhirFolds,
 };
 use multilinear::whir_commit::Commitment;
 use multilinear::whir_hash::P1Whir;
@@ -58,13 +62,29 @@ enum Case {
     /// blowup 2, the automatic 4-ary cap, coset leaves — at 96 queries, under
     /// the leaf's query check `LeafQuery`.
     Production(LeafQuery),
+    /// [`Self::Production`] with one round-0 tree a run: a grouped run's
+    /// polynomials share one joint tree. Grouped splits only.
+    OneTree(LeafQuery),
+    /// [`Self::OneTree`] under the WHIR round form, its counts derived for
+    /// the target; V1.
+    OneTreeRounds,
 }
 
-const CASES: [Case; 3] = [
+const CASES: [Case; 6] = [
     Case::Small,
     Case::Production(LeafQuery::V1),
     Case::Production(LeafQuery::Lean),
+    Case::OneTree(LeafQuery::V1),
+    Case::OneTree(LeafQuery::Lean),
+    Case::OneTreeRounds,
 ];
+
+impl Case {
+    /// Whether a grouped run commits one round-0 tree.
+    fn one_tree(self) -> bool {
+        matches!(self, Case::OneTree(_) | Case::OneTreeRounds)
+    }
+}
 
 fn config(case: Case, group: GroupFold) -> ChainConfig {
     match case {
@@ -92,13 +112,38 @@ fn config(case: Case, group: GroupFold) -> ChainConfig {
                 ..ChainFormat::DEFAULT
             },
         },
+        Case::OneTree(query) => {
+            let c = config(Case::Production(query), group);
+            ChainConfig {
+                format: ChainFormat {
+                    round0: Round0Trees::One,
+                    ..c.format
+                },
+                ..c
+            }
+        }
+        Case::OneTreeRounds => {
+            let mut c = config(Case::OneTree(LeafQuery::V1), group)
+                .with_whir_rounds(2, 64, N_STACK)
+                .expect("a tested shrink");
+            let RoundForm::Whir(w) = c.format.rounds else {
+                unreachable!("the round form")
+            };
+            c.num_queries = multilinear::query_count::num_queries(
+                c.log_blowup,
+                w.union_rounds(),
+                w.security_bits(),
+                c.grind.query,
+            );
+            c
+        }
     }
 }
 
 fn query(case: Case) -> LeafQuery {
     match case {
-        Case::Small => LeafQuery::V1,
-        Case::Production(query) => query,
+        Case::Small | Case::OneTreeRounds => LeafQuery::V1,
+        Case::Production(query) | Case::OneTree(query) => query,
     }
 }
 
@@ -148,6 +193,13 @@ fn fixture(case: Case, group: GroupFold) -> Fixture {
 /// stated value, the opening still proved from the true polynomials: the
 /// honest fixture at a zero `delta`.
 fn moved_fixture(case: Case, group: GroupFold, delta: FEE) -> Fixture {
+    fixture_with(case, group, delta, -delta)
+}
+
+/// The group opened with `value_delta` added to column 0's stated value and
+/// `answer_delta` to polynomial 0's answer, the opening proved by the host
+/// from the true polynomials with those claims stated and carried.
+fn fixture_with(case: Case, group: GroupFold, value_delta: FEE, answer_delta: FEE) -> Fixture {
     let cfg = config(case, group);
     let layout = StackedLayout::build(&HEIGHTS, N_STACK).expect("the layout packs");
     assert_eq!(layout.num_polys(), 7, "the stack this test means");
@@ -167,7 +219,7 @@ fn moved_fixture(case: Case, group: GroupFold, delta: FEE) -> Fixture {
         .zip(&points)
         .map(|(c, p)| c.evaluate_in::<E>(p).expect("a column takes its own point"))
         .collect();
-    values[0] += delta;
+    values[0] += value_delta;
     let stacked = StackedCommitment::<F, P1Whir>::commit(layout.clone(), &borrowed, None, &cfg)
         .expect("the group commits");
     let roots = stacked.roots();
@@ -177,7 +229,7 @@ fn moved_fixture(case: Case, group: GroupFold, delta: FEE) -> Fixture {
     let (mut claims, _) =
         multilinear::stacked_eval::ood_claims::<F, E, _>(&layout, &borrowed, None, &z0)
             .expect("the answers");
-    claims.answers[0] = claims.answers[0] - delta;
+    claims.answers[0] += answer_delta;
     let proof = multilinear::stacked_eval::prove_mapped_ood::<F, E, _, P1Whir, _>(
         &stacked,
         &borrowed,
@@ -256,7 +308,8 @@ fn emit_leg(f: &Fixture, leg: Leg) -> LfmProgram {
         *at += 1;
         cell
     };
-    let roots: Vec<Cell> = (0..polys).map(|_| next(&mut b, &mut at)).collect();
+    // One cell a round-0 tree: a polynomial's, or a joint run's.
+    let roots: Vec<Cell> = (0..f.roots.len()).map(|_| next(&mut b, &mut at)).collect();
     let answers: Vec<Ext> = (0..polys).map(|_| next(&mut b, &mut at).as_ext()).collect();
     let points: Vec<Vec<Ext>> = f
         .points
@@ -295,15 +348,21 @@ fn emit_leg(f: &Fixture, leg: Leg) -> LfmProgram {
         .zip(&openings)
         .map(|(chain, (current, next))| chain.wires(current, next))
         .collect();
+    let mut tree = 0;
     let chains: Vec<StackedChainWires<'_>> = runs
         .iter()
         .enumerate()
-        .map(|(i, run)| StackedChainWires {
-            rounds: &rounds[i],
-            roots: &roots[run.clone()],
-            final_value: finals[i],
+        .map(|(i, run)| {
+            let trees = f.shape.run(run.len()).trees_at(0);
+            tree += trees;
+            StackedChainWires {
+                rounds: &rounds[i],
+                roots: &roots[tree - trees..tree],
+                final_value: finals[i],
+            }
         })
         .collect();
+    assert_eq!(tree, roots.len(), "every round-0 tree is a chain's");
     let claimed_at: Vec<&[Ext]> = points.iter().map(Vec::as_slice).collect();
     let mut transcript = WhirTranscript::for_builder(&mut b);
     let gamma = emit_stacked_verify_chains(
@@ -353,8 +412,20 @@ fn fixtures() -> Vec<Fixture> {
     let mut out = Vec::new();
     for case in CASES {
         for group in GROUPS {
+            if case.one_tree() && group == GroupFold::PerPoly {
+                continue;
+            }
             let f = fixture(case, group);
-            if case == Case::Production(LeafQuery::Lean) {
+            if case.one_tree() {
+                assert!(
+                    f.roots.len() < f.layout.num_polys(),
+                    "{case:?}: a joint tree"
+                );
+            }
+            if matches!(
+                case,
+                Case::Production(LeafQuery::Lean) | Case::OneTree(LeafQuery::Lean)
+            ) {
                 let runs = f.shape.chains(f.layout.num_polys());
                 assert!(
                     runs.iter().any(|run| {
@@ -435,6 +506,9 @@ fn a_false_or_traded_answer_has_no_execution() {
 fn an_answer_traded_against_column_zero_has_no_execution() {
     for case in CASES {
         for group in GROUPS {
+            if case.one_tree() && group == GroupFold::PerPoly {
+                continue;
+            }
             let f = moved_fixture(case, group, fee(1234));
             assert_eq!(
                 f.layout.placements()[0].poly,
@@ -449,6 +523,30 @@ fn an_answer_traded_against_column_zero_has_no_execution() {
             assert!(
                 !host,
                 "{case:?} {group:?}: answer 0 traded against column 0, host"
+            );
+        }
+    }
+}
+
+/// ★ A false answer the host prover states and its chain carries — the
+/// opening proved with it, so the chain's claim and weight are the false
+/// answer's — has no execution, as the host refuses it: under every case,
+/// one tree a run included, polynomial 0 lying in a grouped run of four.
+#[test]
+fn a_false_answer_its_chain_carries_has_no_execution() {
+    for case in CASES {
+        for group in GROUPS {
+            if case.one_tree() && group == GroupFold::PerPoly {
+                continue;
+            }
+            let f = fixture_with(case, group, FEE::zero(), FEE::one());
+            assert!(
+                !host_accepts(&f, &f.claims.answers),
+                "{case:?} {group:?}: a false answer its chain carries, host"
+            );
+            assert!(
+                runs(&program(&f), arena(&f, &f.claims.answers)).is_err(),
+                "{case:?} {group:?}: a false answer its chain carries executed"
             );
         }
     }
@@ -489,7 +587,11 @@ fn hash16_rows(program: &LfmProgram) -> usize {
 /// `commit_ood_point_perms`'s, at either split and either query check.
 #[test]
 fn the_answers_cost_what_the_plan_prices() {
-    for f in fixtures() {
+    // A tree a polynomial: the point's sponge absorbs one root a polynomial.
+    for f in fixtures()
+        .into_iter()
+        .filter(|f| f.cfg.format.round0 == Round0Trees::Each)
+    {
         let group = (f.case, f.cfg.format.group);
         let group_of: Vec<usize> = (0..HEIGHTS.len()).collect();
         let entry = SpongeEntry::fresh_for(WrapHash::Poseidon1);

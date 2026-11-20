@@ -1202,6 +1202,7 @@ pub fn verify_block_levels(
 /// `last` verified against the last level's artifacts, and its words claiming
 /// the block. It trusts `plan`, its prepared roots included, so it is not a
 /// public entry: [`verify_block_levels`] derives the plan itself.
+#[cfg(test)]
 pub(crate) fn verify_levels(
     plan: &WhirBlockPlan,
     family: WlfmFamily,

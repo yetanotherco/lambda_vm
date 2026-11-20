@@ -2053,3 +2053,57 @@ fn the_first_groups_level_proves_and_publishes_their_bus_sum() {
     let exec = execute(&open, &closed_arenas, &hasher).expect("executes");
     assert_eq!(exec.public_words.last().expect("a sum").1, sum);
 }
+
+/// ★ No production code builds a weakened [`VerifierChecks`]: outside test
+/// files, the struct is spelled with braces only where it is defined (its
+/// `ALL`), so every verifier a non-test caller reaches runs every check, the
+/// commit-time answers' batching included. Scans the prover's, the STARK
+/// crate's and the multilinear crate's sources.
+///
+/// [`VerifierChecks`]: stark::multilinear_table::batched::VerifierChecks
+#[test]
+fn no_production_code_builds_weakened_verifier_checks() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a source dir") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "tests") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("_tests.rs") || n == "tests.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["src", "../crypto/stark/src", "../crypto/multilinear/src"] {
+        walk(&root.join(dir), &mut files);
+    }
+    assert!(
+        files.len() > 100,
+        "the scan found the sources: {}",
+        files.len()
+    );
+    let mut built = Vec::new();
+    for file in &files {
+        let src = std::fs::read_to_string(file).expect("a source file");
+        for (at, _) in src.match_indices("VerifierChecks {") {
+            let line = src[..at].lines().last().unwrap_or("");
+            if !line.trim_start().starts_with("pub struct")
+                && !line.trim_start().starts_with("impl")
+            {
+                built.push(format!("{}:{}", file.display(), src[..at].lines().count()));
+            }
+        }
+    }
+    assert!(
+        built.is_empty(),
+        "production code builds a VerifierChecks other than ALL: {built:?}"
+    );
+}
