@@ -420,6 +420,83 @@ fn block_subtrees_of_the_wrong_length_fail_the_prove_and_are_not_a_decline() {
     }
 }
 
+/// Restores the ledger's budget when dropped.
+struct Budget(u64);
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        gpu::set_reserve_budget(self.0);
+    }
+}
+
+/// A revived joint tree whose re-encode the card's ledger refuses for real
+/// (the budget cut to what is promised already, after the commit; the coset
+/// openings declined so the re-encode is asked for) falls back to the host:
+/// the prove has the host's bytes and the host re-encodes every tree, with no
+/// test switch on the re-encode itself. What a card out of memory does in
+/// phase B.
+#[test]
+fn a_joint_re_encode_the_ledger_refuses_falls_back_to_the_host() {
+    let _serial = serial();
+    let cfg = config(Round0Trees::One);
+    for stack in [Stack::run_of_three(), Stack::runs_of_four_and_two()] {
+        let label = stack.name;
+        let (host_roots, host_proof) = stack.on_the_host(&cfg);
+        let refs: Vec<&Mle<F>> = stack.columns.iter().collect();
+        let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+        let committed = StackedCommitment::<F, H>::commit(
+            stack.layout.clone(),
+            &borrow(&stack.columns),
+            Some((&store, 0)),
+            &cfg,
+        )
+        .unwrap_or_else(|e| panic!("{label}: commit: {e:?}"));
+        let roots = committed.roots();
+        let retired = committed
+            .retire(TreeDrop::uniform(4), &cfg)
+            .unwrap_or_else(|e| panic!("{label}: retire: {e:?}"));
+        let (host_trees, _, _) = gpu::open_host_reencodes();
+        let reencoded = gpu::coset_fallbacks();
+        let proof = {
+            let _budget = Budget(gpu::set_reserve_budget(gpu::ledger_reserved()));
+            let _decline = gpu::force_coset_decline(gpu::CosetDecline::Openings);
+            let revived = retired
+                .revive::<H, _>(
+                    &borrow(&stack.columns),
+                    Some((&store, ColumnsAt::From(0))),
+                    &cfg,
+                )
+                .unwrap_or_else(|e| panic!("{label}: revive: {e:?}"));
+            prove::<F, Ext, _, H, _>(
+                &revived,
+                &borrow(&stack.columns),
+                Some((&store, 0)),
+                &Claimed::PerColumn(&stack.points),
+                &stack.values,
+                &cfg,
+                &mut sponge(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: the prove under a full ledger: {e:?}"))
+        };
+        let (now_trees, _, _) = gpu::open_host_reencodes();
+        assert!(
+            gpu::coset_fallbacks() > reencoded,
+            "{label}: the card re-encode was asked for"
+        );
+        assert_eq!(
+            now_trees - host_trees,
+            stack.trees(&cfg),
+            "{label}: every tree re-encoded on the host"
+        );
+        assert_eq!(roots, host_roots, "{label}: roots");
+        stack.verify(&roots, &proof, &cfg, label);
+        assert!(
+            bytes(&proof) == bytes(&host_proof),
+            "{label}: the host's bytes"
+        );
+    }
+}
+
 /// The process's resident high-water mark in bytes, after `reset` restarts it
 /// at what is resident now (`/proc/self/clear_refs`, Linux).
 fn resident_peak(reset: bool) -> Option<u64> {
