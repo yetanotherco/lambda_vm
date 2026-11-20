@@ -3251,6 +3251,17 @@ where
 /// Under the upload once, the margin kept free beside a store's plan.
 const UPLOAD_ONCE_MARGIN_BYTES: u64 = 1 << 30;
 
+/// How a group asks for its upload once's store: a test's refusal of its plan,
+/// the margin its plan keeps, a test's refusal by the card, and whether it goes
+/// up narrow ([`BlockCommitted::with_prepared_store_narrow`]).
+#[derive(Clone, Copy, Debug)]
+struct StoreAsk {
+    refused_by_test: bool,
+    margin: u64,
+    card_refuses_by_test: bool,
+    narrow: bool,
+}
+
 /// Under the upload once, `columns` (a retired prepared stack's) put on the
 /// card for its revive and its opening, where the plan says the ledger holds
 /// them and the revive's own promises (the store's bytes,
@@ -3262,16 +3273,19 @@ fn upload_once_store<F>(
     retired: &RetiredStack<F>,
     columns: &[&multilinear::mle::Mle<F>],
     config: &ChainConfig,
-    refused_by_test: bool,
-    margin: u64,
-    card_refuses_by_test: bool,
-    narrow: bool,
+    ask: StoreAsk,
     upload: &mut UploadOnce,
 ) -> Option<multilinear::gpu::ResidentColumns>
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
 {
+    let StoreAsk {
+        refused_by_test,
+        margin,
+        card_refuses_by_test,
+        narrow,
+    } = ask;
     if refused_by_test {
         upload.planned_out = true;
         return None;
@@ -3497,10 +3511,12 @@ where
                     r,
                     p.columns,
                     config,
-                    argued.upload_once_refused,
-                    argued.upload_once_margin,
-                    argued.upload_once_card_refuses,
-                    argued.upload_once_narrow,
+                    StoreAsk {
+                        refused_by_test: argued.upload_once_refused,
+                        margin: argued.upload_once_margin,
+                        card_refuses_by_test: argued.upload_once_card_refuses,
+                        narrow: argued.upload_once_narrow,
+                    },
                     &mut upload,
                 ),
                 _ => None,
