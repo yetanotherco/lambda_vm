@@ -381,6 +381,45 @@ fn a_round0_opening_the_card_cannot_serve_falls_back_to_the_host_with_its_bytes(
     }
 }
 
+/// A card that answers a re-encoded codeword's block subtrees with the wrong
+/// number of nodes (`gpu::force_short_block_subtrees`, as a faulty card) fails
+/// the prove with that error: it is not read as a card that declined, so the
+/// host re-encodes nothing, for a joint tree a run and one tree a polynomial.
+#[test]
+fn block_subtrees_of_the_wrong_length_fail_the_prove_and_are_not_a_decline() {
+    let _serial = serial();
+    for round0 in [Round0Trees::One, Round0Trees::Each] {
+        let cfg = config(round0);
+        let stack = Stack::run_of_three();
+        let label = format!("{}, {round0:?}", stack.name);
+        let (host_trees, host_stacks, _) = gpu::open_host_reencodes();
+        let refused = {
+            let _decline = gpu::force_coset_decline(gpu::CosetDecline::Openings);
+            let _short = gpu::force_short_block_subtrees(true);
+            stack.try_prove(&cfg, Some(4))
+        };
+        match refused {
+            Err(multilinear::Error::DeviceFailed { stage }) => assert!(
+                stage.contains("came back the wrong length"),
+                "{label}: {stage}"
+            ),
+            other => panic!("{label}: the prove gave {:?}", other.map(|_| ())),
+        }
+        let (now_trees, now_stacks, _) = gpu::open_host_reencodes();
+        assert_eq!(
+            (now_trees - host_trees, now_stacks - host_stacks),
+            (0, 0),
+            "{label}: nothing re-encoded on the host"
+        );
+        // And with the fault gone, the same opening proves.
+        let fine = {
+            let _decline = gpu::force_coset_decline(gpu::CosetDecline::Openings);
+            stack.try_prove(&cfg, Some(4))
+        };
+        assert!(fine.is_ok(), "{label}: without the fault: {:?}", fine.err());
+    }
+}
+
 /// The process's resident high-water mark in bytes, after `reset` restarts it
 /// at what is resident now (`/proc/self/clear_refs`, Linux).
 fn resident_peak(reset: bool) -> Option<u64> {

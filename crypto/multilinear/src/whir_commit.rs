@@ -133,6 +133,13 @@ static TOP_DEVICE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static TOP_HOST_FALLBACK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TOP_HOST_FALLBACK_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The card rungs of a round-0 opening held as its stacks that can decline
+/// before the host re-encodes ([`crate::gpu::note_open_host_reencode`]'s
+/// reason).
+const DECLINED_REENCODE: &str = "the card declined the re-encode";
+const DECLINED_SUBTREES: &str = "the card declined the re-encoded codeword's block subtrees";
+const DECLINED_COSETS: &str = "the card declined the re-encoded codeword's queried cosets";
+
 /// `LAMBDA_VM_TOP_PATHS_HOST=1`: a codeword on the card has its kept-top paths
 /// re-hashed on the host, as when the card's re-hash fails (the fallback's
 /// measurement and its gate). Read once.
@@ -141,6 +148,12 @@ fn top_paths_on_host() -> bool {
     *ON.get_or_init(|| {
         std::env::var("LAMBDA_VM_TOP_PATHS_HOST").is_ok_and(|v| !v.is_empty() && v != "0")
     })
+}
+
+/// The card's share of a kept-top paths call of `elapsed` nanoseconds that
+/// spent `on_host` of them re-encoding on the host.
+fn card_nanos(elapsed: u64, on_host: u64) -> u64 {
+    elapsed.saturating_sub(on_host)
 }
 
 /// `(calls, seconds)` of the kept-top paths of codewords on the card, re-hashed
@@ -1116,13 +1129,21 @@ where
         }
         if let Codeword::Source(source) = &self.codeword {
             let started = std::time::Instant::now();
+            let host_before = crate::gpu::open_host_reencode_nanos();
             let paths = if self.others.is_empty() {
                 self.source_top_paths(source, top, indices)
             } else {
                 self.joint_source_top_paths(top, indices)
             };
+            // A host re-encode inside is booked on its own counter
+            // (`gpu::open_host_reencodes`), not as card time. Phase B opens one
+            // group at a time, so the counter's difference is this call's.
+            let on_host = crate::gpu::open_host_reencode_nanos().saturating_sub(host_before);
             TOP_DEVICE_CALLS.fetch_add(1, Relaxed);
-            TOP_DEVICE_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+            TOP_DEVICE_NANOS.fetch_add(
+                card_nanos(started.elapsed().as_nanos() as u64, on_host),
+                Relaxed,
+            );
             return paths;
         }
         let on_device = matches!(self.codeword, Codeword::Device(_));
@@ -1264,30 +1285,39 @@ where
         }
         // The card re-encodes every codeword and re-hashes over them; with no
         // room for that either, the host does it from the stacks read back.
-        // `None` is a card that declined; an error is a real one (a mismatch).
-        let on_card = || -> Option<Result<PathsAndValues<F>, Error>> {
+        // `Err` is a card that declined, naming the rung; an inner error is a
+        // real one (a mismatch).
+        let on_card = || -> Result<Result<PathsAndValues<F>, Error>, &'static str> {
             let devices = stacks
                 .iter()
                 .map(|stack| stack.encode())
-                .collect::<Option<Vec<_>>>()?;
+                .collect::<Option<Vec<_>>>()
+                .ok_or(DECLINED_REENCODE)?;
             let borrowed: Vec<&crate::gpu::DeviceCodeword> = devices.iter().collect();
-            let paths = match self.joint_card_top_paths_over(&borrowed, top, indices)? {
+            let paths = match self
+                .joint_card_top_paths_over(&borrowed, top, indices)
+                .ok_or(DECLINED_SUBTREES)?
+            {
                 Ok(paths) => paths,
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Ok(Err(e)),
             };
             let block = 1usize << self.log_folding;
             let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); wanted.len()];
             for device in &devices {
-                let blocks = device.cosets::<F>(&wanted, self.num_leaves(), block)?;
+                let blocks = device
+                    .cosets::<F>(&wanted, self.num_leaves(), block)
+                    .ok_or(DECLINED_COSETS)?;
                 for (row, b) in values.iter_mut().zip(blocks) {
                     row.extend(b);
                 }
             }
-            Some(Ok((paths, values)))
+            Ok(Ok((paths, values)))
         };
         let (paths, values) = match on_card() {
-            Some(done) => done?,
-            None => self.host_reencoded_top_paths(&stacks, top, indices, &wanted)?,
+            Ok(done) => done?,
+            Err(declined) => {
+                self.host_reencoded_top_paths(&stacks, top, indices, &wanted, declined)?
+            }
         };
         sources[0].keep(wanted.into_iter().zip(values).collect());
         Ok(paths)
@@ -1306,13 +1336,15 @@ where
     /// the twiddles at a time (≈ 4 GiB at a `2^27` stack, blowup 2), since each
     /// stack's opened blocks are kept and its codeword dropped before the next
     /// is encoded. A host out of memory kills the process; it is not refused.
-    /// Counted and printed ([`crate::gpu::note_open_host_reencode`]).
+    /// Counted and printed with the card rung that declined, `declined`
+    /// ([`crate::gpu::note_open_host_reencode`]).
     fn host_reencoded_top_paths(
         &self,
         stacks: &[&crate::gpu::CosetSource],
         top: &TreeTop,
         indices: &[usize],
         wanted: &[usize],
+        declined: &'static str,
     ) -> Result<PathsAndValues<F>, Error> {
         if stacks.len() != self.blocks() {
             return Err(Error::JointTreeWidth {
@@ -1345,6 +1377,7 @@ where
             stacks.len(),
             encoder.shape(),
             started.elapsed().as_secs_f64(),
+            declined,
         );
         Ok((paths, values))
     }
@@ -1532,19 +1565,25 @@ where
         }
         // The card re-encodes the codeword; with no room for that either, the
         // host does it from the stack read back ([`Self::host_reencoded_top_paths`]).
-        let on_card = || -> Option<Result<PathsAndValues<F>, Error>> {
-            let device = source.source.encode()?;
-            let paths = match self.card_top_paths_over(&device, top, indices)? {
+        let on_card = || -> Result<Result<PathsAndValues<F>, Error>, &'static str> {
+            let device = source.source.encode().ok_or(DECLINED_REENCODE)?;
+            let paths = match self
+                .card_top_paths_over(&device, top, indices)
+                .ok_or(DECLINED_SUBTREES)?
+            {
                 Ok(paths) => paths,
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Ok(Err(e)),
             };
-            let values =
-                device.cosets::<F>(&wanted, self.num_leaves(), 1usize << self.log_folding)?;
-            Some(Ok((paths, values)))
+            let values = device
+                .cosets::<F>(&wanted, self.num_leaves(), 1usize << self.log_folding)
+                .ok_or(DECLINED_COSETS)?;
+            Ok(Ok((paths, values)))
         };
         let (paths, values) = match on_card() {
-            Some(done) => done?,
-            None => self.host_reencoded_top_paths(&[&source.source], top, indices, &wanted)?,
+            Ok(done) => done?,
+            Err(declined) => {
+                self.host_reencoded_top_paths(&[&source.source], top, indices, &wanted, declined)?
+            }
         };
         source.keep(wanted.into_iter().zip(values).collect());
         Ok(paths)
@@ -2315,6 +2354,15 @@ mod tests {
         let domain = Domain::<F>::new(num_vars + log_blowup).unwrap();
         let cw = encode(&monomial_coefficients(&f), &domain).unwrap();
         (cw, domain)
+    }
+
+    /// A kept-top paths call that re-encoded on the host books only the rest
+    /// of its time as the card's: the host's seconds are on their own counter.
+    #[test]
+    fn a_host_reencode_is_not_booked_as_card_time() {
+        assert_eq!(super::card_nanos(10_000, 7_000), 3_000);
+        assert_eq!(super::card_nanos(10_000, 0), 10_000);
+        assert_eq!(super::card_nanos(5_000, 9_000), 0);
     }
 
     /// A joint commitment streamed into its leaves keeps no codeword: every
