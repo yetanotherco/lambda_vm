@@ -13,6 +13,24 @@ using goldilocks::add;
 using goldilocks::sub;
 using goldilocks::mul;
 
+/// The lift's permutation and the NTT's, composed — which turns out to be
+/// neither of them.
+///
+/// The lift reverses a coefficient's index over `log_evals` bits and the NTT
+/// wants its input reversed over `log_n = log_evals + log_blowup`. Reversing
+/// twice around the zero padding leaves coefficient `m` at `m << log_blowup`
+/// and a zero at every other index: the two passes over the whole codeword,
+/// each of them a scattered read, are one pass that also writes the padding.
+extern "C" __global__ void lift_spread(const uint64_t *__restrict__ coeffs,
+                                       uint64_t n,
+                                       uint32_t log_blowup,
+                                       uint64_t *__restrict__ out) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    uint64_t mask = ((uint64_t)1 << log_blowup) - 1;
+    out[j] = (j & mask) == 0 ? coeffs[j >> log_blowup] : 0;
+}
+
 /// Reverse the low `log_n` bits of each index and swap x[i] ↔ x[rev(i)].
 /// One thread per index; guarded by `tid < rev` to avoid double-swap.
 extern "C" __global__ void bit_reverse_permute(uint64_t *x,
@@ -28,6 +46,212 @@ extern "C" __global__ void bit_reverse_permute(uint64_t *x,
         x[tid] = x[rev];
         x[rev] = tmp;
     }
+}
+
+/// One level of the Möbius transform that turns a multilinear's hypercube
+/// evaluations into its monomial coefficients: every index whose `stride` bit
+/// is set loses its partner below. `n/2` threads; the level's blocks are
+/// independent, so nothing crosses a block boundary.
+extern "C" __global__ void mobius_level(uint64_t *x,
+                                        uint64_t half,
+                                        uint64_t stride) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= half) return;
+
+    // Spread `tid` over the indices that have the stride bit set: the low
+    // `log2(stride)` bits stay, the rest move up one.
+    uint64_t low = tid & (stride - 1);
+    uint64_t high = tid - low;
+    uint64_t i = (high << 1) | stride | low;
+    x[i] = sub(x[i], x[i ^ stride]);
+}
+
+/// Columns a Mobius tile spans: one warp, so the load and the store coalesce.
+#define MOBIUS_TILE_COLS 32
+
+/// The first `k_levels` Mobius levels, fused through shared memory.
+///
+/// Levels below eight move only the low eight bits of an index, so a block of
+/// 256 consecutive elements already holds both sides of every pair it has to
+/// subtract — no remap, and the load and the store are contiguous.
+extern "C" __global__ void mobius_low_levels(uint64_t *x, uint32_t k_levels) {
+    __shared__ uint64_t tile[256];
+    uint64_t base = (uint64_t)blockIdx.x * 256;
+    tile[threadIdx.x] = x[base + threadIdx.x];
+    __syncthreads();
+
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        uint32_t half = 1u << l;
+        // Only the element with the level's bit set is written; the other is
+        // what it subtracts.
+        if (threadIdx.x & half) {
+            tile[threadIdx.x] = sub(tile[threadIdx.x], tile[threadIdx.x ^ half]);
+        }
+        __syncthreads();
+    }
+
+    x[base + threadIdx.x] = tile[threadIdx.x];
+}
+
+/// `k_levels` Mobius levels from `base`, fused through shared memory.
+///
+/// The elements that interact across levels `base .. base + k_levels - 1` are
+/// exactly those differing only in the middle `k_levels` bits of their index:
+/// write `i = q*2^(base+k) + r*2^base + c` and the levels move `r` while `q`
+/// and `c` stay put. A block takes one `q`, a warp's worth of consecutive `c`,
+/// and every `r` — so `threadIdx.x` walks what is contiguous in memory and
+/// `threadIdx.y` walks the stride the subtractions work on. Gathering along
+/// the stride instead loses more to uncoalesced traffic than the fused passes
+/// save, which is what the NTT's tile is shaped this way for.
+///
+/// Requires `2^base >= MOBIUS_TILE_COLS`; the levels below that are
+/// [`mobius_low_levels`].
+extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_levels) {
+    // rows x (MOBIUS_TILE_COLS + 1): the odd stride keeps a column off one bank.
+    extern __shared__ uint64_t tile[];
+    const uint32_t cols = MOBIUS_TILE_COLS;
+    const uint32_t pitch = cols + 1;
+
+    uint64_t low = (uint64_t)1 << base;
+    uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
+    // The block's `q`: grid.z carries the multiples of grid.y that grid.y's
+    // 65,535 cannot (see `ntt::split_grid_y`).
+    uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
+    uint64_t i = q * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
+
+    tile[threadIdx.y * pitch + threadIdx.x] = x[i];
+    __syncthreads();
+
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        uint32_t half = 1u << l;
+        if (threadIdx.y & half) {
+            uint32_t r1 = threadIdx.y;
+            uint32_t r0 = r1 ^ half;
+            tile[r1 * pitch + threadIdx.x] =
+                sub(tile[r1 * pitch + threadIdx.x], tile[r0 * pitch + threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
+    x[i] = tile[threadIdx.y * pitch + threadIdx.x];
+}
+
+// ---------------------------------------------------------------------------
+// ★ The Möbius transform in three passes instead of five (the WHIR encoding's
+// default from 2^11; `src/whir.rs` `mobius_wide`). Each element
+// takes exactly the operations, in exactly the level order, that
+// `mobius_low_levels` / `mobius_tile` give it — the element with the level's
+// bit set loses its partner — so the words are theirs bit for bit. Two kernels:
+//   mobius_wide_low   the first `k_levels <= 11` levels over contiguous tiles
+//                     of 2^11 elements, 1,024 threads; with `parts` it GATHERS
+//                     the stack from its parts on the way in (zero where no
+//                     part covers), so the stack copy and its memset never run.
+//   mobius_wide_tile  `k_levels <= 8` strided levels from `base` over a tile of
+//                     2^k rows × 32 columns, each of the 1,024 threads holding
+//                     2^k / 32 rows (dynamic shared memory up to 66 KiB); with
+//                     `parts` it gathers the stack the same way (the fused
+//                     encoding, whose low levels run in the NTT's first
+//                     pass, starts here).
+// ---------------------------------------------------------------------------
+
+#define MOBIUS_WIDE_LOG 11
+
+/// The stack's word at `e`: the part covering it, or zero. `parts` is the
+/// table `(offset, len, src)` per part, sorted by offset, not overlapping;
+/// `[p0, p1)` are the parts that meet this tile (`p0 < p1`).
+__device__ __forceinline__ uint64_t mobius_gather(const uint64_t *parts, uint32_t p0, uint32_t p1,
+                                                  uint64_t e) {
+    uint32_t lo = p0, hi = p1;  // the last part with offset <= e, else p0
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (parts[3 * mid] <= e) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const uint64_t off = parts[3 * lo], len = parts[3 * lo + 1];
+    if (e < off || e >= off + len) return 0;
+    const uint64_t *src = reinterpret_cast<const uint64_t *>(parts[3 * lo + 2]);
+    return src[e - off];
+}
+
+extern "C" __global__ void mobius_wide_low(uint64_t *x, const uint64_t *parts, uint32_t n_parts,
+                                           uint32_t k_levels) {
+    __shared__ uint64_t tile[1 << MOBIUS_WIDE_LOG];
+    __shared__ uint32_t span[2];
+    const uint32_t n = 1u << MOBIUS_WIDE_LOG;
+    const uint64_t base = (uint64_t)blockIdx.x << MOBIUS_WIDE_LOG;
+    if (parts != nullptr) {
+        if (threadIdx.x == 0) {
+            // The first part that ends after the tile's start, then every part
+            // that starts before its end.
+            uint32_t lo = 0, hi = n_parts;
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if (parts[3 * mid] + parts[3 * mid + 1] <= base) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            uint32_t end = lo;
+            while (end < n_parts && parts[3 * end] < base + n) ++end;
+            span[0] = lo;
+            span[1] = end;
+        }
+        __syncthreads();
+        const uint32_t p0 = span[0], p1 = span[1];
+        for (uint32_t j = threadIdx.x; j < n; j += blockDim.x)
+            tile[j] = (p0 < p1) ? mobius_gather(parts, p0, p1, base + j) : 0;
+    } else {
+        for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) tile[j] = x[base + j];
+    }
+    __syncthreads();
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        const uint32_t half = 1u << l;
+        for (uint32_t t = threadIdx.x; t < n / 2; t += blockDim.x) {
+            const uint32_t i1 = ((t >> l) << (l + 1)) | half | (t & (half - 1u));
+            tile[i1] = sub(tile[i1], tile[i1 ^ half]);
+        }
+        __syncthreads();
+    }
+    for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) x[base + j] = tile[j];
+}
+
+extern "C" __global__ void mobius_wide_tile(uint64_t *x, uint64_t base, uint32_t k_levels,
+                                            const uint64_t *parts, uint32_t n_parts) {
+    extern __shared__ uint64_t tile[];
+    const uint32_t cols = MOBIUS_TILE_COLS;
+    const uint32_t pitch = cols + 1;
+    const uint32_t rows = 1u << k_levels;
+    const uint64_t low = (uint64_t)1 << base;
+    const uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
+    const uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
+    const uint64_t i0 = q * (low << k_levels) + c;
+    if (parts != nullptr) {
+        // Each element's part by a search of the whole table (zero where none
+        // covers it, and for an empty table).
+        for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+            tile[r * pitch + threadIdx.x] =
+                n_parts ? mobius_gather(parts, 0, n_parts, i0 + r * low) : 0;
+    } else {
+        for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+            tile[r * pitch + threadIdx.x] = x[i0 + r * low];
+    }
+    __syncthreads();
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        const uint32_t half = 1u << l;
+        for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y) {
+            if (r & half) {
+                tile[r * pitch + threadIdx.x] =
+                    sub(tile[r * pitch + threadIdx.x], tile[(r ^ half) * pitch + threadIdx.x]);
+            }
+        }
+        __syncthreads();
+    }
+    for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+        x[i0 + r * low] = tile[r * pitch + threadIdx.x];
 }
 
 /// Pointwise multiply: x[i] *= w[i]. Used for coset scaling (w = g^i weights).
@@ -227,6 +451,74 @@ extern "C" __global__ void ntt_dit_level(uint64_t *x,
 /// before the first kernel launch).
 ///
 /// Assumes `n` is a multiple of 256, i.e. `log_n >= 8`.
+/// Columns a tile spans: one warp, so the load and the store are coalesced.
+#define NTT_TILE_COLS 32
+
+/// `k_levels` DIT levels from `base`, fused through shared memory.
+///
+/// The elements that interact across levels `base .. base + k_levels - 1` are
+/// exactly those differing only in the middle `k_levels` bits of their index:
+/// write `i = q·2^(base+k) + r·2^base + c` and the levels move `r` while `q`
+/// and `c` stay put. So a block takes one `q`, a warp's worth of *consecutive*
+/// `c`, and every `r`.
+///
+/// That last part is the whole point. The older fused path at `base > 0`
+/// gathered its tile along the stride — consecutive threads a group apart —
+/// and lost more to uncoalesced traffic than it saved in passes. Here
+/// `threadIdx.x` walks `c`, which is contiguous in memory, and the stride is
+/// `threadIdx.y`, which is the dimension the butterflies work on.
+///
+/// Requires `2^base >= NTT_TILE_COLS`; the low levels are the fused
+/// `ntt_dit_8_levels`, which is already coalesced at `base = 0`.
+extern "C" __global__ void ntt_dit_tile(uint64_t *x,
+                                        const uint64_t *tw,
+                                        uint64_t n,
+                                        uint64_t log_n,
+                                        uint64_t base,
+                                        uint32_t k_levels) {
+    // rows × (NTT_TILE_COLS + 1): the odd stride keeps a column off one bank.
+    extern __shared__ uint64_t tile[];
+    const uint32_t cols = NTT_TILE_COLS;
+    const uint32_t rows = 1u << k_levels;
+    const uint32_t pitch = cols + 1;
+
+    uint64_t low = (uint64_t)1 << base;
+    uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
+    // The block's `q`: grid.z carries the multiples of grid.y that grid.y's
+    // 65,535 cannot (see `ntt::split_grid_y`).
+    uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
+    uint64_t i = q * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
+
+    tile[threadIdx.y * pitch + threadIdx.x] = x[i];
+    __syncthreads();
+
+    // Half the rows hold a butterfly's lower element at each level, the same
+    // way the 256-element kernel uses half its threads.
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        if (threadIdx.y < (rows >> 1)) {
+            uint32_t half = 1u << l;
+            uint32_t grp = threadIdx.y >> l;
+            uint32_t pos = threadIdx.y & (half - 1);
+            uint32_t r0 = (grp << (l + 1)) + pos;
+            uint32_t r1 = r0 + half;
+
+            // The twiddle index is the element's low `base + l` bits, which is
+            // `pos` in the middle bits and `c` in the low ones — the same
+            // `k << (log_n - level - 1)` the per-level kernel uses.
+            uint64_t k_index = (uint64_t)pos * low + c;
+            uint64_t w = tw[k_index << (log_n - base - l - 1)];
+
+            uint64_t u = tile[r0 * pitch + threadIdx.x];
+            uint64_t v = mul(w, tile[r1 * pitch + threadIdx.x]);
+            tile[r0 * pitch + threadIdx.x] = add(u, v);
+            tile[r1 * pitch + threadIdx.x] = sub(u, v);
+        }
+        __syncthreads();
+    }
+
+    x[i] = tile[threadIdx.y * pitch + threadIdx.x];
+}
+
 extern "C" __global__ void ntt_dit_8_levels(uint64_t *x,
                                             const uint64_t *tw,
                                             uint64_t n,

@@ -20,6 +20,7 @@ fn mu_is_bit_constrained() {
         state_addr: 0x1000,
         input: [0x0102030405060708u64; 25],
         output: [0u64; 25],
+        sponge: None,
     };
     let honest = generate_keccak_trace(std::slice::from_ref(&op));
     let air = busless_air(cols::NUM_COLUMNS, KeccakConstraints);

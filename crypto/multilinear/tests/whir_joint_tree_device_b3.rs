@@ -1,0 +1,642 @@
+//! One round-0 tree a grouped run (`Round0Trees::One`) under standard 7-round
+//! BLAKE3 (`Blake3Whir`) on the card: the joint tree committed in one leaf
+//! launch over the run's codewords, opened whole, retired and revived over
+//! its stacks, and re-encoded when the stack path is off — every path the
+//! bytes of the same group proved on the host alone — and at the production
+//! block's shape, the card's root is the verifier's host commit's.
+//!
+//! ```text
+//! cargo test --release -p multilinear --features cuda,parallel --test whir_joint_tree_device_b3 -- --test-threads=1
+//! ```
+//!
+//! Needs a GPU. The tests flip process-wide knobs, so they run one at a time.
+#![cfg(feature = "cuda")]
+
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use crypto::merkle_tree::cap::CapPolicy;
+use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+use math::field::goldilocks::GoldilocksField as F;
+use multilinear::gpu;
+use multilinear::mle::Mle;
+use multilinear::stacked_eval::{
+    Claimed, ColumnsAt, StackedCommitment, StackedProof, prove, round0_trees, verify,
+};
+use multilinear::stacking::{StackedLayout, borrow};
+use multilinear::whir::Domain;
+use multilinear::whir_chain::{
+    ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, Round0Trees,
+    RoundOpenings, WhirFolds,
+};
+use multilinear::whir_commit::TreeDrop;
+use multilinear::whir_hash::{Blake3Whir, WhirHash};
+
+type H = Blake3Whir;
+type FE = FieldElement<F>;
+type EE = FieldElement<Ext>;
+
+fn sponge() -> <H as WhirHash>::Sponge {
+    let mut t = H::sponge();
+    t.append_bytes(b"whir-joint-tree-device-b3");
+    t
+}
+
+/// First6 then uniform4, one chain and one round-0 tree per run of up to
+/// four, the coset order, no grind (its nonce is not reproducible across two
+/// searches).
+fn config(round0: Round0Trees) -> ChainConfig {
+    ChainConfig {
+        log_blowup: 2,
+        log_folding: 4,
+        num_queries: 33,
+        grind: GrindBits::default(),
+        format: ChainFormat {
+            folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            arity4_cap: CapPolicy::Auto,
+            group: GroupFold::Indexed,
+            leaves: LeafOrder::Coset,
+            round0,
+            ..ChainFormat::DEFAULT
+        },
+    }
+}
+
+fn column(num_vars: usize, seed: u64) -> Mle<F> {
+    Mle::new(
+        (0..(1u64 << num_vars))
+            .map(|i| {
+                FE::from(
+                    i.wrapping_add(seed)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(17)
+                        >> 11,
+                )
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn bytes(proof: &StackedProof<F, Ext>) -> Vec<u8> {
+    rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+        .unwrap()
+        .to_vec()
+}
+
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The roots and the proof.
+type Proved = (Vec<[u8; 32]>, StackedProof<F, Ext>);
+
+struct Stack {
+    name: &'static str,
+    layout: StackedLayout,
+    columns: Vec<Mle<F>>,
+    points: Vec<Vec<EE>>,
+    values: Vec<EE>,
+}
+
+impl Stack {
+    fn new(name: &'static str, heights: &[usize], n_stack: usize) -> Self {
+        let columns: Vec<Mle<F>> = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| column(h, 41 + 5 * i as u64))
+            .collect();
+        let points: Vec<Vec<EE>> = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| {
+                (0..h)
+                    .map(|j| EE::from(7 + 11 * i as u64 + 3 * j as u64))
+                    .collect()
+            })
+            .collect();
+        let values = columns
+            .iter()
+            .zip(&points)
+            .map(|(c, p)| c.evaluate_in(p).unwrap())
+            .collect();
+        let layout = StackedLayout::build(heights, n_stack).unwrap();
+        Self {
+            name,
+            layout,
+            columns,
+            points,
+            values,
+        }
+    }
+
+    /// One run of three polynomials over `2^18`: one joint tree, 1,536-byte
+    /// leaves.
+    fn run_of_three() -> Self {
+        let stack = Self::new("a run of three", &[18, 17, 17, 16, 15], 18);
+        assert_eq!(stack.layout.num_polys(), 3, "one run of three");
+        stack
+    }
+
+    /// Six polynomials over `2^18`: a run of four (2,048-byte leaves) and a
+    /// run of two (1,024 bytes).
+    fn runs_of_four_and_two() -> Self {
+        let stack = Self::new("runs [4, 2]", &[18; 6], 18);
+        assert_eq!(stack.layout.num_polys(), 6, "six polynomials");
+        stack
+    }
+
+    /// Five polynomials: a run of four and a polynomial alone (its own tree).
+    fn runs_of_four_and_one() -> Self {
+        let stack = Self::new("runs [4, 1]", &[18; 5], 18);
+        assert_eq!(stack.layout.num_polys(), 5, "five polynomials");
+        stack
+    }
+
+    fn trees(&self, cfg: &ChainConfig) -> u64 {
+        round0_trees(self.layout.num_polys(), cfg).len() as u64
+    }
+
+    fn try_prove(
+        &self,
+        cfg: &ChainConfig,
+        drop: Option<usize>,
+    ) -> Result<Proved, multilinear::Error> {
+        let refs: Vec<&Mle<F>> = self.columns.iter().collect();
+        let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+        let committed = StackedCommitment::<F, H>::commit(
+            self.layout.clone(),
+            &borrow(&self.columns),
+            Some((&store, 0)),
+            cfg,
+        )?;
+        let roots = committed.roots();
+        let stacked = match drop {
+            None => committed,
+            Some(drop) => committed
+                .retire(TreeDrop::uniform(drop), cfg)?
+                .revive::<H, _>(
+                    &borrow(&self.columns),
+                    Some((&store, ColumnsAt::From(0))),
+                    cfg,
+                )?,
+        };
+        let proof = prove::<F, Ext, _, H, _>(
+            &stacked,
+            &borrow(&self.columns),
+            Some((&store, 0)),
+            &Claimed::PerColumn(&self.points),
+            &self.values,
+            cfg,
+            &mut sponge(),
+        )?;
+        Ok((roots, proof))
+    }
+
+    fn verify(
+        &self,
+        roots: &[[u8; 32]],
+        proof: &StackedProof<F, Ext>,
+        cfg: &ChainConfig,
+        label: &str,
+    ) {
+        let domain = Domain::<F>::new(self.layout.n_stack() + cfg.log_blowup).unwrap();
+        verify::<F, Ext, _, H>(
+            proof,
+            &self.layout,
+            roots,
+            &Claimed::PerColumn(&self.points),
+            &self.values,
+            &domain,
+            cfg,
+            &mut sponge(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: the verifier refused: {e:?}"));
+    }
+
+    /// The same group proved on the host alone.
+    fn on_the_host(&self, cfg: &ChainConfig) -> Proved {
+        gpu::force_host_whir_commit(true);
+        gpu::force_shared_open_declined(true);
+        let host = self.try_prove(cfg, None);
+        gpu::force_shared_open_declined(false);
+        gpu::force_host_whir_commit(false);
+        host.unwrap_or_else(|e| panic!("{}: the host run: {e:?}", self.name))
+    }
+}
+
+/// ★ A joint BLAKE3 run committed on the card — one leaf launch over its
+/// codewords — has the host's roots with no host commit, and proves the
+/// host's bytes opened whole, retired and revived over its stacks at two kept
+/// depths (one stack opening a tree, nothing re-encoded), and re-encoded with
+/// the stack path off.
+#[test]
+fn a_blake3_joint_run_on_the_card_proves_the_hosts_bytes() {
+    let _serial = serial();
+    let cfg = config(Round0Trees::One);
+    for stack in [
+        Stack::run_of_three(),
+        Stack::runs_of_four_and_two(),
+        Stack::runs_of_four_and_one(),
+    ] {
+        let (host_roots, host_proof) = stack.on_the_host(&cfg);
+        stack.verify(&host_roots, &host_proof, &cfg, stack.name);
+        assert_eq!(
+            host_roots.len() as u64,
+            stack.trees(&cfg),
+            "{}: one root a tree",
+            stack.name
+        );
+        assert!(
+            host_proof
+                .polys
+                .iter()
+                .any(|chain| matches!(chain.rounds[0].openings, RoundOpenings::BaseJoint(_))),
+            "{}: a joint round 0",
+            stack.name
+        );
+
+        let fallbacks = gpu::host_fallbacks();
+        let waits = gpu::serial_encode_waits();
+        let (roots, whole) = stack
+            .try_prove(&cfg, None)
+            .unwrap_or_else(|e| panic!("{}, whole: {e:?}", stack.name));
+        // A group's encodes one at a time (the default): each waited for.
+        assert_eq!(
+            gpu::serial_encode_waits() > waits,
+            gpu::serial_encodes(),
+            "{}: the encodes waited for one at a time",
+            stack.name
+        );
+        assert_eq!(
+            gpu::host_fallbacks(),
+            fallbacks,
+            "{}: no host commit",
+            stack.name
+        );
+        assert_eq!(roots, host_roots, "{}, whole: roots", stack.name);
+        assert!(
+            bytes(&whole) == bytes(&host_proof),
+            "{}, whole: the host's bytes",
+            stack.name
+        );
+
+        for drop in [2, 4] {
+            let label = format!("{}, revived at drop {drop}", stack.name);
+            let from_stack = gpu::coset_openings();
+            let reencoded = gpu::coset_fallbacks();
+            let (roots, proof) = stack
+                .try_prove(&cfg, Some(drop))
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            assert_eq!(
+                gpu::coset_openings() - from_stack,
+                stack.trees(&cfg),
+                "{label}: one stack opening a tree"
+            );
+            assert_eq!(
+                gpu::coset_fallbacks(),
+                reencoded,
+                "{label}: nothing re-encoded"
+            );
+            assert_eq!(roots, host_roots, "{label}: roots");
+            stack.verify(&roots, &proof, &cfg, &label);
+            assert!(
+                bytes(&proof) == bytes(&host_proof),
+                "{label}: the host's bytes"
+            );
+        }
+
+        let label = format!("{}, revived at drop 4, the stack path off", stack.name);
+        gpu::force_coset_openings(Some(false));
+        let from_stack = gpu::coset_openings();
+        let reencoded = stack.try_prove(&cfg, Some(4));
+        let moved = gpu::coset_openings() - from_stack;
+        gpu::force_coset_openings(None);
+        let (_, reencoded) = reencoded.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        assert_eq!(moved, 0, "{label}: no tree from its stack");
+        assert!(
+            bytes(&reencoded) == bytes(&host_proof),
+            "{label}: the host's bytes"
+        );
+    }
+}
+
+/// A round-0 opening the card cannot serve from its stacks re-encodes on the
+/// card; one it can serve neither from its stacks nor by a re-encode — no
+/// room for either, as under card-memory pressure — falls back to the host:
+/// each stack read back, its codeword encoded there and the queried blocks
+/// re-hashed against the kept top. Either way the proof is the host's bytes,
+/// for a joint tree a run and for one tree a polynomial, and each rung is
+/// counted exactly: one card re-encode a stack, or one host re-encode a tree
+/// over all its stacks, and never a host commit.
+#[test]
+fn a_round0_opening_the_card_cannot_serve_falls_back_to_the_host_with_its_bytes() {
+    let _serial = serial();
+    for round0 in [Round0Trees::One, Round0Trees::Each] {
+        let cfg = config(round0);
+        for stack in [Stack::run_of_three(), Stack::runs_of_four_and_two()] {
+            let (host_roots, host_proof) = stack.on_the_host(&cfg);
+            let trees = stack.trees(&cfg);
+            let polys = stack.layout.num_polys() as u64;
+            for mode in [gpu::CosetDecline::Openings, gpu::CosetDecline::Everything] {
+                let label = format!(
+                    "{}, {round0:?}, revived at drop 4, the card declining {mode:?}",
+                    stack.name
+                );
+                let fallbacks = gpu::host_fallbacks();
+                let reencoded = gpu::coset_fallbacks();
+                let (host_trees, host_stacks, _) = gpu::open_host_reencodes();
+                let declined = {
+                    let _decline = gpu::force_coset_decline(mode);
+                    stack.try_prove(&cfg, Some(4))
+                };
+                let (roots, proof) = declined.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                let (now_trees, now_stacks, _) = gpu::open_host_reencodes();
+                assert_eq!(gpu::host_fallbacks(), fallbacks, "{label}: no host commit");
+                let (card, host) = match mode {
+                    gpu::CosetDecline::Openings => (polys, (0, 0)),
+                    _ => (0, (trees, polys)),
+                };
+                assert_eq!(
+                    gpu::coset_fallbacks() - reencoded,
+                    card,
+                    "{label}: card re-encodes, one a stack"
+                );
+                assert_eq!(
+                    (now_trees - host_trees, now_stacks - host_stacks),
+                    host,
+                    "{label}: host re-encodes (trees, stacks)"
+                );
+                assert_eq!(roots, host_roots, "{label}: roots");
+                stack.verify(&roots, &proof, &cfg, &label);
+                assert!(
+                    bytes(&proof) == bytes(&host_proof),
+                    "{label}: the host's bytes"
+                );
+            }
+        }
+    }
+}
+
+/// A card that answers a re-encoded codeword's block subtrees with the wrong
+/// number of nodes (`gpu::force_short_block_subtrees`, as a faulty card) fails
+/// the prove with that error: it is not read as a card that declined, so the
+/// host re-encodes nothing, for a joint tree a run and one tree a polynomial.
+#[test]
+fn block_subtrees_of_the_wrong_length_fail_the_prove_and_are_not_a_decline() {
+    let _serial = serial();
+    for round0 in [Round0Trees::One, Round0Trees::Each] {
+        let cfg = config(round0);
+        let stack = Stack::run_of_three();
+        let label = format!("{}, {round0:?}", stack.name);
+        let (host_trees, host_stacks, _) = gpu::open_host_reencodes();
+        let refused = {
+            let _decline = gpu::force_coset_decline(gpu::CosetDecline::Openings);
+            let _short = gpu::force_short_block_subtrees(true);
+            stack.try_prove(&cfg, Some(4))
+        };
+        match refused {
+            Err(multilinear::Error::DeviceFailed { stage }) => assert!(
+                stage.contains("came back the wrong length"),
+                "{label}: {stage}"
+            ),
+            other => panic!("{label}: the prove gave {:?}", other.map(|_| ())),
+        }
+        let (now_trees, now_stacks, _) = gpu::open_host_reencodes();
+        assert_eq!(
+            (now_trees - host_trees, now_stacks - host_stacks),
+            (0, 0),
+            "{label}: nothing re-encoded on the host"
+        );
+        // And with the fault gone, the same opening proves.
+        let fine = {
+            let _decline = gpu::force_coset_decline(gpu::CosetDecline::Openings);
+            stack.try_prove(&cfg, Some(4))
+        };
+        assert!(fine.is_ok(), "{label}: without the fault: {:?}", fine.err());
+    }
+}
+
+/// Restores the ledger's budget when dropped.
+struct Budget(u64);
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        gpu::set_reserve_budget(self.0);
+    }
+}
+
+/// A revived joint tree whose re-encode the card's ledger refuses for real
+/// (the budget cut to what is promised already, after the commit; the coset
+/// openings declined so the re-encode is asked for) falls back to the host:
+/// the prove has the host's bytes and the host re-encodes every tree, with no
+/// test switch on the re-encode itself. What a card out of memory does in
+/// phase B.
+#[test]
+fn a_joint_re_encode_the_ledger_refuses_falls_back_to_the_host() {
+    let _serial = serial();
+    let cfg = config(Round0Trees::One);
+    for stack in [Stack::run_of_three(), Stack::runs_of_four_and_two()] {
+        let label = stack.name;
+        let (host_roots, host_proof) = stack.on_the_host(&cfg);
+        let refs: Vec<&Mle<F>> = stack.columns.iter().collect();
+        let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+        let committed = StackedCommitment::<F, H>::commit(
+            stack.layout.clone(),
+            &borrow(&stack.columns),
+            Some((&store, 0)),
+            &cfg,
+        )
+        .unwrap_or_else(|e| panic!("{label}: commit: {e:?}"));
+        let roots = committed.roots();
+        let retired = committed
+            .retire(TreeDrop::uniform(4), &cfg)
+            .unwrap_or_else(|e| panic!("{label}: retire: {e:?}"));
+        let (host_trees, _, _) = gpu::open_host_reencodes();
+        let reencoded = gpu::coset_fallbacks();
+        let proof = {
+            let _budget = Budget(gpu::set_reserve_budget(gpu::ledger_reserved()));
+            let _decline = gpu::force_coset_decline(gpu::CosetDecline::Openings);
+            let revived = retired
+                .revive::<H, _>(
+                    &borrow(&stack.columns),
+                    Some((&store, ColumnsAt::From(0))),
+                    &cfg,
+                )
+                .unwrap_or_else(|e| panic!("{label}: revive: {e:?}"));
+            prove::<F, Ext, _, H, _>(
+                &revived,
+                &borrow(&stack.columns),
+                Some((&store, 0)),
+                &Claimed::PerColumn(&stack.points),
+                &stack.values,
+                &cfg,
+                &mut sponge(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: the prove under a full ledger: {e:?}"))
+        };
+        let (now_trees, _, _) = gpu::open_host_reencodes();
+        assert!(
+            gpu::coset_fallbacks() > reencoded,
+            "{label}: the card re-encode was asked for"
+        );
+        assert_eq!(
+            now_trees - host_trees,
+            stack.trees(&cfg),
+            "{label}: every tree re-encoded on the host"
+        );
+        assert_eq!(roots, host_roots, "{label}: roots");
+        stack.verify(&roots, &proof, &cfg, label);
+        assert!(
+            bytes(&proof) == bytes(&host_proof),
+            "{label}: the host's bytes"
+        );
+    }
+}
+
+/// The process's resident high-water mark in bytes, after `reset` restarts it
+/// at what is resident now (`/proc/self/clear_refs`, Linux).
+fn resident_peak(reset: bool) -> Option<u64> {
+    if reset {
+        std::fs::write("/proc/self/clear_refs", "5").ok()?;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// The host fallback at the production shape (a card box, minutes) — a run of three
+/// stacked polynomials of `2^27`, First6, blowup 2, retired at the card's
+/// production drop (8 levels) and revived over its stacks — with the card
+/// declining both rungs proves the bytes the card proves with nothing
+/// declined, re-encodes one tree of three stacks on the host, and prints its
+/// seconds and the process's resident peak beside the card prove's.
+#[test]
+fn a_production_shaped_round0_opening_on_the_host_reports_its_seconds_and_peak() {
+    let _serial = serial();
+    let cfg = ChainConfig {
+        log_blowup: 1,
+        ..config(Round0Trees::One)
+    };
+    let stack = Stack::new("the production shape", &[27; 3], 27);
+    assert_eq!(stack.trees(&cfg), 1, "one joint tree");
+    let gib = |b: Option<u64>| b.map_or(f64::NAN, |b| b as f64 / (1u64 << 30) as f64);
+    let before = gpu::open_host_reencodes();
+    let card_from = resident_peak(true);
+    let (card_roots, card_proof) = stack
+        .try_prove(&cfg, Some(8))
+        .unwrap_or_else(|e| panic!("the card prove: {e:?}"));
+    let card_peak = resident_peak(false);
+    let (trees, stacks, seconds) = gpu::open_host_reencodes();
+    assert_eq!(
+        (trees, stacks),
+        (before.0, before.1),
+        "the card prove re-encodes nothing on the host"
+    );
+    let host_from = resident_peak(true);
+    let declined = {
+        let _decline = gpu::force_coset_decline(gpu::CosetDecline::Everything);
+        stack.try_prove(&cfg, Some(8))
+    };
+    let host_peak = resident_peak(false);
+    let (roots, proof) = declined.unwrap_or_else(|e| panic!("the declined prove: {e:?}"));
+    let (now_trees, now_stacks, now_seconds) = gpu::open_host_reencodes();
+    eprintln!(
+        "ROUND-0 HOST RE-ENCODE AT THE PRODUCTION SHAPE: {} stack(s) of 2^27 at blowup 2 in {:.2} s · \
+         resident peak {:.2} GiB (from {:.2}) declined, {:.2} GiB (from {:.2}) on the card",
+        now_stacks - stacks,
+        now_seconds - seconds,
+        gib(host_peak),
+        gib(host_from),
+        gib(card_peak),
+        gib(card_from),
+    );
+    assert_eq!(
+        (now_trees - trees, now_stacks - stacks),
+        (1, 3),
+        "one tree of three stacks re-encoded on the host"
+    );
+    assert_eq!(roots, card_roots, "roots");
+    stack.verify(&roots, &proof, &cfg, "the production shape, declined");
+    assert!(
+        bytes(&proof) == bytes(&card_proof),
+        "the declined prove's bytes are the card's"
+    );
+}
+
+/// ★ At the production block's shape — a run of three stacked polynomials of
+/// `2^27`, First6, blowup 2, the coset order: `2^22` leaves a tree — a joint
+/// BLAKE3 run committed on the card has the host's root (the verifiers'
+/// commit, `commit_on_host`), with no host fallback.
+#[test]
+fn a_production_shaped_blake3_joint_run_on_the_card_has_the_hosts_root() {
+    let _serial = serial();
+    let cfg = ChainConfig {
+        log_blowup: 1,
+        ..config(Round0Trees::One)
+    };
+    let columns: Vec<Mle<F>> = (0..3).map(|i| column(27, 97 + 13 * i)).collect();
+    let layout = StackedLayout::build(&[27; 3], 27).unwrap();
+    assert_eq!(layout.num_polys(), 3, "one run of three");
+    assert_eq!(round0_trees(3, &cfg), vec![0..3], "one joint tree");
+    let refs: Vec<&Mle<F>> = columns.iter().collect();
+    let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+    let fallbacks = gpu::host_fallbacks();
+    let card = StackedCommitment::<F, H>::commit(
+        layout.clone(),
+        &borrow(&columns),
+        Some((&store, 0)),
+        &cfg,
+    )
+    .unwrap();
+    assert_eq!(gpu::host_fallbacks(), fallbacks, "no host commit");
+    drop(store);
+    let host = StackedCommitment::<F, H>::commit_on_host(layout, &borrow(&columns), &cfg).unwrap();
+    assert_eq!(card.roots().len(), 1, "one root");
+    assert_eq!(host.roots(), card.roots(), "the card's root is the host's");
+}
+
+/// The same stack under one tree a polynomial and one tree a run: each
+/// verifies under its own format and is refused under the other's, and the
+/// joint proof is the smaller.
+#[test]
+fn a_blake3_joint_proof_and_a_per_tree_proof_refuse_each_others_verifier_on_the_card() {
+    let _serial = serial();
+    let stack = Stack::run_of_three();
+    let one = config(Round0Trees::One);
+    let each = config(Round0Trees::Each);
+    let (each_roots, each_proof) = stack.try_prove(&each, None).unwrap();
+    let (one_roots, one_proof) = stack.try_prove(&one, None).unwrap();
+    stack.verify(&each_roots, &each_proof, &each, "each");
+    stack.verify(&one_roots, &one_proof, &one, "one");
+    println!(
+        "B3 JOINT DEVICE BYTES one {} each {}",
+        bytes(&one_proof).len(),
+        bytes(&each_proof).len()
+    );
+    assert!(bytes(&one_proof).len() < bytes(&each_proof).len());
+    let domain = Domain::<F>::new(stack.layout.n_stack() + one.log_blowup).unwrap();
+    for (roots, proof, cfg, label) in [
+        (&one_roots, &one_proof, &each, "a joint proof under each"),
+        (&each_roots, &each_proof, &one, "a per-tree proof under one"),
+    ] {
+        assert!(
+            verify::<F, Ext, _, H>(
+                proof,
+                &stack.layout,
+                roots,
+                &Claimed::PerColumn(&stack.points),
+                &stack.values,
+                &domain,
+                cfg,
+                &mut sponge(),
+            )
+            .is_err(),
+            "{label}: refused"
+        );
+    }
+}

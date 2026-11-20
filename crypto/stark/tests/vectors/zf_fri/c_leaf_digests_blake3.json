@@ -1,0 +1,13 @@
+{
+  "generator": "stark::fri::vectors::leaf_digests_json",
+  "hash": "blake3",
+  "codeword": "b_group_folds.json codeword",
+  "leaves": [
+    {"d": 1, "first_leaf": "fc6b5a1315464730b8df2452f92d09fea246257c366876babf94d266f816785c", "layer_root": "0af0827824c8784c3286f5744b5e0514771d2b0db2f9b7de166d683b53384926"},
+    {"d": 2, "first_leaf": "59b42ef6c0d099a5faf6bf79470aefb3b3ea8087b0aea63427bfda9783ba131b", "layer_root": "e353c8271fbaac2fd72ca9e9a82661d048153108f726d82c1cd4756966b6cc26"},
+    {"d": 3, "first_leaf": "bb9f33c99ebdb34d40ad3345833db10b9c6e938c456b0f75d8c44871983e8f8c", "layer_root": "a2dadf8e4b1e3ecbaa9f99882ac73b2564fa581ffcf364112021a0dbe9d5630d"},
+    {"d": 4, "first_leaf": "2342d11f08ebc2b15cb9e9d3e986273dfe6c7e3ac73002fd11e164ec48e7de84", "layer_root": "048c315bf842569f6c44900ff5f5f7be757e89e45f609076a3b549c012e9b840"},
+    {"d": 5, "first_leaf": "3589df551ad7cbcaeb8879b1e7599d17f608438e92ded33259acc21f9876e221", "layer_root": "d3d89cea298a6732cad6415934da5783538e073a5effa79ac0c6334a2d4a6419"},
+    {"d": 6, "first_leaf": "a2d4e57d011df4ee807c54bf4595850d3ee192cf8f154e044229637606733687", "layer_root": "c051ea4c767e7748c74500005ce3f03e06c38481bfbc0e725df3f33724d0edaa"}
+  ]
+}

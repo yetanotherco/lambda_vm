@@ -548,9 +548,13 @@ impl HasDefaultTranscript for GoldilocksField {
     fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
         loop {
             let candidate = next_u64();
-            if candidate < GOLDILOCKS_PRIME {
+            if Self::candidate_in_range(candidate) {
                 return FieldElement::from(candidate);
             }
         }
+    }
+
+    fn candidate_in_range(candidate: u64) -> bool {
+        candidate < GOLDILOCKS_PRIME
     }
 }

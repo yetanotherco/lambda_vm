@@ -786,7 +786,7 @@ class Assumption:
 
     def __init__(self, config: Config, data: dict):
         assert_no_unexpected(
-            data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"}
+            data, set(type(self).__annotations__.keys()) | {"iter", "iters", "ref"}
         )
         self.desc = data["desc"]
         self.iters = iters_of(data, config)
@@ -801,7 +801,7 @@ class ArithConstraint:
 
     def __init__(self, config: Config, data: dict):
         assert_no_unexpected(
-            data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"}
+            data, set(type(self).__annotations__.keys()) | {"kind", "ref", "iter", "iters"}
         )
         assert data["kind"] == "arith"
         self.constraint = data["constraint"]

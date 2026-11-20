@@ -1,11 +1,9 @@
+#[cfg(not(feature = "fast-memcpy"))]
 use core::arch::global_asm;
 
-use crate::{
-    allocator::init_allocator,
-    syscalls::{
-        DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER, sys_halt,
-    },
-};
+#[cfg(not(feature = "fast-memcpy"))]
+use crate::syscalls::{DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER};
+use crate::{allocator::init_allocator, syscalls::sys_halt};
 
 /// # Safety
 ///
@@ -22,8 +20,133 @@ pub unsafe extern "C" fn _start() -> ! {
     }
 }
 
+// The software memory routines, for guests built with the `fast-memcpy` feature: this
+// `memcpy`, and compiler_builtins' `memmove` and `memset`. Without the feature the three
+// are the copy accelerator's stubs further down, and this routine is not linked.
+//
+// compiler_builtins' routine copies a word in 5 instructions when source and destination
+// share their alignment and in 10 when they do not (it reassembles every misaligned word
+// with shifts), and the ethrex guest spends about a fifth of its instructions in it. This
+// VM executes an unaligned doubleword load or store as one instruction, so this routine
+// aligns the destination with one (possibly unaligned) doubleword copy, moves four
+// doublewords in 11 instructions per iteration with plain loads and stores, and finishes a
+// partial word with one overlapping doubleword copy instead of a byte loop. Its stores stay
+// on the aligned path inside the 32-byte loop; the head, the tail and every load may be
+// unaligned, and the prover's memory argument covers those accesses like any other.
+//
+// It is defined here, next to `_start`, so that it lands in the object the linker always
+// takes, and it is a strong global, so it wins over compiler_builtins' weak `memcpy`.
+// `memmove` and `memset` stay the library's under this feature; `memcmp` is the runtime's
+// either way (below).
+//
+// Contract: the C one and no more. The two regions must not overlap, except that they may be
+// the very same region (the one overlap the compiler emits, for an object assigned to
+// itself). The library routine copies forward a byte or word at a time, so for a destination
+// starting below the source it happened to give the right bytes; this routine does not (its
+// first and last doublewords re-read source bytes the copy may already have overwritten).
+// Rust never asks for that: `copy_from_slice` and `copy_nonoverlapping` cannot overlap in safe
+// code, and `ptr::copy` / `copy_within` lower to `memmove`. A C dependency linked into a guest
+// would be the first caller that might.
+//
+// Tests: `executor/programs/rust/mem_sweep` runs it in the VM at every length to 1100 and
+// every source and destination offset mod 8 (and more, see that guest), and
+// `memcpy_model.rs` checks a transliteration of it on the host for out-of-range accesses.
+// Change the two together.
+#[cfg(feature = "fast-memcpy")]
+core::arch::global_asm!(
+    r#"
+    .section .text.memcpy,"ax",@progbits
+    .p2align 2
+    .globl memcpy
+    .type memcpy,@function
+memcpy:
+    # a0 = dst (returned unchanged), a1 = src, a2 = n; t0 walks dst.
+    mv   t0, a0
+    li   t1, 32
+    bltu a2, t1, 5f
+    # n >= 32: copy the first doubleword, then advance by 1..=8 so that t0 is aligned.
+    ld   t2, 0(a1)
+    sd   t2, 0(t0)
+    andi t3, t0, 7
+    li   t4, 8
+    sub  t3, t4, t3
+    add  t0, t0, t3
+    add  a1, a1, t3
+    sub  a2, a2, t3
+    # 32 bytes an iteration while at least 32 are left; t5 = where the loop stops.
+    andi t5, a2, -32
+    beqz t5, 2f
+    add  t5, t0, t5
+1:
+    ld   t2, 0(a1)
+    ld   t3, 8(a1)
+    ld   t4, 16(a1)
+    ld   t6, 24(a1)
+    sd   t2, 0(t0)
+    sd   t3, 8(t0)
+    sd   t4, 16(t0)
+    sd   t6, 24(t0)
+    addi a1, a1, 32
+    addi t0, t0, 32
+    bltu t0, t5, 1b
+    andi a2, a2, 31
+2:
+    # Fewer than 32 left: whole doublewords.
+    li   t1, 8
+    bltu a2, t1, 4f
+3:
+    ld   t2, 0(a1)
+    sd   t2, 0(t0)
+    addi a1, a1, 8
+    addi t0, t0, 8
+    addi a2, a2, -8
+    bgeu a2, t1, 3b
+4:
+    # 1..=7 left: the last doubleword of the copy, overlapping bytes already written.
+    beqz a2, 9f
+    add  a1, a1, a2
+    add  t0, t0, a2
+    ld   t2, -8(a1)
+    sd   t2, -8(t0)
+    ret
+5:
+    # n < 32: doublewords if n >= 8, then the overlapping last one; else bytes.
+    li   t1, 8
+    bltu a2, t1, 7f
+    add  t5, a1, a2
+    add  t6, t0, a2
+6:
+    ld   t2, 0(a1)
+    sd   t2, 0(t0)
+    addi a1, a1, 8
+    addi t0, t0, 8
+    addi a2, a2, -8
+    bgeu a2, t1, 6b
+    beqz a2, 9f
+    ld   t2, -8(t5)
+    sd   t2, -8(t6)
+    ret
+7:
+    beqz a2, 9f
+8:
+    lbu  t2, 0(a1)
+    sb   t2, 0(t0)
+    addi a1, a1, 1
+    addi t0, t0, 1
+    addi a2, a2, -1
+    bnez a2, 8b
+9:
+    ret
+    .size memcpy, .-memcpy
+"#
+);
+
 // ---------------------------------------------------------------------------
 // DMA memcpy symbol override
+//
+// The default for every guest: `memcpy`, `memmove` and `memset` below hand the copy
+// to the COPY accelerator. A guest that turns on `fast-memcpy` (above) keeps all three
+// in software instead, and none of the three stubs is defined.
 //
 // `memcpy` is defined next to `_start` on purpose, and not in `syscalls.rs`.
 // `compiler_builtins` defines `memcpy` weakly, and a linker extracts an archive
@@ -59,6 +182,7 @@ pub unsafe extern "C" fn _start() -> ! {
 // the VM, which fetches one 4-byte instruction per pc, could not decode it.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "fast-memcpy"))]
 global_asm!(
     r#"
     .section .text.memcpy,"ax",@progbits
@@ -107,6 +231,7 @@ memcpy:
 // Otherwise (disjoint, or dst below src) forward chunking is already safe.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "fast-memcpy"))]
 global_asm!(
     r#"
     .section .text.memmove,"ax",@progbits
@@ -182,6 +307,7 @@ memmove:
 // seed, and below eight bytes there is nothing left to propagate.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "fast-memcpy"))]
 global_asm!(
     r#"
     .section .text.memset,"ax",@progbits
@@ -234,4 +360,86 @@ memset:
 "#,
     syscall = const DMA_MEMSET_SYSCALL_NUMBER,
     max_bytes = const DMA_MEMCPY_MAX_BYTES,
+);
+
+// ---------------------------------------------------------------------------
+// memcmp
+//
+// compiler_builtins' `memcmp` compares one byte per iteration, 7 instructions a byte, and the
+// ethrex guest spends about 2 % of its instructions in it, almost all of it on equal bytes:
+// at the median block 93 % of the calls differ at the first byte, and the calls that find
+// their operands equal (32-, 20- and about 60-byte keys) account for 80 % of the bytes
+// compared. This routine keeps the library's answer for the first byte (the same six
+// instructions when it differs) and then compares a doubleword at a time, 6 instructions per
+// 8 bytes. A length that is not a multiple of 8 ends with one doubleword overlapping bytes
+// already found equal, so no byte loop runs for lengths of 8 or more. Every load stays inside
+// `[a, a + n)` and `[b, b + n)`; the doubleword loads may be unaligned, which this VM executes
+// as one instruction (the target spec's `+unaligned-scalar-mem`).
+//
+// Result: the difference of the first differing bytes as unsigned values, or 0, which is
+// exactly what the library returns (the C contract only fixes its sign). In a differing
+// doubleword the first differing byte is the lowest-order one (little endian), found a byte
+// at a time from the bottom.
+//
+// Unlike the three stubs above it does not depend on `fast-memcpy`. It sits next to `_start`
+// for the same reason they do: compiler_builtins defines `memcmp` weakly, so only a strong
+// global in an object the linker always takes is sure to replace it.
+//
+// Tests: `executor/programs/rust/mem_sweep` runs it in the VM at every length to 300, every
+// pair of offsets mod 8 and many differing positions, and `memcmp_model.rs` sweeps a
+// transliteration of it on the host for out-of-range loads. Change the two together.
+// ---------------------------------------------------------------------------
+
+core::arch::global_asm!(
+    r#"
+    .section .text.memcmp,"ax",@progbits
+    .p2align 2
+    .globl memcmp
+    .type memcmp,@function
+memcmp:
+    beqz a2, .Lmemcmp_equal
+    lbu a3, 0(a0)
+    lbu a4, 0(a1)
+    bne a3, a4, .Lmemcmp_byte_diff
+    li t0, 8
+    bltu a2, t0, .Lmemcmp_bytes
+    // a5 / a6: where the last doubleword of each operand starts
+    add a5, a0, a2
+    addi a5, a5, -8
+    add a6, a1, a2
+    addi a6, a6, -8
+.Lmemcmp_words:
+    ld t1, 0(a0)
+    ld t2, 0(a1)
+    bne t1, t2, .Lmemcmp_word_diff
+    addi a0, a0, 8
+    addi a1, a1, 8
+    bltu a0, a5, .Lmemcmp_words
+    ld t1, 0(a5)
+    ld t2, 0(a6)
+    bne t1, t2, .Lmemcmp_word_diff
+.Lmemcmp_equal:
+    li a0, 0
+    ret
+.Lmemcmp_word_diff:
+    andi a3, t1, 0xff
+    andi a4, t2, 0xff
+    bne a3, a4, .Lmemcmp_byte_diff
+    srli t1, t1, 8
+    srli t2, t2, 8
+    j .Lmemcmp_word_diff
+.Lmemcmp_bytes:
+    // 1 <= n < 8 and byte 0 equal: bytes 1 .. n one at a time
+    addi a0, a0, 1
+    addi a1, a1, 1
+    addi a2, a2, -1
+    beqz a2, .Lmemcmp_equal
+    lbu a3, 0(a0)
+    lbu a4, 0(a1)
+    beq a3, a4, .Lmemcmp_bytes
+.Lmemcmp_byte_diff:
+    sub a0, a3, a4
+    ret
+    .size memcmp, .-memcmp
+"#
 );

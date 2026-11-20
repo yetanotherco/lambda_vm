@@ -65,6 +65,13 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
+    /// The bytes its two root tables hold (the values built on first use come
+    /// later and are not counted).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        (self.lde_roots_of_unity_coset.capacity() + self.trace_roots_of_unity.capacity())
+            * std::mem::size_of::<FieldElement<F>>()
+    }
+
     /// Builds the interpolation and LDE domains used by the prover.
     ///
     /// - Interpolation domain: the `trace_length` roots of unity (must be a power of 2).
@@ -74,8 +81,17 @@ impl<F: IsFFTField> Domain<F> {
     where
         A: AIR<Field = F> + ?Sized,
     {
-        let blowup_factor = air.options().blowup_factor as usize;
-        let coset_offset = FieldElement::from(air.options().coset_offset);
+        Self::from_options(
+            air.options().blowup_factor as usize,
+            air.options().coset_offset,
+            trace_length,
+        )
+    }
+
+    /// [`Domain::new`] from what it reads of the AIR: its blowup factor and
+    /// coset offset.
+    pub fn from_options(blowup_factor: usize, coset_offset: u64, trace_length: usize) -> Self {
+        let coset_offset = FieldElement::from(coset_offset);
         let root_order = trace_length.trailing_zeros();
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
         let trace_roots_of_unity = get_powers_of_primitive_root_coset(
@@ -130,6 +146,11 @@ impl<F: IsFFTField> Domain<F> {
         v
     }
 
+    /// Whether [`Self::boundary_zerofier_inv`] has `step`'s inverse cached.
+    pub(crate) fn has_boundary_zerofier_inv(&self, step: usize) -> bool {
+        self.boundary_z_inv.lock().unwrap().contains_key(&step)
+    }
+
     /// Barycentric OOD constants (round 3), computed once per domain.
     pub fn ood_constants(&self) -> &DomainConstants<F> {
         self.ood_constants
@@ -169,8 +190,86 @@ impl<F: IsFFTField> VerifierDomain<F> {
     }
 }
 
+/// The LDE length of a table whose proof claims `trace_length` rows at
+/// `blowup_factor`, or `None` when no honest proof can make that claim: the
+/// length is not a power of two (zero included), the blowup is not one, the
+/// product overflows `usize`, or the LDE domain is larger than the field's
+/// two-adic subgroup (`2^TWO_ADICITY` points).
+///
+/// The verifier reads `trace_length` from the proof and derives the LDE size,
+/// the blowup log and the FRI fold layout from it, so this runs before any of
+/// that arithmetic. Unchecked, a claim of `2^62 + 2^j` rows at blowup 4 wraps
+/// the product to `2^(j+2)` in a release build: the blowup then reads as 0,
+/// nothing folds, and the final polynomial is as long as the codeword, which
+/// makes the low-degree test vacuous.
+pub fn checked_lde_length<F: IsFFTField>(
+    trace_length: usize,
+    blowup_factor: usize,
+) -> Option<usize> {
+    #[cfg(test)]
+    if wrapped_length::allowed(trace_length) {
+        return Some(trace_length.wrapping_mul(blowup_factor));
+    }
+    if !trace_length.is_power_of_two() || !blowup_factor.is_power_of_two() {
+        return None;
+    }
+    let lde_length = trace_length.checked_mul(blowup_factor)?;
+    (u64::from(lde_length.trailing_zeros()) <= F::TWO_ADICITY).then_some(lde_length)
+}
+
+/// Whether a proof of `air` can claim `trace_length` rows: [`checked_lde_length`]
+/// at `air`'s blowup. The verifier's check on every sub-proof's claimed length,
+/// before anything is derived from it.
+pub fn trace_length_in_range<Field, FieldExtension, PI>(
+    air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    trace_length: usize,
+) -> bool
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    FieldExtension: Send + Sync + IsField,
+{
+    checked_lde_length::<Field>(trace_length, air.options().blowup_factor as usize).is_some()
+}
+
 /// Creates a lightweight verifier domain without pre-computing roots of unity.
 /// This is O(1) instead of O(trace_length * blowup_factor) for domain creation.
+///
+/// `None` when `trace_length` (read from a proof) is not one a proof at `air`'s
+/// blowup can have ([`checked_lde_length`]): the verifier rejects the proof.
+pub fn try_new_verifier_domain<Field, FieldExtension, PI>(
+    air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    trace_length: usize,
+) -> Option<VerifierDomain<Field>>
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    FieldExtension: Send + Sync + IsField,
+{
+    let blowup_factor = air.options().blowup_factor as usize;
+    let coset_offset = FieldElement::from(air.options().coset_offset);
+    let lde_length = checked_lde_length::<Field>(trace_length, blowup_factor)?;
+    let root_order = trace_length.trailing_zeros();
+
+    let trace_primitive_root = Field::get_primitive_root_of_unity(root_order as u64).ok()?;
+
+    let lde_root_order = lde_length.trailing_zeros();
+    let lde_primitive_root = Field::get_primitive_root_of_unity(lde_root_order as u64).ok()?;
+
+    Some(VerifierDomain {
+        root_order,
+        trace_length,
+        lde_length,
+        trace_primitive_root,
+        lde_primitive_root,
+        coset_offset,
+    })
+}
+
+/// [`try_new_verifier_domain`] for a trace length the caller has already
+/// checked (or produced itself).
+///
+/// # Panics
+///
+/// If `trace_length` fails [`checked_lde_length`] at `air`'s blowup.
 pub fn new_verifier_domain<Field, FieldExtension, PI>(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     trace_length: usize,
@@ -179,22 +278,38 @@ where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
 {
-    let blowup_factor = air.options().blowup_factor as usize;
-    let coset_offset = FieldElement::from(air.options().coset_offset);
-    let lde_length = trace_length * blowup_factor;
-    let root_order = trace_length.trailing_zeros();
+    try_new_verifier_domain(air, trace_length)
+        .expect("trace length must be a power of two whose LDE fits the field's two-adic subgroup")
+}
 
-    let trace_primitive_root = Field::get_primitive_root_of_unity(root_order as u64).unwrap();
+/// Test only: the control of the trace-length tests. Under [`with`], the one
+/// length it names passes [`checked_lde_length`] with its product WRAPPED, as
+/// the verifier computed it before the check existed; every other length is
+/// checked as always. Thread-local, so no other test sees it.
+#[cfg(test)]
+pub(crate) mod wrapped_length {
+    use std::cell::Cell;
 
-    let lde_root_order = lde_length.trailing_zeros();
-    let lde_primitive_root = Field::get_primitive_root_of_unity(lde_root_order as u64).unwrap();
+    std::thread_local! {
+        static ALLOWED: Cell<Option<usize>> = const { Cell::new(None) };
+    }
 
-    VerifierDomain {
-        root_order,
-        trace_length,
-        lde_length,
-        trace_primitive_root,
-        lde_primitive_root,
-        coset_offset,
+    pub(crate) fn allowed(trace_length: usize) -> bool {
+        ALLOWED.with(|c| c.get() == Some(trace_length))
+    }
+
+    /// Runs `f` with `trace_length` let through wrapped. Its callers build the
+    /// forgery, which only a release build can.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub(crate) fn with<R>(trace_length: usize, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ALLOWED.with(|c| c.set(None));
+            }
+        }
+        ALLOWED.with(|c| c.set(Some(trace_length)));
+        let _reset = Reset;
+        f()
     }
 }

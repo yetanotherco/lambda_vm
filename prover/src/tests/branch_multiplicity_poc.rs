@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{
@@ -27,7 +26,7 @@ use stark::lookup::{
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::branch::{BranchOperation, bus_interactions, cols, generate_branch_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -224,17 +223,17 @@ fn prove_and_verify(rows: &[Row], victim: Option<u64>) -> bool {
     for (a, t) in airs.iter().zip(traces.iter_mut()) {
         pairs.push((a, t, &()));
     }
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let mut air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&branch_air];
     for a in &airs {
         air_refs.push(a);
     }
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &air_refs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }

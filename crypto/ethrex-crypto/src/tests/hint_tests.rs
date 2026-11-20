@@ -215,9 +215,10 @@ fn field_inv_honest_hint_matches_software() {
     for k in [1u64, 2, 3, 7, 1000, 12345] {
         let x = fe_from_u64(k);
         let sw = Option::<FieldElement>::from(x.invert()).expect("k != 0 is invertible");
-        let got = field_inv_with_oracle(&x, honest_field_inv).expect("inverse exists");
+        let got =
+            field_inv_with_oracle(&Fe::from_k256(&x), honest_field_inv).expect("inverse exists");
         assert_eq!(
-            got.normalize().to_bytes(),
+            FieldBytes::from(got.to_be_bytes()),
             sw.normalize().to_bytes(),
             "honest hint must equal the software inverse (k={k})"
         );
@@ -233,9 +234,10 @@ fn field_inv_lying_hint_falls_back_to_software() {
         for k in [1u64, 2, 12345] {
             let x = fe_from_u64(k);
             let sw = Option::<FieldElement>::from(x.invert()).unwrap();
-            let got = field_inv_with_oracle(&x, |_| lie).expect("fallback recomputes");
+            let got =
+                field_inv_with_oracle(&Fe::from_k256(&x), |_| lie).expect("fallback recomputes");
             assert_eq!(
-                got.normalize().to_bytes(),
+                FieldBytes::from(got.to_be_bytes()),
                 sw.normalize().to_bytes(),
                 "lying hint must fall back to the software inverse (k={k})"
             );
@@ -259,9 +261,10 @@ fn field_inv_canonical_but_wrong_hint_falls_back_to_software() {
             ("-inv", -sw),
         ] {
             let lie_be: [u8; 32] = lie.normalize().to_bytes().into();
-            let got = field_inv_with_oracle(&x, |_| lie_be).expect("fallback recomputes");
+            let got =
+                field_inv_with_oracle(&Fe::from_k256(&x), |_| lie_be).expect("fallback recomputes");
             assert_eq!(
-                got.normalize().to_bytes(),
+                FieldBytes::from(got.to_be_bytes()),
                 sw.to_bytes(),
                 "a canonical-but-wrong hint ({name}) must be rejected and recomputed (k={k})"
             );

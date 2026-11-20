@@ -1,0 +1,46 @@
+// ZisK's arity-4 Merkle vectors for the PRODUCTION kernels of `kernels/p1w16.cu`
+// (`p1s_merkle_level4`, `p1s_merkle_tail4`, `p1s_gather_paths4`): a transcription of
+// `crypto/crypto/src/hash/poseidon1_stark/zisk_kat.rs` (MERKLE4_ROOTS, PATH_ROOT, PATHS),
+// which `scripts/poseidon1/zisk_crosscheck` generates from ZisK's own Rust
+// (`proofman-fields`, pil2-proofman v1.3.0-alpha, d485fac2). Do not edit by hand.
+#pragma once
+#include <cstdint>
+static const uint64_t ZK_SEED_TREE = 0x7eeeull;
+static const uint64_t ZK_SEED_ROWS = 0x2075ull;
+static const uint64_t ZK_PATH_ROWS = 21, ZK_PATH_WIDTH = 7;
+static const uint64_t ZK_TREE_N[9] = {1, 2, 3, 4, 5, 16, 17, 21, 64};
+static const uint64_t ZK_TREE_ROOT[9][4] = {
+    {0x8664c94dbefbe325ull, 0x30089173afe6c9d0ull, 0x04f90fe597272adfull, 0x0b7edc901f59ab82ull},
+    {0x2eb364ea6cdadf19ull, 0xccb753f846d8a40aull, 0xf4f07ab8162431e4ull, 0x3c5ee032d67fdf59ull},
+    {0x86e1acde79585807ull, 0x9abd8ea8b7cbe033ull, 0x11362fa741f967a5ull, 0x84b6f84e20992320ull},
+    {0xe4439b945904eb77ull, 0x0cd8326d455ffdb1ull, 0x54b2f128a7109cf2ull, 0xcf984c5f8ad6848full},
+    {0x20ac5f24df34a743ull, 0x3087e607ce719605ull, 0x5db55fcbca8a11e2ull, 0x983403c51793fa1aull},
+    {0x5cb2c8680856be1bull, 0xcacd01bd16ca97bdull, 0xa929172d0b2e569full, 0x0f0511a671a5dd95ull},
+    {0x199efcaf762e1698ull, 0xa6a300a7f88b0629ull, 0xa495edf09b591039ull, 0x9fcfb670ed6704b9ull},
+    {0x28690a55266d917aull, 0xeb6bec957c51abc5ull, 0x571cbe2b6f5c05f2ull, 0xf101f6580769df1full},
+    {0x37efafed6fd1bf30ull, 0xc1369a094e1dc939ull, 0x5cea7a4244a6e116ull, 0xdf140e80cc1b026eull},
+};
+static const uint64_t ZK_PATH_ROOT[4] = {0x23f761a0cb6ff00cull, 0x052127d1e609285bull, 0x78609f05b5b25a69ull, 0x364c6d50e3240899ull};
+static const uint64_t ZK_PATH_INDEX[4] = {0, 3, 13, 20};
+static const uint64_t ZK_PATH_SIBLINGS[4][3][12] = {
+    {
+        {0x6ebf87658577973bull, 0xb2af426aa2df3d12ull, 0x646457bf9de8f505ull, 0xbd423e46c0b7c70eull, 0xdc3e47b347cdde6dull, 0x8c557853b1ae4858ull, 0x25a1799325aa3076ull, 0xec5f1caa799417d2ull, 0x690cf267be58acffull, 0xed5b61bdf0c7addcull, 0xda3abba88dc03526ull, 0x06ef8ab52eeaae95ull},
+        {0xdaf7006956ca017aull, 0x097dd24a97ba5646ull, 0xad5994585e0cd6e2ull, 0x1ba415ba1aa8761dull, 0xd2b7f30720d8ee9full, 0x89a016d3ff144dacull, 0x9517c5102664d681ull, 0x173fdf02efed4246ull, 0x95761bd58616b352ull, 0x2cf97fe34ea40dc2ull, 0x5106d057dcfce9cdull, 0xf767e484fb091b81ull},
+        {0x0035d153eb31324dull, 0x37c538e270be601aull, 0x21f73928c5344f95ull, 0x0b0e4f442e8de209ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+    },
+    {
+        {0x281e019d55d54de1ull, 0xf0ab5f7cc3764d6full, 0x2cb6b556780ba645ull, 0xaa6d879899c5cf80ull, 0x6ebf87658577973bull, 0xb2af426aa2df3d12ull, 0x646457bf9de8f505ull, 0xbd423e46c0b7c70eull, 0xdc3e47b347cdde6dull, 0x8c557853b1ae4858ull, 0x25a1799325aa3076ull, 0xec5f1caa799417d2ull},
+        {0xdaf7006956ca017aull, 0x097dd24a97ba5646ull, 0xad5994585e0cd6e2ull, 0x1ba415ba1aa8761dull, 0xd2b7f30720d8ee9full, 0x89a016d3ff144dacull, 0x9517c5102664d681ull, 0x173fdf02efed4246ull, 0x95761bd58616b352ull, 0x2cf97fe34ea40dc2ull, 0x5106d057dcfce9cdull, 0xf767e484fb091b81ull},
+        {0x0035d153eb31324dull, 0x37c538e270be601aull, 0x21f73928c5344f95ull, 0x0b0e4f442e8de209ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+    },
+    {
+        {0x40dd5da5d4363562ull, 0x6dff0c226f49789full, 0x07147d0a82d4ef3aull, 0xa3c79042cf6dddcfull, 0x1b6988f938cd9ddaull, 0xa195a6dc7990340eull, 0x1bb1c4cd027f331eull, 0xb3814bb7304c2ae4ull, 0x268ebd7c101b16ddull, 0xc8701b039ebf6a61ull, 0xcc3c5195235401e8ull, 0x86d620a4dc0a8a4aull},
+        {0xc4a0fe4b7c48ac77ull, 0x6380dc66613847b3ull, 0xb0aa8463bff724e2ull, 0x4f2d28e9d19d26a3ull, 0xdaf7006956ca017aull, 0x097dd24a97ba5646ull, 0xad5994585e0cd6e2ull, 0x1ba415ba1aa8761dull, 0xd2b7f30720d8ee9full, 0x89a016d3ff144dacull, 0x9517c5102664d681ull, 0x173fdf02efed4246ull},
+        {0x0035d153eb31324dull, 0x37c538e270be601aull, 0x21f73928c5344f95ull, 0x0b0e4f442e8de209ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+    },
+    {
+        {0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+        {0x5e833b6c497a8a05ull, 0xee643677f38238bcull, 0xb9a53292f76ab34dull, 0x08409edcc0a6b39eull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+        {0x889e95bbeee05d35ull, 0xd6b76c8d22d89bd6ull, 0x795cc749c96b7575ull, 0xd9684e68cd1b09e3ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull},
+    },
+};

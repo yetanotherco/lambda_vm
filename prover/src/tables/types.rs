@@ -354,13 +354,6 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
-    // Copy accelerator
-    // =========================================================================
-    // ID 29 is unused (32 is IS_WH, below). The copy primitive chains over a single
-    // [`BusId::CopyNext`] and carries the functionality selectors inside the tuple,
-    // rather than giving each of its three operations a bus of its own.
-
-    // =========================================================================
     // Continuations
     // =========================================================================
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
@@ -368,13 +361,26 @@ pub enum BusId {
     GlobalMemory = 31,
 
     // =========================================================================
-    // Address range checks
+    // LFM — the Lambda Field Machine (recursion machine; `lfm` module)
     // =========================================================================
-    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
-    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
-    /// template; the IS_WH table receives it. ID 29 (the removed EC_SCALAR
-    /// `ServeK` bus) stays unused.
-    IsWh = 32,
+    /// LFM write-once memory: token `(addr, v0..v3)`. Writes send with the
+    /// preprocessed static read count; reads receive gated by is_real.
+    LfmMem = 32,
+    /// LFM 16-bit range lookup (the `LFM_RANGE` fixed table).
+    LfmRange = 33,
+    /// LFM public values: token `(index, v0..v3)`; closed by a
+    /// consumer-computed balance (the COMMIT-bus pattern).
+    LfmPublic = 34,
+
+    // =========================================================================
+    // BLAKE3 chained absorb
+    // =========================================================================
+    /// BLAKE3 absorb self-referencing chain (row N → row N+1 of one absorb
+    /// group): `(timestamp, remaining, msg_base, ctrl_addr, cv[0..8])`.
+    ///
+    /// ID 35 rather than 29: 29 is a gap left by a removed bus and reusing it
+    /// would make a stale artifact decode as this one.
+    Blake3Absorb = 35,
 
     // =========================================================================
     // Unified copy primitive
@@ -385,9 +391,75 @@ pub enum BusId {
     /// previous one. The functionality selectors travel inside the tuple, so a chain
     /// cannot change operation half way through it — a guarantee that separating the
     /// operations by bus id would otherwise have to carry structurally.
-    CopyNext = 33,
-    // ID 34 is unused. COPY receives the `write` ECALL and reads its operand
-    // registers itself, so nothing defers the commit to a second chip.
+    ///
+    /// ID 36: 32–35 are the LFM and BLAKE3 absorb buses, and 20 and 29 are gaps
+    /// left by removed buses, which a stale artifact would decode as this one.
+    CopyNext = 36,
+
+    // =========================================================================
+    // Address range checks
+    // =========================================================================
+    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
+    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
+    /// template; the IS_WH table receives it. Main numbers it 32, which the LFM
+    /// buses hold here; 37 is the next free ID (20 and 29 stay unused).
+    IsWh = 37,
+
+    // =========================================================================
+    // Keccak-256 of a buffer
+    // =========================================================================
+    /// KECCAK's sponge-mode chain: block `j` of a `keccak256` call sends
+    /// `(T, j + 1, count − 136, src + 136, src_hi, out_lo, out_hi, state[200])` to
+    /// the row of block `j + 1`, which receives it as its own `(T, j, count, src,
+    /// …, previous state)`.
+    ///
+    /// ID 38: the next free one (20 and 29 stay unused).
+    KeccakSponge = 38,
+    /// Register tokens under the format that checks a CPU row's register
+    /// accesses in the row itself: `(register, timestamp, value_lo, value_hi)`,
+    /// the timestamp one field element, one token a 64-bit register
+    /// (`tables::register::RegisterFormat::InRow`).
+    Reg = 39,
+
+    // =========================================================================
+    // Memory as 8-byte words (`tables::word_memory`)
+    // =========================================================================
+    /// Word tokens: `(address_lo, address_hi, timestamp, lo, hi)`, one token an
+    /// aligned 8-byte RAM word, the address two elements and the timestamp one
+    /// (`tables::fused_memory::MemoryFormat::Words`). Its own id, so no tuple
+    /// of another shape (a byte token, a register token) is ever read as one:
+    /// the fingerprint has no length term.
+    MemWord = 40,
+    /// A chip's access to one RAM word, received by MEMW_W: a write
+    /// `(1, address_lo, address_hi, timestamp, new_lo, new_hi)` or an access
+    /// `(0, address_lo, address_hi, timestamp, old_lo, old_hi, new_lo,
+    /// new_hi)` (a read sends old = new). Register accesses never travel on it.
+    MemWordMsg = 41,
+    /// COPY_W's chain under the word memory format: a call's row sends the
+    /// next row's `(T, destination key, source key, count, functionality,
+    /// shift, the source word it read)`, which that row receives as its own
+    /// keys, count and first source word (`tables::copy_w`). Its own id: its
+    /// tuple carries a word, which COPY's chain does not.
+    CopyWordNext = 42,
+
+    // =========================================================================
+    // LFM — standard BLAKE3 on the lean tables (`lfm::blake3_lean`)
+    // =========================================================================
+    /// The lean BLAKE3 byte table's lookups: `(op, a, b, …)` against the
+    /// fixed 2^16-row `B3L_XOR` table (XOR, XOR split into nibbles, a byte
+    /// pair, a 16-bit value).
+    ///
+    /// IDs 43 and 44: past the word memory format's buses (40–42), so the
+    /// two formats share no id.
+    B3lXor = 43,
+    /// The lean BLAKE3 round chain: `(tag, round, state, message)` from a
+    /// compression's head row through its seven round rows and back.
+    B3lRound = 44,
+    /// An authenticated Merkle cap read at a computed index: `(tag, index,
+    /// word)` against the `LEAN_CAP` table's rows (one a cap node, its word
+    /// bound to the authenticated cell), read by `LEAN_CAP_READ` rows
+    /// (`lfm::lean_cap`). ID 45: the next free one after the lean buses.
+    CapLookup = 45,
 }
 
 impl BusId {
@@ -408,6 +480,8 @@ impl BusId {
             BusId::Ecall => "Ecall",
             BusId::Commit => "Commit",
             BusId::CopyNext => "CopyNext",
+            BusId::KeccakSponge => "KeccakSponge",
+            BusId::Reg => "Reg",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -417,7 +491,17 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::LfmMem => "LfmMem",
+            BusId::LfmRange => "LfmRange",
+            BusId::LfmPublic => "LfmPublic",
+            BusId::Blake3Absorb => "Blake3Absorb",
             BusId::IsWh => "IsWh",
+            BusId::MemWord => "MemWord",
+            BusId::MemWordMsg => "MemWordMsg",
+            BusId::CopyWordNext => "CopyWordNext",
+            BusId::B3lXor => "B3lXor",
+            BusId::B3lRound => "B3lRound",
+            BusId::CapLookup => "CapLookup",
         }
     }
 }
@@ -449,8 +533,20 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
-            32 => Ok(BusId::IsWh),
-            33 => Ok(BusId::CopyNext),
+            32 => Ok(BusId::LfmMem),
+            33 => Ok(BusId::LfmRange),
+            34 => Ok(BusId::LfmPublic),
+            35 => Ok(BusId::Blake3Absorb),
+            36 => Ok(BusId::CopyNext),
+            38 => Ok(BusId::KeccakSponge),
+            39 => Ok(BusId::Reg),
+            37 => Ok(BusId::IsWh),
+            40 => Ok(BusId::MemWord),
+            41 => Ok(BusId::MemWordMsg),
+            42 => Ok(BusId::CopyWordNext),
+            43 => Ok(BusId::B3lXor),
+            44 => Ok(BusId::B3lRound),
+            45 => Ok(BusId::CapLookup),
             other => Err(other),
         }
     }
@@ -531,8 +627,22 @@ pub const MU_MAX: u64 = u8::MAX as u64;
 /// several rows when its count exceeds [`MU_MAX`]. Shared by trace generation
 /// and the BITWISE collectors of LT, BYTEWISE and BRANCH so the per-row lookups
 /// they count cannot drift apart.
+///
+/// The map hashes with the process's one state (`tables::trace_hash`), so the
+/// rows come out in one order for one operation list: a streamed chunk built
+/// again is the chunk it was.
 pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, u64)> {
-    let mut op_map: std::collections::HashMap<T, u64> = std::collections::HashMap::new();
+    dedup_rows_of(operations.iter())
+}
+
+/// [`dedup_rows`] over the operations an iterator yields, one after another (a
+/// chunk handed out as the window parts it lies in).
+pub fn dedup_rows_of<'a, T: std::hash::Hash + Eq + Clone + 'a>(
+    operations: impl Iterator<Item = &'a T>,
+) -> Vec<(T, u64)> {
+    use super::trace_hash::{OpMap, trace_hash_state};
+
+    let mut op_map: OpMap<T, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
@@ -546,6 +656,26 @@ pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, 
         }
     }
     rows
+}
+
+/// Rows of operations by merging equal neighbours, with no map: each op joins
+/// the row before it when that row holds the same op below [`MU_MAX`], and
+/// starts a row otherwise. An op that comes back after another starts a new
+/// row, so the rows can be more than [`dedup_rows_of`]'s, but each op's μ
+/// summed over its rows is the same: the multiset a lookup receiver puts on
+/// its bus. The rows are a function of the ops and their order alone, so the
+/// same ops in the same order give the same rows. Appended to `rows`, merging
+/// with its last row: a list handed over a slice at a time merges as one.
+pub fn merge_rows_into<'a, T: Eq + Clone + 'a>(
+    rows: &mut Vec<(T, u64)>,
+    operations: impl Iterator<Item = &'a T>,
+) {
+    for op in operations {
+        match rows.last_mut() {
+            Some((last, mu)) if *mu < MU_MAX && last == op => *mu += 1,
+            _ => rows.push((op.clone(), 1)),
+        }
+    }
 }
 
 // =========================================================================
@@ -1107,5 +1237,35 @@ fn imm_from_instruction(instruction: Instruction) -> u64 {
             (imm as i32) as i64 as u64
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod bus_id_tests {
+    use super::BusId;
+    use std::collections::BTreeSet;
+
+    /// ★ `BusId` is one registry of distinct ids: every id below 256 that
+    /// decodes decodes to the bus whose id it is, no two buses share a name
+    /// or an id, and the word buses are 40, 41 and 42. A bus added with an id
+    /// another holds, or decoded from the wrong id, fails here (the enum's own
+    /// discriminants are distinct by the compiler).
+    #[test]
+    fn every_bus_has_its_own_id_and_name() {
+        let mut ids = Vec::new();
+        let mut names = BTreeSet::new();
+        for id in 0u64..256 {
+            if let Ok(bus) = BusId::try_from(id) {
+                assert_eq!(u64::from(bus), id, "{} decodes from {id}", bus.name());
+                assert!(names.insert(bus.name()), "{} named twice", bus.name());
+                ids.push(id);
+            }
+        }
+        let distinct: BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(distinct.len(), ids.len(), "an id decodes twice: {ids:?}");
+        assert_eq!(
+            [40u64, 41, 42].map(|id| BusId::try_from(id).map(|b| b.name())),
+            [Ok("MemWord"), Ok("MemWordMsg"), Ok("CopyWordNext")]
+        );
     }
 }

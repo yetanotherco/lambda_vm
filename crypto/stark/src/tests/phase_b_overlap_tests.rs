@@ -1,0 +1,1108 @@
+//! Phase B's overlap ([`PhaseBOverlap`]) on a small block of the multi-table
+//! example: each group's openings run beside the next group's argue and the
+//! proof is the one phase B proves one group at a time, byte for byte, in any
+//! order and under either argue format; the observer hears the same groups,
+//! in the same order, with the same shares; a failure on either thread is the
+//! prove's error, never a panic; a refusal turns the rest of phase B serial.
+//!
+//! The block and its verifier here are shared with
+//! [`super::block_commit_ood_tests`].
+
+use std::sync::Mutex;
+
+use math::field::{
+    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+    goldilocks::GoldilocksField as Fp,
+};
+use multilinear::{
+    Error as MlError,
+    mle::Mle,
+    stacked_eval::StackedCommitment,
+    whir::Domain,
+    whir_chain::{ArgueFormat, ChainConfig, ChainFormat, GrindBits, GroupFold},
+    whir_commit::TreeDrop,
+    whir_hash::{KeccakWhir, WhirHash},
+};
+
+use crate::constraints::builder::EmptyConstraints;
+use crate::examples::multi_table_lookup::{
+    new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
+};
+use crate::lookup::{AirWithBuses, NullBoundaryConstraintBuilder};
+use crate::multilinear_air::Uniforms;
+use crate::multilinear_block::{
+    self, ArgueDeviation, BlockCommitted, BlockPrepared, BlockPreparedCheck, BlockProved,
+    GroupOpened, GroupStamps, Narrowing, OverlapFaults, PhaseBOverlap, PhaseBReorder,
+    PreparedCommitment,
+};
+use crate::multilinear_table::{
+    CommittedTable, TableLayout, TableStatement, batched::VerifierChecks, global_layout,
+    global_layouts,
+};
+use crate::proof::options::ProofOptions;
+use crate::traits::AIR;
+
+type FE = FieldElement<Fp>;
+type Air = AirWithBuses<Fp, Ext, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
+pub(super) type H = KeccakWhir;
+
+/// The example's three tables (CPU, ADD, MUL), this many times over: the bus
+/// balances in each copy, so it balances over the block.
+const COPIES: usize = 3;
+
+/// Tables a group: CPU | ADD MUL | CPU | ADD | MUL | CPU ADD | MUL.
+pub(super) const SIZES: [usize; 7] = [1, 2, 1, 1, 1, 2, 1];
+
+/// The prepared stacks: a group and its tables' prefixes, `(table, columns)`.
+const PREPARED: [(usize, &[(usize, usize)]); 2] = [(1, &[(1, 1), (2, 2)]), (5, &[(6, 2), (7, 1)])];
+
+fn config(argue: ArgueFormat) -> ChainConfig {
+    config_for(argue, GroupFold::PerPoly)
+}
+
+/// The block's config under `argue`, each group's stacked polynomials opened
+/// per `group`.
+pub(super) fn config_for(argue: ArgueFormat, group: GroupFold) -> ChainConfig {
+    ChainConfig {
+        log_blowup: 2,
+        log_folding: 2,
+        num_queries: 3,
+        grind: GrindBits::default(),
+        format: ChainFormat {
+            argue,
+            group,
+            ..ChainFormat::DEFAULT
+        },
+    }
+}
+
+fn airs() -> [Air; 3] {
+    let options = ProofOptions::default_test_options();
+    [
+        new_cpu_air_with_lookup(&options),
+        new_add_air_with_lookup(&options),
+        new_mul_air_with_lookup(&options),
+    ]
+}
+
+fn base(values: &[u64]) -> Vec<FE> {
+    values.iter().map(|v| FE::from(*v)).collect()
+}
+
+/// CPU (8 rows), ADD and MUL (4 rows each), as the multi-table example has
+/// them.
+fn columns() -> [Vec<Vec<FE>>; 3] {
+    [
+        vec![
+            base(&[1, 0, 1, 0, 1, 1, 0, 0]),
+            base(&[0, 1, 0, 1, 0, 0, 1, 1]),
+            base(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            base(&[10, 20, 30, 40, 50, 60, 70, 80]),
+            base(&[11, 40, 33, 160, 55, 66, 490, 640]),
+        ],
+        vec![
+            base(&[1, 3, 5, 6]),
+            base(&[10, 30, 50, 60]),
+            base(&[11, 33, 55, 66]),
+            base(&[1, 1, 1, 1]),
+        ],
+        vec![
+            base(&[2, 4, 7, 8]),
+            base(&[20, 40, 70, 80]),
+            base(&[40, 160, 490, 640]),
+            base(&[1, 1, 1, 1]),
+        ],
+    ]
+}
+
+/// Table `t` of the block: which of the three.
+fn kind(t: usize) -> usize {
+    t % 3
+}
+
+/// Table `t`'s height in variables.
+fn num_vars(t: usize) -> usize {
+    columns()[kind(t)][0].len().trailing_zeros() as usize
+}
+
+fn tables(airs: &[Air; 3]) -> Vec<CommittedTable<'_, Fp, Ext>> {
+    let columns = columns();
+    (0..3 * COPIES)
+        .map(|t| {
+            let (air, cols) = (&airs[kind(t)], &columns[kind(t)]);
+            CommittedTable::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                cols.len(),
+                cols[0].len().trailing_zeros() as usize,
+                Uniforms::default(),
+                |col| cols[col as usize].clone(),
+            )
+            .expect("a table")
+        })
+        .collect()
+}
+
+/// Each prepared stack's columns: its tables' prefixes, in its order.
+fn prepared_columns() -> Vec<Vec<Mle<Fp>>> {
+    let columns = columns();
+    PREPARED
+        .iter()
+        .map(|(_, tables)| {
+            tables
+                .iter()
+                .flat_map(|&(t, n)| columns[kind(t)][..n].iter())
+                .map(|values| Mle::new(values.clone()).expect("a column"))
+                .collect()
+        })
+        .collect()
+}
+
+/// Each prepared stack committed over its columns.
+fn prepared_commitments(
+    columns: &[Vec<Mle<Fp>>],
+    config: &ChainConfig,
+) -> Vec<StackedCommitment<Fp, H>> {
+    PREPARED
+        .iter()
+        .zip(columns)
+        .map(|((_, tables), columns)| {
+            let shapes: Vec<(usize, usize)> =
+                tables.iter().map(|&(t, n)| (n, num_vars(t))).collect();
+            let layout = global_layout(&shapes, config.format.stack).expect("a layout");
+            StackedCommitment::<Fp, H>::commit(
+                layout,
+                &multilinear::stacking::borrow(columns),
+                None,
+                config,
+            )
+            .expect("a prepared commitment")
+        })
+        .collect()
+}
+
+/// One group's share as the observer was handed it, serialized.
+type Heard = (usize, Vec<u8>);
+
+/// The block proved under `overlap`, its groups taken in `order`, with a
+/// test's `faults`: the proof and every group's stamps, or the prove's error,
+/// and what the observer heard.
+fn prove(
+    argue: ArgueFormat,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block(&config(argue), overlap, order, faults, &|_| {})
+}
+
+/// [`prove`] under `config`, phase A's block handed to `fault` before phase B
+/// (a test's fault in it, or nothing).
+pub(super) fn prove_block(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block_reordered(config, overlap, order, faults, fault, None)
+}
+
+/// [`prove_block`] with phase B's re-ranking hook ([`PhaseBReorder`]).
+fn prove_block_reordered(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+    reorder: Option<&PhaseBReorder<'_>>,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block_placed(config, overlap, order, faults, fault, reorder, false)
+}
+
+/// [`prove_block_reordered`] with the prepared stacks held (as committed) or,
+/// when `retired`, committed and let go ([`PreparedCommitment::Retired`]):
+/// each revived at its group's opening, after the group's own codewords have
+/// gone.
+fn prove_block_placed(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+    reorder: Option<&PhaseBReorder<'_>>,
+    retired: bool,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    let airs = airs();
+    let config = *config;
+    let columns = prepared_columns();
+    let mut commitments = prepared_commitments(&columns, &config);
+    let retired_stacks: Vec<multilinear::stacked_eval::RetiredStack<Fp>> = if retired {
+        commitments
+            .drain(..)
+            .map(|c| c.retire(TreeDrop::uniform(1), &config).expect("retires"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let borrowed: Vec<Vec<&Mle<Fp>>> = columns
+        .iter()
+        .map(|c| multilinear::stacking::borrow(c))
+        .collect();
+    let prepared: Vec<BlockPrepared<'_, Fp, H>> = PREPARED
+        .iter()
+        .enumerate()
+        .zip(&borrowed)
+        .map(|((k, (group, tables)), columns)| BlockPrepared {
+            group: *group,
+            tables: tables.to_vec(),
+            commitment: if retired {
+                PreparedCommitment::Retired(&retired_stacks[k])
+            } else {
+                (&commitments[k]).into()
+            },
+            columns,
+        })
+        .collect();
+    let mut block = BlockCommitted::commit::<H, <H as WhirHash>::Sponge>(
+        tables(&airs),
+        &SIZES,
+        &config,
+        TreeDrop::uniform(1),
+        Narrowing::Wide,
+        false,
+    )
+    .expect("phase A")
+    .with_phase_b_overlap(overlap)
+    .with_overlap_faults(faults);
+    fault(&mut block);
+    let heard: Mutex<Vec<Heard>> = Mutex::new(Vec::new());
+    let on_group = |opened: GroupOpened<'_, Fp, Ext>| {
+        let share = bincode::serialize(&(
+            opened.roots,
+            opened.commit_ood,
+            opened.argue,
+            opened.tables,
+            opened.opening,
+            opened.prepared,
+        ))
+        .expect("serialize");
+        heard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((opened.group, share));
+    };
+    let mut transcript = H::sponge();
+    let proved = multilinear_block::block_prove_in_order::<Fp, Ext, _, H>(
+        block,
+        &config,
+        &mut transcript,
+        &prepared,
+        &[],
+        &|g| g,
+        &ArgueDeviation::default(),
+        &on_group,
+        order,
+        reorder,
+    );
+    (
+        proved,
+        heard.into_inner().unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+pub(super) fn bytes(proved: &BlockProved<Fp, Ext>) -> Vec<u8> {
+    bincode::serialize(&(&proved.0, &proved.1, &proved.2, &proved.4)).expect("serialize")
+}
+
+/// The verifier's reading of `proved`, against the shapes and the split it
+/// rebuilds itself and the prepared stacks' roots.
+fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlError> {
+    verify_block(&config(argue), proved, &proved.4, VerifierChecks::ALL)
+}
+
+/// [`verify`] under `config`, reading `commit_ood` as the proof's commit-time
+/// answers, with the verifier's `checks`.
+pub(super) fn verify_block(
+    config: &ChainConfig,
+    proved: &BlockProved<Fp, Ext>,
+    commit_ood: &[FieldElement<Ext>],
+    checks: VerifierChecks,
+) -> Result<(), MlError> {
+    let airs = airs();
+    let config = *config;
+    let columns = columns();
+    let prepared_at = |t: usize| {
+        PREPARED
+            .iter()
+            .flat_map(|(_, tables)| tables.iter())
+            .find(|&&(table, _)| table == t)
+            .map(|&(_, n)| n)
+    };
+    let layouts: Vec<TableLayout<'_, Fp, Ext>> = (0..3 * COPIES)
+        .map(|t| {
+            let (air, cols) = (&airs[kind(t)], &columns[kind(t)]);
+            TableLayout::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                cols.len(),
+                cols[0].len().trailing_zeros() as usize,
+                Uniforms::default(),
+            )
+            .expect("a layout")
+        })
+        .collect();
+    let statements: Vec<TableStatement<'_, Fp, Ext>> = layouts
+        .iter()
+        .enumerate()
+        .map(|(t, layout)| match prepared_at(t) {
+            Some(n) => layout.statement_with_prepared_prefix(n),
+            None => layout.statement(),
+        })
+        .collect();
+    let shapes: Vec<(usize, usize)> = (0..3 * COPIES)
+        .map(|t| {
+            let cols = &columns[kind(t)];
+            (cols.len(), cols[0].len().trailing_zeros() as usize)
+        })
+        .collect();
+    let stacks = global_layouts(&shapes, &SIZES, config.format.stack).expect("the stacks");
+    let domains: Vec<Domain<Fp>> = stacks
+        .iter()
+        .map(|layout| Domain::new(layout.n_stack() + config.log_blowup).expect("a domain"))
+        .collect();
+    let prepared = prepared_columns();
+    let commitments = prepared_commitments(&prepared, &config);
+    let roots: Vec<Vec<multilinear::whir_commit::Commitment>> =
+        commitments.iter().map(StackedCommitment::roots).collect();
+    let prepared_checks: Vec<BlockPreparedCheck<'_, Fp>> = PREPARED
+        .iter()
+        .zip(&commitments)
+        .zip(&roots)
+        .map(
+            |(((group, tables), commitment), roots)| BlockPreparedCheck {
+                group: *group,
+                tables: tables.to_vec(),
+                roots,
+                layout: commitment.layout(),
+                domain: commitment.domain(),
+            },
+        )
+        .collect();
+    let mut transcript = H::sponge();
+    multilinear_block::block_verify_with::<Fp, Ext, _, H>(
+        &proved.0,
+        commit_ood,
+        &proved.1,
+        &proved.2,
+        &prepared_checks,
+        &statements,
+        &stacks,
+        &domains,
+        &SIZES,
+        &FieldElement::<Ext>::zero(),
+        &config,
+        &mut transcript,
+        false,
+        checks,
+    )
+}
+
+pub(super) fn in_order() -> Vec<usize> {
+    (0..SIZES.len()).collect()
+}
+
+pub(super) const ARGUES: [ArgueFormat; 2] = [ArgueFormat::PerTable, ArgueFormat::BATCHED];
+
+/// The block's proof in group order under each of [`ARGUES`], SHA3-256 of its
+/// serialized bytes with its commit-time answers, as phase B proves it one
+/// group at a time: re-pinned when every block proof gained those answers
+/// (before them, at 76a950dc2, phase B proved the bytes the overlap was first
+/// pinned against). One group at a time still proves these bytes.
+const BEFORE_THE_OVERLAP: [&str; 2] = [
+    "fef46d1082e57b1c835f97af901a8d6d6b5d8104e33f0d577af8482580284563",
+    "0fe883d9d0241ddf41a7eda3eece5adbe2b7be4af2440a6f248357cca5a3bec0",
+];
+
+fn digest(proved: &BlockProved<Fp, Ext>) -> String {
+    use sha3::{Digest, Sha3_256};
+    Sha3_256::digest(bytes(proved))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn stamps(proved: &BlockProved<Fp, Ext>) -> &[GroupStamps] {
+    &proved.3
+}
+
+/// ★ The overlap moves no byte: under either argue format, with each group's
+/// openings beside the next group's argue, the groups taken in order,
+/// reversed, or odd ones first, and with the openings' read-backs through
+/// pinned staging ([`PhaseBOverlap::Pinned`]), the proof is the one phase B
+/// proves one group at a time in group order — the bytes it proved before the
+/// overlap existed ([`BEFORE_THE_OVERLAP`]) — and it verifies. Every group but the last one
+/// taken opened beside an argue; the last opened alone.
+#[test]
+fn the_overlap_proves_the_bytes_of_one_group_at_a_time() {
+    let n = SIZES.len();
+    let reversed: Vec<usize> = (0..n).rev().collect();
+    let odd_first: Vec<usize> = (1..n).step_by(2).chain((0..n).step_by(2)).collect();
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        let (serial, _) = prove(
+            argue,
+            PhaseBOverlap::Off,
+            &in_order(),
+            OverlapFaults::default(),
+        );
+        let serial = serial.expect("one group at a time");
+        assert_eq!(digest(&serial), before, "{argue:?}: one group at a time");
+        verify(argue, &serial).expect("one group at a time verifies");
+        for (what, order, overlap) in [
+            ("in order", in_order(), PhaseBOverlap::On),
+            ("reversed", reversed.clone(), PhaseBOverlap::On),
+            ("odd first", odd_first.clone(), PhaseBOverlap::On),
+            ("in order, pinned", in_order(), PhaseBOverlap::Pinned),
+            ("reversed, pinned", reversed.clone(), PhaseBOverlap::Pinned),
+        ] {
+            let (proved, _) = prove(argue, overlap, &order, OverlapFaults::default());
+            let proved = proved.unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
+            assert_eq!(
+                bytes(&proved),
+                bytes(&serial),
+                "{argue:?} {what}: the proof"
+            );
+            verify(argue, &proved).unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
+            let s = stamps(&proved);
+            let last = *order.last().expect("a group");
+            for &g in &order {
+                assert_eq!(s[g].overlapped, g != last, "{argue:?} {what}: group {g}");
+                assert!(!s[g].serial_after_refusal, "{argue:?} {what}: group {g}");
+            }
+            // Each transition's window is stamped on the group it argued:
+            // every group taken after the first (0 without a device).
+            assert_eq!(
+                s[order[0]].transition_reserved, 0,
+                "{argue:?} {what}: the first argue ran alone"
+            );
+        }
+    }
+}
+
+/// ★ A block whose groups argue on the two-layer GKR ladder proves and
+/// verifies, one group at a time and with the overlap in any order (the same
+/// bytes), and differs from the one-layer block; neither ladder's verifier
+/// takes the other's block.
+#[test]
+fn a_block_on_the_two_layer_ladder_proves_the_same_bytes_in_any_order() {
+    use multilinear::whir_chain::GkrLadder;
+    let double = ArgueFormat::BATCHED.with_ladder(GkrLadder::Double);
+    let reversed: Vec<usize> = (0..SIZES.len()).rev().collect();
+    let (serial, _) = prove(
+        double,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let serial = serial.expect("one group at a time");
+    verify(double, &serial).expect("the two-layer block verifies");
+    for (what, order, overlap) in [
+        ("in order", in_order(), PhaseBOverlap::On),
+        ("reversed", reversed, PhaseBOverlap::On),
+    ] {
+        let (proved, _) = prove(double, overlap, &order, OverlapFaults::default());
+        let proved = proved.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        assert!(bytes(&proved) == bytes(&serial), "{what}: the proof");
+    }
+    let (single, _) = prove(
+        ArgueFormat::BATCHED,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let single = single.expect("one layer a step");
+    assert!(
+        bytes(&single) != bytes(&serial),
+        "the ladders' bytes differ"
+    );
+    assert!(
+        verify(ArgueFormat::BATCHED, &serial).is_err(),
+        "a two-layer block under the one-layer verifier"
+    );
+    assert!(
+        verify(double, &single).is_err(),
+        "a one-layer block under the two-layer verifier"
+    );
+}
+
+/// ★ Retired prepared stacks move no byte: committed and let go, each revived
+/// at its group's opening after the group's own codewords have gone, the
+/// block proves the held stacks' proof (the bytes of [`BEFORE_THE_OVERLAP`])
+/// under either argue format, alone and beside the next group's argue, in
+/// group order and reversed, and it verifies; every group with a prepared
+/// stack stamps its revive, and each that opened alone let its columns go
+/// before it.
+#[test]
+fn retired_prepared_stacks_prove_the_held_stacks_bytes() {
+    let n = SIZES.len();
+    let reversed: Vec<usize> = (0..n).rev().collect();
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for (what, order, overlap) in [
+            ("alone", in_order(), PhaseBOverlap::Off),
+            ("beside, in order", in_order(), PhaseBOverlap::On),
+            ("beside, reversed", reversed.clone(), PhaseBOverlap::On),
+        ] {
+            let (proved, _) = prove_block_placed(
+                &config(argue),
+                overlap,
+                &order,
+                OverlapFaults::default(),
+                &|_| {},
+                None,
+                true,
+            );
+            let proved = proved.unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
+            assert_eq!(digest(&proved), before, "{argue:?} {what}: the held bytes");
+            verify(argue, &proved).unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
+            let s = stamps(&proved);
+            for (group, _) in PREPARED {
+                assert!(
+                    s[group].prepared_revive > 0.0,
+                    "{argue:?} {what}: group {group} revived its stack"
+                );
+            }
+            // A group that opened alone let its columns go before its
+            // retired stack came back; one beside an argue, or with no
+            // prepared stack, kept them to the end of its turn.
+            for (g, stamp) in s.iter().enumerate() {
+                let retired = PREPARED.iter().any(|(group, _)| *group == g);
+                assert_eq!(
+                    stamp.columns_gone_before_revive,
+                    retired && !stamp.overlapped,
+                    "{argue:?} {what}: group {g}'s columns before its revive"
+                );
+            }
+        }
+    }
+}
+
+/// With the next group's columns uploaded at its own turn rather than beside
+/// the argue, phase B proves the same bytes: held or retired prepared stacks,
+/// under either argue format, alone and beside the next argue, and it
+/// verifies.
+#[test]
+fn uploads_at_each_groups_turn_prove_the_same_bytes() {
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for retired in [false, true] {
+            for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On] {
+                let (proved, _) = prove_block_placed(
+                    &config(argue),
+                    overlap,
+                    &in_order(),
+                    OverlapFaults::default(),
+                    &|block| block.set_phase_b_upload_beside(false),
+                    None,
+                    retired,
+                );
+                let what = format!("{argue:?} retired {retired} {overlap:?}");
+                let proved = proved.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                assert_eq!(digest(&proved), before, "{what}: the bytes");
+                verify(argue, &proved).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            }
+        }
+    }
+}
+
+/// Off, phase B is one group at a time: no group opens beside an argue, none
+/// is counted serial after a refusal, and the driver pays every opening.
+#[test]
+fn with_the_overlap_off_every_group_opens_alone() {
+    let (proved, _) = prove(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let proved = proved.expect("prove");
+    for (g, s) in stamps(&proved).iter().enumerate() {
+        assert!(!s.overlapped, "group {g}");
+        assert!(!s.serial_after_refusal, "group {g}");
+        assert_eq!(s.transition_reserved, 0, "group {g}");
+        assert!(s.open_paid >= s.open, "group {g}: paid {s:?}");
+    }
+}
+
+/// The observer hears each group once, in phase B's order, with its share of
+/// the proof — the same shares with the overlap on and off — and each share
+/// is the proof's.
+#[test]
+fn the_observer_hears_the_same_shares_in_order() {
+    let n = SIZES.len();
+    let reversed: Vec<usize> = (0..n).rev().collect();
+    for argue in ARGUES {
+        let (serial, heard_serial) = prove(
+            argue,
+            PhaseBOverlap::Off,
+            &reversed,
+            OverlapFaults::default(),
+        );
+        let serial = serial.expect("prove");
+        let (proved, heard) = prove(
+            argue,
+            PhaseBOverlap::On,
+            &reversed,
+            OverlapFaults::default(),
+        );
+        proved.expect("prove");
+        let groups: Vec<usize> = heard.iter().map(|(g, _)| *g).collect();
+        assert_eq!(groups, reversed, "{argue:?}: the order heard");
+        assert_eq!(heard, heard_serial, "{argue:?}: the shares heard");
+        // Each share as the proof carries it.
+        let (proof, argues, prepared, _, answers) = &serial;
+        let mut table = 0usize;
+        let mut first_table = vec![0usize; n];
+        for (g, &size) in SIZES.iter().enumerate() {
+            first_table[g] = table;
+            table += size;
+        }
+        for (g, share) in &heard {
+            let tables = match argue {
+                ArgueFormat::PerTable => {
+                    &proof.tables[first_table[*g]..first_table[*g] + SIZES[*g]]
+                }
+                ArgueFormat::Batched { .. } => &proof.tables[..0],
+            };
+            let k = PREPARED.iter().position(|(group, _)| group == g);
+            let expected = bincode::serialize(&(
+                &proof.roots,
+                answers,
+                argues.get(*g).filter(|_| argue != ArgueFormat::PerTable),
+                tables,
+                &proof.columns[*g],
+                k.map(|k| &prepared[k]),
+            ))
+            .expect("serialize");
+            assert_eq!(share, &expected, "{argue:?}: group {g}'s share");
+        }
+    }
+}
+
+/// ★ A failure is the prove's error, never a panic: an opening that fails
+/// beside an argue, an argue that fails beside an opening (the opening
+/// thread joined first), both in one transition (the opening's, the earlier
+/// group's), and a panic on the opening thread (refused, not resumed). The
+/// failed opening is the same error with the overlap off.
+#[test]
+fn a_failure_beside_an_argue_is_the_proves_error() {
+    let failed_opening = MlError::DeviceFailed {
+        stage: "a test's failed opening",
+    };
+    let failed_argue = MlError::DeviceFailed {
+        stage: "a test's failed argue",
+    };
+    let panicked = MlError::DeviceFailed {
+        stage: "the previous group's openings",
+    };
+    for (what, overlap, faults, expected, heard_groups) in [
+        (
+            "an opening fails",
+            PhaseBOverlap::On,
+            OverlapFaults {
+                open_fails: Some(1),
+                ..OverlapFaults::default()
+            },
+            &failed_opening,
+            vec![0],
+        ),
+        (
+            "an opening fails, one at a time",
+            PhaseBOverlap::Off,
+            OverlapFaults {
+                open_fails: Some(1),
+                ..OverlapFaults::default()
+            },
+            &failed_opening,
+            vec![0],
+        ),
+        (
+            "an argue fails",
+            PhaseBOverlap::On,
+            OverlapFaults {
+                argue_fails: Some(3),
+                ..OverlapFaults::default()
+            },
+            &failed_argue,
+            vec![0, 1, 2],
+        ),
+        (
+            "both, in one transition",
+            PhaseBOverlap::On,
+            OverlapFaults {
+                open_fails: Some(2),
+                argue_fails: Some(3),
+                ..OverlapFaults::default()
+            },
+            &failed_opening,
+            vec![0, 1],
+        ),
+        (
+            "the opening thread panics",
+            PhaseBOverlap::On,
+            OverlapFaults {
+                open_panics: Some(4),
+                ..OverlapFaults::default()
+            },
+            &panicked,
+            vec![0, 1, 2, 3],
+        ),
+    ] {
+        let (proved, heard) = prove(ArgueFormat::PerTable, overlap, &in_order(), faults);
+        let err = proved.expect_err(what);
+        assert_eq!(format!("{err:?}"), format!("{expected:?}"), "{what}");
+        // The groups opened before the failure were heard, and no other.
+        let heard: Vec<usize> = heard.iter().map(|(g, _)| *g).collect();
+        assert_eq!(heard, heard_groups, "{what}");
+    }
+}
+
+/// An opening thread slower than the argue beside it moves no byte: what the
+/// driver waits for is paid, at least the stall less that argue and the
+/// upload beside it.
+#[test]
+fn a_stalled_opening_thread_is_paid_and_moves_no_byte() {
+    let stall = std::time::Duration::from_millis(150);
+    let (serial, _) = prove(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let (proved, _) = prove(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::On,
+        &in_order(),
+        OverlapFaults {
+            open_stall: Some(stall),
+            ..OverlapFaults::default()
+        },
+    );
+    let (serial, proved) = (serial.expect("prove"), proved.expect("prove"));
+    assert_eq!(bytes(&proved), bytes(&serial));
+    let s = stamps(&proved);
+    let order = in_order();
+    for w in order.windows(2) {
+        let (h, g) = (w[0], w[1]);
+        assert!(s[h].overlapped, "group {h}");
+        // The opening thread starts as the argue does, so the stall ends
+        // within the argue, the upload's wait after it (no card here: none)
+        // and what the driver paid.
+        let covered = s[h].open_paid + s[g].argue + 0.05;
+        assert!(
+            covered >= stall.as_secs_f64(),
+            "group {h}: paid {:.3} s beside an argue of {:.3} s",
+            s[h].open_paid,
+            s[g].argue
+        );
+    }
+}
+
+/// ★ A refusal turns the rest of phase B serial: the transition that sees one
+/// keeps its overlap, every later group but the last opens alone and is
+/// counted, and the proof is the same.
+#[test]
+fn a_refusal_turns_the_rest_of_phase_b_serial() {
+    let n = SIZES.len();
+    let (serial, _) = prove(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let (proved, _) = prove(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::On,
+        &in_order(),
+        OverlapFaults {
+            refusal_at: Some(2),
+            ..OverlapFaults::default()
+        },
+    );
+    let (serial, proved) = (serial.expect("prove"), proved.expect("prove"));
+    assert_eq!(bytes(&proved), bytes(&serial));
+    let s = stamps(&proved);
+    // Groups 0 and 1 opened beside the argues at places 1 and 2; the refusal
+    // at place 2 sends groups 2..n-1 to the driver, the last one as always.
+    let overlapped: Vec<usize> = (0..n).filter(|&g| s[g].overlapped).collect();
+    let serial_after: Vec<usize> = (0..n).filter(|&g| s[g].serial_after_refusal).collect();
+    assert_eq!(overlapped, vec![0, 1]);
+    assert_eq!(serial_after, (2..n - 1).collect::<Vec<_>>());
+}
+
+/// The order phase B takes under `reorder`, from group order: each turn's
+/// re-ranking applied as the prover applies it.
+fn taken_under(reorder: &PhaseBReorder<'_>) -> Vec<usize> {
+    let mut order = in_order();
+    for p in 0..order.len() {
+        if let Some(rest) = reorder(p, &order) {
+            order[p + 1..].copy_from_slice(&rest);
+        }
+    }
+    order
+}
+
+/// ★ Re-ranking the groups still to come while phase B runs moves no byte:
+/// under either argue format and with the overlap off, on or pinned, a hook
+/// that reverses what is left at one turn, at every turn, or swaps the last
+/// two late proves the bytes of one group at a time in group order (the pinned
+/// [`BEFORE_THE_OVERLAP`]) and verifies — and phase B did take the re-ranked
+/// order (the observer hears it), so the hook is not a no-op.
+#[test]
+fn a_re_ranked_phase_b_proves_the_bytes_of_group_order() {
+    let n = SIZES.len();
+    let at_turn_one = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| order[p + 1..].iter().rev().copied().collect())
+    };
+    let every_turn =
+        |p: usize, order: &[usize]| Some(order[p + 1..].iter().rev().copied().collect());
+    let late_swap = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p + 3 == order.len()).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest.swap(0, 1);
+            rest
+        })
+    };
+    let hooks: [(&str, &PhaseBReorder<'_>); 3] = [
+        ("reversed at turn one", &at_turn_one),
+        ("reversed at every turn", &every_turn),
+        ("the last two swapped late", &late_swap),
+    ];
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for (what, hook) in hooks {
+            let taken = taken_under(hook);
+            assert_ne!(taken, in_order(), "{what}: the hook moves a group");
+            for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On, PhaseBOverlap::Pinned] {
+                let (proved, heard) = prove_block_reordered(
+                    &config(argue),
+                    overlap,
+                    &in_order(),
+                    OverlapFaults::default(),
+                    &|_| {},
+                    Some(hook),
+                );
+                let proved =
+                    proved.unwrap_or_else(|e| panic!("{argue:?} {what} {overlap:?}: {e:?}"));
+                assert_eq!(digest(&proved), before, "{argue:?} {what} {overlap:?}");
+                verify(argue, &proved)
+                    .unwrap_or_else(|e| panic!("{argue:?} {what} {overlap:?}: {e:?}"));
+                let groups: Vec<usize> = heard.iter().map(|(g, _)| *g).collect();
+                assert_eq!(
+                    groups, taken,
+                    "{argue:?} {what} {overlap:?}: the order taken"
+                );
+                assert_eq!(groups.len(), n);
+            }
+        }
+    }
+}
+
+/// A re-ranking that is not a permutation of the groups still to come — one
+/// named twice, one left out, one already taken, one extra, one that does not
+/// exist — is the prove's error, never a panic, with the overlap off, on or
+/// pinned.
+#[test]
+fn a_re_ranking_that_is_not_a_permutation_is_refused() {
+    let n = SIZES.len();
+    let twice = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest[1] = rest[0];
+            rest
+        })
+    };
+    let left_out = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| order[p + 2..].to_vec())
+    };
+    let taken = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest[0] = order[p];
+            rest
+        })
+    };
+    let extra = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest.push(order[0]);
+            rest
+        })
+    };
+    let foreign = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest[0] = n;
+            rest
+        })
+    };
+    let hooks: [(&str, &PhaseBReorder<'_>); 5] = [
+        ("a group twice", &twice),
+        ("a group left out", &left_out),
+        ("a group already taken", &taken),
+        ("a group extra", &extra),
+        ("no such group", &foreign),
+    ];
+    for (what, hook) in hooks {
+        for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On, PhaseBOverlap::Pinned] {
+            let (proved, _) = prove_block_reordered(
+                &config(ArgueFormat::PerTable),
+                overlap,
+                &in_order(),
+                OverlapFaults::default(),
+                &|_| {},
+                Some(hook),
+            );
+            assert!(proved.is_err(), "{what} {overlap:?}: proved");
+        }
+    }
+}
+
+/// ★ The planned overlap (retired prepared stacks, the overlap otherwise off)
+/// moves no byte: under either argue format, the block whose prepared stacks
+/// are retired, opened group by group beside the next group's argue where the
+/// plan fits (always, without a card), proves the bytes phase B proves one
+/// group at a time, and verifies; every group but the last opened beside, and
+/// none was planned out. Off (the default), every group opens alone.
+#[test]
+fn the_planned_overlap_under_retired_stacks_proves_the_same_bytes() {
+    let n = SIZES.len();
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for planned in [false, true] {
+            let (proved, _) = prove_block_placed(
+                &config(argue),
+                PhaseBOverlap::Off,
+                &in_order(),
+                OverlapFaults::default(),
+                &|block| block.set_phase_b_overlap_planned(planned),
+                None,
+                true,
+            );
+            let proved = proved.unwrap_or_else(|e| panic!("{argue:?} {planned}: {e:?}"));
+            assert_eq!(
+                digest(&proved),
+                before,
+                "{argue:?} {planned}: the held bytes"
+            );
+            verify(argue, &proved).unwrap_or_else(|e| panic!("{argue:?} {planned}: {e:?}"));
+            let s = stamps(&proved);
+            assert!(
+                s.iter().all(|g| !g.overlap_planned_out),
+                "{argue:?}: none planned out"
+            );
+            let beside = s.iter().filter(|g| g.overlapped).count();
+            assert_eq!(
+                beside,
+                if planned { n - 1 } else { 0 },
+                "{argue:?} {planned}"
+            );
+        }
+    }
+}
+
+/// The planned overlap's fallbacks prove the same bytes: a transition the plan
+/// refuses opens alone (that group only); a transition in which the card
+/// refused a promise turns the rest of phase B serial (its own opening stands);
+/// an opening that fails beside an argue is the prove's error, never a panic.
+#[test]
+fn the_planned_overlaps_fallbacks_prove_the_same_bytes() {
+    let argue = ARGUES[0];
+    let before = BEFORE_THE_OVERLAP[0];
+    let planned = |faults: OverlapFaults| {
+        prove_block_placed(
+            &config(argue),
+            PhaseBOverlap::Off,
+            &in_order(),
+            faults,
+            &|block| block.set_phase_b_overlap_planned(true),
+            None,
+            true,
+        )
+        .0
+    };
+    // The plan refuses group 1's (a retired prepared stack's) transition.
+    let proved = planned(OverlapFaults {
+        overlap_refused_at: Some(1),
+        ..Default::default()
+    })
+    .expect("proves with a transition planned out");
+    assert_eq!(
+        digest(&proved),
+        before,
+        "a planned-out transition: the same bytes"
+    );
+    let s = stamps(&proved);
+    assert!(
+        s[1].overlap_planned_out && !s[1].overlapped,
+        "group 1 opened alone"
+    );
+    assert!(
+        s[0].overlapped && s[2].overlapped && s[4].overlapped,
+        "only group 1 alone"
+    );
+    // The card refused a promise in the transition that argues group 3 (group
+    // 2's openings beside it): group 2's opening stands, every later group
+    // opens alone.
+    let proved = planned(OverlapFaults {
+        refusal_at: Some(3),
+        ..Default::default()
+    })
+    .expect("proves after a refusal");
+    assert_eq!(digest(&proved), before, "after a refusal: the same bytes");
+    let s = stamps(&proved);
+    assert!(
+        s[0].overlapped && s[1].overlapped && s[2].overlapped,
+        "before the refusal: beside"
+    );
+    assert!(
+        s[3..].iter().all(|g| !g.overlapped),
+        "after the refusal: alone"
+    );
+    // Group 1's openings fail on the opening thread beside group 2's argue.
+    assert!(
+        planned(OverlapFaults {
+            open_fails: Some(1),
+            ..Default::default()
+        })
+        .is_err(),
+        "a failed opening beside an argue is the prove's error"
+    );
+}
+
+/// The planned argue reads a group's commit as the batched commit holds it: a
+/// streamed commit's ledger growth plus what it did not hold
+/// ([`GroupStamps::commit_streamed_not_held`]) plans the batched commit's
+/// argue, 5/4 of its growth. A group of seven polynomials, codewords of
+/// 2 GiB and 4 GiB of room: 18 GiB batched; 6 GiB streamed, plus
+/// the six codewords it did not hold.
+#[test]
+fn a_streamed_commit_plans_the_batched_commits_argue() {
+    const GIB: u64 = 1 << 30;
+    let batched = GroupStamps {
+        polys: 7,
+        commit_base: 3 * GIB,
+        commit_reserved: 21 * GIB,
+        ..Default::default()
+    };
+    let streamed = GroupStamps {
+        commit_reserved: 9 * GIB,
+        commit_streamed_not_held: 12 * GIB,
+        ..batched.clone()
+    };
+    let argue = multilinear_block::overlap_argue_bytes(&batched);
+    assert_eq!(argue, 18 * GIB * 5 / 4, "5/4 of the batched growth");
+    assert_eq!(
+        multilinear_block::overlap_argue_bytes(&streamed),
+        argue,
+        "streamed: the batched commit's argue"
+    );
+}

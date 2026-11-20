@@ -26,11 +26,9 @@ use stark::domain::Domain;
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, NullBoundaryConstraintBuilder,
 };
-use stark::proof::options::ProofOptions;
+use stark::proof::options::{ProofFormat, ProofOptions};
 use stark::proof::stark::MultiProof;
-use stark::prover::{IsStarkProver, Prover, ProvingError};
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
+use stark::prover::{IsStarkProver, ProvingError};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 
@@ -38,6 +36,9 @@ use crate::constraints::cpu::CpuConstraints;
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
+};
+use crate::tables::blake3::{
+    Blake3Constraints, bus_interactions as blake3_bus_interactions, cols as blake3_cols,
 };
 use crate::tables::branch::{
     BranchConstraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
@@ -51,12 +52,17 @@ use crate::tables::cpu::{
 use crate::tables::cpu32::{
     Cpu32Constraints, bus_interactions as cpu32_bus_interactions, cols as cpu32_cols,
 };
-use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::decode::{
+    DecodeTable, bus_interactions as decode_bus_interactions, cols as decode_cols,
+};
 use crate::tables::dvrm::{
     DvrmConstraints, bus_interactions as dvrm_bus_interactions, cols as dvrm_cols,
 };
 use crate::tables::ecdas::{
     EcdasConstraints, bus_interactions as ecdas_bus_interactions, cols as ecdas_cols,
+};
+use crate::tables::ecrec::{
+    EcrecConstraints, bus_interactions as ecrec_bus_interactions, cols as ecrec_cols,
 };
 use crate::tables::ecsm::{
     EcsmConstraints, bus_interactions as ecsm_bus_interactions, cols as ecsm_cols,
@@ -73,9 +79,7 @@ use crate::tables::keccak::{
 use crate::tables::keccak_rc::{
     bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols,
 };
-use crate::tables::keccak_rnd::{
-    KeccakRndConstraints, bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
-};
+use crate::tables::keccak_rnd::{KeccakRndConstraints, cols as keccak_rnd_cols};
 use crate::tables::load::{
     LoadConstraints, bus_interactions as load_bus_interactions, cols as load_cols,
 };
@@ -85,10 +89,7 @@ use crate::tables::lt::{
 use crate::tables::memw::{
     MemwConstraints, bus_interactions as memw_bus_interactions, cols as memw_cols,
 };
-use crate::tables::memw_aligned::{
-    MemwAlignedConstraints, bus_interactions as memw_aligned_bus_interactions,
-    cols as memw_aligned_cols,
-};
+use crate::tables::memw_aligned::{MemwAlignedConstraints, cols as memw_aligned_cols};
 use crate::tables::memw_register::{
     MemwRegisterConstraints, bus_interactions as memw_register_bus_interactions,
     cols as memw_register_cols,
@@ -136,11 +137,14 @@ pub fn multi_prove_ram<PI>(
 where
     PI: Send + Sync + Clone,
 {
-    Prover::<F, E, PI>::multi_prove(
+    // ★ The block path's PIN, not `stark`'s default alias. A test helper that
+    // proves through the alias while the pin names another hash produces a green
+    // suite that means nothing: the prover's recomputed preprocessed root then
+    // disagrees with the AIR's and it fails as `PrecomputedCommitmentMismatch`.
+    crate::hash_pin::BlockProver::<F, E, PI>::multi_prove(
         air_trace_pairs,
         transcript,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
 }
 
@@ -225,26 +229,28 @@ pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize>
 /// REGISTER commitment for a monolithic proof of `elf` that committed
 /// `public_output`: FINI pinned to the halted state, as the production prover and
 /// verifier build it.
-pub fn halted_register_commitment(
+#[cfg(test)]
+pub(crate) fn halted_register_commitment(
     options: &ProofOptions,
     elf: &Elf,
     public_output: &[u8],
-) -> stark::config::Commitment {
+) -> crate::RegisterFiles {
     let committed_bytes = u32::try_from(public_output.len()).expect("public output fits in u32");
-    crate::tables::register::halted_commitment(options, elf.entry_point, committed_bytes)
+    crate::RegisterFiles::halted(options, elf.entry_point, committed_bytes)
 }
 
 /// REGISTER commitment matching `traces`: INIT `init` and FINI as the REGISTER
 /// trace holds it. This is what a prover commits for its own trace (a non-final
 /// continuation epoch does it honestly; a forged run gets a root the halted
 /// verifier does not recompute).
-pub fn trace_register_commitment(
+#[cfg(test)]
+pub(crate) fn trace_register_commitment(
     options: &ProofOptions,
     init: &[u32],
     traces: &crate::tables::trace_builder::Traces,
-) -> stark::config::Commitment {
+) -> crate::RegisterFiles {
     let fini = crate::tables::register::fini_from_trace(&traces.register);
-    crate::tables::register::compute_precomputed_commitment(options, init, &fini)
+    crate::RegisterFiles::new(options, init.to_vec(), fini)
 }
 
 // =============================================================================
@@ -293,12 +299,13 @@ pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<BitwiseOperation> {
+    let decode = DecodeTable::from_instructions(instructions);
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log_and_instruction(log, (i as u64) * 4, instruction);
-            op.collect_bitwise_ops()
+            let row = decode.row(log.current_pc).unwrap();
+            let op = CpuOperation::from_log(log, (i as u64) * 4, decode.entry(row), row);
+            decode.op(&op).collect_bitwise_ops()
         })
         .collect()
 }
@@ -436,9 +443,9 @@ pub fn collect_load_ops_from_logs(
             let loaded_value = log.dst_val;
 
             // Extract individual bytes from loaded value
-            let mut res_bytes = [0u64; 8];
+            let mut res_bytes = [0u8; 8];
             for (j, byte) in res_bytes.iter_mut().take(byte_count).enumerate() {
-                *byte = (loaded_value >> (j * 8)) & 0xFF;
+                *byte = (loaded_value >> (j * 8)) as u8;
             }
 
             // Sign/zero extend the upper bytes
@@ -654,7 +661,12 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 ///
 /// Key correctness: for a given name the constraint set and bus interactions
 /// are a pure function of the table module (PAGE embeds its page base in the
-/// name), and `ProofOptions` covers everything else `AirWithBuses::new` reads.
+/// name), and `ProofOptions` covers everything else `AirWithBuses::new` reads —
+/// ALL of it, the proof `format` included: the AIR carries its options, and the
+/// prover and verifier read the proof format from `air.options()`, so an AIR
+/// served under another format's key is another format's prover and verifier.
+/// [`air_proto_key`] destructures `ProofOptions` without `..`, so a field added
+/// to it later does not compile until it is keyed here too.
 /// The cached prototype is pristine — `with_name` / `with_preprocessed` apply
 /// to the caller's clone only.
 fn air_prototype_cache()
@@ -665,16 +677,30 @@ fn air_prototype_cache()
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-type AirProtoKey = (String, u8, usize, u64, u8, u8);
+type AirProtoKey = (String, u8, usize, u64, u8, u8, ProofFormat);
 
 fn air_proto_key(name: &str, o: &ProofOptions) -> AirProtoKey {
+    // ⛔ No `..`: every field of `ProofOptions` is part of the key. The format
+    // was once missing (it was added to `ProofOptions` after this key was
+    // written), and the first AIR built in a process then fixed the format of
+    // every later AIR of that name — a verifier asked for the default format
+    // verified a capped proof with capped AIRs and accepted it.
+    let ProofOptions {
+        blowup_factor,
+        fri_number_of_queries,
+        coset_offset,
+        grinding_factor,
+        fri_final_poly_log_degree,
+        format,
+    } = o;
     (
         name.to_string(),
-        o.blowup_factor,
-        o.fri_number_of_queries,
-        o.coset_offset,
-        o.grinding_factor,
-        o.fri_final_poly_log_degree,
+        *blowup_factor,
+        *fri_number_of_queries,
+        *coset_offset,
+        *grinding_factor,
+        *fri_final_poly_log_degree,
+        *format,
     )
 }
 
@@ -712,10 +738,21 @@ fn build_air_maybe_cached<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'stati
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS> {
     type Proto<CS> = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS>;
     let key = air_proto_key(name, proof_options);
+    // A hit is served only when its interactions are the ones handed in: the
+    // key holds the name, not the list, and a name whose list varied (a
+    // format value, say) would otherwise serve one list for the other. A
+    // mismatch builds this list uncached and leaves the entry as it is.
+    let mut cache = cache;
     if cache {
-        let cache = air_prototype_cache().lock().unwrap();
-        if let Some(proto) = cache.get(&key).and_then(|p| p.downcast_ref::<Proto<CS>>()) {
-            return proto.clone();
+        let entries = air_prototype_cache().lock().unwrap();
+        if let Some(proto) = entries
+            .get(&key)
+            .and_then(|p| p.downcast_ref::<Proto<CS>>())
+        {
+            if proto.bus_interactions() == interactions.as_slice() {
+                return proto.clone();
+            }
+            cache = false;
         }
     }
     let air = Proto::<CS>::new(
@@ -758,6 +795,68 @@ pub fn create_cpu_air(proof_options: &ProofOptions, ts_base: u64) -> ConcreteVmA
         CpuConstraints,
         &format!("CPU@{ts_base}"),
         ts_base.is_multiple_of(full_table),
+    )
+}
+
+/// The CPU AIR under the in-row register format
+/// ([`crate::tables::register::RegisterFormat::InRow`]): 42 columns, the
+/// in-row interactions, today's constraints.
+pub fn create_cpu_air_inrow(
+    proof_options: &ProofOptions,
+    ts_base: u64,
+) -> ConcreteVmAir<CpuConstraints> {
+    let full_table = crate::tables::cpu::TIMESTAMP_STRIDE * crate::tables::max_rows::CPU as u64;
+    build_air_maybe_cached(
+        crate::tables::cpu::inrow_cols::NUM_COLUMNS_INROW,
+        crate::tables::cpu::bus_interactions_inrow(ts_base),
+        proof_options,
+        1,
+        CpuConstraints,
+        &format!("CPU~inrow@{ts_base}"),
+        ts_base.is_multiple_of(full_table),
+    )
+}
+
+/// The residual register table's AIR (`tables::register_residual`), the in-row register format's table of the
+/// register accesses a CPU row does not check and of keep-alives.
+pub fn create_register_residual_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::register_residual::ResidualConstraints> {
+    build_air(
+        crate::tables::register_residual::cols::NUM_COLUMNS,
+        crate::tables::register_residual::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::register_residual::ResidualConstraints,
+        "MEMW_R~residual",
+    )
+}
+
+/// REGISTER under the in-row register format (`tables::register::inrow`).
+pub fn create_register_air_inrow(
+    proof_options: &ProofOptions,
+    final_pc_ts: u64,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air_maybe_cached(
+        crate::tables::register::inrow::cols::NUM_COLUMNS,
+        crate::tables::register::inrow::bus_interactions(final_pc_ts),
+        proof_options,
+        1,
+        EmptyConstraints,
+        &format!("REGISTER~inrow@{final_pc_ts}"),
+        false,
+    )
+}
+
+/// HALT under the in-row register format (`tables::halt::bus_interactions_inrow`).
+pub fn create_halt_air_inrow(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        halt_cols::NUM_COLUMNS,
+        crate::tables::halt::bus_interactions_inrow(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "HALT~inrow",
     )
 }
 
@@ -857,18 +956,44 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> ConcreteVmAir<MemwConstr
     )
 }
 
-/// Create MEMW_A (aligned) AIR with constraints and bus interactions.
+/// Create MEMW_A (aligned) AIR with constraints and bus interactions: the
+/// timestamp order by an LT lookup, the per-table STARK's form.
 pub fn create_memw_aligned_air(
     proof_options: &ProofOptions,
 ) -> ConcreteVmAir<MemwAlignedConstraints> {
+    create_memw_aligned_air_for(
+        proof_options,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+    )
+}
+
+/// [`create_memw_aligned_air`] with the timestamp order in `order`'s form:
+/// the same columns and constraints, its interactions
+/// ([`crate::tables::memw_aligned::bus_interactions_for`]).
+///
+/// Each form is its own prototype in [`air_prototype_cache`], whose key is the
+/// name: under one name the interactions must be a pure function of the
+/// table, or the first form built in a process would be served for the other.
+/// The limbs' prototype is cached as `MEMW_A~limbs` and its clone named
+/// `MEMW_A`, as today's.
+pub fn create_memw_aligned_air_for(
+    proof_options: &ProofOptions,
+    order: crate::tables::memw_aligned::MemwAlignedOrder,
+) -> ConcreteVmAir<MemwAlignedConstraints> {
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    let cached = match order {
+        MemwAlignedOrder::Lt => "MEMW_A",
+        MemwAlignedOrder::Limbs => "MEMW_A~limbs",
+    };
     build_air(
         memw_aligned_cols::NUM_COLUMNS,
-        memw_aligned_bus_interactions(),
+        crate::tables::memw_aligned::bus_interactions_for(order),
         proof_options,
         1,
         MemwAlignedConstraints,
-        "MEMW_A",
+        cached,
     )
+    .with_name("MEMW_A")
 }
 
 /// Create MEMW_R (register) AIR with constraints and bus interactions.
@@ -895,6 +1020,152 @@ pub fn create_load_air(proof_options: &ProofOptions) -> ConcreteVmAir<LoadConstr
         LoadConstraints,
         "LOAD",
     )
+}
+
+/// The MEM_LOAD AIR (`tables::mem_load`): a CPU load checked in one row with
+/// its memory tokens, under the fused memory format.
+pub fn create_mem_load_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::mem_load::MemLoadConstraints> {
+    build_air(
+        crate::tables::mem_load::cols::NUM_COLUMNS,
+        crate::tables::mem_load::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::mem_load::MemLoadConstraints,
+        "MEM_LOAD",
+    )
+}
+
+/// The MEM_STORE AIR (`tables::mem_store`): a CPU store checked in one row
+/// with its memory tokens, under the fused memory format.
+pub fn create_mem_store_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::mem_store::MemStoreConstraints> {
+    build_air(
+        crate::tables::mem_store::cols::NUM_COLUMNS,
+        crate::tables::mem_store::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::mem_store::MemStoreConstraints,
+        "MEM_STORE",
+    )
+}
+
+/// The CPU word tables' AIRs (`tables::word_cpu`), under the word memory
+/// format, each named by its table.
+macro_rules! word_cpu_air {
+    ($(#[$doc:meta])* $fn:ident, $module:ident, $constraints:ident, $name:literal) => {
+        $(#[$doc])*
+        pub fn $fn(
+            proof_options: &ProofOptions,
+        ) -> ConcreteVmAir<crate::tables::$module::$constraints> {
+            build_air(
+                crate::tables::$module::cols::NUM_COLUMNS,
+                crate::tables::$module::bus_interactions(),
+                proof_options,
+                1,
+                crate::tables::$module::$constraints,
+                $name,
+            )
+        }
+    };
+}
+
+word_cpu_air!(
+    /// The MEM_LOAD8 AIR (`tables::mem_load8`): an LD of one whole word.
+    create_mem_load8_air, mem_load8, MemLoad8Constraints, "MEM_LOAD8"
+);
+word_cpu_air!(
+    /// The MEM_STORE8 AIR (`tables::mem_store8`): an SD of one whole word.
+    create_mem_store8_air, mem_store8, MemStore8Constraints, "MEM_STORE8"
+);
+word_cpu_air!(
+    /// The MEM_LOADW AIR (`tables::mem_loadw`): a narrower load inside one word.
+    create_mem_loadw_air, mem_loadw, MemLoadWConstraints, "MEM_LOADW"
+);
+word_cpu_air!(
+    /// The MEM_STOREW AIR (`tables::mem_storew`): a narrower store inside one word.
+    create_mem_storew_air, mem_storew, MemStoreWConstraints, "MEM_STOREW"
+);
+word_cpu_air!(
+    /// The MEM_LOAD2W AIR (`tables::mem_load2w`): a load across two words.
+    create_mem_load2w_air, mem_load2w, MemLoad2WConstraints, "MEM_LOAD2W"
+);
+word_cpu_air!(
+    /// The MEM_STORE2W AIR (`tables::mem_store2w`): a store across two words.
+    create_mem_store2w_air, mem_store2w, MemStore2WConstraints, "MEM_STORE2W"
+);
+
+/// The MEMW_W AIR (`tables::memw_w`): a chip's access to one RAM word, under
+/// the word memory format.
+pub fn create_memw_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::memw_w::MemwWordConstraints> {
+    build_air(
+        crate::tables::memw_w::cols::NUM_COLUMNS,
+        crate::tables::memw_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::memw_w::MemwWordConstraints,
+        "MEMW_W",
+    )
+}
+
+/// The PAGE_W AIR of `config`'s page (`tables::page_w`), its preprocessed
+/// prefix by the page's kind, or the reason there is none (a base that is not
+/// page-aligned).
+pub fn create_page_w_air(
+    proof_options: &ProofOptions,
+    config: &crate::tables::page::PageConfig,
+) -> Result<VmAir, String> {
+    use crate::tables::page_w;
+    let air = build_air(
+        page_w::cols::NUM_COLUMNS,
+        page_w::bus_interactions(config.page_base, config.is_private_input)?,
+        proof_options,
+        1,
+        EmptyConstraints,
+        &format!("{}0x{:x}", page_w::NAME_PREFIX, config.page_base),
+    );
+    let columns = config.clone();
+    Ok(Box::new(air.with_lazy_preprocessed_columns(
+        page_w::lazy_commitment(config, proof_options),
+        page_w::num_preprocessed_cols(config),
+        std::sync::Arc::new(move || page_w::preprocessed_columns_of(&columns)),
+    )))
+}
+
+/// The AIR of `table`, one of the page tables cut from `configs`
+/// (`tables::page_w::page_tables`): a page's [`create_page_w_air`], or a
+/// block's, named for its class, base and pages, its `OFFSET` preprocessed at
+/// the block's height; or the reason there is none (a table not aligned to its
+/// span, past the cap, or whose pages are not its own).
+pub fn create_page_table_air(
+    proof_options: &ProofOptions,
+    table: &crate::tables::page_w::PageTable,
+    configs: &[crate::tables::page::PageConfig],
+) -> Result<VmAir, String> {
+    use crate::tables::page_w::{self, PageTableKind};
+    page_w::check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    if table.kind == PageTableKind::Page {
+        return create_page_w_air(proof_options, &pages[0]);
+    }
+    let air = build_air(
+        page_w::page_table_width(table),
+        page_w::page_table_interactions(table, configs)?,
+        proof_options,
+        1,
+        EmptyConstraints,
+        &table.name(),
+    );
+    let rows = table.rows();
+    Ok(Box::new(air.with_lazy_preprocessed_columns(
+        page_w::page_table_lazy_commitment(table, configs, proof_options)?,
+        page_w::page_table_num_preprocessed_cols(table, configs)?,
+        std::sync::Arc::new(move || vec![page_w::offset_column_of(rows)]),
+    )))
 }
 
 /// Create DECODE AIR with bus interactions.
@@ -1009,6 +1280,45 @@ pub fn create_copy_air(
     )
 }
 
+pub fn create_ecrec_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::ecrec_w::EcrecWordConstraints> {
+    build_air(
+        crate::tables::ecrec_w::cols::NUM_COLUMNS,
+        crate::tables::ecrec_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::ecrec_w::EcrecWordConstraints,
+        crate::tables::ecrec_w::NAME,
+    )
+}
+
+pub fn create_keccak_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::keccak_w::KeccakWordConstraints> {
+    build_air(
+        crate::tables::keccak_w::cols::NUM_COLUMNS,
+        crate::tables::keccak_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::keccak_w::KeccakWordConstraints,
+        crate::tables::keccak_w::NAME,
+    )
+}
+
+pub fn create_copy_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::copy_w::CopyWordConstraints> {
+    build_air(
+        crate::tables::copy_w::cols::NUM_COLUMNS,
+        crate::tables::copy_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::copy_w::CopyWordConstraints,
+        crate::tables::copy_w::NAME,
+    )
+}
+
 /// Create PAGE AIR with bus interactions for a specific page.
 ///
 /// Each PAGE table instance has its own AIR because the bus interactions
@@ -1065,16 +1375,52 @@ pub fn create_keccak_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakCo
     )
 }
 
+/// Create the BLAKE3 6-round compression AIR (syscall variant, one row per call).
+pub fn create_blake3_air(proof_options: &ProofOptions) -> ConcreteVmAir<Blake3Constraints> {
+    build_air(
+        blake3_cols::NUM_COLUMNS,
+        blake3_bus_interactions(),
+        proof_options,
+        1,
+        Blake3Constraints,
+        "BLAKE3",
+    )
+}
+
 /// Create KECCAK_RND AIR with pi constraints and bus interactions.
 pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakRndConstraints> {
+    create_keccak_rnd_air_for(
+        proof_options,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    )
+}
+
+/// [`create_keccak_rnd_air`] with `form`'s byte checks: the same columns and
+/// constraints.
+///
+/// Each form is its own prototype in [`air_prototype_cache`], whose key is the
+/// name: under one name the interactions must be a pure function of the
+/// table, or the first form built in a process would be served for the other
+/// (a lean prover's AIR to a full verifier). The lean prototype is cached as
+/// `KECCAK_RND~lean` and its clone named `KECCAK_RND`, as today's.
+pub fn create_keccak_rnd_air_for(
+    proof_options: &ProofOptions,
+    form: crate::tables::keccak_rnd::KeccakRndForm,
+) -> ConcreteVmAir<KeccakRndConstraints> {
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    let cached = match form {
+        KeccakRndForm::Full => "KECCAK_RND",
+        KeccakRndForm::Lean => "KECCAK_RND~lean",
+    };
     build_air(
         keccak_rnd_cols::NUM_COLUMNS,
-        keccak_rnd_bus_interactions(),
+        crate::tables::keccak_rnd::bus_interactions_for(form),
         proof_options,
         1,
         KeccakRndConstraints,
-        "KECCAK_RND",
+        cached,
     )
+    .with_name("KECCAK_RND")
 }
 
 /// Create KECCAK_RC AIR with bus interactions (preprocessed table).
@@ -1111,4 +1457,206 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
         EcdasConstraints,
         "ECDAS",
     )
+}
+
+/// The ECDAS AIR under [`EcdasForm::Halves`](crate::tables::ecdas::EcdasForm):
+/// the relations at 16-bit limb positions. Its own prototype in
+/// [`air_prototype_cache`] (`ECDAS~halves`), its clone named `ECDAS`.
+pub fn create_ecdas_halves_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::ecdas::EcdasHalvesConstraints> {
+    use crate::tables::ecdas::{EcdasForm, EcdasHalvesConstraints, bus_interactions_for};
+    build_air(
+        EcdasForm::Halves.num_columns(),
+        bus_interactions_for(EcdasForm::Halves),
+        proof_options,
+        1,
+        EcdasHalvesConstraints,
+        "ECDAS~halves",
+    )
+    .with_name("ECDAS")
+}
+
+/// The ECDAS AIR in `form`, named `name`.
+pub fn create_ecdas_air_for(
+    proof_options: &ProofOptions,
+    form: crate::tables::ecdas::EcdasForm,
+    name: &str,
+) -> VmAir {
+    use crate::tables::ecdas::EcdasForm;
+    match form {
+        EcdasForm::Bytes => Box::new(create_ecdas_air(proof_options).with_name(name)),
+        EcdasForm::Halves => Box::new(create_ecdas_halves_air(proof_options).with_name(name)),
+    }
+}
+
+/// Create ECREC AIR (one ECDSA public-key recovery a row).
+pub fn create_ecrec_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcrecConstraints> {
+    build_air(
+        ecrec_cols::NUM_COLUMNS,
+        ecrec_bus_interactions(),
+        proof_options,
+        1,
+        EcrecConstraints,
+        "ECREC",
+    )
+}
+
+/// A production AIR behind the common trait object, paired with its label.
+pub type LabeledAir = (
+    &'static str,
+    Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
+);
+
+/// The page base used wherever a test needs a concrete PAGE or GLOBAL_MEMORY
+/// AIR.
+///
+/// See [`production_airs`] on why a base has to be pinned at all.
+pub const PAGE_TEST_BASE: u64 = 0x1000;
+
+/// The epoch label used wherever a test needs a concrete L2G AIR. A 1-based fini
+/// epoch — `l2g_memory_air` debug-asserts `>= 1`.
+pub const EPOCH_TEST_LABEL: u64 = 1;
+
+/// Every production table AIR, constructed and boxed behind the common trait
+/// object.
+///
+/// AIR-construction only — no ELF, no program execution — so this runs
+/// anywhere. There is no ELF-free registry to iterate instead (`VmAirs::n` needs
+/// a real ELF plus preprocessed-commitment builds, and omits zero-count tables),
+/// so this list is hand-maintained — but exactly once. It previously existed as
+/// three hand-copied per-suite lists, and all three shared the same blind spot:
+/// the continuation-only tables at the end were in none of them.
+///
+/// # This list includes the CONTINUATION tables
+///
+/// The last three come from `crate::continuation` and appear in no monolithic
+/// proof. They are not optional extras: a continuation proof is what the
+/// recursion path actually verifies, so a per-table sweep that stops at the
+/// monolithic 25 is complete for a proof shape we do not care about.
+///
+/// # Four of these AIRs are PARAMETERIZED
+///
+/// `PAGE` and `GLOBAL_MEMORY` fold a `page_base` into constant bus terms; the
+/// two `L2G` tables fold an `epoch_label` into constant terms
+/// (`BusValue::constant(epoch_label)` and `LinearTerm::Constant(epoch_label-1)`
+/// respectively). Those constants reach the captured IR, so each of these four
+/// has a DIFFERENT constraint program per parameter value — there is no single
+/// "the PAGE program". This list pins one value each
+/// ([`PAGE_TEST_BASE`], [`EPOCH_TEST_LABEL`]) so the per-table suites have
+/// something concrete to check; anything reasoning about a whole continuation
+/// proof must account for one program per distinct base and per distinct epoch.
+/// `constraint_artifact_tests::parameterized_airs_vary_per_parameter_value`
+/// characterizes exactly how they differ.
+pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
+    vec![
+        ("CPU", Box::new(create_cpu_air(proof_options, 0))),
+        ("BITWISE", Box::new(create_bitwise_air(proof_options))),
+        ("LT", Box::new(create_lt_air(proof_options))),
+        ("SHIFT", Box::new(create_shift_air(proof_options))),
+        ("EQ", Box::new(create_eq_air(proof_options))),
+        ("BYTEWISE", Box::new(create_bytewise_air(proof_options))),
+        ("STORE", Box::new(create_store_air(proof_options))),
+        ("CPU32", Box::new(create_cpu32_air(proof_options))),
+        ("MEMW", Box::new(create_memw_air(proof_options))),
+        ("MEMW_A", Box::new(create_memw_aligned_air(proof_options))),
+        ("MEMW_R", Box::new(create_memw_register_air(proof_options))),
+        ("LOAD", Box::new(create_load_air(proof_options))),
+        ("DECODE", Box::new(create_decode_air(proof_options))),
+        ("MUL", Box::new(create_mul_air(proof_options))),
+        ("DVRM", Box::new(create_dvrm_air(proof_options))),
+        ("BRANCH", Box::new(create_branch_air(proof_options))),
+        ("HALT", Box::new(create_halt_air(proof_options))),
+        ("COPY", Box::new(create_copy_air(proof_options))),
+        (
+            "PAGE",
+            Box::new(create_page_air(proof_options, PAGE_TEST_BASE)),
+        ),
+        ("REGISTER", Box::new(create_register_air(proof_options, 0))),
+        ("KECCAK", Box::new(create_keccak_air(proof_options))),
+        ("KECCAK_RND", Box::new(create_keccak_rnd_air(proof_options))),
+        ("KECCAK_RC", Box::new(create_keccak_rc_air(proof_options))),
+        ("ECSM", Box::new(create_ecsm_air(proof_options))),
+        ("ECDAS", Box::new(create_ecdas_air(proof_options))),
+        ("HINT", Box::new(create_hint_air(proof_options))),
+        ("ECREC", Box::new(create_ecrec_air(proof_options))),
+        ("IS_WH", Box::new(create_is_wh_air(proof_options))),
+        // ---- continuation-only tables (no monolithic proof contains these) ----
+        (
+            "L2G_GLOBAL",
+            Box::new(crate::continuation::l2g_global_air(
+                proof_options,
+                EPOCH_TEST_LABEL,
+            )),
+        ),
+        (
+            "L2G_MEMORY",
+            Box::new(crate::continuation::l2g_memory_air(
+                proof_options,
+                EPOCH_TEST_LABEL,
+            )),
+        ),
+        (
+            "GLOBAL_MEMORY",
+            Box::new(create_global_memory_air(proof_options, PAGE_TEST_BASE)),
+        ),
+    ]
+}
+
+/// Create the GLOBAL_MEMORY AIR for one page, as a continuation proof would.
+///
+/// The preprocessed commitment is supplied rather than recomputed: it is a
+/// blowup-dependent Merkle root over the page's genesis values, and it is NOT
+/// part of the constraint artifact (the verifier gets it through the existing
+/// static-commitment mechanism). Recomputing it here would cost an FFT plus a
+/// Merkle build per call and change nothing any IR suite looks at.
+pub fn create_global_memory_air(
+    proof_options: &ProofOptions,
+    page_base: u64,
+) -> ConcreteVmAir<EmptyConstraints> {
+    let config = crate::tables::page::PageConfig::zero_init(page_base);
+    crate::continuation::global_memory_air(proof_options, &config, Some([0u8; 32]))
+}
+
+/// The number of production table AIRs [`production_airs`] yields: 28 monolithic
+/// plus 3 continuation-only.
+///
+/// Every suite that iterates the list asserts against this. That assert is the
+/// point: the list is hand-maintained, so without it a table added to
+/// `test_utils` or to `continuation.rs` and forgotten here escapes every
+/// per-table suite at once and silently — which is exactly what happened to the
+/// three continuation tables. Bump it deliberately when a table is genuinely
+/// added or removed.
+pub const NUM_PRODUCTION_AIRS: usize = 31;
+
+#[cfg(test)]
+mod air_cache_tests {
+    use super::*;
+    use stark::lookup::Multiplicity;
+
+    /// The AIR prototype cache keys an entry by name, so a name handed two
+    /// interaction lists must still give each list back: a hit is served only
+    /// when its list is the one handed in, and a mismatch is built uncached.
+    #[test]
+    fn two_lists_under_one_name_each_come_back() {
+        let opts = ProofOptions::default_test_options();
+        let one = vec![BusInteraction::sender(
+            7u64,
+            Multiplicity::One,
+            vec![BusValue::column(0), BusValue::column(1)],
+        )];
+        let two = vec![BusInteraction::sender(
+            7u64,
+            Multiplicity::One,
+            vec![BusValue::column(1), BusValue::column(0)],
+        )];
+        let name = "AIR_CACHE_TWO_LISTS";
+        for want in [&one, &two, &one, &two] {
+            let air = build_air(2, want.clone(), &opts, 1, EmptyConstraints, name);
+            assert!(
+                air.bus_interactions() == want.as_slice(),
+                "the list handed in"
+            );
+        }
+    }
 }

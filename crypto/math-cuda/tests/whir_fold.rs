@@ -1,0 +1,267 @@
+//! The codeword fold and the ext3 fold-block commit against the host.
+//!
+//! Runs on the merge-queue GPU box via `make test-math-cuda` — both need a real
+//! device, like the other tests here.
+//!
+//! The references are the host arms themselves —
+//! `whir::fold_codeword_k_on_host` and
+//! `CodewordCommitment::from_codeword_on_host` — so the kernels cannot drift
+//! from the protocol: what is compared is every folded value and the root over
+//! the fold blocks. Naming them beats unsetting the kill switches, which are
+//! read once per process and would leave the reference on the device.
+
+use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+use math::field::goldilocks::GoldilocksField as Gl;
+use multilinear::mle::Mle;
+use multilinear::whir::{self, Domain};
+use multilinear::whir_commit::CodewordCommitment;
+use multilinear::whir_hash::KeccakWhir;
+
+type FE3 = FieldElement<Ext3>;
+type FE = FieldElement<Gl>;
+
+/// A codeword with no structure a kernel could accidentally satisfy: the
+/// encoding of a pseudo-random multilinear, so it is a real codeword.
+fn codeword(num_vars: usize, log_blowup: usize) -> (Vec<FE>, Domain<Gl>) {
+    let evals: Vec<FE> = (0..(1u64 << num_vars))
+        .map(|i| FE::from(i.wrapping_mul(6364136223846793005).wrapping_add(11) >> 9))
+        .collect();
+    let f = Mle::new(evals).expect("power of two");
+    let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+    let cw = whir::encode::<Gl, Gl>(&whir::lift_coefficients(&f), &domain).expect("encode");
+    (cw, domain)
+}
+
+fn challenge(seed: u64) -> FE3 {
+    FE3::new([
+        FE::from(seed * 31 + 7),
+        FE::from(seed * 17 + 5),
+        FE::from(seed + 3),
+    ])
+}
+
+/// `levels` folds against the host, then the same again on the ext3 codeword
+/// the first group produced — the base entry point and the ext one.
+#[test]
+fn device_folds_match_the_host_fold() {
+    let (cw, domain) = codeword(14, 2);
+    let alphas: Vec<FE3> = (1..=4).map(challenge).collect();
+
+    let (device, device_domain) =
+        whir::fold_codeword_k::<Gl, Gl, Ext3>(&cw, &domain, &alphas).expect("device fold");
+    let (host, host_domain) =
+        whir::fold_codeword_k_on_host::<Gl, Gl, Ext3>(&cw, &domain, &alphas).expect("host fold");
+    assert_eq!(device.len(), host.len());
+    assert_eq!(device, host, "the base fold differs");
+    assert_eq!(device_domain.log_size(), host_domain.log_size());
+
+    let alphas: Vec<FE3> = (5..=7).map(challenge).collect();
+    let (device_again, _) =
+        whir::fold_codeword_k::<Gl, Ext3, Ext3>(&device, &device_domain, &alphas)
+            .expect("device fold");
+    let (host_again, _) =
+        whir::fold_codeword_k_on_host::<Gl, Ext3, Ext3>(&host, &host_domain, &alphas)
+            .expect("host fold");
+    assert_eq!(device_again, host_again, "the extension fold differs");
+}
+
+/// The tree over an ext3 codeword's fold blocks must be the one the host
+/// builds: same root, and openings that verify against it.
+#[test]
+fn the_device_ext3_commit_matches_the_host() {
+    let (cw, domain) = codeword(14, 2);
+    let alphas: Vec<FE3> = (1..=4).map(challenge).collect();
+    let (folded, _) =
+        whir::fold_codeword_k::<Gl, Gl, Ext3>(&cw, &domain, &alphas).expect("device fold");
+
+    let device = CodewordCommitment::<_, KeccakWhir>::from_codeword(folded.clone(), 4)
+        .expect("device commit");
+    let host =
+        CodewordCommitment::<_, KeccakWhir>::from_codeword_on_host(folded, 4).expect("host commit");
+    assert_eq!(device.root(), host.root(), "roots differ");
+    for index in [0, 1, device.num_leaves() / 3, device.num_leaves() - 1] {
+        let opening = device.open(index).expect("open");
+        assert!(
+            multilinear::whir_commit::verify_opening::<_, KeccakWhir>(
+                &device.root(),
+                device.depth(),
+                index,
+                &opening
+            ),
+            "device opening at {index} does not verify"
+        );
+    }
+}
+
+/// ★ Six levels in one residency (W2 `first6`: the first round folds 6
+/// variables of the base codeword), against the host arm.
+///
+/// ⚠ Called on the device ENTRY POINT, not through `whir::fold_codeword_k`:
+/// that wrapper returns `None` below its size threshold or under
+/// `LAMBDA_VM_NO_GPU_WHIR_FOLD` and falls back to the host silently, so a
+/// comparison through it can be the host against itself. This one either runs
+/// the kernels or fails.
+#[test]
+fn the_device_folds_six_levels_as_the_host_does() {
+    for (num_vars, log_blowup) in [(14, 2), (12, 2), (7, 1)] {
+        let (cw, domain) = codeword(num_vars, log_blowup);
+        let alphas: Vec<FE3> = (1..=6).map(challenge).collect();
+        let (host, host_domain) =
+            whir::fold_codeword_k_on_host::<Gl, Gl, Ext3>(&cw, &domain, &alphas)
+                .expect("host fold");
+
+        // The arguments `multilinear::gpu::fold_codeword_k` builds.
+        let two_inv = *FE::from(2u64).inv().expect("2 is invertible").value();
+        let mut g_inv = domain.generator().inv().expect("a generator is invertible");
+        let mut g_invs = Vec::with_capacity(alphas.len());
+        for _ in 0..alphas.len() {
+            g_invs.push(*g_inv.value());
+            g_inv = g_inv.square();
+        }
+        let raw_alphas: Vec<u64> = alphas
+            .iter()
+            .flat_map(|a| a.value().iter().map(|c| *c.value()))
+            .collect();
+        let raw: Vec<u64> = cw.iter().map(|v| *v.value()).collect();
+        let device = math_cuda::whir::fold_codeword_base(&raw, two_inv, &g_invs, &raw_alphas)
+            .unwrap_or_else(|e| panic!("device fold at 2^{num_vars} (needs a GPU): {e:?}"));
+        let device: Vec<FE3> = device
+            .chunks_exact(3)
+            .map(|c| FE3::new([FE::from_raw(c[0]), FE::from_raw(c[1]), FE::from_raw(c[2])]))
+            .collect();
+
+        assert_eq!(host.len(), cw.len() >> 6);
+        assert_eq!(device.len(), host.len());
+        assert_eq!(
+            device, host,
+            "the six-level base fold differs at 2^{num_vars}"
+        );
+        assert_eq!(host_domain.log_size(), num_vars + log_blowup - 6);
+    }
+}
+
+/// Two-inverse and the inverse generator of every level from `levels` down,
+/// starting at a domain whose generator is `g`: what `multilinear::gpu`
+/// passes a fold.
+fn fold_scalars(g: FE, levels: usize) -> (u64, Vec<u64>) {
+    let two_inv = *FE::from(2u64).inv().expect("2 is invertible").value();
+    let mut g_inv = g.inv().expect("a generator is invertible");
+    let mut g_invs = Vec::with_capacity(levels);
+    for _ in 0..levels {
+        g_invs.push(*g_inv.value());
+        g_inv = g_inv.square();
+    }
+    (two_inv, g_invs)
+}
+
+fn raw_challenges(from: u64, count: usize) -> Vec<u64> {
+    (from..from + count as u64)
+        .map(challenge)
+        .flat_map(|a| a.value().iter().map(|c| *c.value()).collect::<Vec<_>>())
+        .collect()
+}
+
+/// ★ The one-launch fold IS the level-by-level fold, raw limb for limb: the
+/// committed base codeword folded one to six levels, and an extension codeword
+/// (the first fold's output) folded one to four more. Raw rather than equal,
+/// because a proof serializes raw limbs and the fused path is the default.
+///
+/// Called on the device entry points, so it either runs both kernels or fails.
+#[test]
+fn the_fused_fold_is_raw_identical_to_the_level_by_level_fold() {
+    for (num_vars, log_blowup) in [(14usize, 2usize), (9, 2)] {
+        let evals: Vec<u64> = (0..(1u64 << num_vars))
+            .map(|i| i.wrapping_mul(6364136223846793005).wrapping_add(11) >> 9)
+            .collect();
+        let (committed, _root) = math_cuda::whir::commit_codeword(
+            &evals,
+            log_blowup,
+            1,
+            false,
+            math_cuda::DeviceHash::Keccak256,
+        )
+        .unwrap_or_else(|e| panic!("device commit (needs a GPU): {e:?}"));
+        let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+        for levels in 1..=6usize {
+            let (two_inv, g_invs) = fold_scalars(*domain.generator(), levels);
+            let alphas = raw_challenges(1, levels);
+            let stepped = math_cuda::whir::fold_resident(&committed, two_inv, &g_invs, &alphas)
+                .expect("fold");
+            let fused = math_cuda::whir::fold_resident_fused(&committed, two_inv, &g_invs, &alphas)
+                .expect("fused fold");
+            assert_eq!(fused.elements(), stepped.elements());
+            assert!(!fused.is_base());
+            assert_eq!(
+                fused.to_host().expect("read back"),
+                stepped.to_host().expect("read back"),
+                "base fold, {levels} levels at 2^{num_vars}: raw limbs differ"
+            );
+        }
+
+        // The extension entry point: fold two levels, then k more both ways.
+        let (two_inv, g_invs) = fold_scalars(*domain.generator(), 2);
+        let ext =
+            math_cuda::whir::fold_resident(&committed, two_inv, &g_invs, &raw_challenges(9, 2))
+                .expect("fold");
+        let folded_domain = domain.squared().expect("square").squared().expect("square");
+        for levels in 1..=4usize {
+            let (two_inv, g_invs) = fold_scalars(*folded_domain.generator(), levels);
+            let alphas = raw_challenges(20, levels);
+            let stepped =
+                math_cuda::whir::fold_resident(&ext, two_inv, &g_invs, &alphas).expect("fold");
+            let fused = math_cuda::whir::fold_resident_fused(&ext, two_inv, &g_invs, &alphas)
+                .expect("fused fold");
+            assert_eq!(
+                fused.to_host().expect("read back"),
+                stepped.to_host().expect("read back"),
+                "extension fold, {levels} levels at 2^{num_vars}: raw limbs differ"
+            );
+        }
+    }
+}
+
+/// ★ A fold keeps its tree's leaf layer against the room of the codeword it
+/// came from, and gives those bytes back when the fold drops — not when the
+/// codeword does. A chain drops each fold at the end of its round while the
+/// committed codeword lives to the end of the group (of the run, for one held
+/// across epochs), so a room that only shrank with the codeword kept every
+/// opened chain's fold layers promised for all of that.
+#[test]
+fn a_folds_kept_layer_goes_back_to_the_room_when_the_fold_drops() {
+    let (num_vars, log_blowup, first) = (14usize, 2usize, 6usize);
+    let evals: Vec<u64> = (0..(1u64 << num_vars))
+        .map(|i| i.wrapping_mul(6364136223846793005).wrapping_add(11) >> 9)
+        .collect();
+    let hash = math_cuda::DeviceHash::Keccak256;
+    let (committed, _root) =
+        math_cuda::whir::commit_codeword(&evals, log_blowup, first, false, hash)
+            .unwrap_or_else(|e| panic!("device commit (needs a GPU): {e:?}"));
+    let held = committed.reserved_bytes();
+    let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+    let (two_inv, g_invs) = fold_scalars(*domain.generator(), first);
+    let folded = math_cuda::whir::fold_resident_fused(
+        &committed,
+        two_inv,
+        &g_invs,
+        &raw_challenges(1, first),
+    )
+    .expect("fused fold");
+    folded.commit(4, hash).expect("the fold's tree");
+    let kept = folded.retained_leaf_bytes();
+    assert!(
+        kept > 0,
+        "precondition: the fold's commit kept its leaf layer"
+    );
+    assert_eq!(
+        committed.reserved_bytes(),
+        held + kept,
+        "the fold's layer is promised under the room it shares with its source"
+    );
+    drop(folded);
+    assert_eq!(
+        committed.reserved_bytes(),
+        held,
+        "the fold is gone and its layer's bytes are still promised"
+    );
+}

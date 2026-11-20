@@ -4,8 +4,13 @@
 //! to BITWISE lookup tables (BYTE_ALU, ARE_BYTES); the halfword shifts (θ
 //! rotate-by-1 and ρ) are enforced directly by μ-gated linear identities over
 //! the committed shift cells instead of HWSL lookups (see
-//! `KeccakRndConstraints`). ARE_BYTES range checks on the shift outputs and the
-//! IS_BIT constraint on the θ carry are load-bearing for the identities.
+//! `KeccakRndConstraints`). The IS_BIT constraint on the θ carry and the
+//! ARE_BYTES range checks on the ρ shift outputs are load-bearing for the
+//! identities in both forms ([`KeccakRndForm`]). Under `Lean`, the block
+//! format's presets, the θ shift outputs' range comes from the D lookups'
+//! operands (each `Cxz_left` byte, plus the carry for even bytes, is a
+//! `BYTE_ALU[XOR]` operand) and the θ identity's parity; under the `Full`
+//! variant it comes from their own ARE_BYTES checks.
 //!
 //! ## Column layout (1,480 columns)
 //!
@@ -37,6 +42,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -244,14 +250,60 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
 /// every cell is 0: each padding row sends `ARE_BYTES[0, 0]` this many times.
 pub const ARE_BYTES_PER_ROW: usize = 20 + 200;
 
+/// Which byte checks the table sends: a format value the prover and the
+/// verifier of one block both hold, never read from a proof.
+///
+/// [`Lean`](Self::Lean) leaves out the 20 `Cxz_left` checks, which the D XOR
+/// lookups already imply: each `Cxz_left` byte enters a `BYTE_ALU[XOR]` lookup
+/// (whose operands are bytes) as itself (odd bytes) or plus a carry bit (even
+/// bytes), and the θ identity `2·in = 2¹⁶·carry + 256·hi + lo` then rules out
+/// the one extra value an even byte could take, `−1`, by parity: every term is
+/// below 2¹⁸, so the identity holds over the integers, where its left side is
+/// even. On a padding row (μ = 0) nothing reads `Cxz_left`. That leaves 1,011
+/// interactions, which fit 1,024 GKR slots instead of 2,048.
+///
+/// The block format's presets hold `Lean`. `Full` is the type's `Default`: the
+/// form of every build outside the block format (the whole-run builder, the
+/// LFM machine's own chips), and the variant a block caller may name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum KeccakRndForm {
+    /// Every byte check (1,031 interactions).
+    #[default]
+    Full,
+    /// Without the 20 implied `Cxz_left` checks (1,011 interactions): the
+    /// block format's presets.
+    Lean,
+}
+
+impl KeccakRndForm {
+    /// `ARE_BYTES` sends per row under this form ([`ARE_BYTES_PER_ROW`] for
+    /// [`Self::Full`]).
+    pub const fn are_bytes_per_row(self) -> usize {
+        match self {
+            Self::Full => ARE_BYTES_PER_ROW,
+            Self::Lean => 200,
+        }
+    }
+
+    /// Whether the 20 `Cxz_left` byte checks are sent.
+    pub const fn checks_cxz_left(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// `ARE_BYTES[0, 0]` lookups sent by the padding rows of the KECCAK_RND table
 /// built for `num_ops` keccak calls (none when the table is absent).
 pub fn padding_are_bytes(num_ops: usize) -> u64 {
+    padding_are_bytes_for(num_ops, KeccakRndForm::Full)
+}
+
+/// [`padding_are_bytes`] under `form`.
+pub fn padding_are_bytes_for(num_ops: usize, form: KeccakRndForm) -> u64 {
     if num_ops == 0 {
         return 0;
     }
     let rows = num_ops * 24;
-    ((rows.next_power_of_two().max(4) - rows) * ARE_BYTES_PER_ROW) as u64
+    ((rows.next_power_of_two().max(4) - rows) * form.are_bytes_per_row()) as u64
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -263,193 +315,322 @@ pub fn generate_keccak_rnd_trace(
     ops: &[KeccakRoundOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n_rows = (ops.len() * 24).next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(n_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_keccak_rnd_rows(ops, 0, n_rows)
+}
 
-    for (op_idx, op) in ops.iter().enumerate() {
-        // Execute round-by-round, tracking the state
-        let mut state = op.input;
+/// Rows `skip..skip + rows` of the table [`generate_keccak_rnd_trace`] builds
+/// from `ops` — the same rows, zero past the ops' last — as a table of `rows`
+/// rows. Each op's 24 rows depend on that op alone, so a slice of the table is
+/// the slice's ops generated with their row offset: a KECCAK_RND chunk can be
+/// built from the ops that reach it, before the run's last op exists.
+pub fn generate_keccak_rnd_rows(
+    ops: &[KeccakRoundOperation],
+    skip: usize,
+    rows: usize,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_keccak_rnd_rows_as(ops, skip, rows, TraceForm::Wide)
+}
 
-        for round in 0..24 {
-            let row_idx = op_idx * 24 + round;
+/// The widths KECCAK_RND traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
 
-            // Timestamp & round
-            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-            table.set_u64(row_idx, cols::ROUND, round as u64);
+/// Whether [`generate_keccak_rnd_rows_as`] in `form` writes its rows packed,
+/// with no 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier
+/// KECCAK_RND trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
 
-            // start = current state as bytes
-            for x in 0..5 {
-                for y in 0..5 {
-                    let lane = state[x + 5 * y];
-                    table.set_dword_bl(row_idx, cols::start(x, y, 0), lane);
-                }
+/// [`generate_keccak_rnd_rows`] in `form` (`tables::gpack`).
+pub fn generate_keccak_rnd_rows_as(
+    ops: &[KeccakRoundOperation],
+    skip: usize,
+    rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Padding rows have mu=0 and all zeros (default)
+    generate_main!(form, &WIDTHS, rows, cols::NUM_COLUMNS, |table| {
+        for (op_idx, op) in ops.iter().enumerate() {
+            let first = op_idx * 24;
+            if first + 24 <= skip || first >= skip + rows {
+                continue;
             }
-
-            // === θ (theta) ===
-            // Column parities: C[x] = XOR of all 5 lanes in column x
-            // Computed as a chain: Cxz[x][0] = start[x,0] XOR start[x,1]
-            //                      Cxz[x][k] = Cxz[x][k-1] XOR start[x,k+1]
-            let mut c_bytes = [[0u8; 8]; 5]; // C[x][byte] = final parity
-            let mut cxz = [[[0u8; 8]; 4]; 5]; // Cxz[x][stage][byte]
-            for x in 0..5 {
-                // Stage 0: XOR(start[x,0], start[x,1])
-                for b in 0..8 {
-                    let v0 = byte_of(state[x], b);
-                    let v1 = byte_of(state[x + 5], b);
-                    cxz[x][0][b] = v0 ^ v1;
-                }
-                table.set_bytes(row_idx, cols::cxz(x, 0, 0), &cxz[x][0]);
-
-                // Stages 1..3: XOR(Cxz[x][k-1], start[x, k+1])
-                for stage in 1..4 {
-                    let y = stage + 1;
-                    for b in 0..8 {
-                        let prev = cxz[x][stage - 1][b];
-                        let sv = byte_of(state[x + 5 * y], b);
-                        cxz[x][stage][b] = prev ^ sv;
+            if first >= skip && first + 24 <= skip + rows {
+                fill_op(table, op, first - skip);
+            } else {
+                // An op the slice cuts: its 24 rows on the side, the part in
+                // range copied over.
+                let mut scratch = TraceTable::<GoldilocksField, GoldilocksExtension>::new_main(
+                    crate::tables::types::zeroed_fe_vec(24 * cols::NUM_COLUMNS),
+                    cols::NUM_COLUMNS,
+                    1,
+                );
+                fill_op(&mut scratch.main_table, op, 0);
+                for round in 0..24 {
+                    let row = first + round;
+                    if row >= skip && row < skip + rows {
+                        for col in 0..cols::NUM_COLUMNS {
+                            table.set_fe(row - skip, col, *scratch.main_table.get(round, col));
+                        }
                     }
-                    table.set_bytes(row_idx, cols::cxz(x, stage, 0), &cxz[x][stage]);
-                }
-                c_bytes[x] = cxz[x][3];
-            }
-
-            // Rotate C left by 1 bit using HWSL decomposition.
-            // HWSL shifts each halfword (u16) independently. For shift=1, the
-            // carry is a single bit (top bit of the halfword); we store it in
-            // one column per halfword (Cxz_right[x][hw], spec d75944ee).
-            //   rotated_Cxz[z] = Cxz_left[z] + (1 - z%2) * Cxz_right[(z/2 - 1) mod 4]
-            let mut cxz_left_bytes = [[0u8; 8]; 5];
-            let mut cxz_right_bits = [[0u8; 4]; 5];
-            let mut rotated_c = [[0u8; 8]; 5];
-            for x in 0..5 {
-                for hw in 0..4 {
-                    let lo = c_bytes[x][hw * 2] as u16;
-                    let hi = c_bytes[x][hw * 2 + 1] as u16;
-                    let halfword = lo | (hi << 8);
-                    let (shifted, carry) = hwsl(halfword, 1);
-                    cxz_left_bytes[x][hw * 2] = (shifted & 0xFF) as u8;
-                    cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
-                    // For shift=1, carry ∈ {0, 1}.
-                    cxz_right_bits[x][hw] = carry as u8;
-                }
-                table.set_bytes(row_idx, cols::cxz_left(x, 0), &cxz_left_bytes[x]);
-                table.set_bytes(row_idx, cols::cxz_right_bit(x, 0), &cxz_right_bits[x]);
-
-                // Reconstruct: left[b] + (1 - b%2) * right[(b/2 + 3) mod 4]
-                for b in 0..8 {
-                    let right_contribution = match cols::cxz_right_bit_for_byte(b) {
-                        Some(hw) => cxz_right_bits[x][hw],
-                        None => 0,
-                    };
-                    rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(right_contribution);
                 }
             }
+        }
+    })
+}
 
-            // D[x] = C[(x-1)%5] XOR rotated_C[(x+1)%5]
-            let mut d_bytes = [[0u8; 8]; 5];
-            for x in 0..5 {
-                for b in 0..8 {
-                    let val = c_bytes[(x + 4) % 5][b] ^ rotated_c[(x + 1) % 5][b];
-                    d_bytes[x][b] = val;
-                }
-                table.set_bytes(row_idx, cols::dxz(x, 0), &d_bytes[x]);
-            }
+/// A KECCAK_RND table held as the keccak operations its rows come from
+/// (`multilinear::records`), about 208 bytes an op against about 1,480 a row
+/// packed: rows `skip..skip + rows` of the table the ops make, as
+/// [`generate_keccak_rnd_rows`] builds them. The card fills the columns from
+/// the ops; a host reader gets this module's fill of them.
+#[derive(Debug)]
+pub struct KeccakRndRecords {
+    ops: Vec<multilinear::records::KeccakRndOp>,
+    skip: usize,
+    rows: usize,
+}
 
-            // theta[x][y] = start[x][y] XOR D[x]
-            let mut theta_lanes = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let lane = state[x + 5 * y];
-                    let mut d_lane = 0u64;
-                    for b in 0..8 {
-                        d_lane |= (d_bytes[x][b] as u64) << (b * 8);
-                    }
-                    theta_lanes[x + 5 * y] = lane ^ d_lane;
-                    table.set_dword_bl(row_idx, cols::theta(x, y, 0), theta_lanes[x + 5 * y]);
-                }
-            }
-
-            // === ρ (rho) ===
-            // For each lane, rotate theta[x][y] by KECCAK_RHO[x][y] bits.
-            // Decompose rotation as: rnc (nibble, 0..15) + 16*rbc[0] + 32*rbc[1].
-            // rnc and rbc are inlined as compile-time constants per spec
-            // [[variables.constant]]; only HWSL outputs are stored in the trace.
-            for x in 0..5 {
-                for y in 0..5 {
-                    let rho_offset = KECCAK_RHO[x][y] as usize;
-                    let rnc_val = (rho_offset % 16) as u8;
-                    let theta_lane = theta_lanes[x + 5 * y];
-                    let mut rot_left_bytes = [0u8; 8];
-                    let mut rot_right_bytes = [0u8; 8];
-                    for hw in 0..4 {
-                        let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
-                        let (shifted, carry) = hwsl(halfword, rnc_val);
-                        rot_left_bytes[hw * 2] = (shifted & 0xFF) as u8;
-                        rot_left_bytes[hw * 2 + 1] = (shifted >> 8) as u8;
-                        rot_right_bytes[hw * 2] = (carry & 0xFF) as u8;
-                        rot_right_bytes[hw * 2 + 1] = (carry >> 8) as u8;
-                    }
-                    table.set_bytes(row_idx, cols::rot_left(x, y, 0), &rot_left_bytes);
-                    table.set_bytes(row_idx, cols::rot_right(x, y, 0), &rot_right_bytes);
-                }
-            }
-
-            // === π (pi) ===
-            // pi[x][y] = rho[(x+3y)%5][x] where rho is the rotated theta.
-            // pi is a spec [[variables.virtual]] — not stored as trace columns.
-            // It's reconstructed inline in chi bus interactions as
-            //   pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
-            // with (sx, sy) = ((x+3y)%5, x) and (l_byte, r_byte) resolved from
-            // the compile-time rbc constant. pi_lanes is still computed here
-            // for the chi step below.
-            let mut pi_lanes = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
-                    let dst_x = y;
-                    let dst_y = (2 * x + 3 * y) % 5;
-                    pi_lanes[dst_x + 5 * dst_y] = rotated;
-                }
-            }
-
-            // === χ (chi) ===
-            let mut chi_lanes = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let not_next = !pi_lanes[(x + 1) % 5 + 5 * y];
-                    let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
-                    let and_val = not_next & next2;
-                    chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
-                    table.set_dword_bl(row_idx, cols::chi_ands(x, y, 0), and_val);
-                    table.set_dword_bl(row_idx, cols::chi(x, y, 0), chi_lanes[x + 5 * y]);
-                }
-            }
-
-            // === ι (iota) ===
-            let rc_val = KECCAK_RC[round];
-            let iota_lane = chi_lanes[0] ^ rc_val;
-            table.set_dword_bl(row_idx, cols::rc(0), rc_val);
-            table.set_dword_bl(row_idx, cols::iota(0), iota_lane);
-
-            // Update state for next round
-            chi_lanes[0] = iota_lane;
-            state = chi_lanes;
-
-            // mu = 1 (real row)
-            table.set_fe(row_idx, cols::MU, FE::one());
+impl KeccakRndRecords {
+    /// Rows `skip..skip + rows` of the table `ops` make. Each op's rows read
+    /// its timestamp and input alone (`fill_op`), so those are what is kept.
+    pub fn new(
+        ops: impl IntoIterator<Item = multilinear::records::KeccakRndOp>,
+        skip: usize,
+        rows: usize,
+    ) -> Self {
+        Self {
+            ops: ops.into_iter().collect(),
+            skip,
+            rows,
         }
     }
 
-    // Padding rows have mu=0 and all zeros (default)
-    trace
+    /// The table held as these records. `None` where a trace cannot be held
+    /// so (not reached: KECCAK_RND has columns, and its field is Goldilocks).
+    pub fn into_trace(self) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+        TraceTable::try_from_records_main(
+            multilinear::records::Records(std::sync::Arc::new(self)),
+            1,
+        )
+        .ok()
+    }
+}
+
+impl multilinear::records::TableRecords for KeccakRndRecords {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn cols(&self) -> usize {
+        cols::NUM_COLUMNS
+    }
+
+    fn fill(&self) -> multilinear::records::RecordsFill<'_> {
+        multilinear::records::RecordsFill::KeccakRnd {
+            ops: &self.ops,
+            skip: self.skip,
+        }
+    }
+
+    fn host_fill(&self) -> Option<multilinear::narrow::NarrowColumns> {
+        let ops: Vec<KeccakRoundOperation> = self
+            .ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: [0; 25],
+            })
+            .collect();
+        let mut trace = generate_keccak_rnd_rows_as(&ops, self.skip, self.rows, TraceForm::Narrow);
+        // Written packed, except in a build that holds every trace wide.
+        trace.pack_main_narrow();
+        trace.take_narrow_main()
+    }
+}
+
+/// One op's 24 rows, from row `first_row` on.
+#[allow(clippy::needless_range_loop)]
+fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usize) {
+    // Execute round-by-round, tracking the state
+    let mut state = op.input;
+
+    for round in 0..24 {
+        let row_idx = first_row + round;
+
+        // Timestamp & round
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::ROUND, round as u64);
+
+        // start = current state as bytes
+        for x in 0..5 {
+            for y in 0..5 {
+                let lane = state[x + 5 * y];
+                table.set_dword_bl(row_idx, cols::start(x, y, 0), lane);
+            }
+        }
+
+        // === θ (theta) ===
+        // Column parities: C[x] = XOR of all 5 lanes in column x
+        // Computed as a chain: Cxz[x][0] = start[x,0] XOR start[x,1]
+        //                      Cxz[x][k] = Cxz[x][k-1] XOR start[x,k+1]
+        let mut c_bytes = [[0u8; 8]; 5]; // C[x][byte] = final parity
+        let mut cxz = [[[0u8; 8]; 4]; 5]; // Cxz[x][stage][byte]
+        for x in 0..5 {
+            // Stage 0: XOR(start[x,0], start[x,1])
+            for b in 0..8 {
+                let v0 = byte_of(state[x], b);
+                let v1 = byte_of(state[x + 5], b);
+                cxz[x][0][b] = v0 ^ v1;
+            }
+            table.set_bytes(row_idx, cols::cxz(x, 0, 0), &cxz[x][0]);
+
+            // Stages 1..3: XOR(Cxz[x][k-1], start[x, k+1])
+            for stage in 1..4 {
+                let y = stage + 1;
+                for b in 0..8 {
+                    let prev = cxz[x][stage - 1][b];
+                    let sv = byte_of(state[x + 5 * y], b);
+                    cxz[x][stage][b] = prev ^ sv;
+                }
+                table.set_bytes(row_idx, cols::cxz(x, stage, 0), &cxz[x][stage]);
+            }
+            c_bytes[x] = cxz[x][3];
+        }
+
+        // Rotate C left by 1 bit using HWSL decomposition.
+        // HWSL shifts each halfword (u16) independently. For shift=1, the
+        // carry is a single bit (top bit of the halfword); we store it in
+        // one column per halfword (Cxz_right[x][hw], spec d75944ee).
+        //   rotated_Cxz[z] = Cxz_left[z] + (1 - z%2) * Cxz_right[(z/2 - 1) mod 4]
+        let mut cxz_left_bytes = [[0u8; 8]; 5];
+        let mut cxz_right_bits = [[0u8; 4]; 5];
+        let mut rotated_c = [[0u8; 8]; 5];
+        for x in 0..5 {
+            for hw in 0..4 {
+                let lo = c_bytes[x][hw * 2] as u16;
+                let hi = c_bytes[x][hw * 2 + 1] as u16;
+                let halfword = lo | (hi << 8);
+                let (shifted, carry) = hwsl(halfword, 1);
+                cxz_left_bytes[x][hw * 2] = (shifted & 0xFF) as u8;
+                cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
+                // For shift=1, carry ∈ {0, 1}.
+                cxz_right_bits[x][hw] = carry as u8;
+            }
+            table.set_bytes(row_idx, cols::cxz_left(x, 0), &cxz_left_bytes[x]);
+            table.set_bytes(row_idx, cols::cxz_right_bit(x, 0), &cxz_right_bits[x]);
+
+            // Reconstruct: left[b] + (1 - b%2) * right[(b/2 + 3) mod 4]
+            for b in 0..8 {
+                let right_contribution = match cols::cxz_right_bit_for_byte(b) {
+                    Some(hw) => cxz_right_bits[x][hw],
+                    None => 0,
+                };
+                rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(right_contribution);
+            }
+        }
+
+        // D[x] = C[(x-1)%5] XOR rotated_C[(x+1)%5]
+        let mut d_bytes = [[0u8; 8]; 5];
+        for x in 0..5 {
+            for b in 0..8 {
+                let val = c_bytes[(x + 4) % 5][b] ^ rotated_c[(x + 1) % 5][b];
+                d_bytes[x][b] = val;
+            }
+            table.set_bytes(row_idx, cols::dxz(x, 0), &d_bytes[x]);
+        }
+
+        // theta[x][y] = start[x][y] XOR D[x]
+        let mut theta_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let lane = state[x + 5 * y];
+                let mut d_lane = 0u64;
+                for b in 0..8 {
+                    d_lane |= (d_bytes[x][b] as u64) << (b * 8);
+                }
+                theta_lanes[x + 5 * y] = lane ^ d_lane;
+                table.set_dword_bl(row_idx, cols::theta(x, y, 0), theta_lanes[x + 5 * y]);
+            }
+        }
+
+        // === ρ (rho) ===
+        // For each lane, rotate theta[x][y] by KECCAK_RHO[x][y] bits.
+        // Decompose rotation as: rnc (nibble, 0..15) + 16*rbc[0] + 32*rbc[1].
+        // rnc and rbc are inlined as compile-time constants per spec
+        // [[variables.constant]]; only HWSL outputs are stored in the trace.
+        for x in 0..5 {
+            for y in 0..5 {
+                let rho_offset = KECCAK_RHO[x][y] as usize;
+                let rnc_val = (rho_offset % 16) as u8;
+                let theta_lane = theta_lanes[x + 5 * y];
+                let mut rot_left_bytes = [0u8; 8];
+                let mut rot_right_bytes = [0u8; 8];
+                for hw in 0..4 {
+                    let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
+                    let (shifted, carry) = hwsl(halfword, rnc_val);
+                    rot_left_bytes[hw * 2] = (shifted & 0xFF) as u8;
+                    rot_left_bytes[hw * 2 + 1] = (shifted >> 8) as u8;
+                    rot_right_bytes[hw * 2] = (carry & 0xFF) as u8;
+                    rot_right_bytes[hw * 2 + 1] = (carry >> 8) as u8;
+                }
+                table.set_bytes(row_idx, cols::rot_left(x, y, 0), &rot_left_bytes);
+                table.set_bytes(row_idx, cols::rot_right(x, y, 0), &rot_right_bytes);
+            }
+        }
+
+        // === π (pi) ===
+        // pi[x][y] = rho[(x+3y)%5][x] where rho is the rotated theta.
+        // pi is a spec [[variables.virtual]] — not stored as trace columns.
+        // It's reconstructed inline in chi bus interactions as
+        //   pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
+        // with (sx, sy) = ((x+3y)%5, x) and (l_byte, r_byte) resolved from
+        // the compile-time rbc constant. pi_lanes is still computed here
+        // for the chi step below.
+        let mut pi_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+                let dst_x = y;
+                let dst_y = (2 * x + 3 * y) % 5;
+                pi_lanes[dst_x + 5 * dst_y] = rotated;
+            }
+        }
+
+        // === χ (chi) ===
+        let mut chi_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let not_next = !pi_lanes[(x + 1) % 5 + 5 * y];
+                let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
+                let and_val = not_next & next2;
+                chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
+                table.set_dword_bl(row_idx, cols::chi_ands(x, y, 0), and_val);
+                table.set_dword_bl(row_idx, cols::chi(x, y, 0), chi_lanes[x + 5 * y]);
+            }
+        }
+
+        // === ι (iota) ===
+        let rc_val = KECCAK_RC[round];
+        let iota_lane = chi_lanes[0] ^ rc_val;
+        table.set_dword_bl(row_idx, cols::rc(0), rc_val);
+        table.set_dword_bl(row_idx, cols::iota(0), iota_lane);
+
+        // Update state for next round
+        chi_lanes[0] = iota_lane;
+        state = chi_lanes;
+
+        // mu = 1 (real row)
+        table.set_fe(row_idx, cols::MU, FE::one());
+    }
 }
 
 // =========================================================================
-// Bus interactions (1,031 total)
+// Bus interactions (1,011 under `KeccakRndForm::Lean`, the block presets'; 1,031 under `Full`)
 // =========================================================================
 //
 // The θ/ρ halfword shifts no longer emit HWSL lookups (120 sends/row removed):
@@ -457,8 +638,14 @@ pub fn generate_keccak_rnd_trace(
 // `KeccakRndConstraints`. The matching HWSL multiplicities are likewise dropped
 // on the BITWISE side (`collect_bitwise_from_keccak`).
 
-#[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    bus_interactions_for(KeccakRndForm::Full)
+}
+
+/// The table's interactions under `form`: [`bus_interactions`] without the 20
+/// `Cxz_left` byte checks under [`KeccakRndForm::Lean`].
+#[allow(clippy::needless_range_loop)]
+pub fn bus_interactions_for(form: KeccakRndForm) -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(1031);
 
     // --- IO group (3) ---
@@ -621,26 +808,31 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // implementation guidance in spec/is_byte.typ.
     // Cxz_right uses IS_BIT polynomial constraints (see `KeccakRndConstraints`).
     // Multiplicity 1 (the spec's default `cond`, see `ARE_BYTES_PER_ROW`).
-    for x in 0..5 {
-        for i in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::AreBytes,
-                Multiplicity::One,
-                vec![
-                    BusValue::Packed {
-                        start_column: cols::cxz_left(x, 2 * i),
-                        packing: Packing::Direct,
-                    },
-                    BusValue::Packed {
-                        start_column: cols::cxz_left(x, 2 * i + 1),
-                        packing: Packing::Direct,
-                    },
-                ],
-            ));
+    // Not sent under `KeccakRndForm::Lean`, which the D lookups below imply.
+    if form.checks_cxz_left() {
+        for x in 0..5 {
+            for i in 0..4 {
+                interactions.push(BusInteraction::sender(
+                    BusId::AreBytes,
+                    Multiplicity::One,
+                    vec![
+                        BusValue::Packed {
+                            start_column: cols::cxz_left(x, 2 * i),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::cxz_left(x, 2 * i + 1),
+                            packing: Packing::Direct,
+                        },
+                    ],
+                ));
+            }
         }
     }
 
     // --- Theta: Dxz BYTE_ALU[XOR] (40) ---
+    // Under `KeccakRndForm::Lean` these operands carry the `Cxz_left` range:
+    // a change that removes or repacks them must restore the 20 checks above.
     // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
     // rotated_C[x'][b] = Cxz_left[x'][b] + (1 - b%2) * Cxz_right[x'][(b/2 - 1)%4]
     // (spec d75944ee/9143370f). For odd b only Cxz_left contributes.
@@ -871,9 +1063,14 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// * **1 MuIsBit**: `μ · (1 − μ)` (degree 2).
 ///
 /// These identities replace the former θ/ρ HWSL bus lookups. Uniqueness of the
-/// (left, right) decomposition rests on the ARE_BYTES range checks bounding both
-/// halves to `[0, 2¹⁶)` and on `2¹⁶` being invertible mod the Goldilocks prime
-/// (z3-verified equivalent to the HWSL contract).
+/// (left, right) decomposition rests on both halves bounded to `[0, 2¹⁶)` and on
+/// `2¹⁶` being invertible mod the Goldilocks prime. For ρ the bound is the
+/// ARE_BYTES range checks in both forms. For θ under [`KeccakRndForm::Lean`],
+/// the block presets' form, it is the D lookups' byte operands and the
+/// identity's parity, checked by exhaustive enumeration
+/// (`block_keccak_lean_tests`). Under the [`KeccakRndForm::Full`] variant it is
+/// the θ ARE_BYTES checks (z3-verified equivalent to the HWSL contract, on the
+/// full form).
 #[derive(Clone, Copy)]
 pub struct KeccakRndConstraints;
 
@@ -949,3 +1146,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
         b.emit_base(idx, mu.clone() * (one - mu));
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "keccak_rnd_card_tests.rs"]
+mod card_tests;

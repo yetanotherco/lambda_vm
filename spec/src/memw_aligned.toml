@@ -56,12 +56,21 @@ pad = 0
 # Auxiliary
 
 [[variables.auxiliary]]
-name = "old_timestamp"
-type = "DWordWL"
-desc = "The timestamp at which the address was last accessed"
+name = "step"
+type = ["Half", 2]
+desc = """The limbs of the step since the address was last accessed, less one:
+`timestamp - old_timestamp - 1 = step[0] + 2^16 step[1]` on the low words, the two timestamps sharing their
+high word. The block's form; the form before it (the per-table STARK's) held `old_timestamp` as a `DWordWL`
+in these two columns and proved the order by one `ALU[LT]` lookup"""
 pad = 0
 
 # Virtual
+
+[[variables.virtual]]
+name = "old_timestamp"
+type = "DWordWL"
+desc = "The timestamp at which the address was last accessed: its low word derived from `step`, its high word `timestamp`'s"
+def = ["cast", ["arr", ["-", ["idx", "timestamp", 0], 1, ["idx", "step", 0], ["*", 65536, ["idx", "step", 1]]], ["idx", "timestamp", 1]], "DWordWL"]
 
 [[variables.virtual]]
 name = "w2"
@@ -118,6 +127,9 @@ desc = "`IS_BIT<write2 + write4 + write8>`"
 desc = "`IS_WORD[timestamp[i]]`"
 iter = ["i", 0, 1]
 
+[[assumptions]]
+desc = "Every timestamp the memory bus carries is below 2^32 (the clock's high word is 0), so a step in $[1, 2^32]$ from a token is a later timestamp; an access whose two timestamps differ in their high words is MEMW's"
+
 [[constraint_groups]]
 name = "assumptions"
 
@@ -172,9 +184,14 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "ALU"
-input = ["old_timestamp", "timestamp", ["opsel", "LT"]]
-output = ["arr", 1, 0]
+tag = "IS_HALF"
+input = [["idx", "step", 0]]
+multiplicity = "μ_sum"
+
+[[constraints.consistency]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "step", 1]]
 multiplicity = "μ_sum"
 
 [[constraint_groups]]

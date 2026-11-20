@@ -8,7 +8,7 @@ use crate::{
             execution::ExecutionError,
         },
         logs::Log,
-        memory::{Memory, MemoryError, U64HashMap},
+        memory::{ExecPaths, GuestMemory, Memory, MemoryError, U64HashMap},
         registers::Registers,
     },
 };
@@ -30,6 +30,10 @@ pub struct ExecutionResult {
 /// Size of each log chunk - balances memory usage vs callback overhead
 pub(crate) const CHUNK_SIZE: usize = 100_000;
 
+/// The most logs [`Executor::resume_owned`] reserves for its next call
+/// (2^22, 160 MiB); past it the buffer grows as logs are written.
+const MAX_RESERVED_LOGS: usize = 1 << 22;
+
 /// Result of executing one continuation epoch: the logs produced during the
 /// epoch and the VM state at the epoch boundary. The boundary state is the
 /// starting state of the next epoch.
@@ -48,11 +52,31 @@ pub struct Executor {
     pc: u64,
     pub instructions: InstructionCache,
     logs: Vec<Log>,
+    /// A handed-out window's buffer given back ([`Executor::recycle`]).
+    spare: Option<Vec<Log>>,
 }
 
 impl Executor {
     pub fn new(program: &Elf, private_inputs: Vec<u8>) -> Result<Self, ExecutorError> {
-        let mut memory = Memory::default();
+        Self::with_memory(program, private_inputs, Memory::default())
+    }
+
+    /// [`Executor::new`] on the given access paths (the default is
+    /// [`ExecPaths::FAST`]): what a test compares the paths with.
+    pub fn new_with_paths(
+        program: &Elf,
+        private_inputs: Vec<u8>,
+        paths: ExecPaths,
+    ) -> Result<Self, ExecutorError> {
+        let memory = Memory::with_paths(paths);
+        Self::with_memory(program, private_inputs, memory)
+    }
+
+    fn with_memory(
+        program: &Elf,
+        private_inputs: Vec<u8>,
+        mut memory: Memory,
+    ) -> Result<Self, ExecutorError> {
         memory.store_private_inputs(private_inputs)?;
         let instructions = InstructionCache::new(&program.data)?;
         load_program(&program.data, &mut memory)?;
@@ -63,6 +87,7 @@ impl Executor {
             pc: program.entry_point,
             instructions,
             logs: Vec::with_capacity(CHUNK_SIZE),
+            spare: None,
         })
     }
 
@@ -102,6 +127,22 @@ impl Executor {
         &self.memory
     }
 
+    /// The run's state replaced: `pc`, the registers, and a memory holding
+    /// `snapshot`'s bytes and the public output `public_output` (on this
+    /// executor's access paths). The program stays. What a check re-executes
+    /// a window of another engine's run from.
+    pub fn restore(
+        &mut self,
+        pc: u64,
+        registers: Registers,
+        snapshot: &crate::vm::memory::MemorySnapshot,
+        public_output: Vec<u8>,
+    ) {
+        self.memory = Memory::from_snapshot(snapshot, public_output, self.memory.paths());
+        self.registers = registers;
+        self.pc = pc;
+    }
+
     /// Resume execution, running at most `limit` cycles, and return the logs
     /// produced. Returns None when the program is finished.
     pub fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {
@@ -112,17 +153,12 @@ impl Executor {
         self.logs.clear();
 
         while self.pc != 0 && self.logs.len() < limit {
-            if !self.pc.is_multiple_of(4) {
-                return Err(ExecutorError::InstructionAddressMisaligned(self.pc));
-            }
-            let instruction = match self.instructions.get(self.pc) {
-                Some(&instr) => instr,
-                None => {
-                    let next_instruction = self.memory.load_word(self.pc)?;
-                    Instruction::parse(next_instruction)?
-                }
-            };
-            let log = instruction.run(&mut self.pc, &mut self.registers, &mut self.memory)?;
+            let log = step(
+                &mut self.pc,
+                &mut self.registers,
+                &mut self.memory,
+                &self.instructions,
+            )?;
             self.logs.push(log);
         }
 
@@ -131,6 +167,44 @@ impl Executor {
         } else {
             Ok(Some(&self.logs))
         }
+    }
+
+    /// [`Executor::resume_with_limit`], the logs handed out as they lie rather
+    /// than lent: the executor keeps a new buffer of `limit` logs for the next
+    /// call. The same logs, without the copy a caller that keeps them would
+    /// make of the borrowed slice.
+    ///
+    /// The buffer handed out holds exactly its logs (capacity = length), as a
+    /// copied slice would: a caller that counts a window's bytes by its
+    /// capacity when it takes it and by its length when it lets it go (the
+    /// block prover's memory log does) counts the same bytes both times.
+    pub fn resume_owned(&mut self, limit: usize) -> Result<Option<Vec<Log>>, ExecutorError> {
+        // A window's worth, no more than a bound: a caller passing
+        // `usize::MAX` as "the rest" must not reserve it.
+        let window = limit.min(MAX_RESERVED_LOGS);
+        if self.logs.capacity() < window {
+            // Reserved once, exactly: no doubling past the window as it fills.
+            self.logs.clear();
+            self.logs.reserve_exact(window);
+        }
+        if self.resume_with_limit(limit)?.is_none() {
+            return Ok(None);
+        }
+        let next = crate::vm::logs::next_buffer(&mut self.spare, window);
+        let mut logs = std::mem::replace(&mut self.logs, next);
+        // A full window already fills its buffer; the first (the executor's
+        // own buffer, sized before the window was known) and the last (the
+        // run ended early) may not.
+        logs.shrink_to_fit();
+        Ok(Some(logs))
+    }
+
+    /// Gives back a buffer [`Executor::resume_owned`] handed out, once its
+    /// logs are no longer needed: the next window is written into it (when it
+    /// holds a whole window) instead of into fresh memory. The logs are the
+    /// same either way.
+    pub fn recycle(&mut self, buffer: Vec<Log>) {
+        self.spare = Some(buffer);
     }
 
     fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {
@@ -190,7 +264,34 @@ impl Executor {
     }
 }
 
-fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
+/// One cycle: the instruction at `pc` (from the decoded segments, else
+/// decoded from the word in memory) executed, `pc` moved on. The reference
+/// executor's whole loop body; the fast engine's for every instruction it
+/// does not run itself.
+#[inline(always)]
+pub(crate) fn step<M: GuestMemory>(
+    pc: &mut u64,
+    registers: &mut Registers,
+    memory: &mut M,
+    instructions: &InstructionCache,
+) -> Result<Log, ExecutorError> {
+    if !pc.is_multiple_of(4) {
+        return Err(ExecutorError::InstructionAddressMisaligned(*pc));
+    }
+    let instruction = match instructions.get(*pc) {
+        Some(&instr) => instr,
+        None => {
+            let next_instruction = memory.load_word(*pc)?;
+            Instruction::parse(next_instruction)?
+        }
+    };
+    Ok(instruction.run(pc, registers, memory)?)
+}
+
+pub(crate) fn load_program<M: GuestMemory>(
+    segments: &[crate::elf::Segment],
+    memory: &mut M,
+) -> Result<(), MemoryError> {
     for segment in segments {
         for (i, inst) in segment.values.iter().enumerate() {
             let addr = segment.base_addr + (i as u64 * 4);
@@ -304,6 +405,13 @@ impl InstructionCache {
         segment.instructions.get((byte_offset / 4) as usize)
     }
 
+    /// Each decoded segment's base address and instructions.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = (u64, &[Instruction])> {
+        self.segments
+            .iter()
+            .map(|s| (s.base_addr, s.instructions.as_slice()))
+    }
+
     pub fn instruction_count(&self) -> usize {
         self.segments.iter().map(|s| s.instructions.len()).sum()
     }
@@ -347,4 +455,6 @@ pub enum ExecutorError {
     MemoryError(#[from] MemoryError),
     #[error("Instruction address misaligned: {0:#018x}")]
     InstructionAddressMisaligned(u64),
+    #[error("History mode: {0}")]
+    History(String),
 }

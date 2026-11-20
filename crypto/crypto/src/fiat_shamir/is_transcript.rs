@@ -9,6 +9,27 @@ pub trait IsTranscript<F: IsField> {
     fn append_field_element(&mut self, element: &FieldElement<F>);
     /// Appends a bytes to the transcript.
     fn append_bytes(&mut self, new_bytes: &[u8]);
+    /// Tells the transcript that a STATEMENT has just ended, so the alignment
+    /// counter can report what happens after one.
+    ///
+    /// ★ A METRICS CONCERN IN A PRODUCTION TRAIT, and it is here rather than
+    /// beside the counter because only the transcript knows the window. What
+    /// the padding promises is not "no absorb is ever misaligned" — a statement
+    /// is variable-length by nature, so its own fields straddle boundaries
+    /// constantly — but "whatever follows a statement starts aligned", and a
+    /// transcript cannot tell where a statement ends unless it is told.
+    ///
+    /// ⚠ IT MUST NOT TOUCH THE WINDOW. Resetting the offset to zero here would
+    /// make the next absorb aligned BY CONSTRUCTION, including when the padding
+    /// is wrong — a check that cannot fail, wearing the name of the one the pad
+    /// owes. It only starts the counting;
+    /// `a_statement_that_ends_off_a_boundary_is_still_counted` is what holds
+    /// that line.
+    ///
+    /// The default is a no-op, and without `hash-metrics` the override is one
+    /// too, so a normal build compiles every call to nothing.
+    fn mark_statement_end(&mut self) {}
+
     /// Returns a digest of everything absorbed so far (the sponge state).
     ///
     /// This binds the absorbed input stream, but it does NOT capture any

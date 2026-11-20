@@ -25,7 +25,6 @@
 
 use std::collections::HashMap;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{
@@ -35,7 +34,7 @@ use stark::lookup::{
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
@@ -241,7 +240,7 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
         (&msb16_air, &mut msb16_trace, &()),
         (&arebytes_air, &mut arebytes_trace, &()),
     ];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
         &cpu_air,
         &victim_air,
@@ -250,10 +249,10 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
         &msb16_air,
         &arebytes_air,
     ];
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }

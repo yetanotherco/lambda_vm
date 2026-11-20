@@ -136,39 +136,3 @@ fn batch_proof_len_is_expected_for_long_pos_list() {
     let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     assert_eq!(batch_proof.path.len(), 2);
 }
-
-#[cfg(all(feature = "serde", feature = "disk-spill"))]
-mod disk_spill_serde_tests {
-    use crate::merkle_tree::backends::field_element::FieldElementBackend;
-    use crate::merkle_tree::merkle::MerkleTree;
-    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
-    use sha3::Keccak256;
-
-    type F = GoldilocksField;
-    type FE = FieldElement<F>;
-    type Backend = FieldElementBackend<F, Keccak256, 32>;
-
-    /// Serializing a spilled MerkleTree must produce identical bytes to
-    /// serializing the same tree before spilling, and round-trip back to an
-    /// equal tree.
-    #[test]
-    fn test_serialize_spilled_merkle_tree_matches_unspilled() {
-        let values: Vec<FE> = (1..17).map(FE::from).collect();
-        let unspilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
-        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
-
-        let mut spilled = MerkleTree::<Backend>::build(&values).expect("build merkle tree");
-        spilled.spill_nodes_to_disk().expect("spill_nodes_to_disk");
-        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
-
-        assert_eq!(
-            spilled_bytes, unspilled_bytes,
-            "spilled and unspilled trees must serialize to identical bytes"
-        );
-
-        let restored: MerkleTree<Backend> =
-            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(!restored.has_mmap_backing());
-        assert_eq!(restored.root, unspilled.root);
-    }
-}

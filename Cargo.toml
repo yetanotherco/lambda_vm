@@ -7,6 +7,7 @@ members = [
   "crypto/ecsm",
   "crypto/math",
   "crypto/math-cuda",
+  "crypto/multilinear",
   "bin/cli",
 ]
 # Riscv-only bare-metal crate, path-dependent from crypto/crypto (target-gated),

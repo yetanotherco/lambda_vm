@@ -1,11 +1,12 @@
 use executor::{
-    elf::Elf,
+    elf::{Elf, SymbolTable},
     vm::execution::{ExecutionResult, Executor, ReturnValues},
     vm::instruction::{
         decoding::Instruction,
         execution::{DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER},
     },
 };
+use std::ops::Range;
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
 // The test binaries need to be recompiled for 64-bit architecture.
@@ -267,6 +268,170 @@ fn test_commit() {
         "./program_artifacts/rust/commit.elf",
         vec![4, 5, 6, 7],
         vec![4, 5, 6, 7],
+    );
+}
+
+const ETHREX_ELF: &str = "./program_artifacts/rust/ethrex.elf";
+const MEM_SWEEP_ELF: &str = "./program_artifacts/rust/mem_sweep.elf";
+
+/// `ecall`. The copy accelerator's `memcpy`, `memmove` and `memset` stubs (syscalls'
+/// `entrypoint.rs`) each contain one; compiler_builtins' routines and the
+/// `fast-memcpy` software `memcpy` contain none.
+const ECALL: u32 = 0x0000_0073;
+
+/// `ld` (opcode and funct3 bits). The runtime's `memcmp` compares doublewords with it;
+/// compiler_builtins' `memcmp` loads one byte at a time.
+const LD: u32 = 0x0000_3003;
+
+/// The address range and the instruction words of the function that starts at `pc`.
+fn function_at(program: &Elf, symbols: &SymbolTable, pc: u64) -> Option<(Range<u64>, Vec<u32>)> {
+    let f = symbols.lookup(pc).filter(|f| f.address == pc)?;
+    let segment = program.data.iter().find(|s| {
+        s.is_executable && pc >= s.base_addr && pc < s.base_addr + 4 * s.values.len() as u64
+    })?;
+    let first = ((pc - segment.base_addr) / 4) as usize;
+    let words = segment.values[first..first + (f.size / 4) as usize].to_vec();
+    Some((pc..pc + f.size, words))
+}
+
+/// The address range and the instruction words of the function `name` in an ELF.
+fn function_in(elf_bytes: &[u8], name: &str) -> (Range<u64>, Vec<u32>) {
+    let program = Elf::load(elf_bytes).unwrap();
+    let symbols = SymbolTable::parse(elf_bytes);
+    for segment in program.data.iter().filter(|s| s.is_executable) {
+        for i in 0..segment.values.len() as u64 {
+            let pc = segment.base_addr + 4 * i;
+            if symbols
+                .lookup(pc)
+                .is_some_and(|f| f.address == pc && f.name == name)
+            {
+                return function_at(&program, &symbols, pc).unwrap();
+            }
+        }
+    }
+    panic!("no function `{name}` in the ELF");
+}
+
+/// The address range and the instruction words of what `name` executes: the
+/// function itself or, when it is a two-instruction tail jump (`auipc rd, hi` then
+/// `jalr x0, lo(rd)`, which is how these guests' `memmove` enters compiler_builtins'
+/// implementation), the function it jumps to. The words are compared across ELFs,
+/// so they must not depend on where the code sits.
+fn body_of(elf_bytes: &[u8], name: &str) -> (Range<u64>, Vec<u32>) {
+    let (range, words) = function_in(elf_bytes, name);
+    let &[auipc, jalr] = words.as_slice() else {
+        return (range, words);
+    };
+    let rd = (auipc >> 7) & 31;
+    let is_auipc = auipc & 0x7f == 0x17;
+    let is_jump = jalr & 0x7f == 0x67 && (jalr >> 7) & 31 == 0 && (jalr >> 15) & 31 == rd;
+    if !(is_auipc && is_jump) {
+        return (range, words);
+    }
+    let hi = i64::from((auipc & 0xffff_f000) as i32);
+    let lo = i64::from(jalr as i32 >> 20);
+    let target = (range.start as i64 + hi + lo) as u64;
+    let program = Elf::load(elf_bytes).unwrap();
+    let symbols = SymbolTable::parse(elf_bytes);
+    function_at(&program, &symbols, target)
+        .unwrap_or_else(|| panic!("`{name}` jumps to {target:#x}, where no function starts"))
+}
+
+/// In-VM sweep of the memory routines the guest links (`memcpy`, `memmove` and
+/// `memset` are the runtime's copy-accelerator stubs; `memcmp` is the runtime's
+/// doubleword routine). The guest compares every result with values
+/// recomputed from the index and commits `OK` plus its case counts, or `FAIL` plus
+/// the first failing case. Counts, in order: memcpy at every length 0..=1100 and
+/// offsets mod 8; memcpy at lengths 0..=160 and offsets mod 16; memcpy large lengths,
+/// lengths up to a page and the compiler's own copies; memcpy onto itself and between
+/// touching regions; memmove overlapping both ways; memset; memcmp calls.
+#[test]
+fn test_mem_sweep() {
+    let elf = std::fs::read(MEM_SWEEP_ELF).unwrap();
+    // The stubs' own ECALLs are the only instructions inside them that read a7.
+    let stubs = ["memcpy", "memmove", "memset"].map(|name| {
+        let (range, words) = function_in(&elf, name);
+        assert!(
+            words.contains(&ECALL),
+            "the sweep guest does not link the runtime's `{name}` stub"
+        );
+        range
+    });
+    let program = Elf::load(&elf).unwrap();
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to run program");
+    let (mut copy_calls, mut set_calls) = (0u64, 0u64);
+    while let Some(logs) = executor.resume().expect("Failed to run program") {
+        for log in logs.iter() {
+            if stubs.iter().any(|r| r.contains(&log.current_pc)) {
+                copy_calls += u64::from(log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER);
+                set_calls += u64::from(log.src1_val == DMA_MEMSET_SYSCALL_NUMBER);
+            }
+        }
+    }
+    let out = executor
+        .finish()
+        .expect("Failed to run program")
+        .memory_values;
+    if !out.starts_with(b"OK") {
+        assert!(
+            out.starts_with(b"FAIL") && out.len() == 15,
+            "unexpected output {out:?}"
+        );
+        panic!(
+            "mem_sweep failed: stage {} length {} source alignment {} destination alignment {} first wrong byte at destination + {}",
+            out[4],
+            u32::from_le_bytes(out[5..9].try_into().unwrap()),
+            out[9],
+            out[10],
+            i32::from_le_bytes(out[11..15].try_into().unwrap()),
+        );
+    }
+    let counts: Vec<u32> = out[2..]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // 1101 lengths x 64; 161 lengths x 256; 6 x 16 + 2 x 4 + 428 x 4 + 16; 301 x 8 x 3;
+    // 201 x 8 x 19; 301 x 8 x 2 memset; 64 offset pairs x 31_322 memcmp calls
+    // (lengths 0..=300, see `memcmp_positions` in the guest).
+    assert_eq!(
+        counts,
+        [70_464, 41_216, 1_832, 7_224, 30_552, 4_816, 2_004_608]
+    );
+    assert!(
+        function_in(&elf, "memcmp")
+            .1
+            .iter()
+            .any(|&w| w & 0x707f == LD),
+        "the sweep guest's `memcmp` has no doubleword load: it is not the runtime's"
+    );
+    assert!(
+        copy_calls > 0 && set_calls > 0,
+        "the sweep made {copy_calls} copy and {set_calls} memset ecalls: the copy \
+         accelerator's stubs did not run"
+    );
+}
+
+/// The guest every block proof is about links the very `memcpy`, `memmove`, `memset`
+/// and `memcmp` that `test_mem_sweep` exercises: the same instruction words in both ELFs.
+#[test]
+fn test_ethrex_links_the_swept_memory_routines() {
+    let ethrex = std::fs::read(ETHREX_ELF).unwrap();
+    let sweep = std::fs::read(MEM_SWEEP_ELF).unwrap();
+    for name in ["memcpy", "memmove", "memset"] {
+        assert!(
+            function_in(&ethrex, name).1.contains(&ECALL),
+            "the ethrex guest does not link the runtime's `{name}` stub"
+        );
+        assert_eq!(
+            body_of(&ethrex, name).1,
+            body_of(&sweep, name).1,
+            "`{name}` differs between the ethrex guest and the sweep guest"
+        );
+    }
+    assert_eq!(
+        body_of(&ethrex, "memcmp").1,
+        body_of(&sweep, "memcmp").1,
+        "`memcmp` differs between the ethrex guest and the sweep guest"
     );
 }
 

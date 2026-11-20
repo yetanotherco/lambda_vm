@@ -79,6 +79,11 @@ impl<F: IsFFTField> TwoHalfTwiddles<F> {
             bitrev_tw,
         })
     }
+
+    /// The bytes its two twiddle tables hold.
+    pub fn heap_bytes(&self) -> usize {
+        (self.tw.capacity() + self.bitrev_tw.capacity()) * core::mem::size_of::<FieldElement<F>>()
+    }
 }
 
 /// DIT butterfly over two equal-length row-slices, one twiddle for all pairs:

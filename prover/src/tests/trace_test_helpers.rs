@@ -9,8 +9,6 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
 use crate::Error;
@@ -132,14 +130,7 @@ impl Traces {
         max_rows: &MaxRowsConfig,
         private_input: &[u8],
     ) -> Result<Self, Error> {
-        let mut traces = Self::from_elf_and_logs(
-            elf,
-            logs,
-            max_rows,
-            private_input,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-        )?;
+        let mut traces = Self::from_elf_and_logs(elf, logs, max_rows, private_input)?;
         traces.bitwise = trim_zero_rows(traces.bitwise);
         Ok(traces)
     }
