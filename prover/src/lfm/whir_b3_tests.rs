@@ -2297,14 +2297,12 @@ mod stacked {
                     panic!("{lowering} {name}: the honest opening with answers refused: {e}")
                 });
                 let forged = build_with(case, Some(FEE::one()));
-                assert!(
-                    !host_accepts(&forged, &forged.proof),
-                    "{name}: a false answer its chain carries, host"
-                );
+                let host = host_accepts(&forged, &forged.proof);
                 assert!(
                     runs(&program(&forged), arena(&forged, &forged.proof)).is_err(),
                     "{lowering} {name}: a false answer its joint chain carries executed"
                 );
+                assert!(!host, "{name}: a false answer its chain carries, host");
             }
         });
     }
