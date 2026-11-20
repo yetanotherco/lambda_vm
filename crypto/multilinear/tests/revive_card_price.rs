@@ -2,8 +2,11 @@
 //! and `revive_whole_card_bytes`), with coset openings forced on: over a
 //! store on coset leaves the revive holds its room and no codeword, whole it
 //! holds every codeword besides; on natural leaves the two hold the same
-//! codewords. Host only. It forces a process-wide knob, so it is the only
-//! test in its binary.
+//! codewords. The openings' room is the card's working set (zero without the
+//! `cuda` feature, a layout's own size with it) and does not depend on the
+//! leaf order, so "no codeword" is read as natural minus coset being exactly
+//! the codewords, on any build. It forces a process-wide knob, so it is the
+//! only test in its binary.
 
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField as F;
@@ -44,6 +47,7 @@ fn column(num_vars: usize, seed: u64) -> Mle<F> {
 fn a_revive_over_a_store_prices_no_codeword_on_coset_leaves() {
     gpu::force_coset_openings(Some(true));
     let result = std::panic::catch_unwind(|| {
+        let mut over_coset = None;
         for (leaves, coset) in [(LeafOrder::Coset, true), (LeafOrder::Natural, false)] {
             let config = config(leaves);
             let columns: Vec<Mle<F>> = (0..3).map(|k| column(10, k)).collect();
@@ -62,14 +66,20 @@ fn a_revive_over_a_store_prices_no_codeword_on_coset_leaves() {
                     whole >= over + polys * codeword,
                     "{leaves:?}: over {over}, whole {whole}"
                 );
-                assert!(
-                    over < codeword,
-                    "{leaves:?}: a revive over the store holds no codeword ({over})"
-                );
+                over_coset = Some(over);
             } else {
                 assert!(
                     over >= polys * codeword,
                     "{leaves:?}: natural leaves re-encode ({over})"
+                );
+                // The same room on both leaf orders: over a store on coset
+                // leaves the revive holds no codeword, on natural leaves every
+                // one.
+                let on_coset = over_coset.expect("the coset leaves ran first");
+                assert_eq!(
+                    over,
+                    on_coset + polys * codeword,
+                    "a revive over the store on coset leaves holds no codeword ({on_coset} against {over})"
                 );
                 assert!(whole >= polys * codeword, "{leaves:?}: {whole}");
             }
