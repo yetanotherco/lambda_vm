@@ -2028,16 +2028,39 @@ fn rta_first_groups(
     };
     let on_group = |_: stark::multilinear_block::GroupOpened<'_, _, _>| {};
     let t = Instant::now();
-    let prove_base = || {
-        crate::block_whir::prove_block_whir_observed_groups(
-            elf,
-            input,
-            opts,
-            &cfg.format,
-            &cfg.options,
-            &observe,
-            &on_group,
-        )
+    // Either kind of base (local lookups are the BLAKE3 base's default),
+    // held as one type.
+    let prove_base = || -> Result<
+        (crate::block_whir::AnyBlockWhirProof, crate::block_whir::BlockStamps),
+        crate::Error,
+    > {
+        if cfg.format.local_lookups() {
+            crate::block_whir::prove_block_whir_local_observed_led(
+                elf,
+                input,
+                opts,
+                &cfg.format,
+                &cfg.options,
+                &observe,
+                &on_group,
+                None,
+            )
+            .map(|(mut proof, stamps)| {
+                let local = std::mem::take(&mut proof.local);
+                (proof.with_local(Some(local)), stamps)
+            })
+        } else {
+            crate::block_whir::prove_block_whir_observed_groups(
+                elf,
+                input,
+                opts,
+                &cfg.format,
+                &cfg.options,
+                &observe,
+                &on_group,
+            )
+            .map(|(proof, stamps)| (proof.with_local(None), stamps))
+        }
     };
     let (proof, s) = match family {
         WlfmFamily::P1 => prove_base(),
