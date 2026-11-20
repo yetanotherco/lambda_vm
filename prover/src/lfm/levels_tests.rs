@@ -501,6 +501,90 @@ fn the_blake3_levels_driver_proves_a_small_block() {
     );
 }
 
+/// ★ The levels driver over a BLAKE3 base under local lookups (KECCAK_RND's
+/// byte lookups argued per group): the base is proved in its own kind, each
+/// group's local argue reaches level 1 as phase B opens the group, every
+/// level verifies, and the block's own verifier — its plan derived under the
+/// same format — accepts the last. What the whole-pipeline A/B runs on a
+/// real block.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels; box tier"]
+fn the_blake3_levels_driver_proves_a_local_base_to_its_last_level() {
+    use super::levels::prove_block_levels;
+    let format = BlockFormat {
+        argue: multilinear::whir_chain::ArgueFormat::BATCHED,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..b3_format()
+    };
+    assert!(format.local_lookups());
+    let elf = crate::test_utils::asm_elf_bytes("test_keccak");
+    let opts = ProofOptions::default_test_options();
+    let run = prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &streamed_options(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
+    .expect("the local BLAKE3 block proves to its last level");
+    let locals = run
+        .base_proof
+        .local
+        .as_ref()
+        .expect("a base of the local kind")
+        .iter()
+        .filter(|a| !a.is_empty())
+        .count();
+    assert!(locals > 0, "the base argues local lookups");
+    assert!(
+        crate::base_only::with_permit(|| crate::block_whir::verify_block_whir(
+            &run.base_proof,
+            &elf,
+            &opts,
+            &format
+        )
+        .expect("verify runs")),
+        "the local base verifies"
+    );
+    for (k, (level, p)) in run.levels.iter().zip(&run.proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+    }
+    let plan = b3_plan(&elf, &run.base_proof, &format);
+    verify_levels(
+        &plan,
+        WlfmFamily::B3,
+        run.proofs.last().expect("a last level"),
+    )
+    .expect("the block's own verifier accepts the last level");
+    // Today's plan over the same statement is refused (its frame has no
+    // LOCAL_BYTES): the last level claims a block only its own format derives.
+    let todays = BlockFormat {
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
+        ..format
+    };
+    assert!(
+        super::levels::level_plan(
+            &elf,
+            &opts,
+            &todays,
+            run.base_proof.statement(),
+            WlfmFamily::B3,
+            None
+        )
+        .is_err(),
+        "today's plan over a local statement"
+    );
+    println!(
+        "LEVELS DRIVER B3 LOCAL: local groups {locals} · base {:.3}s · levels {:?}",
+        run.times.base, run.times.levels
+    );
+}
+
 /// ★ The driver's stacks are the prover's choice, never the proof's: a small
 /// BLAKE3 block driven with every level's prepared stacks committed on the
 /// card and let go (revived at each group's opening) proves each level's
