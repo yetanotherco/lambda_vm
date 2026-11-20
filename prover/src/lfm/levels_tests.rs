@@ -2174,8 +2174,8 @@ fn a_levels_verifier_pins_its_familys_base() {
     use crate::block_whir::{B3_BASE_GROUP_POLYS, B3Rounds, BlockFormat};
     use multilinear::whir_chain::GroupFold;
     let pinned = BlockFormat::pinned_with(GroupFold::Indexed);
-    let b3 = super::levels::pin_family(pinned.clone(), WlfmFamily::B3, B3Rounds::WHIR3)
-        .expect("the BLAKE3 pin");
+    let b3 =
+        super::levels::pin_family(pinned, WlfmFamily::B3, B3Rounds::WHIR3).expect("the BLAKE3 pin");
     assert_eq!(b3.zf.base, BaseFormat::B3_WHIR);
     assert_eq!(b3.group_polys, B3_BASE_GROUP_POLYS);
     assert_eq!(b3.b3_rounds, B3Rounds::WHIR3);
@@ -2185,7 +2185,7 @@ fn a_levels_verifier_pins_its_familys_base() {
             .argue
             .with_ladder(crate::block_whir::B3_BASE_GKR_DEFAULT)
     );
-    let p1 = super::levels::pin_family(pinned.clone(), WlfmFamily::P1, B3Rounds::Fri)
+    let p1 = super::levels::pin_family(pinned, WlfmFamily::P1, B3Rounds::Fri)
         .expect("the Poseidon1 pin");
     assert_eq!(p1.zf.base, pinned.zf.base);
     assert!(
