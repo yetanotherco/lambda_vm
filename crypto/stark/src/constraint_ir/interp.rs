@@ -160,6 +160,36 @@ where
     values[root as usize].as_base()
 }
 
+/// Evaluate every root of `prog` on one base-field main row, with the LogUp
+/// challenges and alpha powers given, each root promoted to the extension. For
+/// the differential tests: no aux columns, no table offset, row 0 only.
+pub fn eval_program_roots<F, E>(
+    prog: &ConstraintProgram<F, E>,
+    main_row: &[FieldElement<F>],
+    challenges: &[FieldElement<E>],
+    alpha_powers: &[FieldElement<E>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let values = run(
+        prog,
+        |main, _offset, row, col| {
+            assert!(main, "aux leaves are not part of a main-row program");
+            assert_eq!(row, 0, "a main-row program reads row 0 only");
+            Value::Base(main_row[col as usize].clone())
+        },
+        |idx| challenges[idx as usize].clone(),
+        |idx| alpha_powers[idx as usize].clone(),
+        || panic!("table_offset leaves are not part of a main-row program"),
+    );
+    prog.roots
+        .iter()
+        .map(|&root| values[root as usize].to_ext())
+        .collect()
+}
+
 /// Full prover entry point: evaluate every constraint in `prog` against `ctx`
 /// (must be [`TransitionEvaluationContext::Prover`]), writing base-field
 /// ([`Dim::Base`]-rooted) constraints into `base_evals` and extension-field

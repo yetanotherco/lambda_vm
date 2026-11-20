@@ -1,0 +1,69 @@
+name: Formal model
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["formal/**", ".github/workflows/formal.yml"]
+  pull_request:
+    paths: ["formal/**", ".github/workflows/formal.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lean:
+    name: Lean build and export check
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: formal
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install elan
+        env:
+          ELAN_VERSION: v4.2.4
+          ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+        run: |
+          cd "$(mktemp -d)"
+          curl -sSfL "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" -o elan.tar.gz
+          echo "${ELAN_SHA256}  elan.tar.gz" | sha256sum -c -
+          tar xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Clean and CompPoly are compiled from source; Mathlib and its dependencies come from
+      # `lake exe cache get`. One entry per toolchain and manifest, holding the source-built
+      # packages and the LambdaVM build only (a directory in `path` is archived whole, so an
+      # exclusion under it has no effect).
+      - name: Cache Lake builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            formal/.lake/build
+            formal/.lake/packages/Clean
+            formal/.lake/packages/CompPoly
+          key: lake-src-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}
+
+      - name: Fetch Mathlib binaries
+        run: lake exe cache get
+
+      - name: Build
+        run: lake build
+
+      - name: Export is up to date
+        run: |
+          lake env lean --run LambdaVM/Export.lean
+          git diff --exit-code -- export
+          untracked=$(git ls-files --others --exclude-standard -- export)
+          if [ -n "$untracked" ]; then
+            echo "export files not committed:"
+            echo "$untracked"
+            exit 1
+          fi

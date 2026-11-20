@@ -108,6 +108,8 @@ pub mod register_tests;
 pub mod shift_tests;
 
 #[cfg(test)]
+pub mod lean_diff;
+#[cfg(test)]
 pub mod skip_empty_tables_tests;
 #[cfg(test)]
 pub mod statement_tests;
@@ -117,6 +119,8 @@ pub mod static_commitments_tests;
 pub mod store_tests;
 #[cfg(test)]
 pub mod templates_tests;
+#[cfg(test)]
+pub mod test_rng;
 #[cfg(test)]
 pub mod trace_builder_tests;
 #[cfg(test)]
