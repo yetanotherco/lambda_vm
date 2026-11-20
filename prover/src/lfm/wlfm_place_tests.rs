@@ -891,6 +891,15 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
                     assert!(used.is_empty(), "{family:?} {place:?} {narrow}: no store");
                 }
             }
+            // The levels' driver lets the prover's half go before its readout:
+            // the stamps outlive it.
+            let mut build = build;
+            build.release_prover_half();
+            assert_eq!(
+                build.narrow_commit_stamps().len(),
+                stamps.len(),
+                "{family:?} {place:?}: the narrow commit's stamps outlive the release"
+            );
         }
     }
 }
