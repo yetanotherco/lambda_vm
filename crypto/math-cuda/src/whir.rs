@@ -3701,8 +3701,12 @@ pub fn commit_joint_streamed(
     // of 8 values up a codeword is at least that), is the tree's while it
     // lives: the group's room covers the nodes during the commit, but not
     // after the room is given back, before the tree's retire. Until then the
-    // nodes are promised twice, the safe side, and the commit's peak (its
-    // last step) is unchanged.
+    // nodes are promised twice, the safe side. A run's peak (its last step)
+    // is unchanged. A group's is not: in a group of two or more trees an
+    // earlier tree's nodes stay promised while a later run's codeword is alive
+    // (about 0.25 GiB an earlier tree at a 2^27 stack, blowup 2, first fold 6),
+    // so the group's growth, and a plan read from it, is over by that: the
+    // safe side.
     let node_bytes = (total_nodes * 32) as u64;
     let room = last.inspect(|room| room.shrink(room.bytes().saturating_sub(node_bytes)));
     LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
