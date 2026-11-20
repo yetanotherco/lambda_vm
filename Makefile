@@ -6,7 +6,7 @@ test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
-update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
+update-ethrex-fixture-checksums check-ethrex-fixture-checksums check-ethrex-guest-elf ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
 print-real-block-fixture-url \
 test-ethrex-real-block-converter regen-real-block-fixture
@@ -194,10 +194,19 @@ FORCE:
 # presets below), the built binary's filename ($(2)), and optional extra cargo
 # args ($(3), e.g. `--features min`). cargo owns the dep graph (see FORCE
 # above), so the recipe always runs and lets cargo decide what to rebuild.
+# ★ `CARGO_ENCODED_RUSTFLAGS` is the guest's OWN flags plus the path remappings,
+# computed per guest by `scripts/guest_rustflags.py` — see that file for why it
+# reads the flags out of each `.cargo/config.toml` instead of this recipe
+# carrying one list (the guests' flag sets are not uniform, and this variable
+# REPLACES the config's rather than extending it, so a blanket value would drop
+# flags silently). Without the remappings the ELF embeds the absolute paths of
+# the machine that built it, which makes every constant read off it — roots,
+# genesis pages, cycle counts — partly a function of the filesystem.
 define build_guest_elf
 cd $(1) && \
 	CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 	CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
+	CARGO_ENCODED_RUSTFLAGS="$$(python3 $(abspath scripts/guest_rustflags.py) $(abspath $(1)) $(CURDIR) $(abspath $(SYSROOT_DIR)))" \
 	rustup run nightly-2026-02-01 cargo build --release \
 		--target $(RV64_TARGET_SPEC) \
 		-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
@@ -321,6 +330,79 @@ ETHREX_REAL_BLOCK_CACHE_SHA256 := 7aa88a5f7c5755b7575870f95e6c5c26186947f5e9e0d5
 ETHREX_REAL_BLOCK_ID := $(ETHREX_REAL_BLOCK_NETWORK)_$(ETHREX_REAL_BLOCK)
 ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_$(ETHREX_REAL_BLOCK_ID).bin
 ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-block-converter/caches/cache_$(ETHREX_REAL_BLOCK_ID).json
+
+# ★ The BUILT ethrex guest's sha256 — the fixture's twin, for the other input a
+# block proof depends on.
+#
+# The block fixture is pinned because it is fetched and could be the wrong file.
+# The guest is pinned for the opposite reason: it is BUILT, so it looks like a
+# function of the commit and is not obviously something that can drift. Its
+# roots, its genesis page set and its cycle count are all read off it and become
+# constants elsewhere, so a guest that differs is a set of constants that differ,
+# with nothing in the tree to say so.
+#
+# It could drift until now. The ELF embedded the absolute paths of the machine
+# that built it, so two checkouts of one commit produced different bytes and two
+# machines differed by kilobytes. `scripts/guest_rustflags.py` remaps those away;
+# this pin is what makes the result assertable rather than merely intended.
+#
+# ⚠ Regenerate deliberately, never to make the check pass. A miss means the
+# guest changed — the ethrex rev, the syscalls crate, `ethrex-crypto`, the
+# toolchain, or a flag — and every ELF-derived constant needs re-deriving with
+# it. `make check-ethrex-guest-elf` prints both digests on a miss.
+#
+# ⛔ **PROVISIONAL, AND THE REASON IS MEASURED.** The remapping removes every
+# path rustc controls — a build now has ZERO `/Users/...` strings — but the ELF
+# is still not byte-identical across differently NAMED checkouts. Two worktrees
+# of this commit on one machine gave 3,948,944 and 3,950,136 bytes.
+#
+# The residue is not a path in the binary, it is cargo's `-C metadata`
+# disambiguator, which cargo derives from a package's absolute source path and
+# passes to rustc before `--remap-path-prefix` can apply to anything. Measured
+# across the two builds, the boundary is exact:
+#
+#   ethrex (the guest crate, a path package)   DIFFERS
+#   lambda-vm-ethrex-crypto (path dependency)  DIFFERS
+#   ethrex-trie (git dependency)               same
+#   core (build-std)                           same
+#
+# So it is path DEPENDENCIES only, and it is a cargo input rather than a rustc
+# one. Closing it needs the build to happen at a canonical path — a container or
+# a fixed mount — which is a bigger decision than a flag.
+#
+# ⇒ Until then this digest is a property of THIS commit built in a directory
+# named `lambda_vm-remap`, not of the commit. Do not wire the check into `test`
+# or `lint`; it is for a builder that controls its own path, which is what the
+# campaign's fixture-by-sha workflow already is.
+ETHREX_GUEST_ELF := $(RUST_ARTIFACTS_DIR)/ethrex.elf
+ETHREX_GUEST_ELF_SHA256 := 3d34a312e15049a74741eec96232f479dedab9020a4851f20661f60bbce8a197
+
+# $(call assert_sha256,file,want,label) — a CHECK, not a fetch.
+#
+# Separate from `ensure_verified` on purpose: there is nowhere to refetch a built
+# artifact from, so the only useful behaviours are pass and a loud, specific
+# failure. Missing file and wrong digest are distinguished, because they mean
+# different things to whoever reads the line.
+define assert_sha256
+	@set -e; \
+	f="$(1)"; want="$(2)"; \
+	if command -v sha256sum >/dev/null 2>&1; then shacmd="sha256sum"; \
+	elif command -v shasum >/dev/null 2>&1; then shacmd="shasum -a 256"; \
+	else echo "$(3): missing sha256sum or shasum" >&2; exit 1; fi; \
+	if [ ! -f "$$f" ]; then \
+		echo "$(3): $$f is missing - build it first" >&2; exit 1; fi; \
+	got=$$($$shacmd "$$f" | awk '{print $$1}'); \
+	if [ "$$got" != "$$want" ]; then \
+		echo "$(3): $$f" >&2; \
+		echo "  expected $$want" >&2; \
+		echo "  got      $$got" >&2; \
+		echo "  The guest changed. Re-derive every constant read off it before repinning." >&2; \
+		exit 1; fi; \
+	echo "$(3): $$f matches $$want"
+endef
+
+check-ethrex-guest-elf:
+	$(call assert_sha256,$(ETHREX_GUEST_ELF),$(ETHREX_GUEST_ELF_SHA256),ethrex guest ELF)
 
 # $(call ensure_verified,url,sha256,dest,label,url-var-name)
 #
