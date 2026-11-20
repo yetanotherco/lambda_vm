@@ -1437,6 +1437,25 @@ pub fn create_local_bytes_air(proof_options: &ProofOptions) -> ConcreteVmAir<Emp
     )
 }
 
+/// A test's AIR of `num_columns` committed columns, no constraint, no
+/// preprocessed column and `interactions`, named `name`.
+pub fn create_plain_air(
+    proof_options: &ProofOptions,
+    num_columns: usize,
+    interactions: Vec<BusInteraction>,
+    name: &str,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        num_columns,
+        interactions,
+        proof_options,
+        1,
+        EmptyConstraints,
+        name,
+    )
+    .with_name(name)
+}
+
 /// LOCAL_BYTES' AIR with `interactions` in place of its three receivers: a
 /// test's table of another definition (its columns and fixed columns
 /// LOCAL_BYTES').
