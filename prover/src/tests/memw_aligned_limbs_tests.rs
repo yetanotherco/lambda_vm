@@ -1301,6 +1301,229 @@ const PINNED_MEMW_HIGH_WORDS: [&str; 13] = [
     "STORE column 3 from MemoryOp",
 ];
 
+/// ★ The two things the zero-high-word census rests on and does not read: each
+/// MEMW send's multiplicity, and its timestamp's low word. On the block
+/// verifier's own AIR set, every MEMW sender is recorded with the multiplicity
+/// it sends at, its low word's affine form (a column plus a small constant:
+/// the clock value it received, or that value plus 1 or 2), and, for that
+/// column, every bus the table receives it on with that receive's
+/// multiplicity. A send whose multiplicity is not implied by the receive that
+/// gave it its timestamp (a chip's permute-mode write moved onto its sponge
+/// flag too, say) has a free timestamp on the rows the receive does not
+/// cover, and a low word that is not a received clock value is free outright:
+/// either breaks the memory argument in both timestamp forms, and either moves
+/// this pin. Pinned: a change fails here, and the timestamp order is to be
+/// reviewed again before it lands.
+#[cfg(feature = "parallel")]
+#[test]
+fn every_memw_sender_sends_a_received_clock_at_its_receives_multiplicity() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let airs = pinned_block_airs();
+    // The low word's place in a MEMW message: one before the high word.
+    let lo_at = |len: usize| match len {
+        24 => 19,
+        16 => 11,
+        other => panic!("a MEMW message of {other} elements"),
+    };
+    // Per (table, low word, its sources): the multiplicities sent at.
+    let mut census: BTreeMap<(String, String, String), BTreeSet<(usize, String)>> = BTreeMap::new();
+    for air in airs.air_refs() {
+        let table = family(air.name());
+        let interactions = air.bus_interactions();
+        for i in interactions
+            .iter()
+            .filter(|i| i.bus_id == BusId::Memw as u64 && i.is_sender)
+        {
+            let elements = affine_elements(i);
+            let (c, terms) = &elements[lo_at(elements.len())];
+            // Where the table receives each of the low word's columns unscaled:
+            // per bus, the receives' multiplicities.
+            let mut sources: Vec<String> = Vec::new();
+            for (column, _) in terms {
+                let mut by_bus: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                for r in interactions.iter().filter(|r| {
+                    !r.is_sender
+                        && r.bus_id != BusId::Memw as u64
+                        && r.bus_id != BusId::Memory as u64
+                }) {
+                    if affine_elements(r)
+                        .iter()
+                        .any(|(rc, t)| *rc == 0 && t == &[(*column, 1)])
+                    {
+                        let bus = BusId::try_from(r.bus_id).expect("a bus id");
+                        by_bus
+                            .entry(format!("{bus:?}"))
+                            .or_default()
+                            .insert(multiplicity_form(r));
+                    }
+                }
+                let from: Vec<String> = by_bus
+                    .into_iter()
+                    .map(|(bus, ms)| {
+                        if ms.len() > 3 {
+                            format!("{bus} ×{}", ms.len())
+                        } else {
+                            format!(
+                                "{bus} at {}",
+                                ms.into_iter().collect::<Vec<_>>().join(" | ")
+                            )
+                        }
+                    })
+                    .collect();
+                sources.push(format!(
+                    "c{column} from {}",
+                    if from.is_empty() {
+                        "no receive".to_string()
+                    } else {
+                        from.join(" + ")
+                    }
+                ));
+            }
+            let lo = affine_form(*c, terms);
+            let single = match multiplicity_form(i).as_str() {
+                m if m.starts_with("c") && m[1..].chars().all(|d| d.is_ascii_digit()) => {
+                    m[1..].parse().unwrap_or(usize::MAX)
+                }
+                _ => usize::MAX,
+            };
+            census
+                .entry((table.clone(), lo, sources.join("; ")))
+                .or_default()
+                .insert((single, multiplicity_form(i)));
+        }
+    }
+    let lines: Vec<String> = census
+        .into_iter()
+        .map(|((table, lo, sources), ms)| {
+            format!(
+                "{table} ts {lo} ({sources}) at {}",
+                compress_runs(ms.into_iter().collect())
+            )
+        })
+        .collect();
+    for line in &lines {
+        println!("MEMW SEND CLOCK {line}");
+    }
+    assert_eq!(
+        lines, PINNED_MEMW_SEND_CLOCKS,
+        "a MEMW sender's multiplicity, low word or its source moved: review the timestamp order again"
+    );
+}
+
+/// A field element read as a small signed integer.
+#[cfg(feature = "parallel")]
+fn signed(v: u64) -> i128 {
+    if v > P / 2 {
+        -i128::from(P - v)
+    } else {
+        i128::from(v)
+    }
+}
+
+/// `c + Σ k·col` as text: `c12`, `c12 + 1`, `2·c4 − c9 + 3`.
+#[cfg(feature = "parallel")]
+fn affine_form(c: u64, terms: &[(usize, u64)]) -> String {
+    let mut out = String::new();
+    for (column, k) in terms {
+        let k = signed(*k);
+        let sign = if k < 0 { " − " } else { " + " };
+        if out.is_empty() {
+            if k < 0 {
+                out.push('−');
+            }
+        } else {
+            out.push_str(sign);
+        }
+        if k.abs() != 1 {
+            out.push_str(&format!("{}·", k.abs()));
+        }
+        out.push_str(&format!("c{column}"));
+    }
+    let c = signed(c);
+    match (out.is_empty(), c) {
+        (true, c) => c.to_string(),
+        (false, 0) => out,
+        (false, c) if c < 0 => format!("{out} − {}", -c),
+        (false, c) => format!("{out} + {c}"),
+    }
+}
+
+/// `i`'s multiplicity as an affine form over the columns (read off its
+/// evaluation at unit columns).
+#[cfg(feature = "parallel")]
+fn multiplicity_form(i: &BusInteraction) -> String {
+    let at = |g: &dyn Fn(usize) -> FE| eval_mult(&i.multiplicity, g);
+    let zero = at(&|_| FE::zero());
+    let mut terms = Vec::new();
+    for c in i.columns_read() {
+        let k = at(&|j| if j == c { FE::one() } else { FE::zero() }) - zero;
+        if k != FE::zero() {
+            terms.push((c, k.canonical_u64()));
+        }
+    }
+    affine_form(zero.canonical_u64(), &terms)
+}
+
+/// Multiplicities as text, runs of single columns `cA, cA+1, …, cB` written
+/// `cA..=cB`.
+#[cfg(feature = "parallel")]
+fn compress_runs(ms: Vec<(usize, String)>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Option<(usize, usize)> = None;
+    let flush = |run: &mut Option<(usize, usize)>, out: &mut Vec<String>| {
+        if let Some((a, b)) = run.take() {
+            out.push(if a == b {
+                format!("c{a}")
+            } else {
+                format!("c{a}..=c{b}")
+            });
+        }
+    };
+    for (single, form) in ms {
+        if single == usize::MAX {
+            flush(&mut run, &mut out);
+            out.push(form);
+            continue;
+        }
+        run = match run {
+            Some((a, b)) if b + 1 == single => Some((a, single)),
+            other => {
+                let mut other = other;
+                flush(&mut other, &mut out);
+                Some((single, single))
+            }
+        };
+    }
+    flush(&mut run, &mut out);
+    out.join(" | ")
+}
+
+/// [`every_memw_sender_sends_a_received_clock_at_its_receives_multiplicity`]'s
+/// census: each MEMW sender's multiplicity, its timestamp's low word, and the
+/// receives that carry that word's column (bus and multiplicity).
+#[cfg(feature = "parallel")]
+const PINNED_MEMW_SEND_CLOCKS: &[&str] = &[
+    "BLAKE3 ts c0 (c0 from Blake3Absorb at c3220 − c3222 + Ecall at c3219 | c3222) at c3219 | c3221..=c3223 | c3219 + c3222",
+    "COPY ts c0 (c0 from CopyNext at −c32 + c38 + Ecall at c32) at c32 | c37",
+    "COPY ts c0 + c35 (c0 from CopyNext at −c32 + c38 + Ecall at c32; c35 from CopyNext at −c32 + c38) at −4294967296·c22 − 4294967295·c23 + 4294967296·c24 + 281474976710656·c25 + 4294967295·c26 + 281474976645120·c27 − 30064771072·c34 + c38 + 34359738368",
+    "COPY ts c0 − c35 + 1 (c0 from CopyNext at −c32 + c38 + Ecall at c32; c35 from CopyNext at −c32 + c38) at −4294967296·c22 − 4294967295·c23 + 4294967296·c24 + 281474976710656·c25 + 4294967295·c26 + 281474976645120·c27 − 30064771072·c34 + c38 − c39 + 34359738368",
+    "CPU32 ts c0 (c0 from Cpu32 at c37) at c5",
+    "CPU32 ts c0 + 1 (c0 from Cpu32 at c37) at c13",
+    "CPU32 ts c0 + 2 (c0 from Cpu32 at c37) at c28",
+    "ECREC ts c0 (c0 from Bit ×256 + Ecall at c9 + Ecdas at c10) at c9",
+    "ECREC ts c0 + 1 (c0 from Bit ×256 + Ecall at c9 + Ecdas at c10) at c9",
+    "ECREC ts c0 + 2 (c0 from Bit ×256 + Ecall at c9 + Ecdas at c10) at c9",
+    "ECSM ts c0 (c0 from Bit ×256 + Ecall at c666 + Ecdas at c666) at c666",
+    "ECSM ts c0 + 1 (c0 from Bit ×256 + Ecall at c666 + Ecdas at c666) at c666",
+    "ECSM ts c0 + 2 (c0 from Bit ×256 + Ecall at c666 + Ecdas at c666) at c666",
+    "HALT ts 4294967295 () at 1",
+    "HINT ts c0 (c0 from Ecall at c36) at c36",
+    "KECCAK ts c0 (c0 from Ecall at c486 | c488 + Keccak at c486 + c487 + KeccakSponge at c487 − c488) at c486 | c488 | c771..=c906",
+    "KECCAK ts c0 + 1 (c0 from Ecall at c486 | c488 + Keccak at c486 + c487 + KeccakSponge at c487 − c488) at c489",
+    "LOAD ts c2 (c2 from MemoryOp at c17) at c17",
+    "STORE ts c2 (c2 from MemoryOp at c15) at c15",
+];
+
 /// The verifier's pinned presets build the limbs' list for every MEMW_A table
 /// of a block, whatever the group opening.
 #[cfg(feature = "parallel")]
