@@ -1,12 +1,12 @@
 	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
 	.globl	main
 main:
-	# Like test_ecsm.s, but the ECSM pointer registers (a0=&xR, a1=&xG, a2=&k)
+	# Like test_ecsm.s, but the ECSM pointer registers (a0=&out, a1=&xG, a2=&k)
 	# are set at the very START and never rewritten before the ecall. With a small
 	# continuation epoch size the ecall lands in a LATER epoch than the one that set
 	# the pointers, so the per-epoch touched-cell pass must carry registers across
 	# the boundary to compute the right addresses.
-	addi	sp, sp, -96
+	addi	sp, sp, -160
 	addi	a0, sp, 64
 	addi	a1, sp, 0
 	addi	a2, sp, 32
@@ -41,7 +41,7 @@ main:
 	ecall
 
 	# Restore stack and halt.
-	addi	sp, sp, 96
+	addi	sp, sp, 160
 	li	a0, 0
 	li	a7, 93
 	ecall

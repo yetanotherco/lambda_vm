@@ -149,15 +149,20 @@ fn schedule(k: &BigUint) -> Vec<(u8, u8, u8)> {
     sched
 }
 
-/// Executor fast path: the x-coordinate of `k·g`, via k256's optimized scalar
+/// Executor fast path: `k·g` in affine coordinates, via k256's optimized scalar
 /// multiplication. Needs no step list or slopes, so it skips all witness work.
 /// `k` must be in `[1, N)` (guaranteed by `prepare`).
-pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
+pub fn scalar_mul_affine(k: &BigUint, g: &AffinePoint) -> AffinePoint {
     let scalar = Option::<Scalar>::from(Scalar::from_repr(be32(k).into()))
         .expect("ECSM: scalar k must be < N");
     let g_proj = ProjectivePoint::from(to_k256_affine(g));
     let r = (g_proj * scalar).to_affine();
-    from_k256_affine(&r).x
+    from_k256_affine(&r)
+}
+
+/// The x-coordinate of `k·g`. Thin wrapper over [`scalar_mul_affine`].
+pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
+    scalar_mul_affine(k, g).x
 }
 
 /// Jacobian doubling (dbl-2009-l) for `y² = x³ + 7`: on `(X:Y:Z)` with

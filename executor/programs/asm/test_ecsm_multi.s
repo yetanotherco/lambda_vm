@@ -1,8 +1,9 @@
 	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
 	.globl	main
 main:
-	# Stack layout (96 bytes): xG at sp+0, k at sp+32, xR at sp+64.
-	addi	sp, sp, -96
+	# Stack layout (160 bytes): xG at sp+0, k at sp+32, and the ECSM output buffer
+	# [xR ‖ yR ‖ yG] at sp+64..sp+160. Only xR is committed.
+	addi	sp, sp, -160
 
 	# xG = secp256k1 Gx, little-endian (written once; reused by all calls).
 	li	t0, 0x59F2815B16F81798
@@ -62,7 +63,7 @@ main:
 	ecall
 
 	# Restore stack and halt.
-	addi	sp, sp, 96
+	addi	sp, sp, 160
 	li	a0, 0
 	li	a7, 93
 	ecall
