@@ -3050,24 +3050,31 @@ pub fn narrow_store() -> bool {
 /// the card's pinned staging ([`narrow_commit_staged`]). A retired stack keeps
 /// its packed bytes on the host, and under [`NARROW_STORE_ENV`] its opening's
 /// store sends them without packing again. The same roots, so the same proof.
-/// Only the W-LFM prover reads it. Off by default (and for any word but `1` or
-/// `2`) until its timing gate. Read once a process.
+/// Only the W-LFM prover reads it. On by default in the form
+/// [`NARROW_COMMIT_DEFAULT`] (any word but `0`, `1` or `2` reads as the
+/// default); `0` turns it off. Read once a process.
 pub const NARROW_COMMIT_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_COMMIT";
 
-/// [`NARROW_COMMIT_ENV`]'s word: on for `1` and for `2` (spaces around it
-/// ignored), off for anything else.
+/// [`NARROW_COMMIT_ENV`]'s form when it is unset (or any word but `0`, `1`
+/// or `2`).
+pub const NARROW_COMMIT_DEFAULT: u8 = 1;
+
+/// [`NARROW_COMMIT_ENV`]'s word: off only for `0` (spaces around it
+/// ignored), on for anything else.
 pub fn narrow_commit_word(word: Option<&str>) -> bool {
     narrow_commit_mode_word(word) > 0
 }
 
 /// [`NARROW_COMMIT_ENV`]'s form: `1` sends each run's packed bytes with one
 /// pageable copy, `2` through the card's double-buffered pinned staging
-/// ([`narrow_commit_staged`]); 0 is off. The same store either way.
+/// ([`narrow_commit_staged`]); `0` is off, anything else
+/// [`NARROW_COMMIT_DEFAULT`]. The same store either way.
 pub fn narrow_commit_mode_word(word: Option<&str>) -> u8 {
     match word.map(str::trim) {
+        Some("0") => 0,
         Some("1") => 1,
         Some("2") => 2,
-        _ => 0,
+        _ => NARROW_COMMIT_DEFAULT,
     }
 }
 
