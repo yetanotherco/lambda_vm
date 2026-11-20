@@ -839,6 +839,38 @@ fn the_narrow_commit_knob_is_named_and_off_by_default() {
     assert_eq!(narrow_commit_mode_word(None), 0);
 }
 
+/// The narrow pack's knobs: their names; two threads and no nice by default;
+/// only `1` turns either on.
+#[test]
+fn the_narrow_pack_knobs_are_named_and_off_by_default() {
+    use super::levels::{
+        NARROW_PACK_NICE_ENV, NARROW_PACK_THREADS_ENV, narrow_pack_nice_word, narrow_pack_settings,
+        narrow_pack_threads_word,
+    };
+    assert_eq!(
+        NARROW_PACK_THREADS_ENV,
+        "LAMBDA_VM_LEVELS_NARROW_PACK_THREADS"
+    );
+    assert_eq!(NARROW_PACK_NICE_ENV, "LAMBDA_VM_LEVELS_NARROW_PACK_NICE");
+    if std::env::var_os(NARROW_PACK_THREADS_ENV).is_none()
+        && std::env::var_os(NARROW_PACK_NICE_ENV).is_none()
+    {
+        assert_eq!(narrow_pack_settings(), (2, false));
+    }
+    for (word, threads, nice) in [
+        (None, 2, false),
+        (Some(""), 2, false),
+        (Some("0"), 2, false),
+        (Some("2"), 2, false),
+        (Some("on"), 2, false),
+        (Some("1"), 1, true),
+        (Some(" 1 "), 1, true),
+    ] {
+        assert_eq!(narrow_pack_threads_word(word), threads, "{word:?}");
+        assert_eq!(narrow_pack_nice_word(word), nice, "{word:?}");
+    }
+}
+
 /// ★ Committing the prepared stacks from their columns sent narrow
 /// (`LAMBDA_VM_LEVELS_NARROW_COMMIT`), packed in the level's host part or at
 /// the commit, its runs copied pageable or through the pinned staging (`2`),
@@ -870,7 +902,16 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
         let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
             .expect("the held build proves");
         for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
-            for (ahead, staged) in [(false, false), (true, false), (true, true)] {
+            // Packed at the commit, ahead on the caller's pool (pageable, then
+            // staged), and ahead on one thread and on two niced threads (the
+            // pack's knobs).
+            for (ahead, staged, pool) in [
+                (false, false, None),
+                (true, false, None),
+                (true, true, None),
+                (true, false, Some((1, false))),
+                (true, false, Some((2, true))),
+            ] {
                 // The narrow store on at the build: a retired stack keeps its
                 // packed bytes only for a store that sends them.
                 super::wlfm::set_narrow_commit_for_test(Some(true));
@@ -883,14 +924,21 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
                     WlfmLevers::with_family(family),
                 )
                 .expect("prepares");
-                if ahead {
-                    pre.hold_narrow_packs();
+                match (ahead, pool) {
+                    (false, _) => {}
+                    (true, None) => pre.hold_narrow_packs(),
+                    (true, Some((threads, nice))) => {
+                        super::levels::narrow_pack_pool_for(threads, nice)
+                            .expect("the pack's pool")
+                            .install(|| pre.hold_narrow_packs())
+                    }
                 }
                 let mut build = pre.commit(place).expect("commits");
                 super::wlfm::set_narrow_commit_for_test(None);
                 super::wlfm::set_narrow_commit_staged_for_test(None);
                 super::wlfm::set_narrow_store_for_test(None);
-                let tag = format!("{family:?} {place:?} ahead {ahead} staged {staged}");
+                let tag =
+                    format!("{family:?} {place:?} ahead {ahead} staged {staged} pool {pool:?}");
                 assert_eq!(
                     build.artifacts.program_id, held.artifacts.program_id,
                     "{tag}: the wide build's identity"

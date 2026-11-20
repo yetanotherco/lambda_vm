@@ -641,22 +641,75 @@ pub(crate) fn prepare_level(
 
 /// The threads a level's host part packs its prepared stacks narrow on
 /// ([`super::wlfm::WlfmPrebuild::hold_narrow_packs`]), beside the base's
-/// phase B: two, not the shared pool, which phase B binds (a pooled gather
-/// there cost phase B about one for one).
+/// phase B: two by default, not the shared pool, which phase B binds (a pooled
+/// gather there cost phase B about one for one); one under
+/// [`NARROW_PACK_THREADS_ENV`].
 const NARROW_PACK_THREADS: usize = 2;
 
-/// [`NARROW_PACK_THREADS`]' pool, made once; `None` if it cannot be (the
-/// pack then runs on the caller's pool).
-fn narrow_pack_pool() -> Option<&'static rayon::ThreadPool> {
+/// `LAMBDA_VM_LEVELS_NARROW_PACK_THREADS=1`: the narrow commit's pack ahead
+/// runs on one thread instead of [`NARROW_PACK_THREADS`], half the memory
+/// traffic and cycles beside phase B at any time, for about twice as long. Any
+/// other word keeps two. The same packed bytes, so the same proof. Read once a
+/// process.
+pub const NARROW_PACK_THREADS_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_PACK_THREADS";
+
+/// `LAMBDA_VM_LEVELS_NARROW_PACK_NICE=1`: the narrow commit's pack threads run
+/// lowered to [`BESIDE_NICE`] (Linux), below phase B's. Off by default (and
+/// for any word but `1`). The same packed bytes, so the same proof. Read once
+/// a process.
+pub const NARROW_PACK_NICE_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_PACK_NICE";
+
+/// [`NARROW_PACK_THREADS_ENV`]'s word: one thread for `1`, two otherwise.
+pub fn narrow_pack_threads_word(word: Option<&str>) -> usize {
+    if super::wlfm_knobs::knob_word_on(word) {
+        1
+    } else {
+        NARROW_PACK_THREADS
+    }
+}
+
+/// [`NARROW_PACK_NICE_ENV`]'s word: on only for `1`.
+pub fn narrow_pack_nice_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
+}
+
+/// A pool of `threads` for the narrow pack, its threads lowered to
+/// [`BESIDE_NICE`] when `nice`; `None` if it cannot be made.
+pub(crate) fn narrow_pack_pool_for(threads: usize, nice: bool) -> Option<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|k| format!("narrow-pack-{k}"))
+        .start_handler(move |_| {
+            if nice {
+                super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE);
+            }
+        })
+        .build()
+        .ok()
+}
+
+/// The narrow pack's pool as the knobs say ([`NARROW_PACK_THREADS_ENV`],
+/// [`NARROW_PACK_NICE_ENV`]), made once; `None` if it cannot be (the pack
+/// then runs on the caller's pool).
+pub(crate) fn narrow_pack_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(NARROW_PACK_THREADS)
-            .thread_name(|k| format!("narrow-pack-{k}"))
-            .build()
-            .ok()
+        narrow_pack_pool_for(
+            narrow_pack_threads_word(
+                super::wlfm_knobs::env_word(NARROW_PACK_THREADS_ENV).as_deref(),
+            ),
+            narrow_pack_nice_word(super::wlfm_knobs::env_word(NARROW_PACK_NICE_ENV).as_deref()),
+        )
     })
     .as_ref()
+}
+
+/// The narrow pack's settings as the knobs set them: (threads, nice).
+pub fn narrow_pack_settings() -> (usize, bool) {
+    (
+        narrow_pack_threads_word(super::wlfm_knobs::env_word(NARROW_PACK_THREADS_ENV).as_deref()),
+        narrow_pack_nice_word(super::wlfm_knobs::env_word(NARROW_PACK_NICE_ENV).as_deref()),
+    )
 }
 
 /// A prepared level committed where [`stack_place`] puts it.
