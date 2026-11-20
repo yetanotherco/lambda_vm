@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Benchmark: Lambda VM proving ethrex blocks.
 #
-# Proves each block in BLOCKS (an ethrex guest ELF + a serialized ProgramInput
-# private input) and reports single-shot end-to-end proving time and cycle count.
+# Proves each block in BLOCKS (an ethrex guest ELF + an SSZ-encoded stateless
+# input) and reports single-shot end-to-end proving time and cycle count.
 # Add a block by appending a "label|input_basename" entry to BLOCKS — the input
 # file must live in executor/tests/.
 #

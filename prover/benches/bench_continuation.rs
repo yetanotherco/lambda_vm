@@ -19,7 +19,7 @@
 //!
 //! Env:
 //!     BENCH_PRIVATE_INPUT  optional path to a private-input file (e.g. an
-//!                          ethrex ProgramInput .bin). Empty if unset.
+//!                          ethrex SSZ stateless input .bin). Empty if unset.
 
 use std::time::Instant;
 

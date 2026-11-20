@@ -31,13 +31,13 @@
 #        n=4 it is 0.125 and the arm can only ever report BORDERLINE, however large and
 #        clean the effect.
 #        WORKLOAD=real|synthetic (default real) which BLOCK both arms prove.
-#        `real` fetches the real-block fixture (identity lives in the Makefile) and runs
+#        `real` builds the real-block fixture (identity lives in the Makefile) and runs
 #        the continuation arm ONLY — a real block is hundreds of GB monolithically, so
 #        that arm is skipped rather than left to OOM. See "Workload" below.
 #        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 is the
 #        laptop-safe setting, not the fast one: prefer the calibrated tier for the box
 #        you are on — 2^22 on the bench runner or a 64 GiB machine, 2^23 on a 128 GiB
-#        one (see tooling/ethrex-block-converter/README.md, "Choosing the epoch size"),
+#        one (see tooling/ethrex-fixtures/README.md, "Choosing the epoch size"),
 #        which is what /bench and /bench-abba pin. (`cli prove --epoch-size-log2 --help`
 #        measured ethrex 10tx at ~9.5 GB for 2^20 vs ~15.8 GB for 2^21.) Note this does
 #        NOT match bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW
@@ -181,15 +181,24 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ "$WORKLOAD" = "real" ]; then
-  # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not built:
-  # no converter and no ethrex host dependency tree on this path. Unconditional on
-  # purpose: the target hashes whatever is already on disk on every invocation, which
-  # is how a stale copy left by an earlier block or an interrupted fetch gets caught.
-  # A match costs ~35 ms, so there is nothing to gate it on.
-  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  # 549 KB, gitignored, never in a fresh checkout. GENERATED from the block's replay
+  # cache (the cache is what gets fetched, by URL + sha256), so a miss here is a cargo
+  # build of tooling/ethrex-fixtures and not a download. Unconditional on purpose: the
+  # target hashes whatever is already on disk on every invocation, which is how a stale
+  # copy left by an earlier block or an interrupted write gets caught. A match costs
+  # ~35 ms, so there is nothing to gate it on.
+  echo "==> Verifying ethrex real-block fixture (regenerates on a digest miss)"
   make ethrex-real-block-fixture
-elif [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex 20-transfer fixture (missing)"
+else
+  # UNCONDITIONAL, unlike the real block's digest check: these names carry neither the rev
+  # nor the schema (`ethrex_<n>_transfers.bin` is untracked, `ethrex_bench_20.bin` is
+  # gitignored), so a copy left by an earlier ethrex rev is reused byte for byte and no
+  # digest anywhere would notice. The floor below catches the rev bumps that make the
+  # guest REJECT the file; it cannot catch a file that is merely a different valid block.
+  # Regenerating is what makes that impossible, and it is nearly free: the generator is
+  # deterministic, so a fixture that was already right is rewritten identically, and the
+  # cargo build is a no-op on a warm target dir.
+  echo "==> Generating ethrex 20-transfer fixture"
   ( cd tooling/ethrex-fixtures && cargo build --release )
   tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
 fi
@@ -230,6 +239,13 @@ else
   echo "==> Reusing cached binaries (refs + features match; REBUILD=1 to force):"
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
+
+# A fixture the guest REJECTS still proves and still verifies -- a program that read two
+# bytes and gave up. The digest check above catches a stale real-block file, but not the
+# other half of the pair (an ELF whose ethrex rev moved on its own), and the synthetic
+# fixture is generated only when missing, so a pre-bump file is reused as-is. Shared with
+# bench_abba.sh and perf_diff.sh; the floors and the reasoning live there.
+"$ROOT/scripts/assert_workload_cycles.sh" "$WORK/cli_B" "$ELF" "$INPUT" "$WORKLOAD"
 
 # --- 3. Prove, then interleaved A/B/B/A verify measurement ---
 # Default: both sides verify ONE shared proof (proved by the baseline), which gives
