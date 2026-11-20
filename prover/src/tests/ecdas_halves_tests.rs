@@ -504,7 +504,8 @@ fn the_limb_forms_step_check_refuses_a_broken_step_by_name() {
     assert!(ops.len() > 8, "{} steps", ops.len());
     check_halves_rows(&ops).expect("real steps hold");
     let k = ops.len() / 2;
-    let tampers: [(&str, fn(&mut EcdasStep)); 3] = [
+    type Tamper = fn(&mut EcdasStep);
+    let tampers: [(&str, Tamper); 3] = [
         ("λ's", |s| s.lambda[5] ^= 1),
         ("xR's", |s| s.x_r[5] ^= 1),
         ("yR's", |s| s.y_r[5] ^= 1),
