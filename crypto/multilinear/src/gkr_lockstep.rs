@@ -1588,6 +1588,7 @@ where
         let mut rounds = Vec::with_capacity(i);
         let mut z = Vec::with_capacity(i);
         for _ in 0..i {
+            let split = LadderRound::start();
             // The crossover on the step's SUMMED cube: while the active
             // trees' device cubes together are worth a launch, they stay on
             // the card; below it every one comes here — a batched host round
@@ -1669,6 +1670,7 @@ where
             }
             rounds.push(sumcheck::RoundProof { evaluations: sent });
             z.push(r);
+            split.finish();
         }
 
         let mut halves = Vec::with_capacity(step.halves());
@@ -1872,6 +1874,71 @@ where
     W: Fn(&mut HostStep<F>) -> Result<R, Error>,
 {
     hosts.iter_mut().map(|host| work(host)).collect()
+}
+
+/// A measurement, never a byte of the proof: while [`set_ladder_split`] is
+/// on, each ladder round's wall time is added to one of two process-wide
+/// sums, by whether an opening was in flight ([`opening_in_flight`]) when the
+/// round began. A block prover's phase B reads the sums at each group turn.
+static LADDER_SPLIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OPENINGS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LADDER_SPLIT: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Turns the ladder rounds' split sums on or off ([`ladder_split`]).
+pub fn set_ladder_split(on: bool) {
+    LADDER_SPLIT_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ladder rounds' sums so far: `[ns with an opening in flight, rounds
+/// so, ns without, rounds so]`.
+pub fn ladder_split() -> [u64; 4] {
+    core::array::from_fn(|k| LADDER_SPLIT[k].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// An opening in flight until the guard drops: ladder rounds that begin
+/// meanwhile count as beside one.
+pub struct OpeningInFlight(());
+
+impl Drop for OpeningInFlight {
+    fn drop(&mut self) {
+        OPENINGS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Marks an opening in flight ([`OpeningInFlight`]).
+pub fn opening_in_flight() -> OpeningInFlight {
+    OPENINGS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    OpeningInFlight(())
+}
+
+/// One ladder round's stamp: its start and whether an opening was in flight
+/// then; nothing while the split is off.
+struct LadderRound(Option<(std::time::Instant, bool)>);
+
+impl LadderRound {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self(LADDER_SPLIT_ON.load(Relaxed).then(|| {
+            (
+                std::time::Instant::now(),
+                OPENINGS_IN_FLIGHT.load(Relaxed) > 0,
+            )
+        }))
+    }
+
+    fn finish(self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some((at, beside)) = self.0 {
+            let k = if beside { 0 } else { 2 };
+            LADDER_SPLIT[k].fetch_add(at.elapsed().as_nanos() as u64, Relaxed);
+            LADDER_SPLIT[k + 1].fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// A measurement, never a byte of the proof

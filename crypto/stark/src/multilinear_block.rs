@@ -226,6 +226,9 @@ pub struct GroupStamps {
     /// schedstat, when [`BlockCommitted::with_sched_stamps`] asks for them
     /// and the file reads; `None` otherwise.
     pub sched_b: Option<(u64, u64)>,
+    /// Phase B's driver thread over the group's turn, its own counters
+    /// ([`ThreadCounters`]), under the same stamps; `None` otherwise.
+    pub thread_b: Option<ThreadCounters>,
     /// Phase A's ledger: the promise just before the group's commit (its own
     /// columns on the card, and the previous group's while it packs) and the
     /// peak through the commit (the next group's columns, uploaded beside it,
@@ -2382,6 +2385,90 @@ where
     })
 }
 
+/// A thread's own counters (Linux; a measurement, never a byte of a proof):
+/// from `/proc/thread-self/stat` its minor faults and user and system ticks
+/// (100 a second); from `/proc/thread-self/sched` its sleep and its blocked
+/// (uninterruptible, a part of the sleep) nanoseconds, 0 where the kernel
+/// keeps no scheduler statistics, and its voluntary and involuntary switches;
+/// and the process's ladder rounds so far, with an opening in flight and
+/// without ([`multilinear::gkr_lockstep::ladder_split`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadCounters {
+    pub minor_faults: u64,
+    pub user_ticks: u64,
+    pub system_ticks: u64,
+    pub sleep_ns: u64,
+    pub block_ns: u64,
+    pub voluntary: u64,
+    pub involuntary: u64,
+    /// `[ns with an opening in flight, rounds so, ns without, rounds so]`.
+    pub ladder: [u64; 4],
+}
+
+impl ThreadCounters {
+    /// The calling thread's now; `None` where `/proc/thread-self/stat` does
+    /// not read (the sched file may be missing: zeros).
+    fn now() -> Option<Self> {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+        let sched = std::fs::read_to_string("/proc/thread-self/sched").unwrap_or_default();
+        let mut out = parse_thread_stat(&stat)?;
+        (out.sleep_ns, out.block_ns, out.voluntary, out.involuntary) = parse_thread_sched(&sched);
+        out.ladder = multilinear::gkr_lockstep::ladder_split();
+        Some(out)
+    }
+
+    /// Each counter's growth from `then`.
+    fn since(&self, then: &Self) -> Self {
+        Self {
+            minor_faults: self.minor_faults.saturating_sub(then.minor_faults),
+            user_ticks: self.user_ticks.saturating_sub(then.user_ticks),
+            system_ticks: self.system_ticks.saturating_sub(then.system_ticks),
+            sleep_ns: self.sleep_ns.saturating_sub(then.sleep_ns),
+            block_ns: self.block_ns.saturating_sub(then.block_ns),
+            voluntary: self.voluntary.saturating_sub(then.voluntary),
+            involuntary: self.involuntary.saturating_sub(then.involuntary),
+            ladder: core::array::from_fn(|k| self.ladder[k].saturating_sub(then.ladder[k])),
+        }
+    }
+}
+
+/// A `/proc/<id>/stat` line's minor faults (field 10) and user and system
+/// ticks (14, 15), read after the command's closing parenthesis.
+fn parse_thread_stat(text: &str) -> Option<ThreadCounters> {
+    let rest = text.get(text.rfind(')')? + 2..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let num = |k: usize| f.get(k - 3)?.parse::<u64>().ok();
+    Some(ThreadCounters {
+        minor_faults: num(10)?,
+        user_ticks: num(14)?,
+        system_ticks: num(15)?,
+        ..Default::default()
+    })
+}
+
+/// A `/proc/<id>/sched` text's `sum_sleep_runtime` and `sum_block_runtime`
+/// (milliseconds with a fraction, as ns) and its switches; a key is matched
+/// by its last word, so the kernel's `se.statistics.` prefix or its absence
+/// both read; a missing key reads 0.
+fn parse_thread_sched(text: &str) -> (u64, u64, u64, u64) {
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                (k.trim().rsplit('.').next() == Some(key)).then(|| v.trim().to_string())
+            })
+            .unwrap_or_default()
+    };
+    let ms = |key: &str| (value(key).parse::<f64>().unwrap_or(0.0) * 1e6) as u64;
+    let n = |key: &str| value(key).parse::<u64>().unwrap_or(0);
+    (
+        ms("sum_sleep_runtime"),
+        ms("sum_block_runtime"),
+        n("nr_voluntary_switches"),
+        n("nr_involuntary_switches"),
+    )
+}
+
 /// The calling thread's CPU time and run-queue delay so far, in ns, from
 /// `/proc/thread-self/schedstat` (Linux); `None` where the file does not read.
 /// A kernel without scheduler statistics prints zeros.
@@ -3468,6 +3555,10 @@ where
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
     let mut turn_sched: Option<((u64, u64), usize)> = None;
+    let mut turn_thread: Option<(ThreadCounters, usize)> = None;
+    if sched {
+        multilinear::gkr_lockstep::set_ladder_split(true);
+    }
     // The order as it stands: `reorder` may re-rank what is still to come.
     let mut order: Vec<usize> = order.to_vec();
     for p in 0..n {
@@ -3480,6 +3571,11 @@ where
                     Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
             }
             turn_sched = now.map(|now| (now, g));
+            let now = ThreadCounters::now();
+            if let (Some((then, h)), Some(now)) = (turn_thread, now) {
+                stamps[h].thread_b = Some(now.since(&then));
+            }
+            turn_thread = now.map(|now| (now, g));
         }
         let (at, size) = (starts[g], sizes[g]);
         // The groups still to come, re-ranked before the next one is chosen
@@ -3575,6 +3671,7 @@ where
                         // Every stream this thread draws is a background one,
                         // so the argue's kernels are dispatched first.
                         let _background = multilinear::gpu::background_streams();
+                        let _in_flight = multilinear::gkr_lockstep::opening_in_flight();
                         if let Some(stall) = overlap_faults.open_stall {
                             std::thread::sleep(stall);
                         }
@@ -3832,6 +3929,12 @@ where
     }
     if sched && let (Some((then, h)), Some(now)) = (turn_sched, thread_schedstat()) {
         stamps[h].sched_b = Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
+    }
+    if sched && let (Some((then, h)), Some(now)) = (turn_thread, ThreadCounters::now()) {
+        stamps[h].thread_b = Some(now.since(&then));
+    }
+    if sched {
+        multilinear::gkr_lockstep::set_ladder_split(false);
     }
     // Every finished group's records handed back before phase B returns.
     if let Some(returner) = returner {
@@ -4468,6 +4571,26 @@ mod spill_tests {
         );
         assert_eq!(stamps[1].records_pages, RETURNED, "group 1's records");
         assert_eq!(stamps[0].records_pages, PagesReturned::default());
+    }
+
+    /// A thread's stat line reads its faults and ticks past a command with
+    /// parentheses, a short one reads as nothing; its sched text reads with
+    /// or without the kernel's key prefix, a missing key as 0.
+    #[test]
+    fn a_threads_stat_and_sched_read_as_their_counters() {
+        use super::{parse_thread_sched, parse_thread_stat};
+        let stat = "4242 (a (b) c) R 1 2 3 4 5 6 777 8 9 10 111 222 13 14 15";
+        let t = parse_thread_stat(stat).expect("reads");
+        assert_eq!(
+            (t.minor_faults, t.user_ticks, t.system_ticks),
+            (777, 111, 222)
+        );
+        assert_eq!(parse_thread_stat("4242 (x) R 1 2"), None);
+        let new = "se.sum_exec_runtime : 5.0\nsum_sleep_runtime                            :          1234.500000\nsum_block_runtime                            :            12.250000\nnr_voluntary_switches                        :                   17\nnr_involuntary_switches                      :                    3\n";
+        assert_eq!(parse_thread_sched(new), (1_234_500_000, 12_250_000, 17, 3));
+        let old = "se.statistics.sum_sleep_runtime : 2.000000\nse.statistics.sum_block_runtime : 1.000000\n";
+        assert_eq!(parse_thread_sched(old), (2_000_000, 1_000_000, 0, 0));
+        assert_eq!(parse_thread_sched(""), (0, 0, 0, 0));
     }
 
     /// A schedstat line reads as its CPU and run-queue delay nanoseconds; a

@@ -3526,6 +3526,7 @@ impl BlockStamps {
         out.push_str(&self.overlap_line());
         if self.phase_b_sched {
             out.push_str(&self.sched_line());
+            out.push_str(&self.thread_line());
             out.push_str(&match self.phase_b_proc {
                 Some((a, b)) => format!(
                     "BLOCK PHASE-B PROC: minor faults {} · major faults {} · user {:.2}s · system {:.2}s · \
@@ -3736,6 +3737,60 @@ impl BlockStamps {
             wait[..3].iter().sum::<f64>(),
             list(&cpu),
             list(&wait),
+        )
+    }
+
+    /// Phase B's driver thread's own counters over its turns
+    /// ([`GroupStamps::thread_b`]): faults, user and system seconds, sleep and
+    /// its blocked part, switches, and the ladder rounds with an opening in
+    /// flight and without, in all and by group (`group@start:faults:system
+    /// ticks:blocked ms:beside ns:beside rounds:alone ns:alone rounds`).
+    fn thread_line(&self) -> String {
+        let turns: Vec<(usize, f64, stark::multilinear_block::ThreadCounters)> = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(g, s)| s.thread_b.map(|t| (g, s.start_b, t)))
+            .collect();
+        if turns.is_empty() {
+            return "BLOCK PHASE-B THREAD: unavailable (/proc/thread-self/stat did not read)\n"
+                .to_string();
+        }
+        let sum = |f: &dyn Fn(&stark::multilinear_block::ThreadCounters) -> u64| -> u64 {
+            turns.iter().map(|(_, _, t)| f(t)).sum()
+        };
+        let by_group: Vec<String> = turns
+            .iter()
+            .map(|(g, at, t)| {
+                format!(
+                    "{g}@{at:.3}:{}:{}:{:.1}:{}:{}:{}:{}",
+                    t.minor_faults,
+                    t.system_ticks,
+                    t.block_ns as f64 / 1e6,
+                    t.ladder[0],
+                    t.ladder[1],
+                    t.ladder[2],
+                    t.ladder[3]
+                )
+            })
+            .collect();
+        format!(
+            "BLOCK PHASE-B THREAD: the driver thread over {} group turns · minor faults {} · user {:.2}s · system {:.2}s \
+             · sleep {:.3}s (blocked {:.3}s) · voluntary {} · involuntary {} · ladder rounds beside an opening {} in \
+             {:.3}s, alone {} in {:.3}s · by group [{}]\n",
+            turns.len(),
+            sum(&|t| t.minor_faults),
+            sum(&|t| t.user_ticks) as f64 / 100.0,
+            sum(&|t| t.system_ticks) as f64 / 100.0,
+            sum(&|t| t.sleep_ns) as f64 / 1e9,
+            sum(&|t| t.block_ns) as f64 / 1e9,
+            sum(&|t| t.voluntary),
+            sum(&|t| t.involuntary),
+            sum(&|t| t.ladder[1]),
+            sum(&|t| t.ladder[0]) as f64 / 1e9,
+            sum(&|t| t.ladder[3]),
+            sum(&|t| t.ladder[2]) as f64 / 1e9,
+            by_group.join(", "),
         )
     }
 

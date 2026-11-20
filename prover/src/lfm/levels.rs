@@ -1537,6 +1537,26 @@ pub fn prove_block_levels(
     let program_ref = &program_cell;
     let (btx, brx) = mpsc::channel::<()>();
     let result = std::thread::scope(|scope| {
+        // A measurement under `LAMBDA_VM_BLOCK_SCHEDSTAT=1`: the process's
+        // faults and CPU seconds every 10 ms on the driver's clock, until just
+        // after the base ends, printed once level 1's thread is done.
+        let fault_samples = crate::block_whir::phase_b_sched_from_env().then(|| {
+            scope.spawn(move || {
+                let mut out: Vec<(f64, u64, f64, f64)> = Vec::new();
+                let cap = now() + 600.0;
+                loop {
+                    let t = now();
+                    if let Some(p) = crate::block_whir::ProcSample::now() {
+                        out.push((t, p.minor_faults, p.user, p.system));
+                    }
+                    if base_end_ref.get().is_some_and(|&e| t >= e + 0.2) || t > cap {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                out
+            })
+        });
         // The builder's thread (`build_beside`): level 1's stacks' columns,
         // on the host, as soon as its program exists. The card is the base's
         // until it ends: nothing is committed here.
@@ -1844,6 +1864,16 @@ pub fn prove_block_levels(
         };
         let level1 = level1.join();
         let purge = purge.and_then(|p| p.join().ok().flatten());
+        if let Some(samples) = fault_samples.and_then(|h| h.join().ok()) {
+            let list: Vec<String> = samples
+                .iter()
+                .map(|(t, f, u, s)| format!("{t:.3}:{f}:{u:.2}:{s:.2}"))
+                .collect();
+            eprintln!(
+                "LEVELS FAULT SAMPLES: every 10 ms on the driver's clock · t:minor faults:user s:system s · {}",
+                list.join(" ")
+            );
+        }
         (proved, level1, first, purge, at_base)
     });
     let (proved, level1, built_beside, purge, at_base) = result;
