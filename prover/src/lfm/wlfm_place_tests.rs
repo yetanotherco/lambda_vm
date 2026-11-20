@@ -848,9 +848,13 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
         let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
             .expect("the held build proves");
         for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            // The narrow store on at the build: a retired stack keeps its packed
+            // bytes only for a store that sends them.
             super::wlfm::set_narrow_commit_for_test(Some(true));
+            super::wlfm::set_narrow_store_for_test(Some(true));
             let (_, _, build) = probe_placed(family, place);
             super::wlfm::set_narrow_commit_for_test(None);
+            super::wlfm::set_narrow_store_for_test(None);
             assert_eq!(
                 build.artifacts.program_id, held.artifacts.program_id,
                 "{family:?} {place:?}: the wide build's identity"
