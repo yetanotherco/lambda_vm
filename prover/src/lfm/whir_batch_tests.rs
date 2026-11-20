@@ -345,7 +345,9 @@ type ReduceParts = (Vec<Vec<Ext>>, Vec<Ext>);
 
 /// The assembled program over the hinted proof, or — with `leg` false — the
 /// same arena with no leg, so the difference is the leg. With `stream`, the
-/// transcript's next draw after the leg is published last.
+/// transcript's next draw after the leg is published last. Built under
+/// `hash`'s wrap hash, its transcript the one that hash's base runs
+/// ([`WhirTranscript::for_builder`]: the felt sponge, or BLAKE3's byte sponge).
 #[allow(clippy::too_many_arguments)]
 fn batched_program(
     argue: &BatchedArgue<E>,
@@ -356,8 +358,9 @@ fn batched_program(
     total: usize,
     leg: bool,
     stream: bool,
+    hash: super::edsl::WrapHash,
 ) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(hash);
     let arena = b.declare_arena(total as u32);
     let mut index = 0u32;
     let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
@@ -448,7 +451,7 @@ fn batched_program(
             })
         })
         .collect();
-    let mut transcript = WhirTranscript::new();
+    let mut transcript = WhirTranscript::for_builder(&mut b);
     let verdict = emit_batched_argue(
         &mut b,
         &mut transcript,
@@ -572,6 +575,11 @@ impl RunView<'_> {
     }
 
     fn program_with(&self, leg: bool, stream: bool) -> LfmProgram {
+        self.program_under(leg, stream, super::edsl::WrapHash::production())
+    }
+
+    /// [`Self::program_with`] under `hash`.
+    fn program_under(&self, leg: bool, stream: bool, hash: super::edsl::WrapHash) -> LfmProgram {
         batched_program(
             self.argue,
             self.shapes,
@@ -581,6 +589,7 @@ impl RunView<'_> {
             self.values().len(),
             leg,
             stream,
+            hash,
         )
     }
 
@@ -1101,6 +1110,87 @@ fn the_leg_is_its_closed_form(run: &RunView<'_>, what: &str) {
         "{what}: {measured} rows emitted and predicted, {} permutations",
         cost.perms()
     );
+}
+
+/// BLAKE3 compressions a program emits, whichever lowering it took.
+fn blake3_compressions(program: &LfmProgram) -> usize {
+    program
+        .instrs
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                super::instr::Instr::Blake3(_) | super::instr::Instr::B3l(_)
+            )
+        })
+        .count()
+}
+
+/// ★ The cost form under BLAKE3: the leg built under the BLAKE3 wrap hash,
+/// its transcript BLAKE3's byte sponge, emits exactly the BLAKE3 compressions
+/// [`batched_argue_cost`]'s schedule counts from
+/// `SpongeEntry::fresh_for(Blake3)`, on one-layer and two-layer ladders, plain
+/// and packed, at both caps. Those permutations are what a BLAKE3 base's leaf
+/// partition is planned from (`WhirBlockPlan`'s group costs read `perms()`
+/// alone). The census tests above read the form under the felt sponge only
+/// (`SpongeEntry::fresh()`).
+///
+/// The form's ROWS are not pinned here: under BLAKE3 they count the felt
+/// sponge's rows, not the byte sponge's lowering, so the leg emits several
+/// times the rows the form names (printed below). Nothing plans from them
+/// under BLAKE3.
+#[test]
+fn the_leg_is_its_closed_form_under_blake3() {
+    use super::edsl::WrapHash;
+    for (name, fixture) in [
+        ("plain", Fixture::new as fn() -> Fixture),
+        ("packed", Fixture::packed),
+    ] {
+        for ladder in [GkrLadder::Single, GkrLadder::Double] {
+            for cap in [27u8, 0] {
+                with_run_on(
+                    fixture().on(ladder),
+                    cap,
+                    |_| {},
+                    |run| {
+                        let what = format!("BLAKE3 {name} {ladder:?} cap {cap}");
+                        let with = run.program_under(true, false, WrapHash::Blake3);
+                        let without = run.program_under(false, false, WrapHash::Blake3);
+                        let published = 2 * run.shapes.len()
+                            + run
+                                .host
+                                .as_ref()
+                                .expect("host")
+                                .iter()
+                                .map(|c| c.point.len() + c.column_values.len())
+                                .sum::<usize>();
+                        let measured = with.instrs.len()
+                            - without.instrs.len()
+                            - (published - 2) * PUBLISH_ROW;
+                        let cost = batched_argue_cost(
+                            run.shapes,
+                            run.plan,
+                            run.ladder,
+                            SpongeEntry::fresh_for(WrapHash::Blake3),
+                        );
+                        let compressions =
+                            blake3_compressions(&with) - blake3_compressions(&without);
+                        assert!(compressions > 0, "{what}: the byte sponge compresses");
+                        assert_eq!(
+                            compressions,
+                            cost.perms(),
+                            "{what}: compressions emitted against the schedule"
+                        );
+                        println!(
+                            "{what}: {compressions} compressions emitted and predicted; rows \
+                             {measured} emitted, {} in the form (not planned from)",
+                            cost.rows()
+                        );
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// The schedule each bin of a run's ladders follows: the host's own.
