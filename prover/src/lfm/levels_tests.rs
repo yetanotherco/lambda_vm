@@ -2110,27 +2110,35 @@ fn no_production_code_builds_weakened_verifier_checks() {
 }
 
 /// ★ The levels' public verifier derives its own plan, in a test GitHub CI
-/// runs (the one test that executes the entry is box tier). Read from the
-/// source:
-/// - both public entries go through `verify_block_levels_pinned`, and no
-///   public entry calls `level_plan` (whose prepared roots a caller passes);
-/// - the verifier's plan is `level_plan_with(.., None, true)`: prepared roots
-///   committed on the host and the inverse share form, and then the named cap
-///   check — and nothing on the verifier's path reads `share_inverse()` or
-///   `cap_mux()`, the process's knobs, outside the test-only entry;
+/// runs (the one test that executes an entry is box tier). Read from the
+/// source, every function on the entry's path down to the plan and the
+/// level children, whitespace collapsed:
+/// - both public entries go through `verify_block_levels_pinned`, and neither
+///   calls `level_plan(`, reads a knob or names a root;
+/// - each link of the path: the pinned body refuses the process's format knobs
+///   (`check_process_format`) and calls `verifier_level_plan`, which calls
+///   `verifier_level_plan_with`, which calls `level_plan_with(.., None, true,
+///   Some(cap_mux))`: no prepared roots, the inverse share form and the named
+///   cap check, before anything is emitted;
+/// - `level_plan_with` derives through the share-taking derivations only (not
+///   `derive_blake3(`, which reads the share knob) and passes the cap check on;
+/// - every later level's child carries the plan's cap check;
+/// - no function on the path reads `share_inverse()`, `cap_mux()` or a
+///   BLAKE3 base knob (`b3_base_…`), and `pin_family` reads no environment;
 /// - the plan-taking calls stay crate-private: `verify_levels_to` is
-///   `pub(crate)` and `verify_levels` test-only.
+///   `pub(crate)`, `verify_levels` and `verify_block_levels_under` test-only.
 #[test]
 fn the_levels_verifier_derives_its_plan_and_takes_none() {
     let src = include_str!("levels.rs");
-    let body = |name: &str| -> &str {
+    let body = |name: &str| -> String {
         let at = src
             .find(&format!("fn {name}("))
             .unwrap_or_else(|| panic!("levels.rs defines {name}"));
         let rest = &src[at..];
         let end = rest.find("\n}\n").expect("a body's end");
-        &rest[..end]
+        rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
     };
+    let knobs = ["share_inverse()", "cap_mux()", "b3_base_", "std::env"];
     for public in ["verify_block_levels", "verify_block_levels_at"] {
         let b = body(public);
         assert!(
@@ -2141,29 +2149,163 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
             b.contains("verify_block_levels_pinned("),
             "{public} verifies through the pinned body"
         );
-        for forbidden in ["level_plan(", "share_inverse()", "cap_mux()", "Some("] {
+        for forbidden in knobs.iter().chain(&["level_plan(", "Some("]) {
             assert!(!b.contains(forbidden), "{public} reads {forbidden}");
         }
     }
-    let plan = body("verifier_level_plan_with");
+    let links = [
+        ("verify_block_levels_pinned", "check_process_format("),
+        ("verify_block_levels_pinned", "verifier_level_plan("),
+        ("verifier_level_plan", "verifier_level_plan_with("),
+        ("verifier_level_plan_with", "level_plan_with("),
+        ("verifier_level_plan_with", "None, true, Some(cap_mux)"),
+        ("level_plan_with", "derive_full("),
+        ("level_plan_with", "derive_blake3_with_share("),
+        ("level_plan_with", "share_inverse, cap_mux, )"),
+        ("child_of_build", "cap_mux: plan.cap_mux()"),
+        ("check_process_format", "check_format_knobs("),
+    ];
+    for (function, call) in links {
+        assert!(
+            body(function).contains(call),
+            "{function} must contain `{call}`"
+        );
+    }
     assert!(
-        plan.contains("None, true)") && plan.contains(".with_cap_mux(cap_mux)"),
-        "the verifier's plan: no prepared roots, the inverse share form, the named cap check"
+        !body("level_plan_with").contains("derive_blake3("),
+        "level_plan_with derives through the share-reading derive_blake3"
     );
-    for verifier in [
+    // A knob is read by a bare call; `plan.cap_mux()` reads the plan's.
+    let reads = |b: &str, knob: &str| b.match_indices(knob).any(|(at, _)| !b[..at].ends_with('.'));
+    for function in [
         "verify_block_levels_pinned",
         "verifier_level_plan",
+        "verifier_level_plan_with",
+        "level_plan_with",
+        "verify_levels_to",
+        "derive_levels_to",
+        "child_of_build",
         "pin_family",
     ] {
-        let b = body(verifier);
-        for knob in ["share_inverse()", "cap_mux()", "std::env"] {
-            assert!(!b.contains(knob), "{verifier} reads {knob}");
+        let b = body(function);
+        for knob in knobs {
+            assert!(!reads(&b, knob), "{function} reads {knob}");
         }
     }
     assert!(src.contains("\npub(crate) fn verify_levels_to("));
     assert!(src.contains("#[cfg(test)]\npub(crate) fn verify_levels("));
     assert!(src.contains("#[cfg(test)]\npub(crate) fn verify_block_levels_under("));
     assert!(!src.contains("\npub fn verify_levels"));
+}
+
+/// One binary, one format: the public entries' refusal of the process's
+/// format knobs, on given values. The BLAKE3 base's cap height and final
+/// polynomial must be the pinned ones; under the Poseidon1 base the
+/// `LFM_HASH` split must be off; under BLAKE3 the split is inert and taken.
+#[test]
+fn the_levels_verifier_refuses_format_knobs_off_their_pinned_values() {
+    use super::levels::check_format_knobs;
+    use multilinear::whir_chain::FinalPoly;
+    let cap = crate::block_whir::B3_BASE_CAP;
+    let on = FinalPoly::Vars(crate::block_whir::B3_BASE_FINAL_VARS);
+    assert!(check_format_knobs(WlfmFamily::B3, cap, on, false).is_ok());
+    assert!(check_format_knobs(WlfmFamily::B3, cap, on, true).is_ok());
+    assert!(check_format_knobs(WlfmFamily::P1, cap, on, false).is_ok());
+    for (what, refused) in [
+        ("cap 5", check_format_knobs(WlfmFamily::B3, 5, on, false)),
+        ("cap 3", check_format_knobs(WlfmFamily::B3, 3, on, false)),
+        (
+            "no final polynomial",
+            check_format_knobs(WlfmFamily::B3, cap, FinalPoly::Off, false),
+        ),
+        (
+            "the hash split",
+            check_format_knobs(WlfmFamily::P1, cap, on, true),
+        ),
+    ] {
+        assert!(refused.is_err(), "{what} taken");
+    }
+}
+
+/// The scenarios [`the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults`]
+/// runs in processes of their own: an environment, and its child test's name.
+const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 2] = [
+    (
+        "cap",
+        &[
+            ("LAMBDA_VM_B3_BASE_CAP", "5"),
+            ("LAMBDA_VM_B3_BASE_GROUP", "3"),
+            ("LAMBDA_VM_B3_BASE_GKR", "single"),
+            ("LAMBDA_VM_LFM_CAP_MUX", "plain"),
+            ("LFM_WHIR_SHARE_INVERSE", "0"),
+            ("LAMBDA_VM_LFM_HASH_SPLIT", "1"),
+        ],
+    ),
+    ("final", &[("LAMBDA_VM_B3_BASE_FINAL", "off")]),
+];
+
+/// ★ In processes whose knobs are off the defaults, the public entries'
+/// pins hold: the family pin keeps the BLAKE3 base's own group size and GKR
+/// ladder, and the format check refuses the cap, the final polynomial and
+/// (under Poseidon1) the hash split by name. Each scenario runs
+/// [`the_levels_pins_hold_under_knobs_off_the_default`] in a child process.
+#[test]
+fn the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults() {
+    let name = "lfm::levels_tests::the_levels_pins_hold_under_knobs_off_the_default";
+    for (scenario, env) in KNOB_CHILDREN {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                name,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .envs(env.iter().copied())
+            .env("LEVELS_KNOB_SCENARIO", scenario)
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child under the {scenario} knobs:\n{stdout}\n{stderr}"
+        );
+    }
+}
+
+/// Run by [`the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults`]
+/// in a process whose environment is one of [`KNOB_CHILDREN`]; refuses to run
+/// anywhere else.
+#[test]
+#[ignore = "run in a process of its own by the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults"]
+fn the_levels_pins_hold_under_knobs_off_the_default() {
+    use crate::block_whir::{B3_BASE_GKR_DEFAULT, B3_BASE_GROUP_POLYS, B3Rounds, BlockFormat};
+    use multilinear::whir_chain::GroupFold;
+    let scenario = std::env::var("LEVELS_KNOB_SCENARIO").expect("run by its parent");
+    let pinned = BlockFormat::pinned_with(GroupFold::Indexed);
+    let b3 = super::levels::pin_family(pinned, WlfmFamily::B3, B3Rounds::Fri).expect("the pin");
+    match scenario.as_str() {
+        "cap" => {
+            assert_eq!(crate::block_whir::b3_base_group_polys(), 3, "the knob took");
+            assert_eq!(b3.group_polys, B3_BASE_GROUP_POLYS, "the pinned group size");
+            assert_eq!(b3.argue, pinned.argue.with_ladder(B3_BASE_GKR_DEFAULT));
+            let refused = super::levels::check_process_format_for_tests(WlfmFamily::B3)
+                .expect_err("a cap off the pinned one");
+            assert!(refused.contains("LAMBDA_VM_B3_BASE_CAP"), "{refused}");
+            let refused = super::levels::check_process_format_for_tests(WlfmFamily::P1)
+                .expect_err("the hash split under Poseidon1");
+            assert!(refused.contains("LAMBDA_VM_LFM_HASH_SPLIT"), "{refused}");
+        }
+        "final" => {
+            let refused = super::levels::check_process_format_for_tests(WlfmFamily::B3)
+                .expect_err("no final polynomial");
+            assert!(refused.contains("LAMBDA_VM_B3_BASE_FINAL"), "{refused}");
+            super::levels::check_process_format_for_tests(WlfmFamily::P1)
+                .expect("the Poseidon1 base reads no BLAKE3 knob");
+        }
+        other => panic!("no scenario {other}"),
+    }
 }
 
 /// The pinned format a family's verifier checks against: the BLAKE3 base's
@@ -2191,5 +2333,104 @@ fn a_levels_verifier_pins_its_familys_base() {
     assert!(
         super::levels::pin_family(pinned, WlfmFamily::P1, B3Rounds::WHIR3).is_err(),
         "a round form on the Poseidon1 base"
+    );
+    // A round form the chains cannot take is refused, never a panic.
+    for shrink in [0u8, 4, u8::MAX] {
+        for caps_by_q in [false, true] {
+            assert!(
+                super::levels::pin_family(
+                    pinned,
+                    WlfmFamily::B3,
+                    B3Rounds::Whir { shrink, caps_by_q }
+                )
+                .is_err(),
+                "shrink {shrink}"
+            );
+        }
+    }
+    for shrink in 1..=3u8 {
+        super::levels::pin_family(
+            pinned,
+            WlfmFamily::B3,
+            B3Rounds::Whir {
+                shrink,
+                caps_by_q: true,
+            },
+        )
+        .unwrap_or_else(|e| panic!("shrink {shrink}: {e}"));
+    }
+}
+
+/// ★ A public entry executed: a small block's BLAKE3 base proved at the
+/// format `verify_block_levels` pins (the tree's pinned format on the BLAKE3
+/// base) under the options it derives, then `verify_block_levels` itself run
+/// over it. Its whole derivation runs — the family pin, the format check, the
+/// plan with its roots on the host, every level's programs and artifacts —
+/// and only the last proof, another program's, is refused, at the last
+/// level's verify. And the plan the entry derives carries the named cap check,
+/// and no level program has a hash row a split could cut.
+#[test]
+#[ignore = "proves a small BLAKE3 base at the pinned format and derives its levels; box tier"]
+fn the_public_levels_verifier_runs_at_the_pinned_format() {
+    use crate::block_whir::{B3Rounds, BlockFormat};
+    use multilinear::whir_chain::GroupFold;
+    let format = super::levels::pin_family(
+        BlockFormat::pinned_with(GroupFold::Indexed),
+        WlfmFamily::B3,
+        B3Rounds::Fri,
+    )
+    .expect("the pin");
+    let opts = super::proof::block_base_options_under(&format.zf);
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let base = crate::base_only::with_blake3_levels(|| {
+        crate::block_whir::prove_block_whir_with(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &small_block_options(),
+            &crate::block_whir::Deviations::default(),
+        )
+    })
+    .expect("the BLAKE3 base proves at the pinned format")
+    .0;
+    let plan = super::levels::verifier_level_plan(
+        &elf,
+        &format,
+        base.statement(),
+        WlfmFamily::B3,
+        super::merkle_cap::CapMux::Packed,
+    )
+    .expect("the verifier's plan derives");
+    assert_eq!(plan.cap_mux(), Some(super::merkle_cap::CapMux::Packed));
+    let levels = derive_levels_to(&plan, WlfmFamily::B3, LevelStop::DEFAULT, true)
+        .expect("the levels derive");
+    for (k, level) in levels.iter().enumerate() {
+        let rows = level.program.groups.hash.real_rows;
+        assert_eq!(
+            super::chunking::HashChunking::for_rows(rows),
+            super::chunking::HashChunking::unbounded(),
+            "level {}: {rows} hash rows, which a split would cut",
+            k + 1
+        );
+    }
+    let foreign = super::wlfm::WlfmProof {
+        proof: stark::multilinear_table::MultiProof {
+            roots: Vec::new(),
+            tables: Vec::new(),
+            columns: Vec::new(),
+            preprocessed: None,
+        },
+        argues: Vec::new(),
+        prepared: Vec::new(),
+        commit_ood: Vec::new(),
+        public_words: Vec::new(),
+    };
+    let refused =
+        super::levels::verify_block_levels(&elf, base.statement(), WlfmFamily::B3, &foreign)
+            .expect_err("another program's proof");
+    assert!(
+        refused.starts_with("the last level does not verify"),
+        "the derivation ran to the last level's verify: {refused}"
     );
 }

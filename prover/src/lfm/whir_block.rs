@@ -758,7 +758,7 @@ pub struct WhirBlockPlan {
     /// only the block prover proves; meaningless under any other hash.
     b3_lean: bool,
     /// The cap check its programs' BLAKE3 openings take, when the deriver
-    /// named it ([`Self::with_cap_mux`]); `None` takes the process's knob.
+    /// named it; `None` takes the process's knob.
     cap_mux: Option<super::merkle_cap::CapMux>,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
@@ -890,6 +890,7 @@ impl WhirBlockPlan {
             prepared_roots,
             leaf_cap,
             share_inverse(),
+            None,
         )
     }
 
@@ -907,6 +908,7 @@ impl WhirBlockPlan {
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
         leaf_cap: usize,
         share_inverse: bool,
+        cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
@@ -931,6 +933,7 @@ impl WhirBlockPlan {
             leaf_cap,
             share_inverse,
             wrap_hash,
+            cap_mux,
         )
     }
 
@@ -965,6 +968,7 @@ impl WhirBlockPlan {
             num_leaves,
             prepared_roots,
             share_inverse(),
+            None,
         )
     }
 
@@ -979,6 +983,7 @@ impl WhirBlockPlan {
         num_leaves: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
         share_inverse: bool,
+        cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
         if format.zf.base != stark::proof::options::BaseFormat::B3_WHIR {
             return Err(format!(
@@ -997,6 +1002,7 @@ impl WhirBlockPlan {
             usize::MAX,
             share_inverse,
             super::edsl::WrapHash::Blake3,
+            cap_mux,
         )
     }
 
@@ -1013,6 +1019,7 @@ impl WhirBlockPlan {
         leaf_cap: usize,
         share_inverse: bool,
         wrap_hash: super::edsl::WrapHash,
+        cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
         let base = &format.zf.base;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
@@ -1158,7 +1165,9 @@ impl WhirBlockPlan {
             statement_calls,
             wrap_hash,
             b3_lean: wrap_hash == super::edsl::WrapHash::Blake3,
-            cap_mux: None,
+            // Named here, before the measuring probes below emit any program,
+            // so a verifier that names it reads no knob on its derivation.
+            cap_mux,
             public_output: statement.public_output.to_vec(),
             groups,
             prepared,
@@ -1249,14 +1258,8 @@ impl WhirBlockPlan {
         }
     }
 
-    /// This plan with its programs' cap check named `mode`, whatever the
-    /// process's knob says: what a verifier's derivation pins.
-    pub(crate) fn with_cap_mux(mut self, mode: super::merkle_cap::CapMux) -> Self {
-        self.cap_mux = Some(mode);
-        self
-    }
-
-    /// The cap check the deriver named ([`Self::with_cap_mux`]), if any.
+    /// The cap check the deriver named (`derive_full`'s or
+    /// `derive_blake3_with_share`'s `cap_mux`), if any.
     pub(crate) fn cap_mux(&self) -> Option<super::merkle_cap::CapMux> {
         self.cap_mux
     }
@@ -2176,6 +2179,7 @@ fn verify_block_tree_with(
         None,
         leaf_cap,
         share_inverse,
+        None,
     )?;
     verify_top_of(&plan, wrap_opts, top)
 }
@@ -2198,6 +2202,7 @@ pub(crate) fn verifier_plan(
         None,
         LEAF_P1_CAP,
         presets.share_inverse,
+        None,
     )
 }
 

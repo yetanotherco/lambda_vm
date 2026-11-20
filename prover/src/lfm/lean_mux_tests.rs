@@ -228,6 +228,35 @@ fn the_blake3_w_leg_program_is_pinned() {
         leg.instrs.len()
     );
     assert_eq!(digest, DIGEST, "the BLAKE3 W-leg's program");
+    // The LFM_HASH split is inert on a BLAKE3 leg: it has no hash row a split
+    // could cut, so `LAMBDA_VM_LFM_HASH_SPLIT` moves no BLAKE3 program.
+    let rows = leg.groups.hash.real_rows;
+    assert_eq!(
+        super::chunking::HashChunking::for_rows(rows),
+        super::chunking::HashChunking::unbounded(),
+        "{rows} hash rows a split would cut"
+    );
+    // The cap check named by the deriver: the default's own (the same
+    // program), and another (another program).
+    let named = |mode| {
+        let child = super::wlfm_leg::WlfmChild {
+            cap_mux: Some(mode),
+            ..child.clone()
+        };
+        super::whir_chain_tests::program_digest(
+            &super::wlfm_leg::wlfm_leg_program(&child).expect("the named leg emits"),
+        )
+    };
+    assert_eq!(
+        named(super::merkle_cap::CapMux::Packed),
+        DIGEST,
+        "the packed check named: the default's program"
+    );
+    assert_ne!(
+        named(super::merkle_cap::CapMux::Plain),
+        DIGEST,
+        "the plain check named: another program"
+    );
     use super::wlfm_leg::faults::{Fault, with};
     let moved = with(Fault::SkipClosure, || {
         super::wlfm_leg::wlfm_leg_program(&child).expect("the faulted leg emits")
