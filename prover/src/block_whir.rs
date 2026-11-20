@@ -4799,7 +4799,7 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false, false)
+    commit_group_where::<H>(stack, config, false, false, false)
 }
 
 /// [`commit_group`] with the columns sent to the card narrow: packed on the
@@ -4813,8 +4813,9 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
 pub(crate) fn commit_group_narrow<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
+    staged: bool,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false, true)
+    commit_group_where::<H>(stack, config, false, true, staged)
 }
 
 /// Whether a narrow commit's store fits: its words, the largest run's packed
@@ -4834,7 +4835,7 @@ pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, true, false)
+    commit_group_where::<H>(stack, config, true, false, false)
 }
 
 fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
@@ -4842,6 +4843,7 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
     config: &multilinear::whir_chain::ChainConfig,
     on_host: bool,
     narrow: bool,
+    staged: bool,
 ) -> Result<GroupPrepared<H>, Error> {
     let shapes = stack.shapes();
     let group = stack.group;
@@ -4881,7 +4883,12 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
             let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
             if narrow_commit_fits(p.words, staging, price, free) {
                 let t = Instant::now();
-                let store = multilinear::gpu::upload_packed_store(&p.store).map(|(s, _)| s);
+                let store = if staged {
+                    multilinear::gpu::upload_packed_store_staged(&p.store)
+                } else {
+                    multilinear::gpu::upload_packed_store(&p.store)
+                }
+                .map(|(s, _)| s);
                 p.sent = store.is_some();
                 p.upload_secs = t.elapsed().as_secs_f64();
                 store

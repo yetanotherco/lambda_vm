@@ -77,7 +77,14 @@ fn a_narrow_store_holds_the_wide_stores_words_and_its_refusal_is_no_argue_fallba
         "NARROW STORE: {} B packed of {words} B · pack {:.4}s · up {:.4}s",
         stamp.packed_bytes, stamp.pack_secs, stamp.upload_secs
     );
-    drop((wide, narrow));
+    // The same runs copied through the pinned staging: the same words.
+    let packed = gpu::pack_store(&refs).expect("the columns pack");
+    let (staged, _) = gpu::upload_packed_store_staged(&packed).expect("the staged store goes up");
+    assert!(
+        staged.download().expect("the staged store reads back") == a,
+        "the staged narrow store holds the wide store's words"
+    );
+    drop((wide, narrow, staged));
 
     // Room for 1 MiB more than the ledger holds now: the store is refused.
     let budget = gpu::set_reserve_budget(gpu::ledger_reserved() + (1 << 20));

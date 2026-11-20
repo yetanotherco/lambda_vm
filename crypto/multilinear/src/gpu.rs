@@ -5028,6 +5028,25 @@ where
 /// or when the card refuses; the stamp's `pack_secs` is the packed store's.
 #[cfg(feature = "cuda")]
 pub fn upload_packed_store(packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    upload_packed_on(packed, false)
+}
+
+/// [`upload_packed_store`] with each run's bytes copied through the card's
+/// double-buffered pinned staging instead of one pageable copy a run
+/// (`math_cuda::columns::DeviceColumns::upload_store_tables_staged`). The
+/// same store.
+#[cfg(feature = "cuda")]
+pub fn upload_packed_store_staged(packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    upload_packed_on(packed, true)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_packed_store_staged(_packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn upload_packed_on(packed: &PackedStore, staged: bool) -> Option<(ResidentColumns, NarrowStore)> {
     use math_cuda::columns::TableUpload;
 
     if columns_disabled() {
@@ -5047,7 +5066,11 @@ pub fn upload_packed_store(packed: &PackedStore) -> Option<(ResidentColumns, Nar
             ))
         })
         .collect();
-    let store = math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?;
+    let store = if staged {
+        math_cuda::columns::DeviceColumns::upload_store_tables_staged(&uploads)?
+    } else {
+        math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?
+    };
     Some((
         ResidentColumns(store),
         NarrowStore {

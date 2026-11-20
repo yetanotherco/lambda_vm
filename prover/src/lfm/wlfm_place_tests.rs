@@ -751,14 +751,21 @@ fn the_narrow_commit_knob_is_named_and_off_by_default() {
         (Some("on"), false),
         (Some("1"), true),
         (Some(" 1 "), true),
+        (Some("2"), true),
+        (Some("3"), false),
     ] {
         assert_eq!(narrow_commit_word(word), on, "{word:?}");
     }
+    use super::wlfm::narrow_commit_mode_word;
+    assert_eq!(narrow_commit_mode_word(Some("1")), 1);
+    assert_eq!(narrow_commit_mode_word(Some(" 2 ")), 2);
+    assert_eq!(narrow_commit_mode_word(None), 0);
 }
 
 /// ★ Committing the prepared stacks from their columns sent narrow
 /// (`LAMBDA_VM_LEVELS_NARROW_COMMIT`), packed in the level's host part or at
-/// the commit, moves no root and no byte: under both families, every place's
+/// the commit, its runs copied pageable or through the pinned staging (`2`),
+/// moves no root and no byte: under both families, every place's
 /// build has the wide build's program identity and proves the held build's
 /// bytes. On a card every card-placed stack's commit sent its store, packed
 /// ahead where the host part packed it; on the host, or without a card,
@@ -770,6 +777,7 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
     impl Drop for Restore {
         fn drop(&mut self) {
             super::wlfm::set_narrow_commit_for_test(None);
+            super::wlfm::set_narrow_commit_staged_for_test(None);
         }
     }
     let _restore = UploadOnceRestore;
@@ -782,8 +790,9 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
         let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
             .expect("the held build proves");
         for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
-            for ahead in [false, true] {
+            for (ahead, staged) in [(false, false), (true, false), (true, true)] {
                 super::wlfm::set_narrow_commit_for_test(Some(true));
+                super::wlfm::set_narrow_commit_staged_for_test(Some(staged));
                 let mut pre = super::wlfm::prepare_wlfm(
                     &program,
                     super::wlfm_tests::HASHER,
@@ -796,6 +805,7 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
                 }
                 let mut build = pre.commit(place).expect("commits");
                 super::wlfm::set_narrow_commit_for_test(None);
+                super::wlfm::set_narrow_commit_staged_for_test(None);
                 assert_eq!(
                     build.artifacts.program_id, held.artifacts.program_id,
                     "{family:?} {place:?} {ahead}: the wide build's identity"
