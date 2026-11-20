@@ -481,3 +481,200 @@ fn the_local_lane_moves_no_byte_on_a_real_block() {
         assert!(ran > 0, "on a card the lane ran local bins");
     }
 }
+
+/// ★ Where the LOCAL_BYTES tables sit ([`block_whir::check_local_groups`]),
+/// on hand-written groups (no proof): tables 0–3 the run's (0 and 2 send a
+/// local lookup), 4 and 5 LOCAL_BYTES. The honest packing passes; each
+/// misplacement is refused by its own message — two sending groups'
+/// LOCAL_BYTES traded (the `base + j` rule: the j-th sending group ends with
+/// table `base + j`), one not last, two in one group, a sending group with
+/// none, one in a group with no sender, and a LOCAL_BYTES too many.
+#[test]
+fn local_bytes_tables_sit_last_in_their_groups_in_group_order() {
+    let senders = [true, false, true, false, false, false];
+    let check = |groups: &[&[u32]], senders: &[bool]| {
+        let groups: Vec<Vec<u32>> = groups.iter().map(|g| g.to_vec()).collect();
+        block_whir::check_local_groups(&groups, senders, 4).map_err(|e| format!("{e:?}"))
+    };
+    assert_eq!(check(&[&[0, 1, 4], &[2, 3, 5]], &senders), Ok(()));
+    for (groups, want) in [
+        (
+            &[&[0u32, 1, 5][..], &[2, 3, 4]][..],
+            "group 0 ends with LOCAL_BYTES table 5, not 4",
+        ),
+        (
+            &[&[0, 4, 1], &[2, 3, 5]],
+            "group 0 holds a local sender: it ends with exactly one LOCAL_BYTES table",
+        ),
+        (
+            &[&[0, 1, 4, 5], &[2, 3]],
+            "group 0 holds a local sender: it ends with exactly one LOCAL_BYTES table",
+        ),
+        (
+            &[&[0, 1], &[2, 3, 4], &[5]],
+            "group 0 holds a local sender: it ends with exactly one LOCAL_BYTES table",
+        ),
+        (
+            &[&[0, 4], &[1, 5], &[2, 3]],
+            "group 1 holds a LOCAL_BYTES table and no local sender",
+        ),
+    ] {
+        let refused = check(groups, &senders);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains(want)),
+            "{groups:?}: {refused:?}"
+        );
+    }
+    // A LOCAL_BYTES table stated for no sending group.
+    let seven = [true, false, true, false, false, false, false];
+    let refused = check(&[&[0, 1, 4], &[2, 3, 5], &[6]], &seven);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("group 2 holds a LOCAL_BYTES table and no local sender")),
+        "{refused:?}"
+    );
+}
+
+/// ★ Which tables may receive a local bus ([`block_whir::check_local_airs`]),
+/// on hand-built AIRs (no proof): the run's tables, then LOCAL_BYTES at 2^16
+/// rows, passes; a LOCAL_BYTES before the base, a run table after it, a
+/// LOCAL_BYTES at 2^15 rows and a run table receiving a local bus are each
+/// refused by their own message.
+#[test]
+fn only_local_bytes_tables_after_the_base_receive_local_buses() {
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+    use stark::traits::AIR;
+    let opts = opts();
+    let plain = crate::test_utils::create_plain_air(&opts, 4, Vec::new(), "PLAIN");
+    let receiver = crate::test_utils::create_plain_air(
+        &opts,
+        4,
+        vec![BusInteraction::receiver(
+            BusId::LocalAreBytes,
+            Multiplicity::Column(2),
+            vec![
+                BusValue::Packed {
+                    start_column: 0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: 1,
+                    packing: Packing::Direct,
+                },
+            ],
+        )],
+        "RECEIVER",
+    );
+    let fixed = crate::test_utils::create_local_bytes_air(&opts).with_name("LOCAL_BYTES[0]");
+    type Air<'a> = &'a dyn AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = crate::tables::types::GoldilocksExtension,
+        PublicInputs = (),
+    >;
+    let check = |airs: &[Air<'_>], heights: &[u8], base: usize| {
+        block_whir::check_local_airs(airs, heights, base).map_err(|e| format!("{e:?}"))
+    };
+    let lb = local_bytes::LOG_ROWS as u8;
+    assert_eq!(check(&[&plain, &plain, &fixed], &[3, 3, lb], 2), Ok(()));
+    for (airs, heights, base, want) in [
+        (
+            vec![&fixed as Air<'_>, &plain],
+            vec![lb, 3],
+            2,
+            "LOCAL_BYTES[0] (table 0) receives a local bus: only LOCAL_BYTES does",
+        ),
+        (
+            vec![&plain as Air<'_>, &plain],
+            vec![3, 3],
+            1,
+            "table 1 after the run's tables is PLAIN, not LOCAL_BYTES",
+        ),
+        (
+            vec![&plain as Air<'_>, &fixed],
+            vec![3, lb - 1],
+            1,
+            "LOCAL_BYTES (table 1) states 2^15 rows — it has 2^16",
+        ),
+        (
+            vec![&receiver as Air<'_>, &fixed],
+            vec![3, lb],
+            1,
+            "RECEIVER (table 0) receives a local bus: only LOCAL_BYTES does",
+        ),
+    ] {
+        let refused = check(&airs, &heights, base);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains(want)),
+            "{want}: {refused:?}"
+        );
+    }
+}
+
+/// ★ The verifier's digests ([`block_whir::local_digests`]) of two tables
+/// with no interaction, of one shape and different preprocessed counts, in a
+/// group with a local sender: each is the digest of its own inputs, and they
+/// differ. Every table with no interaction shares the one empty list, so a
+/// cache keyed by the list's address alone would give both one digest.
+#[test]
+fn local_digests_of_two_tables_without_interactions_differ_by_their_fixed_count() {
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+    use stark::multilinear_block::table_digest;
+    use stark::traits::AIR;
+    type T = <multilinear::whir_hash::P1Whir as multilinear::whir_hash::WhirHash>::Sponge;
+    let opts = opts();
+    let sender = crate::test_utils::create_plain_air(
+        &opts,
+        local_bytes::cols::NUM_COLUMNS,
+        vec![BusInteraction::sender(
+            BusId::LocalAreBytes,
+            Multiplicity::One,
+            vec![
+                BusValue::Packed {
+                    start_column: 0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: 1,
+                    packing: Packing::Direct,
+                },
+            ],
+        )],
+        "SENDER",
+    );
+    let bare = crate::test_utils::create_plain_air(
+        &opts,
+        local_bytes::cols::NUM_COLUMNS,
+        Vec::new(),
+        "BARE",
+    );
+    let fixed = crate::test_utils::create_local_bytes_air_with(&opts, Vec::new());
+    assert!(bare.bus_interactions().is_empty() && fixed.bus_interactions().is_empty());
+    assert_eq!(
+        fixed.num_precomputed_columns(),
+        local_bytes::NUM_PRECOMPUTED_COLS
+    );
+    type Air<'a> = &'a dyn AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = crate::tables::types::GoldilocksExtension,
+        PublicInputs = (),
+    >;
+    let airs: [Air<'_>; 3] = [&sender, &bare, &fixed];
+    let width = local_bytes::cols::NUM_COLUMNS;
+    let shapes = vec![(width, 4); 3];
+    let digests =
+        block_whir::local_digests::<T>(&[vec![0, 1, 2]], &shapes, |i| airs.get(i).copied())
+            .expect("the digests");
+    let own = |preprocessed: usize| {
+        table_digest::<crate::tables::types::GoldilocksExtension, T>(4, width, preprocessed, &[])
+    };
+    assert_eq!(digests[1], own(0), "the bare table's own digest");
+    assert_eq!(
+        digests[2],
+        own(local_bytes::NUM_PRECOMPUTED_COLS),
+        "the fixed table's own digest"
+    );
+    assert_ne!(digests[1], digests[2]);
+}
