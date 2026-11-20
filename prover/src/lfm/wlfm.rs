@@ -989,6 +989,9 @@ struct WlfmPrepared<H: WhirHash> {
 /// upload's seconds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NarrowCommitStamp {
+    /// The bytes were packed in the level's host part, off the commit's path
+    /// ([`WlfmPrebuild::hold_narrow_packs`]).
+    pub packed_ahead: bool,
     pub sent: bool,
     pub words: u64,
     pub packed_bytes: u64,
@@ -1007,6 +1010,7 @@ fn narrow_parts(
         None => (None, None),
         Some(n) => (
             Some(NarrowCommitStamp {
+                packed_ahead: n.packed_ahead,
                 sent: n.sent,
                 words: n.words,
                 packed_bytes: n.store.packed_bytes(),
@@ -1133,7 +1137,7 @@ fn commit_under<H: WhirHash>(
         .into_iter()
         .map(|stack| {
             let p = if narrow_commit() {
-                crate::block_whir::commit_group_narrow::<H>(stack, config)
+                crate::block_whir::commit_group_narrow::<H>(stack, config, narrow_commit_staged())
             } else {
                 commit_group::<H>(stack, config)
             }
@@ -1491,6 +1495,17 @@ impl WlfmPrebuild {
     /// The seconds [`prepare_wlfm`] took.
     pub fn secs(&self) -> f64 {
         self.secs
+    }
+
+    /// Under [`NARROW_COMMIT_ENV`], each prepared stack's columns packed
+    /// narrow now, in the level's host part (beside the base's phase B, on the
+    /// pool the caller installs), so the commit sends them without packing on
+    /// its path ([`crate::block_whir::GroupStack::pack_narrow`]). The same
+    /// words; nothing for a build with no stacks.
+    pub fn hold_narrow_packs(&mut self) {
+        if let Some(stacks) = self.stacks.as_mut() {
+            stacks.iter_mut().for_each(GroupStack::pack_narrow);
+        }
     }
 
     /// [`WlfmBuild::hold_chip_prefixes`] before the commit, from the columns
@@ -3027,19 +3042,58 @@ pub fn narrow_store() -> bool {
 }
 
 /// `LAMBDA_VM_LEVELS_NARROW_COMMIT=1`: a W-LFM build commits each prepared
-/// stack on the card from its columns sent narrow: packed on the host once,
-/// widened on the card into a store, the commit reading the store
+/// stack on the card from its columns sent narrow: packed in the level's host
+/// part (beside the base's phase B; at the commit for a build made without
+/// it), widened on the card into a store, the commit reading the store
 /// ([`crate::block_whir::commit_group_narrow`]), where today the commit copies
-/// the wide columns in. A retired stack keeps its packed bytes on the host, and
-/// under [`NARROW_STORE_ENV`] its opening's store sends them without packing
-/// again. The same roots, so the same proof. Only the W-LFM prover reads it.
-/// Off by default (and for any word but `1`) until its timing gate. Read once
-/// a process.
+/// the wide columns in. `2` is the same with each packed run copied through
+/// the card's pinned staging ([`narrow_commit_staged`]). A retired stack keeps
+/// its packed bytes on the host, and under [`NARROW_STORE_ENV`] its opening's
+/// store sends them without packing again. The same roots, so the same proof.
+/// Only the W-LFM prover reads it. Off by default (and for any word but `1` or
+/// `2`) until its timing gate. Read once a process.
 pub const NARROW_COMMIT_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_COMMIT";
 
-/// [`NARROW_COMMIT_ENV`]'s word: on only for `1`.
+/// [`NARROW_COMMIT_ENV`]'s word: on for `1` and for `2` (spaces around it
+/// ignored), off for anything else.
 pub fn narrow_commit_word(word: Option<&str>) -> bool {
-    super::wlfm_knobs::knob_word_on(word)
+    narrow_commit_mode_word(word) > 0
+}
+
+/// [`NARROW_COMMIT_ENV`]'s form: `1` sends each run's packed bytes with one
+/// pageable copy, `2` through the card's double-buffered pinned staging
+/// ([`narrow_commit_staged`]); 0 is off. The same store either way.
+pub fn narrow_commit_mode_word(word: Option<&str>) -> u8 {
+    match word.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// Whether the narrow commit copies its runs through the pinned staging
+/// ([`NARROW_COMMIT_ENV`] `2`, or this thread's test override of
+/// [`set_narrow_commit_staged_for_test`]). Read once a process.
+pub fn narrow_commit_staged() -> bool {
+    if let Some(on) = NARROW_COMMIT_STAGED_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        narrow_commit_mode_word(super::wlfm_knobs::env_word(NARROW_COMMIT_ENV).as_deref()) == 2
+    })
+}
+
+thread_local! {
+    /// A test's [`narrow_commit_staged`] on this thread.
+    static NARROW_COMMIT_STAGED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`narrow_commit_staged`] forced on this thread (`None`
+/// restores the knob).
+#[doc(hidden)]
+pub fn set_narrow_commit_staged_for_test(on: Option<bool>) {
+    NARROW_COMMIT_STAGED_FOR_TEST.with(|c| c.set(on));
 }
 
 thread_local! {

@@ -305,7 +305,7 @@ impl DeviceColumns {
 
     /// [`Self::upload_tables`] as it is with `LAMBDA_VM_CARD_ROWS` off.
     pub(crate) fn upload_tables_today(tables: &[TableUpload<'_>]) -> Option<Self> {
-        Self::upload_tables_on(tables, true, None)
+        Self::upload_tables_on(tables, true, None, false)
     }
 
     /// [`Self::upload_tables`] for a store off the argue surface, as
@@ -321,7 +321,21 @@ impl DeviceColumns {
         {
             return None;
         }
-        Self::upload_tables_on(tables, false, None)
+        Self::upload_tables_on(tables, false, None, false)
+    }
+
+    /// [`Self::upload_store_tables`] with each packed table's bytes copied
+    /// through the backend's double-buffered pinned staging
+    /// ([`crate::device::htod_staged`]) instead of one pageable copy a table.
+    /// The same store.
+    pub fn upload_store_tables_staged(tables: &[TableUpload<'_>]) -> Option<Self> {
+        if tables
+            .iter()
+            .any(|table| matches!(table, TableUpload::Records(_)))
+        {
+            return None;
+        }
+        Self::upload_tables_on(tables, false, None, true)
     }
 
     /// [`Self::upload_store_tables`] into a promise taken before (`room`, at
@@ -340,13 +354,14 @@ impl DeviceColumns {
         {
             return None;
         }
-        Self::upload_tables_on(tables, false, Some(room))
+        Self::upload_tables_on(tables, false, Some(room), false)
     }
 
     fn upload_tables_on(
         tables: &[TableUpload<'_>],
         argue: bool,
         prepaid: Option<DeviceReservation>,
+        staged: bool,
     ) -> Option<Self> {
         let total: usize = tables.iter().map(TableUpload::cells).sum();
         if total == 0
@@ -423,10 +438,17 @@ impl DeviceColumns {
                     let (rows, cols) = (packed.rows(), packed.cols());
                     let mut slab = buffer.slice_mut(at..at + rows * cols);
                     let clock = TableClock::start(&stream, false);
-                    crate::narrow::widen_col_major_into(
-                        &stream, be, *packed, rows, cols, &mut slab,
-                    )
-                    .ok()?;
+                    if staged {
+                        crate::narrow::widen_col_major_into_staged(
+                            &stream, be, *packed, rows, cols, &mut slab,
+                        )
+                        .ok()?;
+                    } else {
+                        crate::narrow::widen_col_major_into(
+                            &stream, be, *packed, rows, cols, &mut slab,
+                        )
+                        .ok()?;
+                    }
                     clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
                     spans.extend((0..cols).map(|k| (at + k * rows, rows)));
                     at += rows * cols;

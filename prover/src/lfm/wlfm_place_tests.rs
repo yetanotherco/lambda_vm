@@ -809,14 +809,17 @@ fn the_narrow_store_proves_the_same_bytes_in_every_place() {
     }
 }
 
-/// The narrow-commit knob's name; it is off by default, and only `1` turns
-/// it on.
+/// The narrow-commit knob's name; it is off by default, and only `1` (one
+/// pageable copy a run) and `2` (the pinned staging) turn it on.
 #[test]
 fn the_narrow_commit_knob_is_named_and_off_by_default() {
-    use super::wlfm::{NARROW_COMMIT_ENV, narrow_commit, narrow_commit_word};
+    use super::wlfm::{
+        NARROW_COMMIT_ENV, narrow_commit, narrow_commit_mode_word, narrow_commit_word,
+    };
     assert_eq!(NARROW_COMMIT_ENV, "LAMBDA_VM_LEVELS_NARROW_COMMIT");
     if std::env::var_os(NARROW_COMMIT_ENV).is_none() {
         assert!(!narrow_commit());
+        assert!(!super::wlfm::narrow_commit_staged());
     }
     for (word, on) in [
         (None, false),
@@ -825,21 +828,40 @@ fn the_narrow_commit_knob_is_named_and_off_by_default() {
         (Some("on"), false),
         (Some("1"), true),
         (Some(" 1 "), true),
+        (Some("2"), true),
+        (Some("3"), false),
     ] {
         assert_eq!(narrow_commit_word(word), on, "{word:?}");
     }
+    assert_eq!(narrow_commit_mode_word(Some("1")), 1);
+    assert_eq!(narrow_commit_mode_word(Some(" 2 ")), 2);
+    assert_eq!(narrow_commit_mode_word(Some("3")), 0);
+    assert_eq!(narrow_commit_mode_word(None), 0);
 }
 
 /// ★ Committing the prepared stacks from their columns sent narrow
-/// (`LAMBDA_VM_LEVELS_NARROW_COMMIT`) moves no root and no byte: under both
-/// families, every place's build made so has the wide build's program
-/// identity and proves the held build's bytes, with the narrow store on and
-/// off. On a card each card-placed stack's commit sent its store, and over
-/// retired stacks the opening's narrow store sent the bytes packed at the
-/// commit; without a card, or on the host, nothing was packed.
+/// (`LAMBDA_VM_LEVELS_NARROW_COMMIT`), packed in the level's host part or at
+/// the commit, its runs copied pageable or through the pinned staging (`2`),
+/// moves no root and no byte: under both families, every place's build made
+/// so has the wide build's program identity and proves the held build's
+/// bytes, with the narrow store on and off, under the overlap planner's
+/// defaults. On a card each card-placed stack's commit sent its store, packed
+/// ahead where the host part packed it, and over retired stacks the opening's
+/// narrow store sent the bytes packed before; without a card, or on the host,
+/// nothing was packed. The stamps outlive the release of the prover's half,
+/// which the levels' driver makes before its readout.
 #[test]
 fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::wlfm::set_narrow_commit_for_test(None);
+            super::wlfm::set_narrow_commit_staged_for_test(None);
+            super::wlfm::set_narrow_store_for_test(None);
+        }
+    }
     let _restore = UploadOnceRestore;
+    let _narrow = Restore;
     let _fast = test_format::set(Some(2));
     let _groups = test_format::set_group_polys(1);
     let card = multilinear::gpu::reserve_budget() > 0;
@@ -848,58 +870,69 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
         let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
             .expect("the held build proves");
         for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
-            // The narrow store on at the build: a retired stack keeps its packed
-            // bytes only for a store that sends them.
-            super::wlfm::set_narrow_commit_for_test(Some(true));
-            super::wlfm::set_narrow_store_for_test(Some(true));
-            let (_, _, build) = probe_placed(family, place);
-            super::wlfm::set_narrow_commit_for_test(None);
-            super::wlfm::set_narrow_store_for_test(None);
-            assert_eq!(
-                build.artifacts.program_id, held.artifacts.program_id,
-                "{family:?} {place:?}: the wide build's identity"
-            );
-            let stamps = build.narrow_commit_stamps();
-            if card && place != StackPlace::Host {
-                assert!(
-                    !stamps.is_empty()
-                        && stamps.iter().all(|n| n.sent && n.packed_bytes <= n.words),
-                    "{family:?} {place:?}: every stack's commit sent its store narrow"
-                );
-            } else {
-                assert!(stamps.is_empty(), "{family:?} {place:?}: nothing packed");
-            }
-            for narrow in [false, true] {
-                super::wlfm::set_narrow_store_for_test(Some(narrow));
-                let (got, groups) =
-                    streamed_once(&program, &build, &arenas, true, Default::default())
-                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {narrow}: {e}"));
+            for (ahead, staged) in [(false, false), (true, false), (true, true)] {
+                // The narrow store on at the build: a retired stack keeps its
+                // packed bytes only for a store that sends them.
+                super::wlfm::set_narrow_commit_for_test(Some(true));
+                super::wlfm::set_narrow_commit_staged_for_test(Some(staged));
+                super::wlfm::set_narrow_store_for_test(Some(true));
+                let mut pre = super::wlfm::prepare_wlfm(
+                    &program,
+                    super::wlfm_tests::HASHER,
+                    WlfmRate::Two,
+                    WlfmLevers::with_family(family),
+                )
+                .expect("prepares");
+                if ahead {
+                    pre.hold_narrow_packs();
+                }
+                let mut build = pre.commit(place).expect("commits");
+                super::wlfm::set_narrow_commit_for_test(None);
+                super::wlfm::set_narrow_commit_staged_for_test(None);
                 super::wlfm::set_narrow_store_for_test(None);
-                assert!(
-                    got == want,
-                    "{family:?} {place:?} narrow store {narrow}: the held bytes"
+                let tag = format!("{family:?} {place:?} ahead {ahead} staged {staged}");
+                assert_eq!(
+                    build.artifacts.program_id, held.artifacts.program_id,
+                    "{tag}: the wide build's identity"
                 );
-                let used: Vec<_> = groups.iter().filter(|s| s.upload_once.used).collect();
-                if card && place == StackPlace::CardRetired {
-                    assert!(!used.is_empty(), "{family:?} {narrow}: a store went up");
+                let stamps = build.narrow_commit_stamps();
+                if card && place != StackPlace::Host {
                     assert!(
-                        used.iter().all(|s| s.upload_once.prepacked == narrow
-                            && (!narrow || s.upload_once.pack_secs == 0.0)),
-                        "{family:?} {narrow}: the opening sent the commit's bytes"
+                        !stamps.is_empty()
+                            && stamps.iter().all(|n| n.sent
+                                && n.packed_bytes <= n.words
+                                && n.packed_ahead == ahead),
+                        "{tag}: every stack's commit sent its store narrow"
                     );
                 } else {
-                    assert!(used.is_empty(), "{family:?} {place:?} {narrow}: no store");
+                    assert!(stamps.is_empty(), "{tag}: nothing packed");
                 }
+                for narrow in [false, true] {
+                    super::wlfm::set_narrow_store_for_test(Some(narrow));
+                    let (got, groups) =
+                        streamed_once(&program, &build, &arenas, true, Default::default())
+                            .unwrap_or_else(|e| panic!("{tag} narrow store {narrow}: {e}"));
+                    super::wlfm::set_narrow_store_for_test(None);
+                    assert!(got == want, "{tag} narrow store {narrow}: the held bytes");
+                    let used: Vec<_> = groups.iter().filter(|s| s.upload_once.used).collect();
+                    if card && place == StackPlace::CardRetired {
+                        assert!(!used.is_empty(), "{tag} {narrow}: a store went up");
+                        assert!(
+                            used.iter().all(|s| s.upload_once.prepacked == narrow
+                                && (!narrow || s.upload_once.pack_secs == 0.0)),
+                            "{tag} {narrow}: the opening sent the bytes packed before"
+                        );
+                    } else {
+                        assert!(used.is_empty(), "{tag} {narrow}: no store");
+                    }
+                }
+                build.release_prover_half();
+                assert_eq!(
+                    build.narrow_commit_stamps().len(),
+                    stamps.len(),
+                    "{tag}: the narrow commit's stamps outlive the release"
+                );
             }
-            // The levels' driver lets the prover's half go before its readout:
-            // the stamps outlive it.
-            let mut build = build;
-            build.release_prover_half();
-            assert_eq!(
-                build.narrow_commit_stamps().len(),
-                stamps.len(),
-                "{family:?} {place:?}: the narrow commit's stamps outlive the release"
-            );
         }
     }
 }
