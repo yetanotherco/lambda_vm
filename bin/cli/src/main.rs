@@ -54,6 +54,18 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // pattern. This binary's own unit tests read this export back
 // (`the_binary_runs_its_never_purge_posture`): deleting the lines below turns
 // that test red.
+//
+// On Linux the posture also asks for transparent huge pages: `thp:always` has
+// jemalloc madvise its extents `MADV_HUGEPAGE`, and `metadata_thp:always` its
+// own metadata, so a box whose THP mode is `madvise` faults the prover's big
+// host buffers 2 MiB at a time instead of 4 KiB. On a 5090 box (THP `madvise`,
+// defrag `madvise`), median block, against the never-purge words alone: whole
+// end −0.35 s, most of it in the base. The same bytes either way: only where
+// the pages come from moves. Other systems have no THP and keep the two
+// decay words.
+#[cfg(target_os = "linux")]
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:always\0";
+#[cfg(not(target_os = "linux"))]
 const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 #[allow(non_upper_case_globals)]
@@ -118,6 +130,25 @@ mod allocator {
                 tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0").ok()?,
             ))
         }
+    }
+
+    /// The running `opt.thp` and `opt.metadata_thp` (`always` is the posture
+    /// this binary compiles in on Linux); `None` where jemalloc has no such
+    /// option.
+    pub fn thp() -> Option<(String, String)> {
+        let read = |name: &[u8]| -> Option<String> {
+            // SAFETY: the name is NUL-terminated and the option is a
+            // `const char *` jemalloc keeps for the process's life.
+            let ptr: *const std::ffi::c_char =
+                unsafe { tikv_jemalloc_ctl::raw::read(name) }.ok()?;
+            (!ptr.is_null()).then(|| {
+                // SAFETY: a non-null option string is NUL-terminated.
+                unsafe { std::ffi::CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        };
+        Some((read(b"opt.thp\0")?, read(b"opt.metadata_thp\0")?))
     }
 }
 
@@ -831,6 +862,10 @@ unsafe fn apply_posture() -> Vec<String> {
         Some((-1, -1)) => "never purge (dirty -1, muzzy -1)".to_string(),
         Some((d, m)) => format!("dirty_decay_ms {d}, muzzy_decay_ms {m} (_RJEM_MALLOC_CONF)"),
         None => "unread".to_string(),
+    };
+    let decay = match allocator::thp() {
+        Some((thp, meta)) => format!("{decay} · thp {thp}, metadata_thp {meta}"),
+        None => decay,
     };
     let words = |w: Vec<String>| {
         if w.is_empty() {
@@ -3434,6 +3469,12 @@ mod tests {
             return;
         }
         assert_eq!(allocator::decay_ms(), Some((-1, -1)));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            allocator::thp(),
+            Some(("always".to_string(), "always".to_string())),
+            "on Linux the posture asks for transparent huge pages"
+        );
     }
 
     /// The hooks the binary installs reach its jemalloc: the prover reads the
