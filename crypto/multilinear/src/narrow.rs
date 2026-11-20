@@ -108,6 +108,50 @@ impl NarrowColumns {
         Self::from_parts(rows, widths, data)
     }
 
+    /// [`Self::pack`] on the pool: each column's largest word, then its
+    /// bytes, in blocks of rows at once. The same bytes as [`Self::pack`].
+    #[cfg(feature = "parallel")]
+    pub fn pack_par(columns: &[&[u64]]) -> Option<Self> {
+        const BLOCK: usize = 1 << 16;
+        let rows = columns.first().map_or(0, |c| c.len());
+        if columns.iter().any(|c| c.len() != rows) {
+            return None;
+        }
+        let widths: Vec<u8> = columns
+            .par_iter()
+            .map(|c| {
+                width_of(
+                    c.par_chunks(BLOCK)
+                        .map(|b| b.iter().copied().max().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let total = rows * widths.iter().map(|&w| w as usize).sum::<usize>();
+        // The bytes a store's upload reads: page-locked when that is on.
+        let mut data = crate::pinned::with_pinned(total, || vec![0u8; total]);
+        let mut parts: Vec<(&[u64], usize, &mut [u8])> = Vec::with_capacity(columns.len());
+        let mut rest = data.as_mut_slice();
+        for (column, &w) in columns.iter().zip(&widths) {
+            let (out, tail) = rest.split_at_mut(rows * w as usize);
+            parts.push((column, w as usize, out));
+            rest = tail;
+        }
+        parts.into_par_iter().for_each(|(column, w, out)| {
+            out.par_chunks_mut(BLOCK * w)
+                .zip(column.par_chunks(BLOCK))
+                .for_each(|(out, words)| put_words(out, w, words));
+        });
+        Self::from_parts(rows, widths, data)
+    }
+
+    /// [`Self::pack`] (no pool without `parallel`).
+    #[cfg(not(feature = "parallel"))]
+    pub fn pack_par(columns: &[&[u64]]) -> Option<Self> {
+        Self::pack(columns)
+    }
+
     /// [`Self::pack`] of a row-major trace: the `cols`-wide rows of words
     /// `row_major`, packed column by column (the stark crate's
     /// `NarrowMain::pack`, a block of rows at a time so the block stays in
@@ -277,6 +321,61 @@ impl NarrowColumns {
             None => false,
         }
     }
+}
+
+/// `words` little-endian at `w` bytes each into `out` (`words.len() × w`
+/// bytes); each word fits `w`.
+#[cfg(feature = "parallel")]
+fn put_words(out: &mut [u8], w: usize, words: &[u64]) {
+    match w {
+        1 => out.iter_mut().zip(words).for_each(|(o, &v)| *o = v as u8),
+        2 => out
+            .chunks_exact_mut(2)
+            .zip(words)
+            .for_each(|(o, &v)| o.copy_from_slice(&(v as u16).to_le_bytes())),
+        4 => out
+            .chunks_exact_mut(4)
+            .zip(words)
+            .for_each(|(o, &v)| o.copy_from_slice(&(v as u32).to_le_bytes())),
+        _ => out
+            .chunks_exact_mut(8)
+            .zip(words)
+            .for_each(|(o, &v)| o.copy_from_slice(&v.to_le_bytes())),
+    }
+}
+
+/// The cells a narrow store's run holds at most ([`store_runs`]): a quarter of
+/// a GiB of words, so its packed bytes on the card while it widens stay at
+/// most that, and well inside one widen launch.
+pub const STORE_RUN_CELLS: usize = 1 << 25;
+
+/// Columns of heights `lens`, in order, cut into the runs a narrow store packs
+/// and widens one at a time: consecutive columns of one height, at most
+/// `max_cells` cells a run unless one column alone is more. Every column is in
+/// exactly one run, in order.
+pub fn store_runs(lens: &[usize], max_cells: usize) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    for k in 1..=lens.len() {
+        let cells = (k - start) * lens[start];
+        let ends = k == lens.len() || lens[k] != lens[start] || cells + lens[k] > max_cells;
+        if ends {
+            runs.push(start..k);
+            start = k;
+        }
+    }
+    runs
+}
+
+/// The most a narrow store of columns of heights `lens` holds on the card
+/// beside its words while a run widens: the largest run's words at 8 bytes,
+/// what its packed bytes come to at most.
+pub fn store_staging_bound(lens: &[usize], max_cells: usize) -> u64 {
+    store_runs(lens, max_cells)
+        .into_iter()
+        .map(|r| lens[r].iter().map(|&n| n as u64 * 8).sum::<u64>())
+        .max()
+        .unwrap_or(0)
 }
 
 /// A column's raw words, when `F` is Goldilocks.
@@ -511,5 +610,73 @@ mod tests {
         let narrow = NarrowColumns::pack(&[&[1, 2, 3, 4]]).expect("one height");
         assert!(narrow.widen::<Ext3>().is_none());
         assert!(narrow.widen::<Gl>().is_some());
+    }
+
+    /// The pool's pack writes the serial pack's bytes, at every width and
+    /// across its row blocks (a height that is not a block multiple), and
+    /// refuses columns of two heights.
+    #[test]
+    fn the_pools_pack_is_the_serial_pack() {
+        let edges = [
+            0u64,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            u64::MAX,
+        ];
+        for rows in [1usize, 7, (1 << 16) + 3, 3 << 16] {
+            let columns: Vec<Vec<u64>> = edges
+                .iter()
+                .map(|&edge| {
+                    (0..rows)
+                        .map(|r| {
+                            if r == rows / 2 {
+                                edge
+                            } else {
+                                (r as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % (edge / 2 + 1)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let raw: Vec<&[u64]> = columns.iter().map(Vec::as_slice).collect();
+            let par = NarrowColumns::pack_par(&raw).expect("one height");
+            assert_eq!(
+                Some(&par),
+                NarrowColumns::pack(&raw).as_ref(),
+                "{rows} rows"
+            );
+            assert_eq!(par.widths(), &[1, 1, 2, 2, 4, 4, 8, 8], "{rows} rows");
+        }
+        assert!(NarrowColumns::pack_par(&[&[1, 2], &[3]]).is_none());
+    }
+
+    /// A store's columns cut into runs: each run one height, in order, every
+    /// column once, at most the cap's cells unless one column alone is more;
+    /// the staging bound is the largest run's words at 8 bytes.
+    #[test]
+    fn a_stores_columns_cut_into_runs_of_one_height_under_the_cap() {
+        assert!(store_runs(&[], 8).is_empty());
+        assert_eq!(store_staging_bound(&[], 8), 0);
+        // Heights change at 3 and 5; the cap (8 cells) cuts the first height's
+        // columns of 2 into runs of 4.
+        let lens = [2, 2, 2, 4, 4, 2, 2, 2, 2, 2, 16, 1];
+        let runs = store_runs(&lens, 8);
+        assert_eq!(runs, vec![0..3, 3..5, 5..9, 9..10, 10..11, 11..12]);
+        for r in &runs {
+            assert!(lens[r.clone()].iter().all(|&n| n == lens[r.start]));
+            let cells: usize = lens[r.clone()].iter().sum();
+            assert!(cells <= 8 || r.len() == 1, "{r:?}");
+        }
+        assert_eq!(store_staging_bound(&lens, 8), 16 * 8);
+        assert_eq!(store_staging_bound(&[4, 4, 4], 8), 8 * 8);
+        // Uncapped, a height is one run.
+        assert_eq!(
+            store_runs(&lens, usize::MAX),
+            vec![0..3, 3..5, 5..10, 10..11, 11..12]
+        );
     }
 }

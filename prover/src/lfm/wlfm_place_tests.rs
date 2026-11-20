@@ -442,6 +442,7 @@ struct UploadOnceRestore;
 impl Drop for UploadOnceRestore {
     fn drop(&mut self) {
         super::wlfm::set_upload_once_for_test(None);
+        super::wlfm::set_narrow_store_for_test(None);
         super::wlfm::set_overlap_resident_for_test(None);
         super::wlfm::set_overlap_next_columns_for_test(None);
         super::wlfm::set_overlap_planned_for_test(None);
@@ -726,6 +727,84 @@ fn the_overlap_next_columns_knob_is_named_and_on_by_default() {
         (Some(" 0 "), false),
     ] {
         assert_eq!(overlap_next_columns_word(word), on, "{word:?}");
+    }
+}
+
+/// The narrow-store knob's name; it is off by default, and only `1` turns it
+/// on.
+#[test]
+fn the_narrow_store_knob_is_named_and_off_by_default() {
+    use super::wlfm::{NARROW_STORE_ENV, narrow_store, narrow_store_word};
+    assert_eq!(NARROW_STORE_ENV, "LAMBDA_VM_LEVELS_NARROW_STORE");
+    if std::env::var_os(NARROW_STORE_ENV).is_none() {
+        assert!(!narrow_store());
+    }
+    for (word, on) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("yes"), false),
+        (Some("1"), true),
+        (Some(" 1 "), true),
+    ] {
+        assert_eq!(narrow_store_word(word), on, "{word:?}");
+    }
+}
+
+/// ★ The upload once's store sent narrow (`LAMBDA_VM_LEVELS_NARROW_STORE`)
+/// moves no byte in any place: under both families the probe proves the held
+/// build's bytes with the narrow store on; on a card over retired stacks every
+/// store used went up narrow, at no more bytes than its words, and without a
+/// card, a retired build or the upload once none did.
+#[test]
+fn the_narrow_store_proves_the_same_bytes_in_every_place() {
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let (_, _, build) = probe_placed(family, place);
+            for once in [false, true] {
+                super::wlfm::set_narrow_store_for_test(Some(true));
+                let (got, groups) =
+                    streamed_once(&program, &build, &arenas, once, Default::default())
+                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {once}: {e}"));
+                super::wlfm::set_narrow_store_for_test(None);
+                assert!(
+                    got == want,
+                    "{family:?} {place:?} upload once {once}, narrow: the held bytes"
+                );
+                assert!(
+                    groups
+                        .iter()
+                        .all(|s| !s.upload_once.planned_out && !s.upload_once.refused),
+                    "{family:?} {place:?} {once}: nothing planned out or refused"
+                );
+                let used: Vec<_> = groups.iter().filter(|s| s.upload_once.used).collect();
+                if card && once && place == StackPlace::CardRetired {
+                    assert!(!used.is_empty(), "{family:?}: a store went up");
+                    for s in &used {
+                        let u = s.upload_once;
+                        assert!(
+                            u.narrow && u.packed_bytes > 0 && u.packed_bytes <= u.bytes,
+                            "{family:?}: the store went up narrow ({} of {} B)",
+                            u.packed_bytes,
+                            u.bytes
+                        );
+                    }
+                } else {
+                    assert!(used.is_empty(), "{family:?} {place:?} {once}: no store");
+                    assert!(
+                        groups.iter().all(|s| !s.upload_once.narrow),
+                        "{family:?} {place:?} {once}: nothing narrow"
+                    );
+                }
+            }
+        }
     }
 }
 
