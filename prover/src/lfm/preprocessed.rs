@@ -64,6 +64,82 @@ pub const fn bitwise_preprocessed_rows() -> usize {
         + sllc_and_suffix
 }
 
+/// ★ LOCAL_BYTES' four preprocessed columns' multilinear extensions at one
+/// point, emitted: `X`, `Y`, `X ∧ Y`, `X ⊕ Y` (`tables::local_bytes::cols`
+/// order) over the table's 16 index bits — row `r` is the byte pair
+/// `(r mod 256, r div 256)`, so `X` is the low byte's linear form, `Y` the
+/// high byte's, and each logic column one product of two distinct bit
+/// variables a bit. BITWISE's closed form on its byte pair, with no third
+/// operand.
+///
+/// `point` is in [`multilinear::mle::Mle::evaluate_in`]'s order: its FIRST
+/// coordinate binds index bit 15.
+pub fn emit_local_bytes_preprocessed(
+    b: &mut LfmBuilder,
+    point: &[Ext],
+) -> [Ext; crate::tables::local_bytes::NUM_PRECOMPUTED_COLS] {
+    use crate::tables::local_bytes::LOG_ROWS;
+    assert_eq!(
+        point.len(),
+        LOG_ROWS,
+        "the point must have one coordinate per LOCAL_BYTES row-index bit"
+    );
+    // The variable carried by index bit k.
+    let v: Vec<Ext> = (0..LOG_ROWS).map(|k| point[LOG_ROWS - 1 - k]).collect();
+    let one = b.ext_const(&FEE::one());
+    let mut pow2 = Vec::with_capacity(8);
+    pow2.push(one);
+    for i in 1..8 {
+        let prev = pow2[i - 1];
+        pow2.push(b.eadd(prev, prev));
+    }
+    let mut linear = [one; 2];
+    for (slot, lo) in [0usize, 8].into_iter().enumerate() {
+        let mut acc = v[lo];
+        for i in 1..8 {
+            acc = b.emul_add(pow2[i], v[lo + i], acc);
+        }
+        linear[slot] = acc;
+    }
+    let [x, y] = linear;
+    let mut and = one;
+    let mut xor = one;
+    for i in 0..8 {
+        let (a, c) = (v[i], v[8 + i]);
+        let ab = b.emul(a, c);
+        let sum = b.eadd(a, c);
+        let or_bit = b.esub(sum, ab);
+        let xor_bit = b.esub(or_bit, ab);
+        if i == 0 {
+            and = ab;
+            xor = xor_bit;
+        } else {
+            and = b.emul_add(pow2[i], ab, and);
+            xor = b.emul_add(pow2[i], xor_bit, xor);
+        }
+    }
+    #[cfg(test)]
+    if super::whir_block::local_faults::get()
+        == super::whir_block::local_faults::Fault::LocalBytesXorAsOr
+    {
+        // A mutant closed form: OR's column in XOR's place.
+        let mut or = one;
+        for i in 0..8 {
+            let (a, c) = (v[i], v[8 + i]);
+            let ab = b.emul(a, c);
+            let sum = b.eadd(a, c);
+            let or_bit = b.esub(sum, ab);
+            or = if i == 0 {
+                or_bit
+            } else {
+                b.emul_add(pow2[i], or_bit, or)
+            };
+        }
+        return [x, y, and, or];
+    }
+    [x, y, and, xor]
+}
+
 /// ★ The eleven BITWISE preprocessed columns' multilinear extensions at one
 /// point, emitted — `O(NUM_VARS)` rows where the fold is `O(2^NUM_VARS)`.
 ///

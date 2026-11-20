@@ -151,9 +151,9 @@ fn small_block_cut(
     (elf, proof)
 }
 
-pub(super) fn plan_of(
+pub(super) fn plan_of<L>(
     elf: &[u8],
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     format: &BlockFormat,
     leaves: Option<usize>,
 ) -> WhirBlockPlan {
@@ -239,6 +239,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
                 commit_ood: opened.commit_ood.to_vec(),
                 tables: opened.tables.to_vec(),
                 argue: opened.argue.cloned(),
+                local: opened.local.cloned(),
                 opening: opened.opening.clone(),
                 prepared: opened.prepared.cloned(),
                 at: 0.0,
@@ -273,6 +274,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
                     m.group,
                     &m.tables,
                     m.argue.as_ref(),
+                    m.local.as_ref(),
                     &m.opening,
                     m.prepared.as_ref(),
                 )
@@ -303,6 +305,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
                 0,
                 &seen[0].tables,
                 seen[0].argue.as_ref(),
+                seen[0].local.as_ref(),
                 &seen[1].opening,
                 seen[0].prepared.as_ref(),
             );
@@ -3085,7 +3088,11 @@ fn a_small_blocks_leaves_stream_in_pieces_to_their_execute() {
 /// each wave, and what is left once the leaf's last group lands: the last wave,
 /// the finish and the fill. The waves run on 8 threads of their own, as the
 /// early leaves' pool; the fill on the prover's pool.
-fn stream_leaf_probe(plan: &WhirBlockPlan, proof: &BlockWhirProof, phase_b: &[(usize, f64)]) {
+fn stream_leaf_probe<L: crate::block_whir::LocalPart>(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof<L>,
+    phase_b: &[(usize, f64)],
+) {
     use super::executor::{ArenaPiece, StreamedExecution};
     use super::whir_block::block_leaf_groups;
     let end_of = |g: usize| phase_b.iter().find(|&&(h, _)| h == g).map(|&(_, e)| e);
