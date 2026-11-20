@@ -545,3 +545,453 @@ fn an_in_row_block_with_other_register_files_is_refused_at_its_preprocessed_open
         inrow::register_of_row(row)
     );
 }
+
+// ---- censuses of the block verifier's AIR sets under the in-row format ----------------------------------------------
+//
+// The one-path argument for registers takes two premises from the AIR set as a whole rather than
+// from any one table's constraints: which tables touch the REG bus (and how), and that no table
+// but the MEMW and MEMW_A relays holds a register token on the Memory bus. A third, that no MEMW
+// requester names the PC's register x255, keeps a CPU row with `pc_double_read = 1` from having
+// its PC token rewritten inside the `[ts − 3, ts]` gap. These censuses read every table kind of a
+// block under each memory format, so a new table or a changed interaction fails here.
+
+use crate::tables::fused_memory::MemoryFormat;
+use stark::lookup::Multiplicity;
+
+const MEMORY_FORMATS: [MemoryFormat; 3] = [
+    MemoryFormat::Split,
+    MemoryFormat::Fused,
+    MemoryFormat::Words,
+];
+
+/// The block verifier's AIRs under the in-row register format and `memory`, with every table
+/// kind present: two CPU tables, two residual register tables, two MEMW_A tables, one of every
+/// other family, and the fused or word tables of `memory`.
+fn every_table_airs(memory: MemoryFormat) -> crate::VmAirs {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let counts = crate::TableCounts {
+        cpu: 2,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 2,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 2,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        copy: 1,
+        blake3: 1,
+        is_wh: 1,
+        ecrec: 1,
+    };
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &[],
+        0,
+        1 << 20,
+    )
+    .expect("pages");
+    let inputs = crate::BlockAirInputs::new(&opts, &program, vec![1 << 10, 1 << 4], &[])
+        .expect("the AIR inputs");
+    let pinned = BlockFormat::pinned();
+    assert_eq!(
+        pinned.registers,
+        RegisterFormat::InRow,
+        "the pinned register format"
+    );
+    let mut airs = crate::block_airs(
+        &program,
+        &opts,
+        &pages,
+        &counts,
+        &inputs,
+        pinned.keccak_rnd,
+        pinned.memw_aligned,
+        RegisterFormat::InRow,
+        pinned.ecdas,
+    );
+    match memory {
+        MemoryFormat::Split => {}
+        MemoryFormat::Fused => airs.with_fused_memory(&opts, [1, 1]),
+        MemoryFormat::Words => airs
+            .with_word_memory(&opts, [1; 7], &pages)
+            .expect("the word tables"),
+    }
+    airs
+}
+
+/// A table's family: its AIR's name without the index (`CPU[1]`) or the page
+/// base (`PAGE:0x0`).
+fn family(name: &str) -> String {
+    name.split(['[', ':']).next().unwrap_or("").to_string()
+}
+
+/// An affine form over the main columns: `(constant, [(column, coefficient)])`.
+type Affine = (u64, Vec<(usize, u64)>);
+
+/// `i`'s message elements (the bus id excluded) as affine forms, read off the real evaluator.
+fn affine_elements(i: &BusInteraction) -> Vec<Affine> {
+    use crate::tables::types::FE;
+    let eval = |g: &dyn Fn(usize) -> FE| -> Vec<FE> {
+        i.values.iter().flat_map(|v| v.combine_from(g)).collect()
+    };
+    let zero = eval(&|_| FE::zero());
+    let mut out: Vec<Affine> = zero
+        .iter()
+        .map(|c| (c.canonical_u64(), Vec::new()))
+        .collect();
+    for c in i.columns_read() {
+        let e = eval(&|j| if j == c { FE::one() } else { FE::zero() });
+        for (k, v) in e.iter().enumerate() {
+            let coefficient = *v - zero[k];
+            if coefficient != FE::zero() {
+                out[k].1.push((c, coefficient.canonical_u64()));
+            }
+        }
+    }
+    out
+}
+
+fn constant(c: u64) -> Affine {
+    (c, Vec::new())
+}
+
+/// ★ The REG bus, over every table kind of an in-row block under each memory format: only the
+/// CPU, the residual register table (MEMW_R's slot), REGISTER and HALT touch it, each with an
+/// exact count of interactions; every tuple has four elements; every multiplicity is a bit its
+/// AIR fixes (one, a CPU flag in the CPU's IS_BIT set, the residual's three-flag sum, REGISTER's
+/// PC flag or its negation); and each node's consume and produce name one register at one
+/// weight. A new table on the bus, or a weight that is not a bit, would let a register's tokens
+/// leave its one path.
+#[test]
+fn only_the_cpu_the_residual_table_register_and_halt_touch_the_reg_bus() {
+    use crate::tables::register::inrow::cols as reg_cols;
+    use crate::tables::register_residual::cols as res;
+    let reg = u64::from(BusId::Reg);
+    for memory in MEMORY_FORMATS {
+        let airs = every_table_airs(memory);
+        // Per family: (senders, receivers) on the REG bus, over all its tables.
+        let mut users: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for air in airs.air_refs() {
+            let name = air.name();
+            let fam = family(name);
+            let on_reg: Vec<&BusInteraction> = air
+                .bus_interactions()
+                .iter()
+                .filter(|i| i.bus_id == reg)
+                .collect();
+            for i in &on_reg {
+                let e = users.entry(fam.clone()).or_default();
+                if i.is_sender {
+                    e.0 += 1;
+                } else {
+                    e.1 += 1;
+                }
+                // `num_bus_elements` counts the bus id too.
+                assert_eq!(
+                    i.num_bus_elements(),
+                    1 + 4,
+                    "{memory:?}: {name}: a REG tuple"
+                );
+                let bit = match (&i.multiplicity, fam.as_str()) {
+                    (Multiplicity::One, _) => true,
+                    (Multiplicity::Column(c), "CPU") => {
+                        crate::constraints::cpu::BIT_FLAG_COLUMNS.contains(c)
+                    }
+                    (Multiplicity::Sum3(a, b, c), "MEMW_R") => {
+                        (*a, *b, *c) == (res::MU_READ, res::MU_WRITE, res::MU_KEEP)
+                    }
+                    (Multiplicity::Column(c) | Multiplicity::Negated(c), "REGISTER") => {
+                        *c == reg_cols::IS_PC
+                    }
+                    _ => false,
+                };
+                assert!(
+                    bit,
+                    "{memory:?}: {name}: REG multiplicity {:?}",
+                    i.multiplicity
+                );
+            }
+            // A node is a consume followed by its produce: both name one register (the same
+            // first element) at one weight.
+            let mut k = 0;
+            while k + 1 < on_reg.len() {
+                if on_reg[k].is_sender && !on_reg[k + 1].is_sender {
+                    assert_eq!(
+                        affine_elements(on_reg[k])[0],
+                        affine_elements(on_reg[k + 1])[0],
+                        "{memory:?}: {name}: a node's two tokens name one register"
+                    );
+                    assert_eq!(
+                        on_reg[k].multiplicity,
+                        on_reg[k + 1].multiplicity,
+                        "{memory:?}: {name}: a node's two tokens at one weight"
+                    );
+                    k += 2;
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        println!("REG BUS USERS {memory:?}: {users:?}");
+        let expected: std::collections::BTreeMap<String, (usize, usize)> = [
+            // Two CPU tables: three slots and the PC edge, a consume and a produce each.
+            ("CPU", (8, 8)),
+            // Two residual tables: one consume and one produce each.
+            ("HALT", (1, 1)),
+            ("MEMW_R", (2, 2)),
+            // Every register's initial token, and its final one (PC and the rest).
+            ("REGISTER", (2, 1)),
+        ]
+        .into_iter()
+        .map(|(f, n)| (f.to_string(), n))
+        .collect();
+        assert_eq!(users, expected, "{memory:?}: the REG bus's users");
+    }
+}
+
+/// ★ The Memory bus, over every table kind of an in-row block under each memory format: its
+/// users are pinned by family; every token's `is_register` element is the constant 0 except in
+/// the MEMW and MEMW_A relays, whose element is their own `IS_REGISTER` column (taken from the
+/// MEMW message they receive); no table holds a constant non-zero `is_register`; and PAGE's
+/// first token, the only token a table produces without a requester, sits at the timestamp
+/// `(0, 0)`. So a register token on the Memory bus can only be produced by a relay row that
+/// consumed an earlier one: with REGISTER, the CPU and HALT off the bus, a register access routed
+/// to a relay has no chain to start from.
+#[test]
+fn no_table_but_the_relays_holds_a_register_token_on_the_memory_bus() {
+    let memory_bus = u64::from(BusId::Memory);
+    for memory in MEMORY_FORMATS {
+        let airs = every_table_airs(memory);
+        let mut users: std::collections::BTreeSet<String> = Default::default();
+        let mut page_produced = 0;
+        for air in airs.air_refs() {
+            let name = air.name();
+            let fam = family(name);
+            for i in air
+                .bus_interactions()
+                .iter()
+                .filter(|i| i.bus_id == memory_bus)
+            {
+                if users.insert(fam.clone()) {
+                    println!("MEMORY BUS USER {memory:?}: {name}");
+                }
+                let elements = affine_elements(i);
+                let is_register = &elements[0];
+                if fam == "MEMW" || fam == "MEMW_A" {
+                    let column = match fam.as_str() {
+                        "MEMW" => crate::tables::memw::cols::IS_REGISTER,
+                        _ => crate::tables::memw_aligned::cols::IS_REGISTER,
+                    };
+                    assert_eq!(
+                        *is_register,
+                        (0, vec![(column, 1)]),
+                        "{memory:?}: {name}: a relay's token carries its IS_REGISTER column"
+                    );
+                } else {
+                    assert_eq!(
+                        *is_register,
+                        constant(0),
+                        "{memory:?}: {name} holds a Memory token whose is_register is not 0"
+                    );
+                }
+                // PAGE's produce (a receive on this bus) is the first token of an address.
+                if fam == "PAGE" && !i.is_sender {
+                    assert_eq!(
+                        (&elements[3], &elements[4]),
+                        (&constant(0), &constant(0)),
+                        "{memory:?}: {name}: the first token's timestamp"
+                    );
+                    page_produced += 1;
+                }
+            }
+        }
+        println!("MEMORY BUS USERS {memory:?}: {users:?}");
+        // Under the word memory format RAM is on its own word buses (PAGE_W mints there), so
+        // the Memory bus keeps only the two relays and no table produces a first token on it.
+        assert_eq!(
+            page_produced > 0,
+            memory != MemoryFormat::Words,
+            "{memory:?}: PAGE produces first tokens"
+        );
+        let expected: &[&str] = match memory {
+            MemoryFormat::Split => &["MEMW", "MEMW_A", "PAGE"],
+            MemoryFormat::Fused => &["MEMW", "MEMW_A", "MEM_LOAD", "MEM_STORE", "PAGE"],
+            MemoryFormat::Words => &["MEMW", "MEMW_A"],
+        };
+        assert_eq!(
+            users.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "{memory:?}: the Memory bus's users"
+        );
+    }
+}
+
+/// ★ MEMW messages that address a register, over every table kind of an in-row block under each
+/// memory format. No sender's `is_register` is column-valued (each is the constant 0 or 1). A
+/// register message (`is_register` = 1) names its register with `base_address[1] = 0` and either
+/// a constant `2·r` for r in 1..=31 or x254 (the commit buffer), or exactly one of the column
+/// forms the senders are known to use: CPU32's `2·rs1`, `2·rs2`, `2·rd` (DECODE-bound, below 32)
+/// and COPY's `20 + 488·IS_WRITE` (x10 or x254). No sender may name x255, the PC: a requester
+/// write into the PC's `[ts − 3, ts]` gap on a row with `pc_double_read = 1` would rewrite it.
+/// Every register message's width flags are the constants `(1, 0, 0)`. Receivers: MEMW_R takes
+/// register messages at the constant `is_register` = 1; MEMW and MEMW_A take any at their
+/// `IS_REGISTER` column; nobody else receives.
+#[test]
+fn every_register_message_names_x1_to_x31_or_x254_by_a_known_form() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let memw = u64::from(BusId::Memw);
+    for memory in MEMORY_FORMATS {
+        let airs = every_table_airs(memory);
+        let mut column_forms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut constants: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        let mut free_is_register: Vec<String> = Vec::new();
+        let mut receivers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for air in airs.air_refs() {
+            let fam = family(air.name());
+            for i in air.bus_interactions().iter().filter(|i| i.bus_id == memw) {
+                let n = i.num_bus_elements() - 1;
+                // `is_register` is element 8 of a 24-element access, 0 of a 16-element write.
+                let at = match n {
+                    24 => 8,
+                    16 => 0,
+                    other => panic!("{memory:?}: {fam}: a MEMW message of {other} elements"),
+                };
+                let elements = affine_elements(i);
+                let is_register = &elements[at];
+                if !i.is_sender {
+                    receivers
+                        .entry(fam.clone())
+                        .or_default()
+                        .insert(format!("{is_register:?}"));
+                    continue;
+                }
+                match is_register {
+                    (0, t) if t.is_empty() => continue,
+                    (1, t) if t.is_empty() => {}
+                    other => {
+                        free_is_register.push(format!("{fam}: {other:?}"));
+                        continue;
+                    }
+                }
+                let address = &elements[at + 1];
+                assert_eq!(
+                    elements[at + 2],
+                    constant(0),
+                    "{memory:?}: {fam}: a register message's base_address[1]"
+                );
+                for (k, want) in [(n - 3, 1u64), (n - 2, 0), (n - 1, 0)] {
+                    assert_eq!(
+                        elements[k],
+                        constant(want),
+                        "{memory:?}: {fam}: a register message's width flag {k}"
+                    );
+                }
+                if address.1.is_empty() {
+                    constants.entry(fam.clone()).or_default().insert(address.0);
+                } else {
+                    column_forms
+                        .entry(fam.clone())
+                        .or_default()
+                        .insert(format!("{address:?}"));
+                }
+            }
+        }
+        println!("MEMW RECEIVERS {memory:?} (is_register forms): {receivers:?}");
+        println!("MEMW REGISTER MESSAGES {memory:?}, constant addresses: {constants:?}");
+        println!("MEMW REGISTER MESSAGES {memory:?}, column addresses: {column_forms:?}");
+        assert!(
+            free_is_register.is_empty(),
+            "{memory:?}: a MEMW sender with a column-valued is_register: {free_is_register:?}"
+        );
+        for (fam, addresses) in &constants {
+            for &a in addresses {
+                assert!(
+                    a % 2 == 0 && ((2..=62).contains(&a) || a == 2 * 254),
+                    "{memory:?}: {fam} addresses register word {a}"
+                );
+            }
+        }
+        let copy_select = format!(
+            "{:?}",
+            (20u64, vec![(crate::tables::copy::cols::IS_WRITE, 488u64)])
+        );
+        let cpu32_fields: BTreeSet<String> = [
+            crate::tables::cpu32::cols::RS1,
+            crate::tables::cpu32::cols::RS2,
+            crate::tables::cpu32::cols::RD,
+        ]
+        .iter()
+        .map(|&c| format!("{:?}", (0u64, vec![(c, 2u64)])))
+        .collect();
+        // Under the word memory format COPY_W names x10 and x254 by constants.
+        let mut expected: BTreeMap<String, BTreeSet<String>> =
+            [("CPU32".to_string(), cpu32_fields)].into_iter().collect();
+        if memory != MemoryFormat::Words {
+            expected.insert("COPY".to_string(), [copy_select].into_iter().collect());
+        }
+        assert_eq!(
+            column_forms, expected,
+            "{memory:?}: the column-valued register addresses"
+        );
+        let relay = |column: usize| -> BTreeSet<String> {
+            [format!("{:?}", (0u64, vec![(column, 1u64)]))]
+                .into_iter()
+                .collect()
+        };
+        let expected: BTreeMap<String, BTreeSet<String>> = [
+            (
+                "MEMW".to_string(),
+                relay(crate::tables::memw::cols::IS_REGISTER),
+            ),
+            (
+                "MEMW_A".to_string(),
+                relay(crate::tables::memw_aligned::cols::IS_REGISTER),
+            ),
+            (
+                "MEMW_R".to_string(),
+                [format!("{:?}", constant(1))].into_iter().collect(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(receivers, expected, "{memory:?}: the MEMW receivers");
+    }
+}
+
+/// ★ The wrap budget from the code's own constants: along any chain of REG-bus nodes a
+/// register's timestamp advances by at most 2^16 a CPU slot (three a row, `IS_HALF[step − 1]`),
+/// 4 a PC edge (one a row), and 2^32 a residual row; with at most `MAX_CPU_ROWS` CPU rows and
+/// `MAX_ROWS_TOTAL` residual rows the total stays below p, so no chain closes on a timestamp it
+/// passed. And the verifier's u128 sum of the residual tables' rows cannot overflow at the
+/// frame's bounds.
+#[test]
+fn the_register_clock_cannot_wrap_the_field_at_the_codes_bounds() {
+    let p: u128 = 0xFFFF_FFFF_0000_0001;
+    let rows = u128::from(cpu::MAX_CPU_ROWS);
+    let residual = u128::from(register_residual::MAX_ROWS_TOTAL);
+    let total = 3 * rows * (1 << 16) + 4 * rows + residual * (1 << 32);
+    println!(
+        "REGISTER CLOCK BUDGET: 2^{:.3} against p = 2^{:.3}",
+        (total as f64).log2(),
+        (p as f64).log2()
+    );
+    assert!(
+        1 + total < p,
+        "the register clock's total advance stays below p"
+    );
+    let most = (block_whir::BLOCK_MAX_TABLES as u128) << block_whir::BLOCK_MAX_TABLE_VARS;
+    assert!(most < u128::MAX / 2);
+}
