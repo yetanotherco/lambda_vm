@@ -407,6 +407,37 @@ type Air3 = dyn AIR<Field = F, FieldExtension = E3, PublicInputs = ()>;
 /// largest LDE, a wrapping claim, and the top bit.
 const OUT_OF_RANGE: [usize; 6] = [0, 24, 1 << 32, (1 << 63) + 4, 1 << 63, usize::MAX];
 
+/// ★ Phase A's own check, in release: a claimed length out of range is
+/// refused before Phase A absorbs anything, so the verifier's transcript is
+/// still a fresh one when it returns. Phase A weakened back to `== 0` would
+/// absorb the table's root first and leave the refusal to rounds 2 to 4.
+#[test]
+fn phase_a_refuses_an_out_of_range_length_before_it_absorbs_anything() {
+    let air = FibonacciAIR::<F>::new(&options());
+    let honest = honest_proof(&air);
+    for claimed in [24, 1 << 31, WRAPPED_ROWS] {
+        let mut proof = honest.clone();
+        proof.trace_length = claimed;
+        let mut t = transcript();
+        assert!(
+            !V::verify(&proof, &air, &mut t),
+            "length {claimed} was accepted"
+        );
+        assert_eq!(
+            t.state(),
+            transcript().state(),
+            "length {claimed}: Phase A absorbed before refusing"
+        );
+    }
+    let mut t = transcript();
+    assert!(V::verify(&honest, &air, &mut t), "the control");
+    assert_ne!(
+        t.state(),
+        transcript().state(),
+        "the control: an accepted proof's Phase A absorbs its roots"
+    );
+}
+
 /// `verify_rounds_2_to_4` alone, past Phase A: the honest proof's rounds
 /// verify at its own length and refuse out-of-range ones, with no panic.
 #[test]

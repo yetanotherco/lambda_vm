@@ -96,3 +96,65 @@ fn an_out_of_range_trace_length_in_an_lfm_proof_is_refused() {
     under::<LegacyFamily>("legacy");
     under::<BlockFamily>("block");
 }
+
+/// ★ The commit bus's phase A replay (`replay_transcript_phase_a_view`), called
+/// directly at the default format on a block proof's own AIRs: it recovers
+/// `(z, α)` from the honest proof and refuses (`None`) the proof with one
+/// table's length patched out of range, before it derives anything from it.
+#[test]
+fn the_phase_a_replay_refuses_an_out_of_range_length() {
+    use crate::tables::trace_builder::Traces;
+    use stark::proof::view::MultiProofView;
+    let elf_bytes = asm_elf_bytes("test_mul_8");
+    let opts = options(OneRowMode::Off);
+    let vm =
+        crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default()).expect("proves");
+    let program = executor::elf::Elf::load(&elf_bytes).expect("an ELF");
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &vm.runtime_page_ranges,
+        vm.num_private_input_pages,
+        vm.proof.proofs.len(),
+    )
+    .expect("page configs");
+    let committed = u32::try_from(vm.public_output.len()).expect("a short output");
+    let replay = |proof: &stark::proof::stark::MultiProof<crate::F, crate::E, ()>| {
+        let view = MultiProofView::Owned(proof);
+        let cpu_heights =
+            crate::cpu_heights_from_proofs(view, &vm.table_counts, true).expect("the CPU tables");
+        let airs = crate::VmAirs::new(
+            &program,
+            &opts,
+            false,
+            &page_configs,
+            &vm.table_counts,
+            &cpu_heights,
+            None,
+            true,
+            None,
+            crate::RegisterFiles::halted(&opts, program.entry_point, committed).preprocessed(),
+        );
+        let refs = airs.air_refs();
+        let mut transcript = crate::hash_pin::block_transcript(&[]);
+        crate::replay_transcript_phase_a_view(&refs, view, &mut transcript)
+    };
+    assert!(
+        replay(&vm.proof).is_some(),
+        "the control: the honest replay"
+    );
+    // A table that is not a CPU table: the CPU heights size the AIRs.
+    let cpu_start = crate::cpu_proof_start(true, &vm.table_counts);
+    let table = if cpu_start == 0 {
+        vm.table_counts.cpu
+    } else {
+        0
+    };
+    for claimed in [0, 24, 1 << 32, (1 << 63) + 8] {
+        let mut proof = vm.proof.clone();
+        proof.proofs[table].trace_length = claimed;
+        assert!(
+            replay(&proof).is_none(),
+            "table {table} at length {claimed}: the replay recovered challenges"
+        );
+    }
+}
