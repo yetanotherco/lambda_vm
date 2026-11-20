@@ -973,6 +973,45 @@ struct WlfmPrepared<H: WhirHash> {
     columns: Vec<Mle<F>>,
     roots: Vec<Commitment>,
     hold: PreparedHold<H>,
+    /// Under [`NARROW_COMMIT_ENV`], the stack's commit sent narrow
+    /// ([`NarrowCommitStamp`]), and for a retired stack its packed columns,
+    /// kept for its opening's store.
+    narrow: Option<NarrowCommitStamp>,
+    packed: Option<multilinear::gpu::PackedStore>,
+}
+
+/// One prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]): whether its
+/// store went up (`sent`), its words' and packed bytes, and the pack's and
+/// upload's seconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NarrowCommitStamp {
+    pub sent: bool,
+    pub words: u64,
+    pub packed_bytes: u64,
+    pub pack_secs: f64,
+    pub upload_secs: f64,
+}
+
+/// A commit's packed columns split into their stamp and the bytes.
+fn narrow_parts(
+    n: Option<crate::block_whir::NarrowCommit>,
+) -> (
+    Option<NarrowCommitStamp>,
+    Option<multilinear::gpu::PackedStore>,
+) {
+    match n {
+        None => (None, None),
+        Some(n) => (
+            Some(NarrowCommitStamp {
+                sent: n.sent,
+                words: n.words,
+                packed_bytes: n.store.packed_bytes(),
+                pack_secs: n.store.pack_secs(),
+                upload_secs: n.upload_secs,
+            }),
+            Some(n.store),
+        ),
+    }
 }
 
 enum PreparedHold<H: WhirHash> {
@@ -982,12 +1021,16 @@ enum PreparedHold<H: WhirHash> {
 
 impl<H: WhirHash> WlfmPrepared<H> {
     fn held(p: GroupPrepared<H>) -> Self {
+        // A held stack's opening reads its host columns: the packed bytes go.
+        let (narrow, _) = narrow_parts(p.packed);
         WlfmPrepared {
             group: p.group,
             tables: p.tables,
             columns: p.columns,
             roots: p.roots,
             hold: PreparedHold::Held(p.commitment),
+            narrow,
+            packed: None,
         }
     }
 
@@ -1008,12 +1051,15 @@ impl<H: WhirHash> WlfmPrepared<H> {
                 p.group
             ));
         }
+        let (narrow, packed) = narrow_parts(p.packed);
         Ok(WlfmPrepared {
             group: p.group,
             tables: p.tables,
             columns: p.columns,
             roots: p.roots,
             hold: PreparedHold::Retired(retired),
+            narrow,
+            packed,
         })
     }
 
@@ -1079,7 +1125,12 @@ fn commit_under<H: WhirHash>(
     stacks
         .into_iter()
         .map(|stack| {
-            let p = commit_group::<H>(stack, config).map_err(|e| format!("{e:?}"))?;
+            let p = if narrow_commit() {
+                crate::block_whir::commit_group_narrow::<H>(stack, config)
+            } else {
+                commit_group::<H>(stack, config)
+            }
+            .map_err(|e| format!("{e:?}"))?;
             match place {
                 StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config),
                 _ => Ok(WlfmPrepared::held(p)),
@@ -1203,6 +1254,15 @@ impl WlfmBuild {
     /// The seconds [`Self::hold_chip_prefixes`] took (0 before it ran).
     pub fn chip_prefix_secs(&self) -> f64 {
         self.chip_prefix_secs
+    }
+
+    /// Each prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]), in group
+    /// order; empty when no stack was committed so.
+    pub fn narrow_commit_stamps(&self) -> Vec<NarrowCommitStamp> {
+        match &self.stacks {
+            WlfmStacks::P1(s) => s.iter().filter_map(|p| p.narrow).collect(),
+            WlfmStacks::B3(s) => s.iter().filter_map(|p| p.narrow).collect(),
+        }
     }
 
     /// The prover's half let go: the prepared stacks (their columns and
@@ -2396,6 +2456,7 @@ fn prove_traces_under<H: WhirHash>(
             tables: p.tables.clone(),
             commitment: p.commitment(),
             columns,
+            packed: p.packed.as_ref(),
         })
         .collect();
     let order: Vec<usize> = (0..artifacts.sizes.len()).collect();
@@ -2949,6 +3010,45 @@ pub fn narrow_store() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| narrow_store_word(super::wlfm_knobs::env_word(NARROW_STORE_ENV).as_deref()))
+}
+
+/// `LAMBDA_VM_LEVELS_NARROW_COMMIT=1`: a W-LFM build commits each prepared
+/// stack on the card from its columns sent narrow: packed on the host once,
+/// widened on the card into a store, the commit reading the store
+/// ([`crate::block_whir::commit_group_narrow`]), where today the commit copies
+/// the wide columns in. A retired stack keeps its packed bytes on the host, and
+/// under [`NARROW_STORE_ENV`] its opening's store sends them without packing
+/// again. The same roots, so the same proof. Only the W-LFM prover reads it.
+/// Off by default (and for any word but `1`) until its timing gate. Read once
+/// a process.
+pub const NARROW_COMMIT_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_COMMIT";
+
+/// [`NARROW_COMMIT_ENV`]'s word: on only for `1`.
+pub fn narrow_commit_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
+}
+
+thread_local! {
+    /// A test's [`narrow_commit`] on this thread.
+    static NARROW_COMMIT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`narrow_commit`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_narrow_commit_for_test(on: Option<bool>) {
+    NARROW_COMMIT_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`NARROW_COMMIT_ENV`] is on (or this thread's test override).
+pub fn narrow_commit() -> bool {
+    if let Some(on) = NARROW_COMMIT_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        narrow_commit_word(super::wlfm_knobs::env_word(NARROW_COMMIT_ENV).as_deref())
+    })
 }
 
 /// `LAMBDA_VM_LEVELS_OVERLAP_NEXT_COLUMNS` (on unless `0`): phase B's planned

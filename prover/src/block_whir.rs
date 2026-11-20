@@ -4541,7 +4541,26 @@ pub(crate) struct GroupPrepared<H: multilinear::whir_hash::WhirHash> {
     pub(crate) columns: Vec<Mle<F>>,
     pub(crate) roots: Vec<multilinear::whir_commit::Commitment>,
     pub(crate) commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
+    /// Under [`commit_group_narrow`], the columns packed narrow for the commit
+    /// (kept for a later store of the same columns) and what the commit's
+    /// narrow store cost; `None` otherwise, or where it packed nothing.
+    pub(crate) packed: Option<NarrowCommit>,
 }
+
+/// A prepared stack committed from a store sent narrow ([`commit_group_narrow`]):
+/// the columns' packed bytes, and whether the commit read them from the card
+/// (`sent`; `false` when the plan or the card kept them on the host), with the
+/// upload's seconds.
+pub(crate) struct NarrowCommit {
+    pub(crate) store: multilinear::gpu::PackedStore,
+    pub(crate) words: u64,
+    pub(crate) sent: bool,
+    pub(crate) upload_secs: f64,
+}
+
+/// What a narrow commit keeps free on the card beside its store and its own
+/// promises.
+const NARROW_COMMIT_MARGIN_BYTES: u64 = 1 << 30;
 
 /// One group's prepared stack before its commitment: which tables, and their
 /// prefixes' columns concatenated in the group's order.
@@ -4765,7 +4784,32 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false)
+    commit_group_where::<H>(stack, config, false, false)
+}
+
+/// [`commit_group`] with the columns sent to the card narrow: packed on the
+/// host once (`multilinear::gpu::pack_store`), widened on the card into a
+/// store, and committed from that store, where today the commit copies the
+/// wide columns in. The same words at the same places, so the same roots.
+/// Where there is no card, or the plan (the store, its staging, a card
+/// commit's price and a margin, against what the ledger has free) or the card
+/// says no, it commits as [`commit_group`] does; the packed bytes are kept
+/// either way ([`GroupPrepared::packed`]) for a later store of the columns.
+pub(crate) fn commit_group_narrow<H: multilinear::whir_hash::WhirHash>(
+    stack: GroupStack,
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<GroupPrepared<H>, Error> {
+    commit_group_where::<H>(stack, config, false, true)
+}
+
+/// Whether a narrow commit's store fits: its words, the largest run's packed
+/// bytes at most, a card commit's price and a margin, within what is free.
+fn narrow_commit_fits(words: u64, staging: u64, commit: u64, free: u64) -> bool {
+    words
+        .saturating_add(staging)
+        .saturating_add(commit)
+        .saturating_add(NARROW_COMMIT_MARGIN_BYTES)
+        <= free
 }
 
 /// [`commit_group`] on the host, whatever a card would do
@@ -4775,13 +4819,14 @@ pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, true)
+    commit_group_where::<H>(stack, config, true, false)
 }
 
 fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
     on_host: bool,
+    narrow: bool,
 ) -> Result<GroupPrepared<H>, Error> {
     let shapes = stack.shapes();
     let group = stack.group;
@@ -4793,16 +4838,51 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
     let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let borrowed = multilinear::stacking::borrow(&columns);
+    let budget = multilinear::gpu::reserve_budget();
+    let mut packed = (narrow && !on_host && budget > 0 && !multilinear::gpu::columns_disabled())
+        .then(|| multilinear::gpu::pack_store(&borrowed))
+        .flatten()
+        .map(|store| NarrowCommit {
+            store,
+            words: borrowed.iter().map(|c| c.len() as u64 * 8).sum(),
+            sent: false,
+            upload_secs: 0.0,
+        });
+    let store = match packed.as_mut() {
+        Some(p) => {
+            let lens: Vec<usize> = borrowed.iter().map(|c| c.len()).collect();
+            let staging = multilinear::narrow::store_staging_bound(
+                &lens,
+                multilinear::narrow::STORE_RUN_CELLS,
+            );
+            let price = multilinear::stacked_eval::commit_card_bytes(&layout, config);
+            let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+            if narrow_commit_fits(p.words, staging, price, free) {
+                let t = Instant::now();
+                let store = multilinear::gpu::upload_packed_store(&p.store).map(|(s, _)| s);
+                p.sent = store.is_some();
+                p.upload_secs = t.elapsed().as_secs_f64();
+                store
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     let commitment = if on_host {
         multilinear::stacked_eval::StackedCommitment::<F, H>::commit_on_host(
             layout, &borrowed, config,
         )
     } else {
         multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
-            layout, &borrowed, None, config,
+            layout,
+            &borrowed,
+            store.as_ref().map(|s| (s, 0)),
+            config,
         )
     }
     .map_err(|e| Error::Prover(format!("group {group}: {e:?}")))?;
+    // The store goes when this returns, before a retired stack is let go.
     let roots = commitment.roots();
     Ok(GroupPrepared {
         group,
@@ -4810,6 +4890,7 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
         columns,
         roots,
         commitment,
+        packed,
     })
 }
 
@@ -6205,6 +6286,7 @@ pub(crate) fn prove_traces(
                 tables: p.tables.clone(),
                 commitment: (&p.commitment).into(),
                 columns,
+                packed: None,
             })
             .collect();
         let t = Instant::now();
@@ -9702,6 +9784,7 @@ fn prove_streamed(
                 tables: p.tables.clone(),
                 commitment: (&p.commitment).into(),
                 columns,
+                packed: None,
             })
             .collect();
         let _ = multilinear::whir_split::take_chain();
@@ -13607,5 +13690,23 @@ mod close_before_bitwise_tests {
         assert!(!past_budget(&[small], small, cap, 8).expect("a layout"));
         assert!(past_budget(&[small], bitwise, cap, 8).expect("a layout"));
         assert!(past_budget(&[small, small], small, cap, 1).expect("a layout"));
+    }
+}
+
+#[cfg(test)]
+mod narrow_commit_tests {
+    use super::{NARROW_COMMIT_MARGIN_BYTES, narrow_commit_fits};
+
+    /// A narrow commit's store fits only with its words, its staging, a card
+    /// commit's price and the margin all within what is free; one byte short
+    /// refuses, and nothing overflows.
+    #[test]
+    fn a_narrow_commit_fits_with_its_store_staging_price_and_margin() {
+        let (words, staging, price) = (2_480 << 20, 256 << 20, 6_000 << 20);
+        let need = words + staging + price + NARROW_COMMIT_MARGIN_BYTES;
+        assert!(narrow_commit_fits(words, staging, price, need));
+        assert!(!narrow_commit_fits(words, staging, price, need - 1));
+        assert!(!narrow_commit_fits(words, 0, price, words + price));
+        assert!(!narrow_commit_fits(u64::MAX, staging, price, u64::MAX - 1));
     }
 }
