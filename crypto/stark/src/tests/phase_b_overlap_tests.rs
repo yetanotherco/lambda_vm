@@ -245,7 +245,9 @@ fn prove_block_placed<Hh: WhirHash>(
     reorder: Option<&PhaseBReorder<'_>>,
     retired: bool,
 ) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
-    prove_block_with::<Hh>(config, overlap, order, faults, fault, reorder, retired, None)
+    prove_block_with::<Hh>(
+        config, overlap, order, faults, fault, reorder, retired, None,
+    )
 }
 
 /// A phase A of a test's own over the block's tables, in place of
