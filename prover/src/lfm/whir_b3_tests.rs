@@ -1748,7 +1748,7 @@ mod stacked {
     use super::super::executor::execute;
     use super::super::validator::validate;
     use super::super::whir_chain::{ChainShape, RoundStorage, byte_digest_words, push_round_words};
-    use super::super::whir_stacked::{StackedChainWires, emit_stacked_verify_chains};
+    use super::super::whir_stacked::{OodWires, StackedChainWires, emit_stacked_verify_chains};
     use super::super::whir_transcript::WhirTranscript;
     use super::super::word::{LfmWord, ext_word, word_as_ext};
     use super::{HostTranscript, builder, hash_rows};
@@ -1825,9 +1825,20 @@ mod stacked {
         proof: StackedProof<F, E>,
         domain: Domain<F>,
         shape: ChainShape,
+        /// The commit-time answers the opening carries, at `(z0, answers)`:
+        /// `None` for an opening without them.
+        ood: Option<(FEE, Vec<FEE>)>,
     }
 
     pub(super) fn build(case: &Case) -> Fixture {
+        build_with(case, None)
+    }
+
+    /// [`build`], the opening carrying commit-time answers at a fixed `z0`
+    /// when `answer_delta` is given: polynomial 0's answer moved by it, then
+    /// stated and proved as given, so a nonzero delta is a false answer the
+    /// prover's own chain carries.
+    pub(super) fn build_with(case: &Case, answer_delta: Option<FEE>) -> Fixture {
         let cfg = config(case);
         let layout = StackedLayout::build(&case.heights, case.n_stack).expect("the layout packs");
         let columns: Vec<Mle<F>> = case
@@ -1851,15 +1862,35 @@ mod stacked {
         let stacked =
             StackedCommitment::<F, Blake3Whir>::commit(layout.clone(), &borrowed, None, &cfg)
                 .expect("the group commits");
-        let proof = multilinear::stacked_eval::prove::<F, E, _, Blake3Whir, _>(
-            &stacked,
-            &borrowed,
-            None,
-            &Claimed::PerColumn(&points),
-            &values,
-            &cfg,
-            &mut HostTranscript::new(&[]),
-        )
+        let ood = answer_delta.map(|delta| {
+            let z0 = fee(0x0bad_5eed);
+            let (mut claims, _) =
+                multilinear::stacked_eval::ood_claims::<F, E, _>(&layout, &borrowed, None, &z0)
+                    .expect("the answers");
+            claims.answers[0] += delta;
+            claims
+        });
+        let proof = match &ood {
+            None => multilinear::stacked_eval::prove::<F, E, _, Blake3Whir, _>(
+                &stacked,
+                &borrowed,
+                None,
+                &Claimed::PerColumn(&points),
+                &values,
+                &cfg,
+                &mut HostTranscript::new(&[]),
+            ),
+            Some(claims) => multilinear::stacked_eval::prove_mapped_ood::<F, E, _, Blake3Whir, _>(
+                &stacked,
+                &borrowed,
+                None,
+                &Claimed::PerColumn(&points),
+                &values,
+                Some(claims),
+                &cfg,
+                &mut HostTranscript::new(&[]),
+            ),
+        }
         .expect("the group proves");
         let f = Fixture {
             shape: ChainShape::for_hash(&cfg, layout.n_stack(), WrapHash::Blake3),
@@ -1870,12 +1901,29 @@ mod stacked {
             roots: stacked.roots(),
             proof,
             domain: stacked.domain().clone(),
+            ood: ood.map(|claims| (claims.z0, claims.answers)),
         };
-        assert!(host_accepts(&f, &f.proof), "the host accepts its own proof");
+        if answer_delta.is_none_or(|d| d == FEE::zero()) {
+            assert!(host_accepts(&f, &f.proof), "the host accepts its own proof");
+        }
         f
     }
 
     fn host_accepts(f: &Fixture, proof: &StackedProof<F, E>) -> bool {
+        if let Some((z0, answers)) = &f.ood {
+            return multilinear::stacked_eval::verify_ood::<F, E, _, Blake3Whir>(
+                proof,
+                &f.layout,
+                &f.roots,
+                &Claimed::PerColumn(&f.points),
+                &f.values,
+                Some(multilinear::stacked_eval::CommitOod { z0, answers }),
+                &f.domain,
+                &f.cfg,
+                &mut HostTranscript::new(&[]),
+            )
+            .is_ok();
+        }
         multilinear::stacked_eval::verify::<F, E, _, Blake3Whir>(
             proof,
             &f.layout,
@@ -1921,6 +1969,12 @@ mod stacked {
         for (run, t) in runs.iter().zip(&trees) {
             chain_at.push(total);
             total += 2 * t.len() as u32 + 1 + RoundStorage::words(&f.shape.run(run.len()));
+        }
+        // The answers' point (the stack's coordinates) and the answers, after
+        // the chains.
+        let ood_at = total;
+        if f.ood.is_some() {
+            total += (f.layout.n_stack() + f.layout.num_polys()) as u32;
         }
         let arena = b.declare_arena(total);
         let mut transcript = WhirTranscript::for_builder(&mut b);
@@ -1973,6 +2027,20 @@ mod stacked {
             })
             .collect();
         let claimed: Vec<&[Ext]> = points.iter().map(Vec::as_slice).collect();
+        let hinted = |b: &mut super::super::builder::LfmBuilder, from: u32, n: usize| -> Vec<Ext> {
+            (0..n as u32)
+                .map(|i| b.hint_word(arena, from + i).as_ext())
+                .collect()
+        };
+        let ood_wires = f.ood.as_ref().map(|_| {
+            let point = hinted(&mut b, ood_at, f.layout.n_stack());
+            let answers = hinted(
+                &mut b,
+                ood_at + f.layout.n_stack() as u32,
+                f.layout.num_polys(),
+            );
+            (point, answers)
+        });
         let gamma = emit_stacked_verify_chains(
             &mut b,
             &mut transcript,
@@ -1980,7 +2048,9 @@ mod stacked {
             &chains,
             &claimed,
             &values,
-            None,
+            ood_wires
+                .as_ref()
+                .map(|(point, answers)| OodWires { point, answers }),
             &f.shape,
             &f.domain,
         );
@@ -2000,6 +2070,11 @@ mod stacked {
             }
             words.push(ext_word(&chain.final_value));
             push_round_words(&mut words, &f.shape.run(run.len()), chain);
+        }
+        if let Some((z0, answers)) = &f.ood {
+            let point = multilinear::whir_chain::ood_point(z0, f.layout.n_stack());
+            words.extend(point.iter().map(ext_word));
+            words.extend(answers.iter().map(ext_word));
         }
         words
     }
@@ -2185,6 +2260,51 @@ mod stacked {
                         "a joint root off in its second word"
                     );
                 }
+            }
+        });
+    }
+
+    /// ★ The commit-time answers under BLAKE3 and one tree a run, in-guest: an
+    /// opening that carries its answers (the point hinted) executes on the
+    /// host's honest proof, under both lowerings, today's form and the round
+    /// form; and a false answer that the prover states and its joint chain
+    /// carries — polynomial 0, in a run of two or more — has no execution, as
+    /// the host refuses it.
+    #[test]
+    fn a_joint_blake3_opening_binds_its_answers() {
+        let mut picked: Vec<(&'static str, Case)> = cases()
+            .into_iter()
+            .filter(|(_, c)| c.round0 == Round0Trees::One && c.cap == CapPolicy::Off)
+            .collect();
+        picked.extend(
+            round_form_cases()
+                .into_iter()
+                .filter(|(n, c)| *n == "three polys, shrink 2" && c.round0 == Round0Trees::One),
+        );
+        assert!(
+            picked.iter().any(|(_, c)| c.whir.is_some()),
+            "a round-form case"
+        );
+        super::under_both(|lowering| {
+            for (name, case) in &picked {
+                let honest = build_with(case, Some(FEE::zero()));
+                let first = honest.shape.chains(honest.layout.num_polys())[0].clone();
+                assert!(
+                    first.start == 0 && honest.shape.run(first.len()).joint(),
+                    "{name}: polynomial 0 lies in a joint run"
+                );
+                runs(&program(&honest), arena(&honest, &honest.proof)).unwrap_or_else(|e| {
+                    panic!("{lowering} {name}: the honest opening with answers refused: {e}")
+                });
+                let forged = build_with(case, Some(FEE::one()));
+                assert!(
+                    !host_accepts(&forged, &forged.proof),
+                    "{name}: a false answer its chain carries, host"
+                );
+                assert!(
+                    runs(&program(&forged), arena(&forged, &forged.proof)).is_err(),
+                    "{lowering} {name}: a false answer its joint chain carries executed"
+                );
             }
         });
     }
