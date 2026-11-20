@@ -1590,16 +1590,33 @@ fn cmd_prove_block_base(
     // (`LAMBDA_VM_ALLOC_WATERMARK`), so the base's memory behaves as there.
     let watermark = prover::alloc_purge::start_watermark(prover::block_whir::memory_target_bytes());
     let t = Instant::now();
-    let proved = prover::block_whir::prove_block_whir_observed_led(
-        &elf_data,
-        &input,
-        &opts,
-        &cfg.format,
-        &cfg.options,
-        &|_, _| {},
-        &|_| {},
-        None,
-    );
+    // A format that argues local lookups per group has a proof type of its
+    // own (it carries every group's local argue).
+    let proved = if cfg.format.local_lookups() {
+        prover::block_whir::prove_block_whir_local_observed_led(
+            &elf_data,
+            &input,
+            &opts,
+            &cfg.format,
+            &cfg.options,
+            &|_, _| {},
+            &|_| {},
+            None,
+        )
+        .map(|(proof, stamps)| (BaseProof::Local(proof), stamps))
+    } else {
+        prover::block_whir::prove_block_whir_observed_led(
+            &elf_data,
+            &input,
+            &opts,
+            &cfg.format,
+            &cfg.options,
+            &|_, _| {},
+            &|_| {},
+            None,
+        )
+        .map(|(proof, stamps)| (BaseProof::Today(proof), stamps))
+    };
     let base_secs = t.elapsed().as_secs_f64();
     // The base's allocator peak (`ALLOC PEAK base`, as `prove-block` prints it).
     if let Some(peak) = prover::alloc_purge::peak_window() {
@@ -1647,7 +1664,7 @@ fn cmd_prove_block_base(
              rounds' message reads)"
         );
     }
-    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+    let bytes = match proof.bytes() {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("Failed to serialize the base proof: {e}");
@@ -1662,7 +1679,7 @@ fn cmd_prove_block_base(
         return ExitCode::FAILURE;
     }
     let t = Instant::now();
-    let verified = prover::block_whir::verify_block_whir(&proof, &elf_data, &opts, &cfg.format);
+    let verified = proof.verify(&elf_data, &opts, &cfg.format);
     let verify_secs = t.elapsed().as_secs_f64();
     let verdict = match &verified {
         Ok(true) => "verified".to_string(),
@@ -1684,6 +1701,36 @@ fn cmd_prove_block_base(
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// A base proof as `prove-block-base` proved it: today's, or one that argues
+/// local lookups per group.
+enum BaseProof {
+    Today(prover::block_whir::BlockWhirProof),
+    Local(prover::block_whir::BlockWhirProof<prover::block_whir::LocalArgues>),
+}
+
+impl BaseProof {
+    /// Its archived bytes.
+    fn bytes(&self) -> Result<Vec<u8>, rkyv::rancor::Error> {
+        match self {
+            Self::Today(proof) => rkyv::to_bytes::<rkyv::rancor::Error>(proof).map(|b| b.to_vec()),
+            Self::Local(proof) => rkyv::to_bytes::<rkyv::rancor::Error>(proof).map(|b| b.to_vec()),
+        }
+    }
+
+    /// The host verifier's reading of it under `format`.
+    fn verify(
+        &self,
+        elf: &[u8],
+        opts: &stark::proof::options::ProofOptions,
+        format: &prover::block_whir::BlockFormat,
+    ) -> Result<bool, prover::Error> {
+        match self {
+            Self::Today(proof) => prover::block_whir::verify_block_whir(proof, elf, opts, format),
+            Self::Local(proof) => prover::block_whir::verify_block_whir(proof, elf, opts, format),
+        }
     }
 }
 
