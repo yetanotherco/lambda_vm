@@ -131,7 +131,7 @@ fn level_1_executes(plan: &WhirBlockPlan, proof: &BlockWhirProof) -> Census {
 
 /// Group 0's first chain with a round after round 0 that opens its tree:
 /// (chain, round).
-fn later_round(proof: &BlockWhirProof) -> (usize, usize) {
+fn later_round<L>(proof: &BlockWhirProof<L>) -> (usize, usize) {
     proof.proof.columns[0]
         .polys
         .iter()
@@ -151,16 +151,16 @@ fn later_round(proof: &BlockWhirProof) -> (usize, usize) {
         .expect("a later round of group 0 opens its tree")
 }
 
-/// A one-value edit of a base proof.
-type Tamper = Box<dyn Fn(&mut BlockWhirProof)>;
+/// A one-value edit of a base proof (of either kind, `L`).
+type Tamper<L = ()> = Box<dyn Fn(&mut BlockWhirProof<L>)>;
 
 /// Three one-value tampers in group 0's chain `c`: round `r`'s first opened
 /// value, round 0's out-of-domain answer and round 0's first opened value.
-fn tampers(c: usize, r: usize) -> Vec<(&'static str, Tamper)> {
+fn tampers<L: 'static>(c: usize, r: usize) -> Vec<(&'static str, Tamper<L>)> {
     vec![
         (
             "a later round's opened value",
-            Box::new(move |p: &mut BlockWhirProof| {
+            Box::new(move |p: &mut BlockWhirProof<L>| {
                 match &mut p.proof.columns[0].polys[c].rounds[r].openings {
                     RoundOpenings::Extension(o) => {
                         o.current[0].values[0] += FieldElement::<E>::one()
@@ -171,7 +171,7 @@ fn tampers(c: usize, r: usize) -> Vec<(&'static str, Tamper)> {
         ),
         (
             "round 0's out-of-domain answer",
-            Box::new(move |p: &mut BlockWhirProof| {
+            Box::new(move |p: &mut BlockWhirProof<L>| {
                 let round = &mut p.proof.columns[0].polys[c].rounds[0];
                 let value = round.ood_value.as_mut().expect("round 0 has a successor");
                 *value += FieldElement::<E>::one();
@@ -179,7 +179,7 @@ fn tampers(c: usize, r: usize) -> Vec<(&'static str, Tamper)> {
         ),
         (
             "a round-0 opened value",
-            Box::new(move |p: &mut BlockWhirProof| {
+            Box::new(move |p: &mut BlockWhirProof<L>| {
                 match &mut p.proof.columns[0].polys[c].rounds[0].openings {
                     RoundOpenings::Base(o) => o.current[0].values[0] += FE::one(),
                     RoundOpenings::BaseGrouped(o) => o.current[0][0].values[0] += FE::one(),
@@ -409,16 +409,36 @@ fn rf_level_1_over_a_real_block() {
     };
     let on_group = |_: stark::multilinear_block::GroupOpened<'_, _, _>| {};
     let t = Instant::now();
-    let (proof, _) = crate::base_only::with_blake3_levels(|| {
-        crate::block_whir::prove_block_whir_observed_groups(
-            &elf,
-            &input,
-            &opts,
-            format,
-            &cfg.options,
-            &observe,
-            &on_group,
-        )
+    // The BLAKE3 base argues KECCAK_RND's byte lookups per group unless
+    // `LAMBDA_VM_B3_BASE_LOCAL=off`: either kind of proof, held as one type.
+    let proof: crate::block_whir::AnyBlockWhirProof = crate::base_only::with_blake3_levels(|| {
+        if format.local_lookups() {
+            crate::block_whir::prove_block_whir_local_observed_led(
+                &elf,
+                &input,
+                &opts,
+                format,
+                &cfg.options,
+                &observe,
+                &on_group,
+                None,
+            )
+            .map(|(mut proof, _)| {
+                let local = std::mem::take(&mut proof.local);
+                proof.with_local(Some(local))
+            })
+        } else {
+            crate::block_whir::prove_block_whir_observed_groups(
+                &elf,
+                &input,
+                &opts,
+                format,
+                &cfg.options,
+                &observe,
+                &on_group,
+            )
+            .map(|(proof, _)| proof.with_local(None))
+        }
     })
     .unwrap_or_else(|e| panic!("the base proves: {e}"));
     let prove = t.elapsed().as_secs_f64();

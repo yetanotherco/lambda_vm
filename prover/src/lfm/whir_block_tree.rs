@@ -606,14 +606,15 @@ impl WhirTreeConfig {
             std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
         )?);
         // KECCAK_RND's form: the knob's, else the production format's — the
-        // pinned preset's (lean) unless the BLAKE3 base argues its byte
-        // lookups per group (`LAMBDA_VM_B3_BASE_LOCAL`), which takes no
-        // other form beside it.
+        // pinned preset's (lean), and on the BLAKE3 base its byte lookups
+        // argued per group (`LAMBDA_VM_B3_BASE_LOCAL`, on unless `off`),
+        // which takes no other form beside it.
         let keccak_rnd = match std::env::var("BLOCK_WHIR_KECCAK_RND").ok() {
             None => production.keccak_rnd,
             Some(word) if production.local_lookups() => {
                 return Err(format!(
-                    "BLOCK_WHIR_KECCAK_RND={word} beside {}: local lookups fix KECCAK_RND's form",
+                    "BLOCK_WHIR_KECCAK_RND={word} beside local lookups (the BLAKE3 base's \
+                     default): local lookups fix KECCAK_RND's form; set {}=off for another",
                     crate::block_whir::B3_BASE_LOCAL_ENV
                 ));
             }

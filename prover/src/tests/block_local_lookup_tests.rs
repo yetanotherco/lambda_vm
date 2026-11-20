@@ -103,20 +103,36 @@ fn verify<L: block_whir::LocalPart>(
     verify_block_whir(proof, elf, &opts(), f).unwrap_or(false)
 }
 
-/// `LAMBDA_VM_B3_BASE_LOCAL`: unset, `0` or `off` is off; `keccak` argues
-/// KECCAK_RND's byte lookups per group; anything else is refused.
+/// `LAMBDA_VM_B3_BASE_LOCAL`: unset is the base's default (on for the
+/// BLAKE3 base, `B3_BASE_LOCAL_DEFAULT`), `0` or `off` is off, `keccak` argues
+/// KECCAK_RND's byte lookups per group; anything else is refused. The
+/// BLAKE3 base's default form is the local one, and the pinned (Poseidon1)
+/// preset's stays lean.
 #[test]
 fn the_local_knob_reads_off_or_keccak() {
-    assert_eq!(b3_base_local_setting(None), Ok(false));
-    assert_eq!(b3_base_local_setting(Some("0")), Ok(false));
-    assert_eq!(b3_base_local_setting(Some(" off ")), Ok(false));
-    assert_eq!(b3_base_local_setting(Some("keccak")), Ok(true));
+    use crate::block_whir::{B3_BASE_KECCAK_RND, B3_BASE_LOCAL_DEFAULT};
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    assert_eq!(b3_base_local_setting(None), Ok(None));
+    assert_eq!(b3_base_local_setting(Some("0")), Ok(Some(false)));
+    assert_eq!(b3_base_local_setting(Some(" off ")), Ok(Some(false)));
+    assert_eq!(b3_base_local_setting(Some("keccak")), Ok(Some(true)));
     for bad in ["", "1", "on", "all", "lean"] {
         assert!(b3_base_local_setting(Some(bad)).is_err(), "{bad:?}");
     }
+    const { assert!(B3_BASE_LOCAL_DEFAULT) };
+    assert_eq!(B3_BASE_KECCAK_RND, KeccakRndForm::LeanLocal);
     assert!(!BlockFormat::pinned().local_lookups());
     assert!(local().local_lookups());
     assert!(!lean().local_lookups());
+    // The test process sets no knob and keeps the Poseidon1 base: its
+    // production format argues none (the BLAKE3 base's default is pinned by
+    // `levels_tests::a_levels_verifier_pins_its_familys_base`).
+    assert_eq!(
+        crate::block_whir::b3_base_local(),
+        None,
+        "no test sets the knob"
+    );
+    assert!(!BlockFormat::production().local_lookups());
 }
 
 /// `LAMBDA_VM_LOCAL_LANE`: unset, empty or `1` is on (phase A's lane runs

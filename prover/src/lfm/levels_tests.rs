@@ -2460,36 +2460,61 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
 
 /// One binary, one format: the public entries' refusal of the process's
 /// format knobs, on given values. The BLAKE3 base's cap height and final
-/// polynomial must be the pinned ones; under the Poseidon1 base the
-/// `LFM_HASH` split must be off; under BLAKE3 the split is inert and taken.
+/// polynomial must be the pinned ones, and its local lookups on (unset or
+/// `keccak`; `off` refused by name); under the Poseidon1 base the `LFM_HASH`
+/// split must be off and local lookups not asked for; under BLAKE3 the split
+/// is inert and taken.
 #[test]
 fn the_levels_verifier_refuses_format_knobs_off_their_pinned_values() {
     use super::levels::check_format_knobs;
     use multilinear::whir_chain::FinalPoly;
     let cap = crate::block_whir::B3_BASE_CAP;
     let on = FinalPoly::Vars(crate::block_whir::B3_BASE_FINAL_VARS);
-    assert!(check_format_knobs(WlfmFamily::B3, cap, on, false).is_ok());
-    assert!(check_format_knobs(WlfmFamily::B3, cap, on, true).is_ok());
-    assert!(check_format_knobs(WlfmFamily::P1, cap, on, false).is_ok());
-    for (what, refused) in [
-        ("cap 5", check_format_knobs(WlfmFamily::B3, 5, on, false)),
-        ("cap 3", check_format_knobs(WlfmFamily::B3, 3, on, false)),
+    assert!(check_format_knobs(WlfmFamily::B3, cap, on, false, None).is_ok());
+    assert!(check_format_knobs(WlfmFamily::B3, cap, on, true, None).is_ok());
+    assert!(check_format_knobs(WlfmFamily::B3, cap, on, false, Some(true)).is_ok());
+    assert!(check_format_knobs(WlfmFamily::P1, cap, on, false, None).is_ok());
+    assert!(check_format_knobs(WlfmFamily::P1, cap, on, false, Some(false)).is_ok());
+    for (what, refused, knob) in [
+        (
+            "cap 5",
+            check_format_knobs(WlfmFamily::B3, 5, on, false, None),
+            "LAMBDA_VM_B3_BASE_CAP",
+        ),
+        (
+            "cap 3",
+            check_format_knobs(WlfmFamily::B3, 3, on, false, None),
+            "LAMBDA_VM_B3_BASE_CAP",
+        ),
         (
             "no final polynomial",
-            check_format_knobs(WlfmFamily::B3, cap, FinalPoly::Off, false),
+            check_format_knobs(WlfmFamily::B3, cap, FinalPoly::Off, false, None),
+            "LAMBDA_VM_B3_BASE_FINAL",
+        ),
+        (
+            "local lookups off",
+            check_format_knobs(WlfmFamily::B3, cap, on, false, Some(false)),
+            "LAMBDA_VM_B3_BASE_LOCAL",
         ),
         (
             "the hash split",
-            check_format_knobs(WlfmFamily::P1, cap, on, true),
+            check_format_knobs(WlfmFamily::P1, cap, on, true, None),
+            "LAMBDA_VM_LFM_HASH_SPLIT",
+        ),
+        (
+            "local lookups on the Poseidon1 base",
+            check_format_knobs(WlfmFamily::P1, cap, on, false, Some(true)),
+            "LAMBDA_VM_B3_BASE_LOCAL",
         ),
     ] {
-        assert!(refused.is_err(), "{what} taken");
+        let refused = refused.expect_err(what);
+        assert!(refused.contains(knob), "{what}: {refused}");
     }
 }
 
 /// The scenarios [`the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults`]
 /// runs in processes of their own: an environment, and its child test's name.
-const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 3] = [
+const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 5] = [
     (
         "cap",
         &[
@@ -2500,6 +2525,8 @@ const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 3] = [
         ],
     ),
     ("final", &[("LAMBDA_VM_B3_BASE_FINAL", "off")]),
+    ("local-off", &[("LAMBDA_VM_B3_BASE_LOCAL", "off")]),
+    ("local-word", &[("LAMBDA_VM_B3_BASE_LOCAL", "sometimes")]),
     (
         "malformed",
         &[
@@ -2512,9 +2539,10 @@ const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 3] = [
 
 /// ★ In processes whose knobs are off the defaults, the public entries'
 /// pins hold: the family pin keeps the BLAKE3 base's own group size and GKR
-/// ladder, and the format check refuses the cap, the final polynomial and
-/// (under Poseidon1) the hash split by name, and a malformed word of any of
-/// the three is an `Err` under either family, never an abort or a panic.
+/// ladder, and the format check refuses the cap, the final polynomial, local
+/// lookups off and (under Poseidon1) the hash split by name, and a malformed
+/// word of any of them is an `Err` under either family, never an abort or a
+/// panic.
 /// Each scenario runs
 /// [`the_levels_pins_hold_under_knobs_off_the_default`] in a child process.
 #[test]
@@ -2572,6 +2600,28 @@ fn the_levels_pins_hold_under_knobs_off_the_default() {
             super::levels::check_process_format_for_tests(WlfmFamily::P1)
                 .expect("the Poseidon1 base reads no BLAKE3 knob");
         }
+        "local-off" => {
+            assert_eq!(
+                b3.keccak_rnd,
+                crate::block_whir::B3_BASE_KECCAK_RND,
+                "the pinned form"
+            );
+            let refused = super::levels::check_process_format_for_tests(WlfmFamily::B3)
+                .expect_err("local lookups off");
+            assert!(refused.contains("LAMBDA_VM_B3_BASE_LOCAL"), "{refused}");
+            super::levels::check_process_format_for_tests(WlfmFamily::P1)
+                .expect("the Poseidon1 base takes local lookups off");
+        }
+        "local-word" => {
+            for family in [WlfmFamily::B3, WlfmFamily::P1] {
+                let refused = super::levels::check_process_format_for_tests(family)
+                    .expect_err("a malformed local-lookups word");
+                assert!(
+                    refused.contains("LAMBDA_VM_B3_BASE_LOCAL"),
+                    "{family:?}: {refused}"
+                );
+            }
+        }
         "malformed" => {
             for family in [WlfmFamily::B3, WlfmFamily::P1] {
                 let refused = super::levels::check_process_format_for_tests(family)
@@ -2587,8 +2637,9 @@ fn the_levels_pins_hold_under_knobs_off_the_default() {
 }
 
 /// The pinned format a family's verifier checks against: the BLAKE3 base's
-/// own constants (group size, GKR ladder) and the named round form on
-/// `B3`; a round form on `P1` refused.
+/// own constants (group size, GKR ladder, KECCAK_RND's local form) and the
+/// named round form on `B3`; a round form on `P1` refused, and `P1` keeps the
+/// preset's lean form.
 #[test]
 fn a_levels_verifier_pins_its_familys_base() {
     use crate::block_whir::{B3_BASE_GROUP_POLYS, B3Rounds, BlockFormat};
@@ -2605,9 +2656,13 @@ fn a_levels_verifier_pins_its_familys_base() {
             .argue
             .with_ladder(crate::block_whir::B3_BASE_GKR_DEFAULT)
     );
+    assert_eq!(b3.keccak_rnd, crate::block_whir::B3_BASE_KECCAK_RND);
+    assert!(b3.local_lookups(), "the BLAKE3 pin argues local lookups");
     let p1 = super::levels::pin_family(pinned, WlfmFamily::P1, B3Rounds::Fri)
         .expect("the Poseidon1 pin");
     assert_eq!(p1.zf.base, pinned.zf.base);
+    assert_eq!(p1.keccak_rnd, pinned.keccak_rnd);
+    assert!(!p1.local_lookups(), "the Poseidon1 pin argues none");
     assert!(
         super::levels::pin_family(pinned, WlfmFamily::P1, B3Rounds::WHIR3).is_err(),
         "a round form on the Poseidon1 base"

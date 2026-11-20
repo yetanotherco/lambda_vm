@@ -1298,8 +1298,9 @@ pub fn verify_block_levels_at(
 /// [`WlfmFamily::P1`] (whose chains take no round form), and for
 /// [`WlfmFamily::B3`] the 7-round BLAKE3 base with its own constants — its
 /// group size ([`crate::block_whir::B3_BASE_GROUP_POLYS`]), its GKR ladder
-/// ([`crate::block_whir::B3_BASE_GKR_DEFAULT`]) and the round form `rounds` —
-/// never their environment knobs. The leaf order and round-0 trees are
+/// ([`crate::block_whir::B3_BASE_GKR_DEFAULT`]), KECCAK_RND's form (its byte
+/// lookups argued per group, [`crate::block_whir::B3_BASE_KECCAK_RND`]) and
+/// the round form `rounds` — never their environment knobs. The leaf order and round-0 trees are
 /// re-checked against the new base.
 pub(crate) fn pin_family(
     mut format: crate::block_whir::BlockFormat,
@@ -1326,6 +1327,7 @@ pub(crate) fn pin_family(
             format.argue = format
                 .argue
                 .with_ladder(crate::block_whir::B3_BASE_GKR_DEFAULT);
+            format.keccak_rnd = crate::block_whir::B3_BASE_KECCAK_RND;
         }
     }
     format.zf.check_leaves()?;
@@ -1393,7 +1395,10 @@ fn verify_block_levels_pinned(
 /// would select another honest configuration than the pinned one —
 /// under the BLAKE3 base its cap height and final polynomial
 /// (`LAMBDA_VM_B3_BASE_CAP`, `LAMBDA_VM_B3_BASE_FINAL`, which the base's
-/// chains and its statement tag read), and under the Poseidon1 base the
+/// chains and its statement tag read) and its local lookups
+/// (`LAMBDA_VM_B3_BASE_LOCAL` off, which the prover's format reads; a word
+/// asking for them is refused under Poseidon1, whose format aborts on it),
+/// and under the Poseidon1 base the
 /// `LFM_HASH` split (`LAMBDA_VM_LFM_HASH_SPLIT`, which every level program's
 /// identity reads). Under BLAKE3 the split is inert: a lean program has no
 /// hash row (pinned by `lean_mux_tests::the_blake3_w_leg_program_is_pinned`
@@ -1414,15 +1419,25 @@ fn check_process_format(family: WlfmFamily) -> Result<(), String> {
         crate::block_whir::b3_base_final_setting,
     )?;
     let hash_split = knob_word(super::chunking::HASH_SPLIT_ENV, hash_split_word)?;
-    let (cap, final_poly, hash_split) = match family {
+    let local = knob_word(
+        crate::block_whir::B3_BASE_LOCAL_ENV,
+        crate::block_whir::b3_base_local_setting,
+    )?;
+    let (cap, final_poly, hash_split, local) = match family {
         WlfmFamily::B3 => (
             crate::block_whir::b3_base_cap(),
             crate::block_whir::b3_base_final(),
             hash_split,
+            crate::block_whir::b3_base_local(),
         ),
-        WlfmFamily::P1 => (cap, final_poly, super::chunking::hash_split_enabled()),
+        WlfmFamily::P1 => (
+            cap,
+            final_poly,
+            super::chunking::hash_split_enabled(),
+            local,
+        ),
     };
-    check_format_knobs(family, cap, final_poly, hash_split)
+    check_format_knobs(family, cap, final_poly, hash_split, local)
 }
 
 /// A knob's word in this process, through its own refusing parser: unset is
@@ -1456,15 +1471,26 @@ pub(crate) fn check_process_format_for_tests(family: WlfmFamily) -> Result<(), S
     check_process_format(family)
 }
 
-/// [`check_process_format`] on given values.
+/// [`check_process_format`] on given values; `local` is the local-lookups
+/// knob's word (`None` unset).
 pub(crate) fn check_format_knobs(
     family: WlfmFamily,
     cap: u8,
     final_poly: multilinear::whir_chain::FinalPoly,
     hash_split: bool,
+    local: Option<bool>,
 ) -> Result<(), String> {
     match family {
         WlfmFamily::B3 => {
+            if local.unwrap_or(crate::block_whir::B3_BASE_LOCAL_DEFAULT)
+                != crate::block_whir::B3_BASE_LOCAL_DEFAULT
+            {
+                return Err(format!(
+                    "{} turns local lookups off: the levels verifier checks the pinned \
+                     KECCAK_RND form, its byte lookups argued per group",
+                    crate::block_whir::B3_BASE_LOCAL_ENV
+                ));
+            }
             let pinned_cap = crate::block_whir::b3_base_cap_setting(None)?;
             if cap != pinned_cap {
                 return Err(format!(
@@ -1483,6 +1509,12 @@ pub(crate) fn check_format_knobs(
             }
         }
         WlfmFamily::P1 => {
+            if local == Some(true) {
+                return Err(format!(
+                    "{} asks for local lookups: they are the BLAKE3 base's alone",
+                    crate::block_whir::B3_BASE_LOCAL_ENV
+                ));
+            }
             if hash_split != super::chunking::HASH_SPLIT_DEFAULT {
                 return Err(format!(
                     "{} asks for another LFM_HASH split: the levels verifier checks the \
