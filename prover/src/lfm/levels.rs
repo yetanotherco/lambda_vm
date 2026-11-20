@@ -159,11 +159,15 @@ pub fn level_plan(
         family,
         prepared_roots,
         super::whir_block::share_inverse(),
+        None,
     )
 }
 
 /// [`level_plan`] with the leaves' share form named (`share_inverse`,
-/// `whir_block::emit_share`) rather than the process's knob.
+/// `whir_block::emit_share`) rather than the process's knob, and the
+/// programs' cap check named (`cap_mux`; `None` reads the process's knob)
+/// before the derivation emits anything.
+#[allow(clippy::too_many_arguments)]
 fn level_plan_with(
     elf: &[u8],
     proof_options: &crate::ProofOptions,
@@ -172,6 +176,7 @@ fn level_plan_with(
     family: WlfmFamily,
     prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
     share_inverse: bool,
+    cap_mux: Option<CapMux>,
 ) -> Result<WhirBlockPlan, String> {
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
@@ -186,6 +191,7 @@ fn level_plan_with(
             prepared_roots,
             super::whir_block::LEAF_P1_CAP,
             share_inverse,
+            cap_mux,
         )?,
         WlfmFamily::B3 => WhirBlockPlan::derive_blake3_with_share(
             elf,
@@ -195,6 +201,7 @@ fn level_plan_with(
             1,
             prepared_roots,
             share_inverse,
+            cap_mux,
         )?,
     };
     check_family(&plan, family)?;
@@ -1249,7 +1256,10 @@ pub fn verify_block_levels(
 /// prepared roots committed on the host, the base's options under the
 /// format's own WHIR format, the leaves' share form `p · (1/q)` — never
 /// `LFM_WHIR_SHARE_INVERSE` — and the named cap check — never
-/// `LAMBDA_VM_LFM_CAP_MUX`.
+/// `LAMBDA_VM_LFM_CAP_MUX`, named before the derivation emits a program. The
+/// format knobs the derivation still reads (the BLAKE3 base's cap and final
+/// polynomial, the `LFM_HASH` split) are refused off their pinned values
+/// ([`check_process_format`]).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_levels_at(
     elf: &[u8],
@@ -1305,6 +1315,11 @@ pub(crate) fn pin_family(
             }
         }
         WlfmFamily::B3 => {
+            if let crate::block_whir::B3Rounds::Whir { shrink, .. } = rounds
+                && !(1..=3).contains(&shrink)
+            {
+                return Err(format!("the round form's shrink is 1 to 3, not {shrink}"));
+            }
             format.zf.base = BaseFormat::B3_WHIR;
             format.group_polys = crate::block_whir::B3_BASE_GROUP_POLYS;
             format.b3_rounds = rounds;
@@ -1322,7 +1337,9 @@ pub(crate) fn pin_family(
 /// The levels verifier's plan under `format`: level 1's plan with its
 /// prepared roots committed on the host (`None`), the base's options under
 /// `format.zf` (never the process's), the share form `p · (1/q)` and the cap
-/// check `cap_mux` — nothing read from the environment.
+/// check `cap_mux`, named before any program is emitted. Neither the share
+/// form nor the cap check is read from the environment; the knobs that
+/// remain are refused by [`check_process_format`] in the public entries.
 pub(crate) fn verifier_level_plan(
     elf: &[u8],
     format: &crate::block_whir::BlockFormat,
@@ -1344,9 +1361,15 @@ fn verifier_level_plan_with(
     family: WlfmFamily,
     cap_mux: CapMux,
 ) -> Result<WhirBlockPlan, String> {
-    Ok(
-        level_plan_with(elf, proof_options, format, statement, family, None, true)?
-            .with_cap_mux(cap_mux),
+    level_plan_with(
+        elf,
+        proof_options,
+        format,
+        statement,
+        family,
+        None,
+        true,
+        Some(cap_mux),
     )
 }
 
@@ -1361,8 +1384,74 @@ fn verify_block_levels_pinned(
     cap_mux: CapMux,
     last: &WlfmProof,
 ) -> Result<(), String> {
+    check_process_format(family)?;
     let plan = verifier_level_plan(elf, format, statement, family, cap_mux)?;
     verify_levels_to(&plan, family, stop, last)
+}
+
+/// One binary, one format: the public entries refuse a process whose knobs
+/// would select another honest configuration than the pinned one —
+/// under the BLAKE3 base its cap height and final polynomial
+/// (`LAMBDA_VM_B3_BASE_CAP`, `LAMBDA_VM_B3_BASE_FINAL`, which the base's
+/// chains and its statement tag read), and under the Poseidon1 base the
+/// `LFM_HASH` split (`LAMBDA_VM_LFM_HASH_SPLIT`, which every level program's
+/// identity reads). Under BLAKE3 the split is inert: a lean program has at
+/// most one hash row, which no split cuts (pinned by
+/// `lean_mux_tests::the_blake3_w_leg_program_is_pinned` and
+/// `levels_tests::the_public_levels_verifier_runs_at_the_pinned_format`).
+fn check_process_format(family: WlfmFamily) -> Result<(), String> {
+    check_format_knobs(
+        family,
+        crate::block_whir::b3_base_cap(),
+        crate::block_whir::b3_base_final(),
+        super::chunking::hash_split_enabled(),
+    )
+}
+
+/// [`check_process_format`], for the tests that run it in a process of
+/// their own.
+#[cfg(test)]
+pub(crate) fn check_process_format_for_tests(family: WlfmFamily) -> Result<(), String> {
+    check_process_format(family)
+}
+
+/// [`check_process_format`] on given values.
+pub(crate) fn check_format_knobs(
+    family: WlfmFamily,
+    cap: u8,
+    final_poly: multilinear::whir_chain::FinalPoly,
+    hash_split: bool,
+) -> Result<(), String> {
+    match family {
+        WlfmFamily::B3 => {
+            let pinned_cap = crate::block_whir::b3_base_cap_setting(None)?;
+            if cap != pinned_cap {
+                return Err(format!(
+                    "{} asks for a cap of height {cap}: the levels verifier checks the pinned \
+                     {pinned_cap}",
+                    crate::block_whir::B3_BASE_CAP_ENV
+                ));
+            }
+            let pinned_final = crate::block_whir::b3_base_final_setting(None)?;
+            if final_poly != pinned_final {
+                return Err(format!(
+                    "{} asks for {final_poly:?}: the levels verifier checks the pinned \
+                     {pinned_final:?}",
+                    crate::block_whir::B3_BASE_FINAL_ENV
+                ));
+            }
+        }
+        WlfmFamily::P1 => {
+            if hash_split != super::chunking::HASH_SPLIT_DEFAULT {
+                return Err(format!(
+                    "{} asks for another LFM_HASH split: the levels verifier checks the \
+                     pinned one",
+                    super::chunking::HASH_SPLIT_ENV
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`verify_block_levels`] under a format and proof options of the caller's:
