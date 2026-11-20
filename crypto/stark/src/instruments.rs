@@ -362,8 +362,15 @@ pub fn take_r1_sub() -> Round1SubOps {
 /// Note: thread local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
 /// for the calling thread. Rayon worker threads are not reset, so stale data is
 /// possible if a previous run panicked without consuming stored values.
-/// In practice this is safe because store/take pairs always execute within the
-/// same rayon task closure.
+///
+/// Each store/take pair must also stay adjacent on one thread, with no rayon
+/// region in between. The CPU table scheduler runs a whole table's task as a
+/// rayon item, so a worker that blocks inside one table's nested parallelism
+/// can run a sibling table's task on top of that frame, consume this thread's
+/// slot, and leave the outer table reporting zeros. Measured with a probe: no
+/// loss while the tables in flight stay under the pool's thread count (the
+/// default `k` does), 7-10 % of them lost once they exceed it — e.g. with
+/// `TABLE_PARALLELISM` raised past the core count.
 pub fn reset_all() {
     R1_MAIN_LDE_US.store(0, Ordering::Relaxed);
     R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
