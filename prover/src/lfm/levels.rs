@@ -1395,17 +1395,58 @@ fn verify_block_levels_pinned(
 /// (`LAMBDA_VM_B3_BASE_CAP`, `LAMBDA_VM_B3_BASE_FINAL`, which the base's
 /// chains and its statement tag read), and under the Poseidon1 base the
 /// `LFM_HASH` split (`LAMBDA_VM_LFM_HASH_SPLIT`, which every level program's
-/// identity reads). Under BLAKE3 the split is inert: a lean program has at
-/// most one hash row, which no split cuts (pinned by
-/// `lean_mux_tests::the_blake3_w_leg_program_is_pinned` and
-/// `levels_tests::the_public_levels_verifier_runs_at_the_pinned_format`).
+/// identity reads). Under BLAKE3 the split is inert: a lean program has no
+/// hash row (pinned by `lean_mux_tests::the_blake3_w_leg_program_is_pinned`
+/// and `levels_tests::the_public_levels_verifier_accepts_at_the_pinned_format`).
+///
+/// Each knob's word is parsed first, from the environment, by the knob's own
+/// refusing parser: a malformed word, under either family, is an `Err` here,
+/// never the abort or panic of the process-wide reader. Only then are the
+/// process-wide cells read — the values the derivation will use — and only
+/// the family's own: a Poseidon1 verification reads no BLAKE3 cell.
 fn check_process_format(family: WlfmFamily) -> Result<(), String> {
-    check_format_knobs(
-        family,
-        crate::block_whir::b3_base_cap(),
-        crate::block_whir::b3_base_final(),
-        super::chunking::hash_split_enabled(),
-    )
+    let cap = knob_word(
+        crate::block_whir::B3_BASE_CAP_ENV,
+        crate::block_whir::b3_base_cap_setting,
+    )?;
+    let final_poly = knob_word(
+        crate::block_whir::B3_BASE_FINAL_ENV,
+        crate::block_whir::b3_base_final_setting,
+    )?;
+    let hash_split = knob_word(super::chunking::HASH_SPLIT_ENV, hash_split_word)?;
+    let (cap, final_poly, hash_split) = match family {
+        WlfmFamily::B3 => (
+            crate::block_whir::b3_base_cap(),
+            crate::block_whir::b3_base_final(),
+            hash_split,
+        ),
+        WlfmFamily::P1 => (cap, final_poly, super::chunking::hash_split_enabled()),
+    };
+    check_format_knobs(family, cap, final_poly, hash_split)
+}
+
+/// A knob's word in this process, through its own refusing parser: unset is
+/// the parser's `None`, and a word that is not Unicode is refused by name.
+fn knob_word<T>(name: &str, parse: fn(Option<&str>) -> Result<T, String>) -> Result<T, String> {
+    match std::env::var(name) {
+        Ok(word) => parse(Some(&word)),
+        Err(std::env::VarError::NotPresent) => parse(None),
+        Err(std::env::VarError::NotUnicode(word)) => Err(format!("{name}={word:?}: not a word")),
+    }
+}
+
+/// `LAMBDA_VM_LFM_HASH_SPLIT`'s word as `chunking::hash_split_setting` reads
+/// it, refused rather than panicked on when it is not `0` or `1`.
+fn hash_split_word(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(super::chunking::HASH_SPLIT_DEFAULT),
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{} must be 0 or 1, got {other:?}",
+            super::chunking::HASH_SPLIT_ENV
+        )),
+    }
 }
 
 /// [`check_process_format`], for the tests that run it in a process of

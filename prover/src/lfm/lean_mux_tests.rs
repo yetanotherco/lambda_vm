@@ -228,14 +228,9 @@ fn the_blake3_w_leg_program_is_pinned() {
         leg.instrs.len()
     );
     assert_eq!(digest, DIGEST, "the BLAKE3 W-leg's program");
-    // The LFM_HASH split is inert on a BLAKE3 leg: it has no hash row a split
-    // could cut, so `LAMBDA_VM_LFM_HASH_SPLIT` moves no BLAKE3 program.
-    let rows = leg.groups.hash.real_rows;
-    assert_eq!(
-        super::chunking::HashChunking::for_rows(rows),
-        super::chunking::HashChunking::unbounded(),
-        "{rows} hash rows a split would cut"
-    );
+    // The LFM_HASH split is inert on a BLAKE3 leg: it has no hash row at all,
+    // so `LAMBDA_VM_LFM_HASH_SPLIT` moves no BLAKE3 program.
+    assert_eq!(leg.groups.hash.real_rows, 0, "a BLAKE3 leg's hash rows");
     // The cap check named by the deriver: the default's own (the same
     // program), and another (another program).
     let named = |mode| {
