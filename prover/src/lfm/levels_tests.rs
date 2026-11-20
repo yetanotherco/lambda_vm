@@ -1404,6 +1404,24 @@ fn rta_one_run(
                 super::wlfm::prepare_par(),
             );
         }
+        let narrow = level.build.narrow_commit_stamps();
+        if !narrow.is_empty() {
+            let gb = |f: &dyn Fn(&super::wlfm::NarrowCommitStamp) -> u64| {
+                narrow.iter().map(f).sum::<u64>() as f64 / 1e9
+            };
+            println!(
+                "RTA LEVEL {} NARROW COMMIT: stacks {} · sent {} · packed ahead {} · words {:.3} GB · crossed \
+                 {:.3} GB · pack {:.4}s · up {:.4}s",
+                k + 1,
+                narrow.len(),
+                narrow.iter().filter(|n| n.sent).count(),
+                narrow.iter().filter(|n| n.packed_ahead).count(),
+                gb(&|n| n.words),
+                gb(&|n| if n.sent { n.packed_bytes } else { 0 }),
+                narrow.iter().map(|n| n.pack_secs).sum::<f64>(),
+                narrow.iter().map(|n| n.upload_secs).sum::<f64>(),
+            );
+        }
         if let Some(st) = t.stamps.get(k) {
             print_level_stamps(&format!("RTA LEVEL {}", k + 1), st);
         }

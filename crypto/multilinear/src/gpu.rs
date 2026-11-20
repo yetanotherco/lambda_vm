@@ -4930,6 +4930,156 @@ where
     upload_columns_on(columns, false)
 }
 
+/// What [`upload_store_columns_narrow`]'s store cost on the host: the packed
+/// bytes that crossed the bus, the seconds packing them took and the seconds
+/// their upload and widen took.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NarrowStore {
+    pub packed_bytes: u64,
+    pub pack_secs: f64,
+    pub upload_secs: f64,
+}
+
+/// A store's columns packed narrow on the host, a run of one height at a time
+/// ([`pack_store`]): what [`upload_packed_store`] sends. A caller that sends
+/// the same columns more than once (a retired prepared stack's commit, then
+/// its opening) keeps it and packs once.
+#[derive(Debug)]
+pub struct PackedStore {
+    runs: Vec<crate::narrow::NarrowColumns>,
+    lens: Vec<usize>,
+    pack_secs: f64,
+}
+
+impl PackedStore {
+    /// The packed bytes that cross the bus.
+    pub fn packed_bytes(&self) -> u64 {
+        self.runs.iter().map(|p| p.data().len() as u64).sum()
+    }
+
+    /// The seconds the pack took.
+    pub fn pack_secs(&self) -> f64 {
+        self.pack_secs
+    }
+
+    /// Whether it packs columns of these heights, in this order: what a caller
+    /// checks before sending it for them.
+    pub fn fits<F: math::field::traits::IsField + 'static>(
+        &self,
+        columns: &[&crate::mle::Mle<F>],
+    ) -> bool {
+        self.lens.len() == columns.len()
+            && self.lens.iter().zip(columns).all(|(&n, c)| n == c.len())
+    }
+}
+
+/// `columns` packed for [`upload_packed_store`]: cut into runs of one height
+/// ([`crate::narrow::store_runs`]), each packed on the host
+/// ([`crate::narrow::NarrowColumns::pack_par`]). `None` unless `F` is
+/// Goldilocks, or for no columns.
+pub fn pack_store<F>(columns: &[&crate::mle::Mle<F>]) -> Option<PackedStore>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    let evals: Vec<&[math::field::element::FieldElement<F>]> =
+        columns.iter().map(|c| c.evals()).collect();
+    pack_store_fields(&evals)
+}
+
+/// [`pack_store`] of columns held as field elements (a prepared stack's
+/// before its commit makes them `Mle`s): the same bytes for the same words.
+pub fn pack_store_fields<F>(
+    columns: &[&[math::field::element::FieldElement<F>]],
+) -> Option<PackedStore>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>()
+        || columns.is_empty()
+    {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw: Vec<&[u64]> = columns
+        .iter()
+        .map(|column| unsafe {
+            core::slice::from_raw_parts(column.as_ptr() as *const u64, column.len())
+        })
+        .collect();
+    let lens: Vec<usize> = raw.iter().map(|c| c.len()).collect();
+    let runs = crate::narrow::store_runs(&lens, crate::narrow::STORE_RUN_CELLS)
+        .into_iter()
+        .map(|run| crate::narrow::NarrowColumns::pack_par(&raw[run]))
+        .collect::<Option<_>>()?;
+    Some(PackedStore {
+        runs,
+        lens,
+        pack_secs: t.elapsed().as_secs_f64(),
+    })
+}
+
+/// A packed store ([`pack_store`]) sent to the card and widened there into
+/// the same words at the same spans, in the same order, as
+/// [`upload_store_columns`] of its columns holds. A refusal is not an argue
+/// device fallback. `None` without a card, under `LAMBDA_VM_NO_GPU_COLUMNS`,
+/// or when the card refuses; the stamp's `pack_secs` is the packed store's.
+#[cfg(feature = "cuda")]
+pub fn upload_packed_store(packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    use math_cuda::columns::TableUpload;
+
+    if columns_disabled() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    let uploads: Vec<TableUpload<'_>> = packed
+        .runs
+        .iter()
+        .map(|p| {
+            TableUpload::Narrow(math_cuda::narrow::NarrowInput::new(
+                p.data(),
+                p.offsets(),
+                p.widths(),
+                p.rows(),
+                p.cols(),
+            ))
+        })
+        .collect();
+    let store = math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?;
+    Some((
+        ResidentColumns(store),
+        NarrowStore {
+            packed_bytes: packed.packed_bytes(),
+            pack_secs: packed.pack_secs,
+            upload_secs: t.elapsed().as_secs_f64(),
+        },
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_packed_store(_packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    None
+}
+
+/// [`upload_store_columns`] across the bus at the bytes the words need:
+/// [`pack_store`] then [`upload_packed_store`], so the store holds the same
+/// words at the same spans, in the same order. A refusal is not an argue
+/// device fallback, as for [`upload_store_columns`]. `None` where that is, or
+/// a run does not pack.
+pub fn upload_store_columns_narrow<F>(
+    columns: &[&crate::mle::Mle<F>],
+) -> Option<(ResidentColumns, NarrowStore)>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    if !cfg!(feature = "cuda") || columns_disabled() {
+        return None;
+    }
+    upload_packed_store(&pack_store(columns)?)
+}
+
 /// Whether `LAMBDA_VM_NO_GPU_COLUMNS` keeps every column store off the card
 /// (read once a process).
 pub fn columns_disabled() -> bool {

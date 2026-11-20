@@ -214,6 +214,23 @@ fn room_bytes_unnoted(
     }
 }
 
+/// What a card commit of a stack laid out as `layout` holds at most, a plan's
+/// number: its room for the turn the commit holds it ([`room_bytes`]; the
+/// columns staged from the host, as a commit with no store stages them), every
+/// polynomial's codeword, and what each keeps of its tree, half a codeword
+/// (the whole tree at the production fold width, the larger of the two
+/// retentions).
+pub fn commit_card_bytes(layout: &StackedLayout, config: &ChainConfig) -> u64 {
+    let turn = if crate::gpu::room_park() {
+        Turn::Commit
+    } else {
+        Turn::Both
+    };
+    let codeword = (1u64 << (layout.n_stack() + config.log_blowup)) * 8;
+    room_bytes_unnoted(layout, config, true, turn)
+        .saturating_add((codeword + codeword / 2).saturating_mul(layout.num_polys() as u64))
+}
+
 /// Where a group's columns sit in a resident store.
 ///
 /// `From(first)` is the contiguous run every group has always been — column `c`

@@ -281,6 +281,26 @@ impl DeviceColumns {
 
     /// [`Self::upload_tables`] as it is with `LAMBDA_VM_CARD_ROWS` off.
     pub(crate) fn upload_tables_today(tables: &[TableUpload<'_>]) -> Option<Self> {
+        Self::upload_tables_on(tables, true)
+    }
+
+    /// [`Self::upload_tables`] for a store off the argue surface, as
+    /// [`Self::upload_store`] is for [`Self::upload`]: a retired prepared
+    /// stack's columns, packed or wide, for its revive and its opening. A
+    /// refused room moves no work to the host, so it is not counted as a
+    /// device fallback, nor its bytes as argue bytes. Records are not a
+    /// store's (`None`).
+    pub fn upload_store_tables(tables: &[TableUpload<'_>]) -> Option<Self> {
+        if tables
+            .iter()
+            .any(|table| matches!(table, TableUpload::Records(_)))
+        {
+            return None;
+        }
+        Self::upload_tables_on(tables, false)
+    }
+
+    fn upload_tables_on(tables: &[TableUpload<'_>], argue: bool) -> Option<Self> {
         let total: usize = tables.iter().map(TableUpload::cells).sum();
         if total == 0
             || tables.iter().any(|table| {
@@ -291,7 +311,9 @@ impl DeviceColumns {
         }
         let be = backend().ok()?;
         let Some(room) = be.reserve(total as u64 * 8) else {
-            crate::device::note_device_fallback();
+            if argue {
+                crate::device::note_device_fallback();
+            }
             return None;
         };
         // The packed bytes (or records) sit on the card only while their
@@ -310,13 +332,17 @@ impl DeviceColumns {
             0 => None,
             bytes => {
                 let Some(promise) = be.reserve(bytes) else {
-                    crate::device::note_device_fallback();
+                    if argue {
+                        crate::device::note_device_fallback();
+                    }
                     return None;
                 };
                 Some(promise)
             }
         };
-        crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
+        if argue {
+            crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
+        }
         let stream = be.next_stream();
         // SAFETY: every element is written by the copies and widens below.
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;

@@ -734,3 +734,103 @@ fn an_opening_handed_the_store_stages_nothing_from_the_host() {
         assert_eq!(staged, [0, 0], "no card, no card opening");
     }
 }
+
+/// The narrow-commit knob's name; it is off by default, and only `1` turns
+/// it on.
+#[test]
+fn the_narrow_commit_knob_is_named_and_off_by_default() {
+    use super::wlfm::{NARROW_COMMIT_ENV, narrow_commit, narrow_commit_word};
+    assert_eq!(NARROW_COMMIT_ENV, "LAMBDA_VM_LEVELS_NARROW_COMMIT");
+    if std::env::var_os(NARROW_COMMIT_ENV).is_none() {
+        assert!(!narrow_commit());
+    }
+    for (word, on) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("on"), false),
+        (Some("1"), true),
+        (Some(" 1 "), true),
+    ] {
+        assert_eq!(narrow_commit_word(word), on, "{word:?}");
+    }
+}
+
+/// ★ Committing the prepared stacks from their columns sent narrow
+/// (`LAMBDA_VM_LEVELS_NARROW_COMMIT`), packed in the level's host part or at
+/// the commit, moves no root and no byte: under both families, every place's
+/// build has the wide build's program identity and proves the held build's
+/// bytes. On a card every card-placed stack's commit sent its store, packed
+/// ahead where the host part packed it; on the host, or without a card,
+/// nothing is packed. The stamps outlive the release of the prover's half,
+/// which the levels' driver makes before its readout.
+#[test]
+fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::wlfm::set_narrow_commit_for_test(None);
+        }
+    }
+    let _restore = UploadOnceRestore;
+    let _narrow = Restore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            for ahead in [false, true] {
+                super::wlfm::set_narrow_commit_for_test(Some(true));
+                let mut pre = super::wlfm::prepare_wlfm(
+                    &program,
+                    super::wlfm_tests::HASHER,
+                    WlfmRate::Two,
+                    WlfmLevers::with_family(family),
+                )
+                .expect("prepares");
+                if ahead {
+                    pre.hold_narrow_packs();
+                }
+                let mut build = pre.commit(place).expect("commits");
+                super::wlfm::set_narrow_commit_for_test(None);
+                assert_eq!(
+                    build.artifacts.program_id, held.artifacts.program_id,
+                    "{family:?} {place:?} {ahead}: the wide build's identity"
+                );
+                let stamps = build.narrow_commit_stamps();
+                if card && place != StackPlace::Host {
+                    assert!(
+                        !stamps.is_empty()
+                            && stamps.iter().all(|n| n.sent
+                                && n.packed_bytes <= n.words
+                                && n.packed_ahead == ahead),
+                        "{family:?} {place:?} {ahead}: every stack's commit sent its store narrow"
+                    );
+                } else {
+                    assert!(
+                        stamps.is_empty(),
+                        "{family:?} {place:?} {ahead}: nothing packed"
+                    );
+                }
+                for once in [false, true] {
+                    let (got, _) =
+                        streamed_once(&program, &build, &arenas, once, Default::default())
+                            .unwrap_or_else(|e| panic!("{family:?} {place:?} {ahead} {once}: {e}"));
+                    assert!(
+                        got == want,
+                        "{family:?} {place:?} {ahead} {once}: the held bytes"
+                    );
+                }
+                build.release_prover_half();
+                assert_eq!(
+                    build.narrow_commit_stamps().len(),
+                    stamps.len(),
+                    "{family:?} {place:?}: the stamps outlive the release"
+                );
+            }
+        }
+    }
+}

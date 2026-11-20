@@ -940,6 +940,10 @@ pub struct WlfmBuild {
     chip_prefixes: Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
     /// The seconds [`Self::hold_chip_prefixes`] took.
     chip_prefix_secs: f64,
+    /// Each prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]), in group
+    /// order, kept apart from the stacks so it outlives
+    /// [`Self::release_prover_half`].
+    narrow_commit: Vec<NarrowCommitStamp>,
 }
 
 /// The prover's prepared stacks, under the build's family.
@@ -973,6 +977,36 @@ struct WlfmPrepared<H: WhirHash> {
     columns: Vec<Mle<F>>,
     roots: Vec<Commitment>,
     hold: PreparedHold<H>,
+    /// Under [`NARROW_COMMIT_ENV`], the stack's commit sent narrow
+    /// ([`NarrowCommitStamp`]).
+    narrow: Option<NarrowCommitStamp>,
+}
+
+/// One prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]): whether its
+/// store went up (`sent`), its words' and packed bytes, and the pack's and
+/// upload's seconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NarrowCommitStamp {
+    /// The bytes were packed in the level's host part, off the commit's path
+    /// ([`WlfmPrebuild::hold_narrow_packs`]).
+    pub packed_ahead: bool,
+    pub sent: bool,
+    pub words: u64,
+    pub packed_bytes: u64,
+    pub pack_secs: f64,
+    pub upload_secs: f64,
+}
+
+/// A commit's narrow store stamped (its packed bytes go with the commit).
+fn narrow_stamp(n: Option<crate::block_whir::NarrowCommit>) -> Option<NarrowCommitStamp> {
+    n.map(|n| NarrowCommitStamp {
+        packed_ahead: n.packed_ahead,
+        sent: n.sent,
+        words: n.words,
+        packed_bytes: n.store.packed_bytes(),
+        pack_secs: n.store.pack_secs(),
+        upload_secs: n.upload_secs,
+    })
 }
 
 enum PreparedHold<H: WhirHash> {
@@ -982,12 +1016,14 @@ enum PreparedHold<H: WhirHash> {
 
 impl<H: WhirHash> WlfmPrepared<H> {
     fn held(p: GroupPrepared<H>) -> Self {
+        let narrow = narrow_stamp(p.packed);
         WlfmPrepared {
             group: p.group,
             tables: p.tables,
             columns: p.columns,
             roots: p.roots,
             hold: PreparedHold::Held(p.commitment),
+            narrow,
         }
     }
 
@@ -1008,12 +1044,14 @@ impl<H: WhirHash> WlfmPrepared<H> {
                 p.group
             ));
         }
+        let narrow = narrow_stamp(p.packed);
         Ok(WlfmPrepared {
             group: p.group,
             tables: p.tables,
             columns: p.columns,
             roots: p.roots,
             hold: PreparedHold::Retired(retired),
+            narrow,
         })
     }
 
@@ -1079,7 +1117,12 @@ fn commit_under<H: WhirHash>(
     stacks
         .into_iter()
         .map(|stack| {
-            let p = commit_group::<H>(stack, config).map_err(|e| format!("{e:?}"))?;
+            let p = if narrow_commit() {
+                crate::block_whir::commit_group_narrow::<H>(stack, config)
+            } else {
+                commit_group::<H>(stack, config)
+            }
+            .map_err(|e| format!("{e:?}"))?;
             match place {
                 StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config),
                 _ => Ok(WlfmPrepared::held(p)),
@@ -1203,6 +1246,14 @@ impl WlfmBuild {
     /// The seconds [`Self::hold_chip_prefixes`] took (0 before it ran).
     pub fn chip_prefix_secs(&self) -> f64 {
         self.chip_prefix_secs
+    }
+
+    /// Each prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]), in group
+    /// order; empty when no stack was committed so. Kept past
+    /// [`Self::release_prover_half`], which the levels' driver calls before
+    /// its readout.
+    pub fn narrow_commit_stamps(&self) -> Vec<NarrowCommitStamp> {
+        self.narrow_commit.clone()
     }
 
     /// The prover's half let go: the prepared stacks (their columns and
@@ -1427,6 +1478,17 @@ impl WlfmPrebuild {
         self.secs
     }
 
+    /// Under [`NARROW_COMMIT_ENV`], each prepared stack's columns packed
+    /// narrow now, in the level's host part (beside the base's phase B, on the
+    /// pool the caller installs), so the commit sends them without packing on
+    /// its path ([`crate::block_whir::GroupStack::pack_narrow`]). The same
+    /// words; nothing for a build with no stacks.
+    pub fn hold_narrow_packs(&mut self) {
+        if let Some(stacks) = self.stacks.as_mut() {
+            stacks.iter_mut().for_each(GroupStack::pack_narrow);
+        }
+    }
+
     /// [`WlfmBuild::hold_chip_prefixes`] before the commit, from the columns
     /// the stacks will commit (the same words, so the same prefixes): a
     /// host's work that need not wait for the card.
@@ -1516,6 +1578,10 @@ impl WlfmPrebuild {
             }
         };
         artifacts.program_id = wlfm_program_id(&artifacts);
+        let narrow_commit = match &committed {
+            WlfmStacks::P1(s) => s.iter().filter_map(|p| p.narrow).collect(),
+            WlfmStacks::B3(s) => s.iter().filter_map(|p| p.narrow).collect(),
+        };
         Ok(WlfmBuild {
             artifacts,
             stacks: committed,
@@ -1524,6 +1590,7 @@ impl WlfmPrebuild {
             released: false,
             chip_prefixes,
             chip_prefix_secs,
+            narrow_commit,
         })
     }
 }
@@ -2909,6 +2976,43 @@ pub fn overlap_resident() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         overlap_resident_word(super::wlfm_knobs::env_word(OVERLAP_RESIDENT_ENV).as_deref())
+    })
+}
+
+/// `LAMBDA_VM_LEVELS_NARROW_COMMIT=1`: a W-LFM build commits each prepared
+/// stack on the card from its columns sent narrow: packed on the host once,
+/// widened on the card into a store, the commit reading the store
+/// ([`crate::block_whir::commit_group_narrow`]), where today the commit copies
+/// the wide columns in. The same roots, so the same proof. Only the W-LFM prover reads it.
+/// Off by default (and for any word but `1`) until its timing gate. Read once
+/// a process.
+pub const NARROW_COMMIT_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_COMMIT";
+
+/// [`NARROW_COMMIT_ENV`]'s word: on only for `1`.
+pub fn narrow_commit_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
+}
+
+thread_local! {
+    /// A test's [`narrow_commit`] on this thread.
+    static NARROW_COMMIT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`narrow_commit`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_narrow_commit_for_test(on: Option<bool>) {
+    NARROW_COMMIT_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`NARROW_COMMIT_ENV`] is on (or this thread's test override).
+pub fn narrow_commit() -> bool {
+    if let Some(on) = NARROW_COMMIT_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        narrow_commit_word(super::wlfm_knobs::env_word(NARROW_COMMIT_ENV).as_deref())
     })
 }
 
