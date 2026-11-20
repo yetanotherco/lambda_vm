@@ -479,6 +479,27 @@ pub(crate) fn preprocessed_mles(
         .collect()
 }
 
+/// The tallest table a monolithic proof may state, in variables: an LDE of at
+/// least twice its rows (blowup ≥ 2) must fit the field's two-adic subgroup.
+pub(crate) const MAX_STATED_TABLE_VARS: u64 =
+    <F as math::field::traits::IsFFTField>::TWO_ADICITY - 1;
+
+/// Refuses a stated table height no domain can hold
+/// ([`MAX_STATED_TABLE_VARS`]): checked before any shift or stack is computed
+/// from the proof's heights.
+pub(crate) fn check_stated_heights(table_num_vars: &[u8]) -> Result<(), Error> {
+    match table_num_vars
+        .iter()
+        .enumerate()
+        .find(|&(_, &n)| u64::from(n) > MAX_STATED_TABLE_VARS)
+    {
+        Some((idx, &n)) => Err(Error::InvalidTableCounts(format!(
+            "table {idx} states 2^{n} rows; a table takes at most 2^{MAX_STATED_TABLE_VARS}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Verifies a proof from [`prove_with_options_and_inputs`].
 pub fn verify_with_options(
     proof: &MultilinearVmProof,
@@ -534,6 +555,10 @@ pub fn verify_with_options(
             proof.table_num_vars.len(),
         )));
     }
+    // The heights are the proof's: refuse any no domain can hold (an LDE of at
+    // least twice the table, inside the field's two-adic subgroup) before a
+    // shift or a stack is computed from one.
+    check_stated_heights(&proof.table_num_vars)?;
 
     // The CPU heights the proof states fix the CPU timestamps and the final PC
     // timestamp; REGISTER's FINI is the halted file of the public output.

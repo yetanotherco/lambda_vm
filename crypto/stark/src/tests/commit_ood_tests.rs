@@ -44,7 +44,7 @@ fn options() -> ProofOptions {
 }
 
 /// The instance proved bound under `faults`, its answers beside it.
-fn prove_bound(faults: Faults) -> (MultiProof<F, E, ()>, Answers) {
+pub(super) fn prove_bound(faults: Faults) -> (MultiProof<F, E, ()>, Answers) {
     let (mut cpu_trace, mut add_trace, mut mul_trace) = super::residency_mode_tests::traces();
     let opts = options();
     let cpu_air = new_cpu_air_with_lookup(&opts);
@@ -69,7 +69,11 @@ fn prove_bound(faults: Faults) -> (MultiProof<F, E, ()>, Answers) {
     .expect("the instance proves")
 }
 
-fn verify_bound(proof: &MultiProof<F, E, ()>, answers: &[Vec<EE>], faults: Faults) -> bool {
+pub(super) fn verify_bound(
+    proof: &MultiProof<F, E, ()>,
+    answers: &[Vec<EE>],
+    faults: Faults,
+) -> bool {
     let opts = options();
     let cpu_air = new_cpu_air_with_lookup(&opts);
     let add_air = new_add_air_with_lookup(&opts);

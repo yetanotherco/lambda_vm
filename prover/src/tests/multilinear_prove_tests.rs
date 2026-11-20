@@ -88,6 +88,32 @@ fn a_restated_table_height_is_rejected() {
     assert!(!verify(&proof, &elf));
 }
 
+/// A stated height no domain can hold — past the field's two-adic subgroup at
+/// any blowup, or one that wraps a shift (64 and more) — is refused by name,
+/// before a shift or a stack is computed from it, in every build.
+#[test]
+fn a_stated_height_past_the_two_adic_subgroup_is_refused_before_use() {
+    let elf = asm_elf_bytes("sub");
+    let honest = prove(&elf);
+    let max = multilinear_prove::MAX_STATED_TABLE_VARS as u8;
+    for at in [0, honest.table_num_vars.len() - 1] {
+        let height = honest.table_num_vars[at];
+        for stated in [max + 1, height.wrapping_add(64), 64, u8::MAX] {
+            let mut proof = honest.clone();
+            proof.table_num_vars[at] = stated;
+            let refused = multilinear_prove::verify_with_options(
+                &proof,
+                &elf,
+                &ProofOptions::default_test_options(),
+            );
+            assert!(
+                matches!(refused, Err(crate::Error::InvalidTableCounts(ref m)) if m.contains("states 2^")),
+                "table {at} at 2^{stated}: {refused:?}"
+            );
+        }
+    }
+}
+
 /// The preprocessed tables are bound to the program, and a forged one is
 /// rejected — the property the proof would otherwise be missing entirely.
 ///
