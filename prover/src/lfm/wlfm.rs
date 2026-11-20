@@ -940,6 +940,10 @@ pub struct WlfmBuild {
     chip_prefixes: Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
     /// The seconds [`Self::hold_chip_prefixes`] took.
     chip_prefix_secs: f64,
+    /// Each prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]), in group
+    /// order, kept apart from the stacks so it outlives
+    /// [`Self::release_prover_half`].
+    narrow_commit: Vec<NarrowCommitStamp>,
 }
 
 /// The prover's prepared stacks, under the build's family.
@@ -1260,12 +1264,11 @@ impl WlfmBuild {
     }
 
     /// Each prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]), in group
-    /// order; empty when no stack was committed so.
+    /// order; empty when no stack was committed so. Kept past
+    /// [`Self::release_prover_half`], which the levels' driver calls before
+    /// its readout.
     pub fn narrow_commit_stamps(&self) -> Vec<NarrowCommitStamp> {
-        match &self.stacks {
-            WlfmStacks::P1(s) => s.iter().filter_map(|p| p.narrow).collect(),
-            WlfmStacks::B3(s) => s.iter().filter_map(|p| p.narrow).collect(),
-        }
+        self.narrow_commit.clone()
     }
 
     /// The prover's half let go: the prepared stacks (their columns and
@@ -1579,6 +1582,10 @@ impl WlfmPrebuild {
             }
         };
         artifacts.program_id = wlfm_program_id(&artifacts);
+        let narrow_commit = match &committed {
+            WlfmStacks::P1(s) => s.iter().filter_map(|p| p.narrow).collect(),
+            WlfmStacks::B3(s) => s.iter().filter_map(|p| p.narrow).collect(),
+        };
         Ok(WlfmBuild {
             artifacts,
             stacks: committed,
@@ -1587,6 +1594,7 @@ impl WlfmPrebuild {
             released: false,
             chip_prefixes,
             chip_prefix_secs,
+            narrow_commit,
         })
     }
 }
