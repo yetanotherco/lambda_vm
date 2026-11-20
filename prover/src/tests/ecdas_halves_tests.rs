@@ -478,6 +478,53 @@ fn real_steps_hold_in_both_forms() {
     assert_both_forms_hold(&steps, "ECREC");
 }
 
+/// Real steps as the finish holds them, a timestamp each.
+fn real_ops() -> Vec<crate::tables::ecdas::EcdasOperation> {
+    steps_for(&k_le(0xABCD))
+        .into_iter()
+        .enumerate()
+        .map(|(i, step)| crate::tables::ecdas::EcdasOperation {
+            timestamp: 1000 + i as u64,
+            step,
+        })
+        .collect()
+}
+
+/// ★ The finish's check of the steps the limb form lays out
+/// (`ecdas::check_halves_rows`): real steps pass; a step whose λ's, xR's or
+/// yR's relation does not hold is refused naming the step, its timestamp and
+/// the relation (one byte of λ, xR or yR moved, each in turn, in the middle
+/// of the list); a deferred ECREC call's row is refused. Without it a broken
+/// step reaches its table as carries the table's constraints refuse, in a
+/// release build silently.
+#[test]
+fn the_limb_forms_step_check_refuses_a_broken_step_by_name() {
+    use crate::tables::ecdas::{EcdasOperation, check_halves_rows};
+    let ops = real_ops();
+    assert!(ops.len() > 8, "{} steps", ops.len());
+    check_halves_rows(&ops).expect("real steps hold");
+    let k = ops.len() / 2;
+    let tampers: [(&str, fn(&mut EcdasStep)); 3] = [
+        ("λ's", |s| s.lambda[5] ^= 1),
+        ("xR's", |s| s.x_r[5] ^= 1),
+        ("yR's", |s| s.y_r[5] ^= 1),
+    ];
+    for (relation, tamper) in tampers {
+        let mut bad = ops.clone();
+        tamper(&mut bad[k].step);
+        let err = check_halves_rows(&bad).expect_err(relation);
+        assert!(
+            err.contains(&format!("ECDAS step {k} (timestamp {})", 1000 + k))
+                && err.contains(&format!("{relation} relation does not hold")),
+            "{relation}: {err}"
+        );
+    }
+    let mut deferred = ops.clone();
+    deferred[k] = EcdasOperation::deferred_ecrec(1000 + k as u64);
+    let err = check_halves_rows(&deferred).expect_err("a deferred row");
+    assert!(err.contains("deferred ECREC"), "{err}");
+}
+
 // =============================================================================
 // The carry bound, computed
 // =============================================================================

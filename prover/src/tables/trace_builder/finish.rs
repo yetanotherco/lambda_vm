@@ -2045,6 +2045,9 @@ impl<'a> FinishPlan<'a> {
         };
         let ecdas_form = skip.ecdas_form;
         let gen_ecdases = || {
+            if ecdas_form == ecdas::EcdasForm::Halves {
+                ecdas::check_halves_rows(ecdas_ops.parts().flatten()).map_err(Error::Prover)?;
+            }
             if skip.ecdas_rows > 0 {
                 return cut_tables(
                     &ecdas_ops,
@@ -2997,6 +3000,9 @@ impl<'a> FinishPlan<'a> {
         drop(ecsm_ops);
         let ecdas_ops = Arc::clone(&shared.ecdas_ops);
         let ecdas_form = skip.ecdas_form;
+        if ecdas_form == ecdas::EcdasForm::Halves {
+            ecdas::check_halves_rows(ecdas_ops.parts().flatten()).map_err(Error::Prover)?;
+        }
         units.extend(cut_units(
             family("ECDAS"),
             &ecdas_ops,
@@ -3907,7 +3913,8 @@ impl<'a> FinishPlan<'a> {
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        emit_streamed_units(self.units(), gate, send, false, None, None)
+        let ecdas_form = self.skip.ecdas_form;
+        emit_streamed_units_ordered(self.units(), gate, send, false, &[], None, None, ecdas_form)
     }
 
     /// [`Self::emit_streamed`], and with `keep` what phase B needs to build
@@ -3925,6 +3932,7 @@ impl<'a> FinishPlan<'a> {
         let last = (slide && self.header.bitwise_last).then_some(0);
         let keccak_rnd_first = slide && self.header.keccak_rnd_first;
         let pages_first = slide && self.header.pages_first;
+        let ecdas_form = self.skip.ecdas_form;
         let (units, regen, side) = match self.units_keeping(keep) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
@@ -3942,7 +3950,7 @@ impl<'a> FinishPlan<'a> {
             }
             _ => Vec::new(),
         };
-        emit_streamed_units_ordered(units, gate, send, slide, &first, last, side)?;
+        emit_streamed_units_ordered(units, gate, send, slide, &first, last, side, ecdas_form)?;
         Ok(regen)
     }
 }
@@ -3962,12 +3970,22 @@ fn emit_streamed_units<'a>(
     last: Option<usize>,
     side: Option<Side<'a>>,
 ) -> Result<(), Error> {
-    emit_streamed_units_ordered(units, gate, send, slide, &[], last, side)
+    emit_streamed_units_ordered(
+        units,
+        gate,
+        send,
+        slide,
+        &[],
+        last,
+        side,
+        ecdas::EcdasForm::Bytes,
+    )
 }
 
 /// [`emit_streamed_units`], sliding with the positions `first` (ascending)
 /// handed on before every other, in their order ([`hand_on_order_first`]).
 /// In waves `first` is ignored: AIR order.
+#[allow(clippy::too_many_arguments)]
 fn emit_streamed_units_ordered<'a>(
     units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
@@ -3976,15 +3994,16 @@ fn emit_streamed_units_ordered<'a>(
     first: &[usize],
     last: Option<usize>,
     side: Option<Side<'a>>,
+    ecdas_form: ecdas::EcdasForm,
 ) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send, first, last, side)
+        emit_units_sliding(units, gate, send, first, last, side, ecdas_form)
     } else {
         if let Some(side) = side {
             side();
         }
-        emit_units(units, gate, send)
+        emit_units(units, gate, send, ecdas_form)
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
@@ -3992,7 +4011,7 @@ fn emit_streamed_units_ordered<'a>(
         if let Some(side) = side {
             side();
         }
-        emit_units(units, gate, send)
+        emit_units(units, gate, send, ecdas_form)
     };
     if let Err(e) = &result {
         gate.stop(&format!("the finish stopped: {e:?}"));
@@ -4001,20 +4020,31 @@ fn emit_streamed_units_ordered<'a>(
 }
 
 /// A table's bytes before it is built: its family's measured bytes a row once
-/// one of the family has been built, eight bytes a cell before.
+/// one of the family has been built, eight bytes a cell before (ECDAS at the
+/// columns of the form it is built in).
 struct Estimates {
     per_row: [Option<f64>; FAMILIES.len()],
+    ecdas_columns: usize,
 }
 
 impl Estimates {
-    fn new() -> Self {
+    fn new(ecdas_form: ecdas::EcdasForm) -> Self {
         Self {
             per_row: [None; FAMILIES.len()],
+            ecdas_columns: ecdas_form.num_columns(),
         }
     }
 
+    /// The columns a table of `family` is estimated at before one is built.
+    fn columns(&self, family: usize) -> usize {
+        if family == self::family("ECDAS") {
+            return self.ecdas_columns;
+        }
+        FAMILIES.get(family).map_or(1, |&(_, columns)| columns)
+    }
+
     fn of(&self, family: usize, rows: usize) -> usize {
-        let wide = FAMILIES.get(family).map_or(1, |&(_, columns)| columns) * 8;
+        let wide = self.columns(family) * 8;
         let a_row = self
             .per_row
             .get(family)
@@ -4039,9 +4069,10 @@ fn emit_units(
     units: Result<Vec<Unit<'_>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    ecdas_form: ecdas::EcdasForm,
 ) -> Result<(), Error> {
     let wave_bytes = (gate.budget() / 2).max(1);
-    let mut estimates = Estimates::new();
+    let mut estimates = Estimates::new(ecdas_form);
     let mut units = units?.into_iter().enumerate().peekable();
     let mut next_table = 0usize;
     while units.peek().is_some() {
@@ -4155,6 +4186,7 @@ fn emit_units_sliding<'a>(
     first: &[usize],
     last: Option<usize>,
     side: Option<Side<'a>>,
+    ecdas_form: ecdas::EcdasForm,
 ) -> Result<(), Error> {
     let units = units?;
     let last_waits = side.is_some();
@@ -4166,7 +4198,7 @@ fn emit_units_sliding<'a>(
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
             });
         }
-        slide_units(units, gate, send, first, last, last_waits)
+        slide_units(units, gate, send, first, last, last_waits, ecdas_form)
     })
 }
 
@@ -4179,9 +4211,10 @@ fn slide_units(
     first: &[usize],
     last: Option<usize>,
     last_waits: bool,
+    ecdas_form: ecdas::EcdasForm,
 ) -> Result<(), Error> {
     let total = units.len();
-    let mut estimates = Estimates::new();
+    let mut estimates = Estimates::new(ecdas_form);
     // Built, not yet handed on, by AIR position (`Some(None)`: a streamed
     // chunk's slot).
     let mut ready: Vec<Option<Option<Table>>> = (0..total).map(|_| None).collect();

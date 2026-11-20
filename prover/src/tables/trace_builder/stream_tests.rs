@@ -1149,6 +1149,7 @@ fn tables_handed_on_first_stream_under_a_one_byte_budget() {
                 &first,
                 Some(0),
                 None,
+                crate::tables::ecdas::EcdasForm::Bytes,
             );
             result.map(|()| (order, most.into_inner()))
         });
@@ -2203,4 +2204,36 @@ fn the_keccak_w_split_is_on_by_default_and_cuts_eight_parts() {
         ),
         vec![0, 2 * KECCAK_W_SPLIT_MIN_ROWS - 1]
     );
+}
+
+/// A table not yet built is estimated at its family's columns, eight bytes a
+/// cell, and ECDAS's at the columns of the form it is built in: the limb
+/// form's 515, the byte form's 521 (the family table lists the byte form's).
+/// Every other family's estimate does not move with the form.
+#[test]
+fn an_ecdas_table_is_estimated_at_its_forms_columns() {
+    use crate::tables::ecdas::{EcdasForm, cols, halves_cols};
+    let ecdas = super::family("ECDAS");
+    let rows = 1 << 10;
+    for (form, columns) in [
+        (EcdasForm::Bytes, cols::NUM_COLUMNS),
+        (EcdasForm::Halves, halves_cols::NUM_COLUMNS),
+    ] {
+        assert_eq!(
+            super::Estimates::new(form).of(ecdas, rows),
+            columns * 8 * rows,
+            "{form:?}"
+        );
+    }
+    assert_ne!(cols::NUM_COLUMNS, halves_cols::NUM_COLUMNS);
+    let (bytes, halves) = (
+        super::Estimates::new(EcdasForm::Bytes),
+        super::Estimates::new(EcdasForm::Halves),
+    );
+    for (f, &(name, columns)) in FAMILIES.iter().enumerate() {
+        if f != ecdas {
+            assert_eq!(bytes.of(f, rows), columns * 8 * rows, "{name}");
+            assert_eq!(halves.of(f, rows), bytes.of(f, rows), "{name}");
+        }
+    }
 }

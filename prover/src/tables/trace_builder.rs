@@ -9840,7 +9840,6 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
-        use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
@@ -9980,8 +9979,10 @@ impl Traces {
         for t in ecsms {
             total += (t.num_rows() * ECSM_COLS) as u64;
         }
+        // ECDAS at its own table's width: the byte form's 521 columns or the
+        // limb form's 515, whichever the table was built in.
         for t in ecdases {
-            total += (t.num_rows() * ECDAS_COLS) as u64;
+            total += (t.num_rows() * t.main_table.width) as u64;
         }
         for t in hints {
             total += (t.num_rows() * HINT_COLS) as u64;

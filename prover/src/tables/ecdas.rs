@@ -1083,6 +1083,9 @@ impl<'a> StepBytes<'a> {
     }
 
     /// The row's carries under [`EcdasForm::Halves`], λ's, xR's and yR's.
+    /// A step whose relations do not hold gets carries its table refuses; the
+    /// finish refuses such a step before any table is built
+    /// ([`check_halves_rows`]).
     pub(crate) fn halves_carries(&self) -> [[i64; HALVES_CARRIES]; 3] {
         self.terms().map(|t| {
             let (carries, exact) = halves_chain(&t);
@@ -1090,6 +1093,52 @@ impl<'a> StepBytes<'a> {
             carries
         })
     }
+
+    /// Why the limb form cannot lay this row out, if it cannot: one of its
+    /// three relations does not hold exactly, or a carry's high part is not a
+    /// byte (its `AreBytes` lookup would count a truncated value).
+    fn halves_problem(&self) -> Option<String> {
+        const RELATIONS: [&str; 3] = ["λ's", "xR's", "yR's"];
+        for (name, terms) in RELATIONS.iter().zip(self.terms()) {
+            let (carries, exact) = halves_chain(&terms);
+            if !exact {
+                return Some(format!("{name} relation does not hold"));
+            }
+            if let Some(&c) = carries
+                .iter()
+                .find(|&&c| !(0..1 << 8).contains(&split_carry(c).1))
+            {
+                return Some(format!("{name} carry {c} is out of range"));
+            }
+        }
+        None
+    }
+}
+
+/// The limb form's check of the steps it is about to lay out
+/// ([`EcdasForm::Halves`]): every step's relations hold exactly and every
+/// carry's high part is a byte. A step that fails would be written as a row
+/// its constraints refuse; the finish refuses it here instead, naming the
+/// step, before any ECDAS table is built. The byte form does not need it.
+pub(crate) fn check_halves_rows<'r, R: EcdasRow + 'r>(
+    rows: impl IntoIterator<Item = &'r R>,
+) -> Result<(), String> {
+    for (k, row) in rows.into_iter().enumerate() {
+        let s = row.step_bytes();
+        if s.op == DEFERRED_ECREC_OP {
+            return Err(format!(
+                "ECDAS step {k} (timestamp {}): a deferred ECREC call's row reached the ECDAS table",
+                s.timestamp
+            ));
+        }
+        if let Some(problem) = s.halves_problem() {
+            return Err(format!(
+                "ECDAS step {k} (timestamp {}) under the limb form: {problem}",
+                s.timestamp
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A row as a builder holds it ([`EcdasOperation`] or [`CompactEcdasOp`]):
