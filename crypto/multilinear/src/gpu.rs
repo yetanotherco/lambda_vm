@@ -4916,7 +4916,7 @@ pub fn upload_columns<F>(columns: &[&crate::mle::Mle<F>]) -> Option<ResidentColu
 where
     F: math::field::traits::IsField + 'static,
 {
-    upload_columns_on(columns, true)
+    upload_columns_on(columns, true, None)
 }
 
 /// [`upload_columns`] for a retired prepared stack's store, read by its revive
@@ -4927,7 +4927,32 @@ pub fn upload_store_columns<F>(columns: &[&crate::mle::Mle<F>]) -> Option<Reside
 where
     F: math::field::traits::IsField + 'static,
 {
-    upload_columns_on(columns, false)
+    upload_columns_on(columns, false, None)
+}
+
+/// [`upload_store_columns`] into a promise taken before (`room`, the
+/// columns' bytes at least): the ledger cannot refuse it here. `None` (the
+/// promise given back) when the room is short or the card fails the copy.
+#[cfg(feature = "cuda")]
+pub fn upload_store_columns_in<F>(
+    columns: &[&crate::mle::Mle<F>],
+    room: DeviceRoom,
+) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    upload_columns_on(columns, false, Some(room))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_store_columns_in<F>(
+    _columns: &[&crate::mle::Mle<F>],
+    _room: DeviceRoom,
+) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
 }
 
 /// What [`upload_store_columns_narrow`]'s store cost on the host: the packed
@@ -5015,6 +5040,34 @@ where
 /// or when the card refuses; the stamp's `pack_secs` is the packed store's.
 #[cfg(feature = "cuda")]
 pub fn upload_packed_store(packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    upload_packed_on(packed, None)
+}
+
+/// [`upload_packed_store`] into a promise taken before (`room`: the words and
+/// the largest run's packed bytes at least, [`crate::narrow::store_staging_bound`]);
+/// the staging's part goes back once the runs are up. `None` (the promise
+/// given back) when the room is short or the card fails the upload.
+#[cfg(feature = "cuda")]
+pub fn upload_packed_store_in(
+    packed: &PackedStore,
+    room: DeviceRoom,
+) -> Option<(ResidentColumns, NarrowStore)> {
+    upload_packed_on(packed, Some(room))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_packed_store_in(
+    _packed: &PackedStore,
+    _room: DeviceRoom,
+) -> Option<(ResidentColumns, NarrowStore)> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn upload_packed_on(
+    packed: &PackedStore,
+    prepaid: Option<DeviceRoom>,
+) -> Option<(ResidentColumns, NarrowStore)> {
     use math_cuda::columns::TableUpload;
 
     if columns_disabled() {
@@ -5034,7 +5087,12 @@ pub fn upload_packed_store(packed: &PackedStore) -> Option<(ResidentColumns, Nar
             ))
         })
         .collect();
-    let store = math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?;
+    let store = match prepaid {
+        None => math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?,
+        Some(DeviceRoom(room)) => {
+            math_cuda::columns::DeviceColumns::upload_store_tables_in(&uploads, room)?
+        }
+    };
     Some((
         ResidentColumns(store),
         NarrowStore {
@@ -5067,6 +5125,21 @@ where
     upload_packed_store(&pack_store(columns)?)
 }
 
+/// [`upload_store_columns_narrow`] into a promise taken before (as
+/// [`upload_packed_store_in`]).
+pub fn upload_store_columns_narrow_in<F>(
+    columns: &[&crate::mle::Mle<F>],
+    room: DeviceRoom,
+) -> Option<(ResidentColumns, NarrowStore)>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    if !cfg!(feature = "cuda") || columns_disabled() {
+        return None;
+    }
+    upload_packed_store_in(&pack_store(columns)?, room)
+}
+
 /// Whether `LAMBDA_VM_NO_GPU_COLUMNS` keeps every column store off the card
 /// (read once a process).
 pub fn columns_disabled() -> bool {
@@ -5075,7 +5148,11 @@ pub fn columns_disabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
-fn upload_columns_on<F>(columns: &[&crate::mle::Mle<F>], argue: bool) -> Option<ResidentColumns>
+fn upload_columns_on<F>(
+    columns: &[&crate::mle::Mle<F>],
+    argue: bool,
+    prepaid: Option<DeviceRoom>,
+) -> Option<ResidentColumns>
 where
     F: math::field::traits::IsField + 'static,
 {
@@ -5094,10 +5171,12 @@ where
             core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
         })
         .collect();
-    if argue {
-        math_cuda::columns::DeviceColumns::upload(&raw).map(ResidentColumns)
-    } else {
-        math_cuda::columns::DeviceColumns::upload_store(&raw).map(ResidentColumns)
+    match (argue, prepaid) {
+        (true, _) => math_cuda::columns::DeviceColumns::upload(&raw).map(ResidentColumns),
+        (false, None) => math_cuda::columns::DeviceColumns::upload_store(&raw).map(ResidentColumns),
+        (false, Some(DeviceRoom(room))) => {
+            math_cuda::columns::DeviceColumns::upload_store_in(&raw, room).map(ResidentColumns)
+        }
     }
 }
 

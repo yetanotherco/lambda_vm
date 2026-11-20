@@ -79,6 +79,49 @@ fn a_narrow_store_holds_the_wide_stores_words_and_its_refusal_is_no_argue_fallba
     );
     drop((wide, narrow));
 
+    // Into a promise taken before: the same words, wide and narrow, and the
+    // ledger keeps exactly the words (the narrow staging's part given back).
+    let staging =
+        multilinear::narrow::store_staging_bound(&lens, multilinear::narrow::STORE_RUN_CELLS);
+    let before = gpu::ledger_reserved();
+    let room = gpu::reserve_room(words).expect("the card promises the words");
+    let wide_in =
+        gpu::upload_store_columns_in(&refs, room).expect("the wide store goes into its promise");
+    assert_eq!(
+        gpu::ledger_reserved() - before,
+        words,
+        "wide: the promise is the words"
+    );
+    assert!(
+        wide_in.download().expect("reads back") == a,
+        "wide into a promise: the same words"
+    );
+    drop(wide_in);
+    assert_eq!(
+        gpu::ledger_reserved(),
+        before,
+        "the store's promise goes with it"
+    );
+    let room = gpu::reserve_room(words + staging).expect("the card promises words and staging");
+    let (narrow_in, _) = gpu::upload_store_columns_narrow_in(&refs, room)
+        .expect("the narrow store goes into its promise");
+    assert_eq!(
+        gpu::ledger_reserved() - before,
+        words,
+        "narrow: the staging's part given back once the runs are up"
+    );
+    assert!(
+        narrow_in.download().expect("reads back") == a,
+        "narrow into a promise: the same words"
+    );
+    drop(narrow_in);
+    let short = gpu::reserve_room(words - 8).expect("a short promise");
+    assert!(
+        gpu::upload_store_columns_in(&refs, short).is_none(),
+        "a promise short of the words takes nothing"
+    );
+    assert_eq!(gpu::ledger_reserved(), before, "every promise given back");
+
     // Room for 1 MiB more than the ledger holds now: the store is refused.
     let budget = gpu::set_reserve_budget(gpu::ledger_reserved() + (1 << 20));
     let before = gpu::argue_device_fallbacks();

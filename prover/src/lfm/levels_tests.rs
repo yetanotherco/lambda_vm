@@ -1831,6 +1831,12 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
                 None => String::new(),
             },
         );
+        if s.store_promised || s.store_promise_refused {
+            println!(
+                "{tag} PROMISE {g}: taken at admission {} · refused {} · spent by the store {}",
+                s.store_promised, s.store_promise_refused, s.upload_once.promised
+            );
+        }
         if s.upload_once.used {
             let u = s.upload_once;
             println!(
