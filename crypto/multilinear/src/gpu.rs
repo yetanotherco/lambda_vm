@@ -4859,6 +4859,88 @@ where
     upload_columns_on(columns, false)
 }
 
+/// What [`upload_store_columns_narrow`]'s store cost on the host: the packed
+/// bytes that crossed the bus, the seconds packing them took and the seconds
+/// their upload and widen took.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NarrowStore {
+    pub packed_bytes: u64,
+    pub pack_secs: f64,
+    pub upload_secs: f64,
+}
+
+/// [`upload_store_columns`] across the bus at the bytes the words need: the
+/// columns cut into runs of one height ([`crate::narrow::store_runs`]), each
+/// run packed on the host ([`crate::narrow::NarrowColumns::pack_par`]) and
+/// widened on the card into its place, so the store holds the same words at
+/// the same spans, in the same order. A refusal is not an argue device
+/// fallback, as for [`upload_store_columns`]. `None` where that is, or a run
+/// does not pack.
+#[cfg(feature = "cuda")]
+pub fn upload_store_columns_narrow<F>(
+    columns: &[&crate::mle::Mle<F>],
+) -> Option<(ResidentColumns, NarrowStore)>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+    use math_cuda::columns::TableUpload;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if columns_disabled() || columns.is_empty() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw: Vec<&[u64]> = columns
+        .iter()
+        .map(|column| unsafe {
+            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+        })
+        .collect();
+    let lens: Vec<usize> = raw.iter().map(|c| c.len()).collect();
+    let runs = crate::narrow::store_runs(&lens, crate::narrow::STORE_RUN_CELLS);
+    let packed: Vec<crate::narrow::NarrowColumns> = runs
+        .into_iter()
+        .map(|run| crate::narrow::NarrowColumns::pack_par(&raw[run]))
+        .collect::<Option<_>>()?;
+    let pack_secs = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let uploads: Vec<TableUpload<'_>> = packed
+        .iter()
+        .map(|p| {
+            TableUpload::Narrow(math_cuda::narrow::NarrowInput::new(
+                p.data(),
+                p.offsets(),
+                p.widths(),
+                p.rows(),
+                p.cols(),
+            ))
+        })
+        .collect();
+    let store = math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?;
+    Some((
+        ResidentColumns(store),
+        NarrowStore {
+            packed_bytes: packed.iter().map(|p| p.data().len() as u64).sum(),
+            pack_secs,
+            upload_secs: t.elapsed().as_secs_f64(),
+        },
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_store_columns_narrow<F>(
+    _columns: &[&crate::mle::Mle<F>],
+) -> Option<(ResidentColumns, NarrowStore)>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 /// Whether `LAMBDA_VM_NO_GPU_COLUMNS` keeps every column store off the card
 /// (read once a process).
 pub fn columns_disabled() -> bool {

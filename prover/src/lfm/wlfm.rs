@@ -2375,6 +2375,7 @@ fn prove_traces_under<H: WhirHash>(
                     .with_phase_b_overlap_planned(overlap_planned())
                     .with_prepared_upload_once(upload_once())
                     .with_overlap_priced_resident(overlap_resident())
+                    .with_prepared_store_narrow(narrow_store())
                     .with_overlap_next_columns_priced(overlap_next_columns())
                     .with_overlap_faults(overlap_faults_for_test())
             })
@@ -2912,6 +2913,42 @@ pub fn overlap_resident() -> bool {
     *ON.get_or_init(|| {
         overlap_resident_word(super::wlfm_knobs::env_word(OVERLAP_RESIDENT_ENV).as_deref())
     })
+}
+
+/// `LAMBDA_VM_LEVELS_NARROW_STORE=1`: under [`UPLOAD_ONCE_ENV`], each retired
+/// prepared stack's store crosses the bus at the bytes its words need: packed
+/// on the host a run of one height at a time and widened on the card into the
+/// same words at the same places
+/// ([`multilinear_block::BlockCommitted::with_prepared_store_narrow`]), where
+/// today it crosses at 8 bytes a cell. The same proof. Only the W-LFM prover
+/// reads it. Off by default (and for any word but `1`) until its timing gate.
+/// Read once a process.
+pub const NARROW_STORE_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_STORE";
+
+/// [`NARROW_STORE_ENV`]'s word: on only for `1`.
+pub fn narrow_store_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
+}
+
+thread_local! {
+    /// A test's [`narrow_store`] on this thread.
+    static NARROW_STORE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`narrow_store`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_narrow_store_for_test(on: Option<bool>) {
+    NARROW_STORE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`NARROW_STORE_ENV`] is on (or this thread's test override).
+pub fn narrow_store() -> bool {
+    if let Some(on) = NARROW_STORE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| narrow_store_word(super::wlfm_knobs::env_word(NARROW_STORE_ENV).as_deref()))
 }
 
 /// `LAMBDA_VM_LEVELS_OVERLAP_NEXT_COLUMNS` (on unless `0`): phase B's planned

@@ -135,6 +135,9 @@ pub fn block_groups(
 /// opening no longer makes), or the plan kept the two copies (`planned_out`,
 /// with what it `need`ed and what the budget had `free`), or the card refused
 /// the store (`refused`). All `false` / 0 without a retired stack or a card.
+/// `upload_secs` is the store's upload; under
+/// [`BlockCommitted::with_prepared_store_narrow`] the store went up `narrow`,
+/// `packed_bytes` crossing the bus after `pack_secs` of packing them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UploadOnce {
     pub used: bool,
@@ -144,6 +147,10 @@ pub struct UploadOnce {
     pub refused: bool,
     pub need: u64,
     pub free: u64,
+    pub upload_secs: f64,
+    pub narrow: bool,
+    pub packed_bytes: u64,
+    pub pack_secs: f64,
 }
 
 /// What a group cost, for the readout. Seconds of wall time on the prover's
@@ -1751,6 +1758,9 @@ where
     /// retired prepared stack's revive over its store
     /// ([`Self::with_overlap_priced_resident`]); `false` unless set.
     overlap_resident: bool,
+    /// Under [`Self::with_prepared_upload_once`], the store goes up narrow
+    /// ([`Self::with_prepared_store_narrow`]); `false` unless set.
+    store_narrow: bool,
     /// The planned overlap prices the next group's columns when they go up at
     /// that group's own turn ([`Self::with_overlap_next_columns_priced`]);
     /// `false` unless set.
@@ -2192,6 +2202,7 @@ where
             overlap_planned: false,
             upload_once: false,
             overlap_resident: false,
+            store_narrow: false,
             overlap_next_columns: false,
             sched: false,
             ood,
@@ -2264,6 +2275,18 @@ where
     /// once it changes nothing. The same proof.
     pub fn with_overlap_priced_resident(mut self, on: bool) -> Self {
         self.overlap_resident = on;
+        self
+    }
+
+    /// Under [`Self::with_prepared_upload_once`], each store crosses the bus
+    /// at the bytes its words need: packed on the host a run of one height at
+    /// a time and widened on the card into the same words at the same places
+    /// (`multilinear::gpu::upload_store_columns_narrow`), instead of at 8 bytes
+    /// a cell (`false`, the default). Its plan adds the largest run's packed
+    /// bytes at most ([`narrow_store_staging`]). Without the upload once it
+    /// changes nothing. The same columns read: the same proof.
+    pub fn with_prepared_store_narrow(mut self, on: bool) -> Self {
+        self.store_narrow = on;
         self
     }
 
@@ -2960,6 +2983,8 @@ where
     upload_once_refused: bool,
     upload_once_margin: u64,
     upload_once_card_refuses: bool,
+    /// Its store goes up narrow ([`BlockCommitted::with_prepared_store_narrow`]).
+    upload_once_narrow: bool,
     /// The planned overlap prices its prepared revive over the upload once's
     /// store ([`BlockCommitted::with_overlap_priced_resident`]).
     overlap_resident: bool,
@@ -3188,6 +3213,17 @@ fn prepared_revive_price(resident: bool, store: u64, over_store: u64, whole: u64
     }
 }
 
+/// What a narrow store adds to its plan ([`store_plan_need`]): the largest
+/// run's packed bytes, at most its words', which sit on the card while that
+/// run widens; nothing for a wide store.
+fn narrow_store_staging(narrow: bool, lens: &[usize]) -> u64 {
+    if narrow {
+        multilinear::narrow::store_staging_bound(lens, multilinear::narrow::STORE_RUN_CELLS)
+    } else {
+        0
+    }
+}
+
 /// What the upload once's store plans to hold: the store, a revive over it,
 /// and a margin.
 fn store_plan_need(store: u64, over_store: u64, margin: u64) -> u64 {
@@ -3229,6 +3265,7 @@ fn upload_once_store<F>(
     refused_by_test: bool,
     margin: u64,
     card_refuses_by_test: bool,
+    narrow: bool,
     upload: &mut UploadOnce,
 ) -> Option<multilinear::gpu::ResidentColumns>
 where
@@ -3246,16 +3283,31 @@ where
         return None;
     }
     let bytes = prepared_store_bytes(columns);
-    upload.need = store_plan_need(bytes, retired.revive_over_store_card_bytes(config), margin);
+    let lens: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    upload.need = store_plan_need(
+        bytes.saturating_add(narrow_store_staging(narrow, &lens)),
+        retired.revive_over_store_card_bytes(config),
+        margin,
+    );
     upload.free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
     if upload.need > upload.free {
         upload.planned_out = true;
         return None;
     }
-    let store = match card_refuses_by_test {
-        true => None,
-        false => multilinear::gpu::upload_store_columns(columns),
+    let t = Instant::now();
+    let store = match (card_refuses_by_test, narrow) {
+        (true, _) => None,
+        (false, false) => multilinear::gpu::upload_store_columns(columns),
+        (false, true) => {
+            multilinear::gpu::upload_store_columns_narrow(columns).map(|(store, stamp)| {
+                upload.narrow = true;
+                upload.packed_bytes = stamp.packed_bytes;
+                upload.pack_secs = stamp.pack_secs;
+                store
+            })
+        }
     };
+    upload.upload_secs = t.elapsed().as_secs_f64();
     match store {
         Some(store) => {
             upload.used = true;
@@ -3448,6 +3500,7 @@ where
                     argued.upload_once_refused,
                     argued.upload_once_margin,
                     argued.upload_once_card_refuses,
+                    argued.upload_once_narrow,
                     &mut upload,
                 ),
                 _ => None,
@@ -3684,6 +3737,7 @@ where
         overlap_planned,
         upload_once,
         overlap_resident,
+        store_narrow,
         overlap_next_columns,
         sched,
         ood,
@@ -4045,6 +4099,7 @@ where
                 .upload_once_margin
                 .unwrap_or(UPLOAD_ONCE_MARGIN_BYTES),
             upload_once_card_refuses: overlap_faults.upload_once_card_refuses_at == Some(p),
+            upload_once_narrow: store_narrow,
             overlap_resident: priced_resident(upload_once, overlap_resident),
         };
         // Under the planned overlap (retired stacks, the overlap otherwise off),
@@ -5386,6 +5441,24 @@ mod upload_once_rule_tests {
         assert!(!super::priced_resident(false, true));
         assert!(!super::priced_resident(true, false));
         assert!(!super::priced_resident(false, false));
+    }
+
+    /// A narrow store's plan adds its largest run's words at 8 bytes (what
+    /// its packed bytes come to at most, on the card while it widens); a wide
+    /// store's adds nothing.
+    #[test]
+    fn a_narrow_stores_plan_holds_its_largest_run_while_it_widens() {
+        let run = multilinear::narrow::STORE_RUN_CELLS;
+        // A short height, then a tall one cut into a full run and a part.
+        let mut lens = vec![1usize << 10; 3];
+        lens.extend(std::iter::repeat_n(run / 4, 6));
+        assert_eq!(super::narrow_store_staging(false, &lens), 0);
+        assert_eq!(super::narrow_store_staging(true, &lens), run as u64 * 8);
+        assert_eq!(
+            super::narrow_store_staging(true, &lens[..3]),
+            3 * (1 << 10) * 8
+        );
+        assert_eq!(super::narrow_store_staging(true, &[]), 0);
     }
 }
 
