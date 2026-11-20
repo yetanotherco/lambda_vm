@@ -214,6 +214,24 @@ fn room_bytes_unnoted(
     }
 }
 
+/// What a card commit of a stack laid out as `layout` holds at most, a plan's
+/// number: its room for the turn the commit holds it ([`room_bytes`]; the
+/// columns staged from the host, as a commit with no store stages them), every
+/// polynomial's codeword, and what each keeps of its tree, half a codeword
+/// (the whole tree at the production fold width, the larger of the two
+/// retentions). A planner's stand-in for a commit whose growth on the ledger
+/// it did not see (one that fell back to the host).
+pub fn commit_card_bytes(layout: &StackedLayout, config: &ChainConfig) -> u64 {
+    let turn = if crate::gpu::room_park() {
+        Turn::Commit
+    } else {
+        Turn::Both
+    };
+    let codeword = (1u64 << (layout.n_stack() + config.log_blowup)) * 8;
+    room_bytes_unnoted(layout, config, true, turn)
+        .saturating_add((codeword + codeword / 2).saturating_mul(layout.num_polys() as u64))
+}
+
 /// Where a group's columns sit in a resident store.
 ///
 /// `From(first)` is the contiguous run every group has always been — column `c`
@@ -1711,6 +1729,34 @@ mod tests {
 
     fn point(num_vars: usize) -> Vec<FE> {
         (0..num_vars).map(|i| FE::from(101 + i as u64)).collect()
+    }
+
+    /// A card commit's plan price holds every polynomial's codeword and half
+    /// of one for its tree, and (with a card) its room on top: more
+    /// polynomials, more bytes.
+    #[test]
+    fn a_commits_card_price_holds_its_codewords_trees_and_room() {
+        let config = config();
+        for (count, num_vars, n_stack) in [(1, 10, 10), (4, 10, 10), (7, 9, 11)] {
+            let (layout, _) = stack_of(count, num_vars, n_stack);
+            let codeword = (1u64 << (layout.n_stack() + config.log_blowup)) * 8;
+            let polys = layout.num_polys() as u64;
+            let price = super::commit_card_bytes(&layout, &config);
+            assert!(
+                price >= polys * (codeword + codeword / 2),
+                "{count} columns: {price}"
+            );
+            // The room is the card's kernels' working set: nothing without one.
+            if cfg!(feature = "cuda") {
+                assert!(
+                    price > polys * (codeword + codeword / 2),
+                    "{count} columns: the room is in it"
+                );
+            }
+        }
+        let (one, _) = stack_of(1, 10, 10);
+        let (four, _) = stack_of(4, 10, 10);
+        assert!(super::commit_card_bytes(&four, &config) > super::commit_card_bytes(&one, &config));
     }
 
     /// `count` columns of one height, and the layout that packs them.

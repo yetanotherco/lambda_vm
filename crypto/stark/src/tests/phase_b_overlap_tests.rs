@@ -1106,3 +1106,28 @@ fn a_streamed_commit_plans_the_batched_commits_argue() {
         "streamed: the batched commit's argue"
     );
 }
+
+/// Phase A stamps every group's card price (at least its codewords) and how
+/// many commits fell back to the host while it committed: without a card,
+/// every commit is a host fallback, so every group counts one or more; with
+/// one, the count is what the planner reads to stand the price in.
+#[test]
+fn phase_a_stamps_each_groups_card_price_and_its_host_fallbacks() {
+    let (proved, _) = prove(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let proved = proved.expect("prove");
+    for (g, s) in stamps(&proved).iter().enumerate() {
+        assert!(s.polys > 0, "group {g}");
+        assert!(s.commit_priced > 0, "group {g}: {s:?}");
+        if multilinear::gpu::reserve_budget() == 0 {
+            assert!(
+                s.commit_host_fallbacks > 0,
+                "group {g}: a card-less commit falls back"
+            );
+        }
+    }
+}
