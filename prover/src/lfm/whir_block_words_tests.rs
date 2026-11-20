@@ -3214,3 +3214,80 @@ fn a_blake3_local_leaf_is_pinned_without_a_proof() {
         );
     }
 }
+
+/// ★ THE STAGE-2 GATE: local lookups' precondition on senders over the WHOLE
+/// local-format AIR set the frame builds, not one chip's list. The static
+/// check holds receivers only, and a local sender of multiplicity −1 is a
+/// receiver on committed values; so every
+/// local sender is a KECCAK_RND table (whose multiplicities the KECCAK_RND
+/// test pins) and every local receiver a LOCAL_BYTES table. With a sender of
+/// a free multiplicity added to LOCAL_BYTES (the test hook), this turns red
+/// where the KECCAK_RND-only test cannot see it. A new local sender (stage 2)
+/// needs its own multiplicity pin before it joins the allowlist.
+#[test]
+fn every_local_sender_of_a_local_air_set_is_keccak_rnd() {
+    use crate::tables::local_bytes::{self, LOCAL_BUSES, cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat {
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..p1_format(MemoryFormat::Split, LeafScale::Fixed)
+    };
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    let rnd: &[(usize, usize)] = &[(1 << 8, 1)];
+    let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+    mix.push(("KECCAK", keccak));
+    mix.push(("KECCAK_RND", rnd));
+    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let offenders = || -> Vec<String> {
+        let frame =
+            crate::block_whir::block_frame(owned.view(), elf, &opts, &format).expect("the frame");
+        let mut out = Vec::new();
+        for air in frame.airs.air_refs() {
+            for i in air
+                .bus_interactions()
+                .iter()
+                .filter(|i| LOCAL_BUSES.contains(&i.bus_id))
+            {
+                let allowed = if i.is_sender {
+                    air.name().starts_with("KECCAK_RND")
+                } else {
+                    air.name().starts_with("LOCAL_BYTES[")
+                };
+                if !allowed {
+                    out.push(format!(
+                        "{} {} on bus {}",
+                        air.name(),
+                        if i.is_sender { "sends" } else { "receives" },
+                        i.bus_id
+                    ));
+                }
+            }
+        }
+        out
+    };
+    assert_eq!(offenders(), Vec::<String>::new(), "today's AIR set");
+    // A LOCAL_BYTES that also SENDS its committed MU columns with a free
+    // multiplicity (a receive of committed values when it is −1).
+    let direct = |column: usize| BusValue::Packed {
+        start_column: column,
+        packing: Packing::Direct,
+    };
+    let mut interactions = local_bytes::bus_interactions();
+    interactions.push(BusInteraction::sender(
+        BusId::LocalAreBytes,
+        Multiplicity::Column(cols::MU_ARE_BYTES),
+        vec![direct(cols::MU_AND), direct(cols::MU_XOR)],
+    ));
+    crate::LOCAL_BYTES_INTERACTIONS_FOR_TEST.with(|c| *c.borrow_mut() = Some(interactions));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(offenders));
+    crate::LOCAL_BYTES_INTERACTIONS_FOR_TEST.with(|c| *c.borrow_mut() = None);
+    let found = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    println!("LOCAL SENDERS (free sender added): {found:?}");
+    assert!(
+        found.iter().any(|f| f.starts_with("LOCAL_BYTES[0] sends")),
+        "a local sender outside KECCAK_RND is named: {found:?}"
+    );
+}
