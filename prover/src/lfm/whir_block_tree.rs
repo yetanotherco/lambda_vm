@@ -602,11 +602,28 @@ impl WhirTreeConfig {
             Ok(word) => with_pack(argue, pack_setting(Some(&word))?)?,
             Err(_) => argue,
         };
+        let production = BlockFormat::production_with(group_setting(
+            std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
+        )?);
+        // KECCAK_RND's form: the knob's, else the production format's — the
+        // pinned preset's (lean) unless the BLAKE3 base argues its byte
+        // lookups per group (`LAMBDA_VM_B3_BASE_LOCAL`), which takes no
+        // other form beside it.
+        let keccak_rnd = match std::env::var("BLOCK_WHIR_KECCAK_RND").ok() {
+            None => production.keccak_rnd,
+            Some(word) if production.local_lookups() => {
+                return Err(format!(
+                    "BLOCK_WHIR_KECCAK_RND={word} beside {}: local lookups fix KECCAK_RND's form",
+                    crate::block_whir::B3_BASE_LOCAL_ENV
+                ));
+            }
+            Some(word) => keccak_rnd_setting(Some(&word))?,
+        };
         let format = BlockFormat {
             argue,
             leaf_scale,
             leaf_query,
-            keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
+            keccak_rnd,
             memw_aligned: memw_aligned_setting(std::env::var("BLOCK_WHIR_MEMW_A").ok().as_deref())?,
             ecdas: ecdas_setting(std::env::var("BLOCK_WHIR_ECDAS").ok().as_deref())?,
             registers: registers_setting(std::env::var("BLOCK_WHIR_REGISTERS").ok().as_deref())?,
@@ -615,9 +632,7 @@ impl WhirTreeConfig {
                 crate::base_only::declared(),
             )?,
             page_run_log2: page_run_setting(std::env::var("BLOCK_WHIR_PAGE_RUN").ok().as_deref())?,
-            ..BlockFormat::production_with(group_setting(
-                std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
-            )?)
+            ..production
         };
         eprintln!(
             "★ BLOCK KECCAK_RND: {} (BLOCK_WHIR_KECCAK_RND; lean drops the 20 byte checks its D \

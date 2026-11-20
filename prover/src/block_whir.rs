@@ -5466,6 +5466,38 @@ pub(crate) fn prove_block_whir_local_with(
     )
 }
 
+/// [`prove_block_whir_observed_led`] under a format that argues local lookups
+/// per group ([`BlockFormat::local_lookups`]): the proof carries every
+/// group's local argue. Refuses any other format.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_block_whir_local_observed_led(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
+) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
+    if !format.local_lookups() {
+        return Err(Error::Prover(
+            "prove_block_whir_local proves a format with local lookups".to_string(),
+        ));
+    }
+    prove_block_whir_inner(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        &Deviations::default(),
+        on_statement,
+        on_group,
+        lead,
+    )
+}
+
 /// What a caller is handed when the statement is final — after phase A,
 /// before phase B: everything the recursion's programs are a function of, and
 /// the prover's own prepared roots by group, in group order.
