@@ -2952,6 +2952,76 @@ fn the_tree_verifier_takes_its_named_page_run() {
     assert!(verifier_plan_at(&off, 2).is_err());
 }
 
+/// The file verifier at every pinned named choice, the word memory format and
+/// `page_run_log2`: through its two hops (`verify_whir_block_tree_proof_at` →
+/// `verify_block_tree_at` → `verifier_presets_at`), as the CLI calls it.
+fn verify_file_at(file: &WhirBlockTreeProof, page_run_log2: u8) -> Result<(), String> {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let pinned = BlockFormat::pinned();
+    verify_whir_block_tree_proof_at(
+        elf,
+        file,
+        pinned.group,
+        crate::zf_format::WhirBlowup::Two,
+        pinned.zf.whir_leaves,
+        pinned.zf.whir_trees,
+        pinned.leaf_scale,
+        pinned.leaf_query,
+        multilinear::whir_chain::GkrPack::PRODUCTION,
+        MemoryFormat::Words,
+        page_run_log2,
+    )
+}
+
+/// ★ The file verifier hands its named page run on, unchanged, through both
+/// hops to the presets: a file whose statement is cut at runs of 4 pages is
+/// refused at runs off and at 8 pages with the frame's own refusal of that cut
+/// (the presets' plan error), and at runs of 4 passes the frame (refused only
+/// by its empty top, which no plan error names); a file cut with runs off
+/// passes the frame at runs off and is refused at 4. A hop that dropped the
+/// run, or set its own, turns one of these red; the presets' own test
+/// (`the_tree_verifier_takes_its_named_page_run`) does not reach the hops.
+#[test]
+fn the_file_verifier_hands_its_page_run_to_the_presets() {
+    let at2 = pinned_statement_at(2, 8);
+    let file = WhirBlockTreeProof::new(at2.clone(), empty_top());
+    for other in [0u8, 3] {
+        let plan = verifier_plan_at(&at2, other)
+            .err()
+            .expect("the presets refuse another cut");
+        let refused = verify_file_at(&file, other).expect_err("refused");
+        assert!(
+            refused.contains(&plan),
+            "at 2^{other}: the file verifier's {refused:?} is not the frame's {plan:?}"
+        );
+    }
+    let cut_refusals: Vec<String> = [0u8, 3]
+        .iter()
+        .map(|&other| verifier_plan_at(&at2, other).err().expect("refused"))
+        .collect();
+    let past = verify_file_at(&file, 2).expect_err("an empty top");
+    assert!(
+        cut_refusals.iter().all(|c| !past.contains(c.as_str())),
+        "at runs of 4 the frame took the cut: {past}"
+    );
+
+    let off = pinned_statement_at(0, 8);
+    let off_file = WhirBlockTreeProof::new(off.clone(), empty_top());
+    let at4 = verifier_plan_at(&off, 2).err().expect("refused at 4");
+    assert!(
+        verify_file_at(&off_file, 2)
+            .expect_err("refused")
+            .contains(&at4),
+        "runs off read at 4"
+    );
+    assert!(
+        !verify_file_at(&off_file, 0)
+            .expect_err("an empty top")
+            .contains(&at4),
+        "runs off read at runs off"
+    );
+}
+
 /// ★ Every table of a plan with page blocks takes its route, and every leaf
 /// emits: a zero block's and a private block's route checks `OFFSET` alone at
 /// the block's height, a page of data's PAGE_W's five columns; the leaves
