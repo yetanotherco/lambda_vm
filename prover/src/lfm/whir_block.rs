@@ -811,6 +811,22 @@ macro_rules! local_fault {
     }};
 }
 
+/// Whether a local group's fork absorbs its local state right after the
+/// group index: always, but under a test's mutant.
+fn local_state_first() -> bool {
+    #[cfg(test)]
+    {
+        !matches!(
+            local_faults::get(),
+            local_faults::Fault::NoLocalState | local_faults::Fault::LocalStateLast
+        )
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 /// A plan's local lookups: the format's local buses
 /// (`tables::local_bytes::LOCAL_BUSES`) and every table's digest
 /// (`stark::multilinear_block::table_digest`), in the proof's table order —
@@ -3471,7 +3487,7 @@ fn emit_leaf_over(
         fork.absorb_const_bytes(&(g as u64).to_le_bytes());
         // The local argue's state, before anything else on the fork: it binds
         // the local argue into the group's global one.
-        let state_first = !local_fault!(NoLocalState) && !local_fault!(LocalStateLast);
+        let state_first = local_state_first();
         if let Some(local) = &local
             && state_first
         {

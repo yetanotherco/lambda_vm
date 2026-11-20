@@ -387,7 +387,7 @@ pub(crate) fn emit_preprocessed_leg_at(
                 "BITWISE's columns are covered by the closed form, not by an opening"
             );
             let targets = preprocessed_targets(slot_of, shape.kinds, NUM_PRECOMPUTED_COLS);
-            let values = emit_bitwise_preprocessed(b, &verdict.point);
+            let values = emit_bitwise_preprocessed(b, verdict.point);
             for (value, &target) in values.iter().zip(&targets) {
                 b.assert_eq_ext(*value, verdict.column_values[target]);
             }
@@ -406,12 +406,12 @@ pub(crate) fn emit_preprocessed_leg_at(
                 1usize << verdict.point.len(),
                 "OFFSET must have one entry per row of its table"
             );
-            let ramp = super::preprocessed::emit_offset_ramp(b, &verdict.point);
+            let ramp = super::preprocessed::emit_offset_ramp(b, verdict.point);
             b.assert_eq_ext(ramp, verdict.column_values[targets[0]]);
             if !init.is_empty() {
                 // Each INIT column against its own claimed value, in the
                 // table's preprocessed order after OFFSET.
-                let values = super::preprocessed::emit_sparse_mle_at(b, init, &verdict.point);
+                let values = super::preprocessed::emit_sparse_mle_at(b, init, verdict.point);
                 for (value, &target) in values.iter().zip(&targets[1..]) {
                     b.assert_eq_ext(*value, verdict.column_values[target]);
                 }
@@ -433,7 +433,7 @@ pub(crate) fn emit_preprocessed_leg_at(
                 shape.kinds,
                 crate::tables::cpu::NUM_PRECOMPUTED_COLS,
             );
-            let timestamp = super::preprocessed::emit_timestamp_ramp(b, &verdict.point);
+            let timestamp = super::preprocessed::emit_timestamp_ramp(b, verdict.point);
             b.assert_eq_ext(timestamp, verdict.column_values[targets[0]]);
             return;
         }
@@ -453,7 +453,7 @@ pub(crate) fn emit_preprocessed_leg_at(
         return;
     }
     let targets = preprocessed_targets(slot_of, shape.kinds, columns.len());
-    let values = emit_const_mle_at(b, remaining, &verdict.point);
+    let values = emit_const_mle_at(b, remaining, verdict.point);
     for (value, &target) in values.iter().zip(&targets[plan.settled..]) {
         b.assert_eq_ext(*value, verdict.column_values[target]);
     }
