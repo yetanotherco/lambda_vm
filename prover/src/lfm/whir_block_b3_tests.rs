@@ -86,9 +86,9 @@ fn b3_plan(
 }
 
 /// Leaf `k` executed over `proof`'s arena: its published words, or why not.
-fn run_leaf(
+fn run_leaf<L: crate::block_whir::LocalPart>(
     plan: &WhirBlockPlan,
-    proof: &BlockWhirProof,
+    proof: &BlockWhirProof<L>,
     k: usize,
 ) -> Result<Vec<LfmWord>, String> {
     let program = plan.leaf_program(k)?;
@@ -364,20 +364,48 @@ fn blake3_level0_census_on_a_real_block() {
     assert_eq!(cfg.format.zf.base, BaseFormat::B3_WHIR);
     let opts = super::proof::block_base_options();
     let t = std::time::Instant::now();
-    let proof = crate::base_only::with_permit(|| {
-        crate::block_whir::prove_block_whir_observed_led(
-            &elf,
-            &input,
-            &opts,
-            &cfg.format,
-            &cfg.options,
-            &|_, _| {},
-            &|_| {},
-            None,
-        )
-        .expect("the BLAKE3 base proves")
-        .0
+    // Under local lookups (`LAMBDA_VM_B3_BASE_LOCAL=keccak`) the base is a
+    // proof of its own kind: either kind is held as one type.
+    let proof: crate::block_whir::AnyBlockWhirProof = crate::base_only::with_permit(|| {
+        if cfg.format.local_lookups() {
+            let mut proof = crate::block_whir::prove_block_whir_local_observed_led(
+                &elf,
+                &input,
+                &opts,
+                &cfg.format,
+                &cfg.options,
+                &|_, _| {},
+                &|_| {},
+                None,
+            )
+            .expect("the BLAKE3 base proves")
+            .0;
+            let local = std::mem::take(&mut proof.local);
+            proof.with_local(Some(local))
+        } else {
+            crate::block_whir::prove_block_whir_observed_led(
+                &elf,
+                &input,
+                &opts,
+                &cfg.format,
+                &cfg.options,
+                &|_, _| {},
+                &|_| {},
+                None,
+            )
+            .expect("the BLAKE3 base proves")
+            .0
+            .with_local(None)
+        }
     });
+    println!(
+        "B3 CENSUS FORMAT: local lookups {} · local groups {}",
+        cfg.format.local_lookups(),
+        proof
+            .local
+            .as_ref()
+            .map_or(0, |argues| argues.iter().filter(|a| !a.is_empty()).count())
+    );
     let prove_secs = t.elapsed().as_secs_f64();
     let (host, one_copy, per_point) = multilinear::whir_chain::final_message_reads();
     println!("B3 CENSUS FINAL READS: one-copy {one_copy} · host {host} · per-point {per_point}");
@@ -560,7 +588,11 @@ fn blake3_level0_census_on_a_real_block() {
 /// Whether leaf `k` has no execution over `proof`: its arena is refused as
 /// laid out, or the executor refuses it (a length the program does not
 /// declare included).
-fn leaf_refuses(plan: &WhirBlockPlan, proof: &BlockWhirProof, k: usize) -> bool {
+fn leaf_refuses<L: crate::block_whir::LocalPart>(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof<L>,
+    k: usize,
+) -> bool {
     let program = plan.leaf_program(k).expect("the leaf emits");
     match block_leaf_arena(plan, proof, k) {
         Err(_) => true,
