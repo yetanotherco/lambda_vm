@@ -1047,7 +1047,7 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
     let mut out = String::new();
     for (g, s) in &local {
         let l = &s.zc_lane;
-        let bins = if l.local { l.bins } else { s.local_b.len() };
+        let bins = local_bins(s);
         out.push_str(&format!(
             "BLOCK LOCAL LANE: group {g} · {} · bins {} of {bins} in phase A · lane {:.3}s · \
              store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}]\n",
@@ -1082,11 +1082,7 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
         local.iter().map(|(_, s)| s.zc_lane.bins_ran).sum::<usize>(),
         local
             .iter()
-            .map(|(_, s)| if s.zc_lane.local {
-                s.zc_lane.bins
-            } else {
-                s.local_b.len()
-            })
+            .map(|(_, s)| local_bins(s))
             .sum::<usize>(),
         count(LaneState::Ran),
         count(LaneState::Deferred(LaneDefer::Hold)),
@@ -1109,6 +1105,15 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
         stamps.iter().map(|s| s.zc_lane.close_wait).fold(0.0, f64::max),
     ));
     out
+}
+
+/// A local group's bins: those run on the lane and those run in phase B (a
+/// job refused before its prover was made knows no plan of its own).
+fn local_bins(stamps: &GroupStamps) -> usize {
+    stamps
+        .zc_lane
+        .bins
+        .max(stamps.zc_lane.bins_ran + stamps.local_b.len())
 }
 
 /// A group's ladders' hidden credit: its phase-B bins' own seconds over the
