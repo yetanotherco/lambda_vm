@@ -502,6 +502,80 @@ fn a_streamed_groups_add_back_is_what_the_batched_commit_held() {
     }
 }
 
+/// Restores the ledger's budget when dropped.
+struct Budget(u64);
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        gpu::set_reserve_budget(self.0);
+    }
+}
+
+/// A streamed run keeps its codeword's promise between two steps: with the
+/// budget at the streamed commit's own peak plus half a codeword, another
+/// caller asking for a codeword between two steps
+/// (`gpu::arm_streamed_gap_probe`) is refused every time, and the run streams
+/// on the card with the host's roots, no host commit. Were the promise let go
+/// with the codeword's values, the other caller would take that room, the next
+/// encode would be refused and the run would fall off the card.
+#[test]
+fn a_streamed_run_keeps_its_codewords_room_between_steps() {
+    let _serial = serial();
+    let cfg = config(Round0Trees::One);
+    let stack = Stack::new("a run of four", &[18; 4], 18);
+    let codeword = (1u64 << (18 + cfg.log_blowup)) * 8;
+    let (host_roots, _) = stack.on_the_host(&cfg);
+    let refs: Vec<&Mle<F>> = stack.columns.iter().collect();
+    let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+    let _on = gpu::force_streamed_joint_leaves(true);
+    let commit = || {
+        StackedCommitment::<F, H>::commit_to_retire(
+            stack.layout.clone(),
+            &borrow(&stack.columns),
+            Some((&store, ColumnsAt::From(0))),
+            &cfg,
+            &|| {},
+        )
+        .unwrap()
+        .roots()
+    };
+    // The streamed commit's own peak, on a roomy ledger.
+    gpu::reset_reserved_window();
+    let base = gpu::ledger_reserved();
+    let streamed = gpu::joint_streamed_builds();
+    assert_eq!(commit(), host_roots, "roots");
+    assert_eq!(gpu::joint_streamed_builds(), streamed + 1, "streamed");
+    let peak = gpu::reserved_window_peak().saturating_sub(base);
+    assert!(
+        peak >= codeword,
+        "the commit promised {peak} B: no ledger budget"
+    );
+    // Now the budget leaves half a codeword beside that peak.
+    let held = gpu::ledger_reserved();
+    let _budget = Budget(gpu::set_reserve_budget(held + peak + codeword / 2));
+    let probe = gpu::arm_streamed_gap_probe(codeword);
+    let (streamed, fallbacks) = (gpu::joint_streamed_builds(), gpu::host_fallbacks());
+    let roots = commit();
+    let (taken, refused) = probe.outcomes();
+    eprintln!(
+        "STREAMED GAP: a run of four at 2^18 (a codeword {:.1} MiB, the commit's peak {:.1} MiB, \
+         budget {:.1} MiB free beside it): the other caller was granted {taken} and refused {refused} \
+         time(s) between steps",
+        codeword as f64 / (1u64 << 20) as f64,
+        peak as f64 / (1u64 << 20) as f64,
+        (codeword / 2) as f64 / (1u64 << 20) as f64,
+    );
+    assert_eq!(taken, 0, "another caller took the room between two steps");
+    assert_eq!(refused, 3, "asked at each of the three gaps");
+    assert_eq!(
+        gpu::joint_streamed_builds(),
+        streamed + 1,
+        "the run streamed on the card"
+    );
+    assert_eq!(gpu::host_fallbacks(), fallbacks, "no host commit");
+    assert_eq!(roots, host_roots, "roots");
+}
+
 /// A card that declines after the first codeword (the encode of codeword 1,
 /// 2 or 3 of a run of four refused): the partial tree is let go, nothing is
 /// streamed, the batched commit runs on the card (no host commit), and the

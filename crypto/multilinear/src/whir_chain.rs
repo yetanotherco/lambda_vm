@@ -2081,11 +2081,20 @@ where
     let first = config.schedule(num_vars).first().copied().unwrap_or(0);
     let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
     let leaves = config.format.leaves;
-    let encode_one = |f: &Stacked<'_, F>| match &f.resident {
-        Some((store, parts)) => {
-            crate::gpu::encode_resident(store, parts, num_vars, config.log_blowup, transient)
-        }
-        None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient),
+    // `carried`: the promise of the streamed run's codeword before this one
+    // (`crate::gpu::commit_joint_streamed`); none for a batched encode.
+    let encode_one = |f: &Stacked<'_, F>, carried: Option<crate::gpu::CarriedRoom>| match &f
+        .resident
+    {
+        Some((store, parts)) => crate::gpu::encode_resident(
+            store,
+            parts,
+            num_vars,
+            config.log_blowup,
+            transient,
+            carried,
+        ),
+        None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient, carried),
     };
     // One codeword at a time into the joint leaves, when asked: the commit
     // holds one of the run's codewords, not all of them. The same tree; the
@@ -2100,7 +2109,7 @@ where
             first,
             H::DEVICE,
             leaves,
-            |k| polys.get(k).and_then(encode_one),
+            |k, carried| polys.get(k).and_then(|f| encode_one(f, carried)),
         )
     {
         let commitment = CodewordCommitment::from_device_joint_streamed(
@@ -2119,7 +2128,7 @@ where
     }
     let mut on_card = Vec::with_capacity(polys.len());
     for f in polys {
-        let encoded = encode_one(f);
+        let encoded = encode_one(f, None);
         match encoded {
             // One encode at a time ([`crate::gpu::serial_encodes`]): its
             // coefficient buffer and scratch go back to the pool before the
@@ -2222,9 +2231,9 @@ where
     let num_vars = f.num_vars();
     let attempt = match &f.resident {
         Some((store, parts)) => {
-            crate::gpu::encode_resident(store, parts, num_vars, config.log_blowup, transient)
+            crate::gpu::encode_resident(store, parts, num_vars, config.log_blowup, transient, None)
         }
-        None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient),
+        None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient, None),
     };
     match attempt {
         Some(codeword) => {
