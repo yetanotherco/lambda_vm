@@ -975,6 +975,7 @@ impl WhirBlockPlan {
     /// [`Self::derive_blake3`] with the leaves' share form named
     /// (`share_inverse`, [`emit_share`]) rather than the process's knob: the
     /// pinned levels verifier's derivation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn derive_blake3_with_share(
         elf_bytes: &[u8],
         proof_options: &crate::ProofOptions,
