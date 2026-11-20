@@ -1911,6 +1911,7 @@ pub fn encode_codeword_slices(
         },
         log_blowup,
         transient,
+        None,
     )
 }
 
@@ -1948,7 +1949,7 @@ fn commit_from(
         (1usize << log_n) >> log_folding >= 2,
         "tree needs at least two leaves"
     );
-    let mut codeword = encode_from(source, log_blowup, transient)?;
+    let mut codeword = encode_from(source, log_blowup, transient, None)?;
     codeword.placement = placement;
     let root = codeword.commit(log_folding, hash)?;
     Ok((codeword, root))
@@ -1967,6 +1968,20 @@ pub fn encode_codeword_resident(
     log_blowup: usize,
     transient: bool,
 ) -> Result<DeviceCodeword> {
+    encode_codeword_resident_carrying(store, parts, log_evals, log_blowup, transient, None)
+}
+
+/// [`encode_codeword_resident`] under a promise carried over from the codeword
+/// before it (`carried`, [`commit_joint_streamed`]'s): used as this codeword's
+/// when it is the same size, else given back first.
+pub fn encode_codeword_resident_carrying(
+    store: &crate::columns::DeviceColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+    carried: Option<crate::device::DeviceReservation>,
+) -> Result<DeviceCodeword> {
     encode_from(
         Source::Resident {
             store,
@@ -1975,6 +1990,7 @@ pub fn encode_codeword_resident(
         },
         log_blowup,
         transient,
+        carried,
     )
 }
 
@@ -1985,7 +2001,24 @@ pub fn encode_codeword_parts(
     log_blowup: usize,
     transient: bool,
 ) -> Result<DeviceCodeword> {
-    encode_from(Source::Parts { parts, log_evals }, log_blowup, transient)
+    encode_codeword_parts_carrying(parts, log_evals, log_blowup, transient, None)
+}
+
+/// [`encode_codeword_parts`] under a carried promise, as
+/// [`encode_codeword_resident_carrying`].
+pub fn encode_codeword_parts_carrying(
+    parts: &[(&[u64], usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+    carried: Option<crate::device::DeviceReservation>,
+) -> Result<DeviceCodeword> {
+    encode_from(
+        Source::Parts { parts, log_evals },
+        log_blowup,
+        transient,
+        carried,
+    )
 }
 
 /// What an encode promises the ledger, in codewords of its own length: its
@@ -1997,7 +2030,12 @@ pub const fn codeword_promise(transient: bool) -> u64 {
 
 /// The Reed–Solomon codeword of `source`, on the card, reserved like a
 /// commit's: the codeword, plus its working set when `transient`.
-fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result<DeviceCodeword> {
+fn encode_from(
+    source: Source<'_>,
+    log_blowup: usize,
+    transient: bool,
+    carried: Option<crate::device::DeviceReservation>,
+) -> Result<DeviceCodeword> {
     let log_evals = source.log_evals();
     let log_n = log_evals + log_blowup as u64;
     let n = 1usize << log_n;
@@ -2014,11 +2052,21 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
     // at a time. A caller committing a group of polynomials promises that once
     // for all of them and passes `transient: false`; one committing alone
     // promises it here.
-    let promise = codeword_promise(transient);
-    let Some(room) = be.reserve(n as u64 * 8 * promise) else {
-        return Err(cudarc::driver::DriverError(
-            cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
-        ));
+    //
+    // A promise `carried` over from the codeword before this one (a streamed
+    // joint commit's, [`commit_joint_streamed`]) is this codeword's when it is
+    // the same size: nothing is asked of the ledger, so no other caller can
+    // take the room between the two. Any other carried promise goes back
+    // before this one is asked for.
+    let bytes = n as u64 * 8 * codeword_promise(transient);
+    let room = match carried {
+        Some(room) if room.bytes() == bytes => room,
+        other => {
+            drop(other);
+            be.reserve(bytes).ok_or(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            ))?
+        }
     };
     let stream = be.next_stream();
 
@@ -3387,12 +3435,157 @@ pub fn joint_streamed_builds() -> u64 {
     JOINT_STREAMED_BUILDS.load(Ordering::Relaxed)
 }
 
+/// The order of [`commit_joint_streamed`]'s steps, over any codeword `C` and
+/// promise `R`: codeword `k` of `blocks` comes from `encode(k, carried)`,
+/// `absorb` reads it, and before codeword `k + 1` is encoded `let_go` frees
+/// its values and hands back its promise, which is `carried` into that encode.
+/// The last codeword goes whole (values and promise) after its step, and an
+/// error at any step drops what is held, promise included.
+pub(crate) fn stream_codewords<C, R, E>(
+    blocks: usize,
+    mut encode: impl FnMut(usize, Option<R>) -> std::result::Result<C, E>,
+    mut absorb: impl FnMut(usize, &C) -> std::result::Result<(), E>,
+    mut let_go: impl FnMut(C) -> Option<R>,
+) -> std::result::Result<(), E> {
+    let mut carried = None;
+    for k in 0..blocks {
+        let codeword = encode(k, carried.take())?;
+        absorb(k, &codeword)?;
+        carried = if k + 1 < blocks {
+            let_go(codeword)
+        } else {
+            drop(codeword);
+            None
+        };
+    }
+    Ok(())
+}
+
+/// A codeword's values freed and its promise handed back
+/// ([`stream_codewords`]' `let_go`): `None` when another holder shares the
+/// promise (a fold or a clone), which then lives on with it.
+fn codeword_promise_of(codeword: DeviceCodeword) -> Option<crate::device::DeviceReservation> {
+    let DeviceCodeword { buffer, room, .. } = codeword;
+    drop(buffer);
+    Arc::try_unwrap(room).ok()
+}
+
+#[cfg(test)]
+mod stream_codewords_tests {
+    use super::stream_codewords;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A promise on a fake ledger: counted while it lives.
+    struct Promise(Rc<RefCell<Ledger>>);
+
+    #[derive(Default)]
+    struct Ledger {
+        held: usize,
+        asked: usize,
+        /// Promises held when each encode ran, before it asked for its own.
+        at_encode: Vec<usize>,
+    }
+
+    impl Promise {
+        fn new(ledger: &Rc<RefCell<Ledger>>) -> Self {
+            let mut l = ledger.borrow_mut();
+            l.held += 1;
+            l.asked += 1;
+            Self(Rc::clone(ledger))
+        }
+    }
+
+    impl Drop for Promise {
+        fn drop(&mut self) {
+            self.0.borrow_mut().held -= 1;
+        }
+    }
+
+    /// A codeword: its promise.
+    struct Codeword(Promise);
+
+    /// Runs the loop over `blocks` codewords whose encode takes the carried
+    /// promise when one comes, and fails at step `fail_at`.
+    fn run(blocks: usize, fail_at: Option<usize>) -> (Result<(), ()>, Rc<RefCell<Ledger>>) {
+        let ledger = Rc::new(RefCell::new(Ledger::default()));
+        let result = stream_codewords(
+            blocks,
+            |_, carried: Option<Promise>| {
+                let held = ledger.borrow().held;
+                ledger.borrow_mut().at_encode.push(held);
+                Ok(Codeword(carried.unwrap_or_else(|| Promise::new(&ledger))))
+            },
+            |k, _: &Codeword| if Some(k) == fail_at { Err(()) } else { Ok(()) },
+            |Codeword(promise)| Some(promise),
+        );
+        (result, ledger)
+    }
+
+    /// From the first encode to the last step the run holds one codeword's
+    /// promise, never none: each encode after the first finds the previous
+    /// codeword's promise still held and takes it, so the ledger is asked
+    /// once a run. After the last step nothing is held.
+    #[test]
+    fn a_streamed_run_holds_one_promise_from_its_first_encode_to_its_last_step() {
+        for blocks in 2..=4 {
+            let (result, ledger) = run(blocks, None);
+            assert!(result.is_ok());
+            let l = ledger.borrow();
+            let mut expected = vec![1; blocks];
+            expected[0] = 0;
+            assert_eq!(l.at_encode, expected, "{blocks}: held at each encode");
+            assert_eq!(l.asked, 1, "{blocks}: one promise asked for");
+            assert_eq!(l.held, 0, "{blocks}: nothing held after the last step");
+        }
+    }
+
+    /// A step that fails gives the held promise back.
+    #[test]
+    fn a_failed_step_gives_its_promise_back() {
+        for fail_at in 0..4 {
+            let (result, ledger) = run(4, Some(fail_at));
+            assert!(result.is_err());
+            assert_eq!(ledger.borrow().held, 0, "failed at {fail_at}");
+            assert_eq!(ledger.borrow().at_encode.len(), fail_at + 1);
+        }
+    }
+
+    /// A promise `let_go` cannot hand back (shared) is not carried: the next
+    /// encode asks for its own.
+    #[test]
+    fn a_promise_not_handed_back_is_not_carried() {
+        let ledger = Rc::new(RefCell::new(Ledger::default()));
+        let mut kept = Vec::new();
+        let result: Result<(), ()> = stream_codewords(
+            3,
+            |_, carried: Option<Promise>| {
+                assert!(carried.is_none());
+                Ok(Codeword(Promise::new(&ledger)))
+            },
+            |_, _: &Codeword| Ok(()),
+            |codeword| {
+                kept.push(codeword);
+                None
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(ledger.borrow().asked, 3);
+        drop(kept);
+        assert_eq!(ledger.borrow().held, 0);
+    }
+}
+
 /// [`commit_joint`] one codeword at a time, under 7-round BLAKE3: codeword
 /// `k` of the run's `blocks` (2–4, each `elements` base values) comes from
-/// `encode(k)` (`None`: the encode declined, and so does this), is absorbed into every leaf's chain
-/// (`b3w_leaves_base_coset_joint_step`, the chain kept in the leaf's node
-/// slot) and is let go before codeword `k + 1` is encoded; then the inner
-/// levels. The same tree and root as [`commit_joint`] over the same codewords,
+/// `encode(k, carried)` (`None`: the encode declined, and so does this), is
+/// absorbed into every leaf's chain (`b3w_leaves_base_coset_joint_step`, the
+/// chain kept in the leaf's node slot) and is let go before codeword `k + 1`
+/// is encoded; then the inner levels. Its values go, its promise does not:
+/// codeword `k`'s reservation is `carried` into codeword `k + 1`'s encode
+/// ([`encode_codeword_resident_carrying`]), so the run holds one codeword's
+/// promise from its first encode to its last step, and no other caller can
+/// take that room between two steps ([`stream_codewords`]). The same tree and root as [`commit_joint`] over the same codewords,
 /// with one codeword alive at a time instead of the run's. BLAKE3 only, and a
 /// fold block of at least 8 values (a codeword's block a whole number of
 /// 64-byte blocks).
@@ -3402,7 +3595,7 @@ pub fn commit_joint_streamed(
     log_folding: usize,
     hash: crate::DeviceHash,
     placement: LeafPlacement,
-    mut encode: impl FnMut(usize) -> Option<DeviceCodeword>,
+    mut encode: impl FnMut(usize, Option<crate::device::DeviceReservation>) -> Option<DeviceCodeword>,
 ) -> Result<(JointTree, [u8; 32])> {
     ensure!(
         hash == crate::DeviceHash::Blake3,
@@ -3433,17 +3626,18 @@ pub fn commit_joint_streamed(
     let cfg = crate::blake3_whir::launch_cfg(num_leaves as u64);
     let (blocks_u64, num_leaves_u64, log_block_u32) =
         (blocks as u64, num_leaves as u64, log_folding as u32);
-    for k in 0..blocks {
-        let codeword = encode(k).ok_or_else(crate::invalid_value)?;
-        ensure!(
-            codeword.base && codeword.elements == elements && codeword.buffer.len() >= elements,
-            "a joint tree's codewords are base and of one length"
-        );
-        // The codeword's encode, and the step before this one, are done
-        // before this step reads them.
-        codeword.stream.synchronize()?;
-        let step = k as u64;
-        {
+    stream_codewords(
+        blocks,
+        |k, carried| encode(k, carried).ok_or_else(crate::invalid_value),
+        |k, codeword: &DeviceCodeword| {
+            ensure!(
+                codeword.base && codeword.elements == elements && codeword.buffer.len() >= elements,
+                "a joint tree's codewords are base and of one length"
+            );
+            // The codeword's encode, and the step before this one, are done
+            // before this step reads them.
+            codeword.stream.synchronize()?;
+            let step = k as u64;
             let mut region = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
             unsafe {
                 stream
@@ -3457,17 +3651,19 @@ pub fn commit_joint_streamed(
                     .arg(&mut region)
                     .launch(cfg)?;
             }
-        }
-        // The step has read the codeword before it goes.
-        stream.synchronize()?;
-        drop(codeword);
-    }
+            // The step has read the codeword before it goes.
+            stream.synchronize()
+        },
+        codeword_promise_of,
+    )?;
     LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
     TREE_BUILDS.fetch_add(1, Ordering::Relaxed);
-    JOINT_STREAMED_BUILDS.fetch_add(1, Ordering::Relaxed);
     let head = crate::readback::clone_dtoh(&stream, &nodes.slice(0..32))?;
     stream.synchronize()?;
+    // Counted once the root is home: a run whose read-back fails commits
+    // batched, and is not a streamed build.
+    JOINT_STREAMED_BUILDS.fetch_add(1, Ordering::Relaxed);
     let mut root = [0u8; 32];
     root.copy_from_slice(&head);
     Ok((

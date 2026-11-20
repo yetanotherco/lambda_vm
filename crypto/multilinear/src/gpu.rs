@@ -8436,6 +8436,7 @@ pub(crate) fn encode_resident(
     log_evals: usize,
     log_blowup: usize,
     transient: bool,
+    carried: Option<CarriedRoom>,
 ) -> Option<DeviceCodeword> {
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
@@ -8444,8 +8445,8 @@ pub(crate) fn encode_resident(
         return None;
     }
     math_cuda::device::backend().ok()?;
-    match math_cuda::whir::encode_codeword_resident(
-        &store.0, parts, log_evals, log_blowup, transient,
+    match math_cuda::whir::encode_codeword_resident_carrying(
+        &store.0, parts, log_evals, log_blowup, transient, carried,
     ) {
         Ok(codeword) => Some(DeviceCodeword(codeword)),
         Err(err) => {
@@ -8462,6 +8463,7 @@ pub(crate) fn encode_parts<F>(
     log_evals: usize,
     log_blowup: usize,
     transient: bool,
+    carried: Option<CarriedRoom>,
 ) -> Option<DeviceCodeword>
 where
     F: math::field::traits::IsField + 'static,
@@ -8495,7 +8497,9 @@ where
         })
         .collect();
     math_cuda::device::backend().ok()?;
-    match math_cuda::whir::encode_codeword_parts(&raw, log_evals, log_blowup, transient) {
+    match math_cuda::whir::encode_codeword_parts_carrying(
+        &raw, log_evals, log_blowup, transient, carried,
+    ) {
         Ok(codeword) => Some(DeviceCodeword(codeword)),
         Err(err) => {
             note_commit_error("encode parts", log_evals, log_blowup, &err);
@@ -8511,6 +8515,7 @@ pub(crate) fn encode_resident(
     _log_evals: usize,
     _log_blowup: usize,
     _transient: bool,
+    _carried: Option<CarriedRoom>,
 ) -> Option<DeviceCodeword> {
     None
 }
@@ -8521,6 +8526,7 @@ pub(crate) fn encode_parts<F>(
     _log_evals: usize,
     _log_blowup: usize,
     _transient: bool,
+    _carried: Option<CarriedRoom>,
 ) -> Option<DeviceCodeword>
 where
     F: math::field::traits::IsField + 'static,
@@ -9081,9 +9087,11 @@ pub(crate) fn commit_joint(
 }
 
 /// [`commit_joint`] one codeword at a time
-/// ([`math_cuda::whir::commit_joint_streamed`]): `encode(k)` gives the run's
-/// codeword `k` of `blocks`, each `2^log_elements` values, and each goes
-/// before the next is encoded. `None` when the hash has no streamed joint
+/// ([`math_cuda::whir::commit_joint_streamed`]): `encode(k, carried)` gives the
+/// run's codeword `k` of `blocks`, each `2^log_elements` values, and each goes
+/// before the next is encoded; its promise is `carried` into the next encode
+/// ([`encode_resident`], [`encode_parts`]), so the run keeps one codeword's
+/// room from its first encode to its last step. `None` when the hash has no streamed joint
 /// leaf (BLAKE3 only), the fold block is under 8 values, or the card declines
 /// (an encode, or the tree): the caller commits as before.
 #[cfg(feature = "cuda")]
@@ -9093,7 +9101,7 @@ pub(crate) fn commit_joint_streamed(
     log_folding: usize,
     hash: crate::whir_hash::DeviceHashKey,
     leaves: crate::whir_commit::LeafOrder,
-    mut encode: impl FnMut(usize) -> Option<DeviceCodeword>,
+    mut encode: impl FnMut(usize, Option<CarriedRoom>) -> Option<DeviceCodeword>,
 ) -> Option<(JointTree, [u8; 32])> {
     let hash = hash.into_math_cuda();
     if hash != math_cuda::DeviceHash::Blake3 || log_folding < 3 {
@@ -9116,11 +9124,20 @@ pub(crate) fn commit_joint_streamed(
         log_folding,
         hash,
         placement(leaves),
-        |k| match (k as u64 != decline_at).then(|| encode(k)).flatten() {
-            Some(codeword) => Some(codeword.0),
-            None => {
-                declined = true;
-                None
+        |k, carried| {
+            // Test only: another caller asks the ledger between two steps.
+            if k > 0 {
+                probe_streamed_gap();
+            }
+            match (k as u64 != decline_at)
+                .then(|| encode(k, carried))
+                .flatten()
+            {
+                Some(codeword) => Some(codeword.0),
+                None => {
+                    declined = true;
+                    None
+                }
             }
         },
     );
@@ -9183,9 +9200,81 @@ pub(crate) fn commit_joint_streamed(
     _log_folding: usize,
     _hash: crate::whir_hash::DeviceHashKey,
     _leaves: crate::whir_commit::LeafOrder,
-    _encode: impl FnMut(usize) -> Option<DeviceCodeword>,
+    _encode: impl FnMut(usize, Option<CarriedRoom>) -> Option<DeviceCodeword>,
 ) -> Option<(JointTree, [u8; 32])> {
     None
+}
+
+/// A codeword's ledger promise carried from one streamed step to the next
+/// ([`commit_joint_streamed`]); none exists without a device.
+#[cfg(feature = "cuda")]
+pub(crate) type CarriedRoom = math_cuda::device::DeviceReservation;
+#[cfg(not(feature = "cuda"))]
+pub(crate) type CarriedRoom = std::convert::Infallible;
+
+/// Test only: bytes another caller asks the ledger for between two streamed
+/// steps (0: none), and what it got, held until the probe is disarmed.
+#[cfg(feature = "cuda")]
+static STREAMED_GAP_PROBE: std::sync::Mutex<(u64, Option<DeviceRoom>, u64, u64)> =
+    std::sync::Mutex::new((0, None, 0, 0));
+
+#[cfg(feature = "cuda")]
+fn probe_streamed_gap() {
+    let mut probe = STREAMED_GAP_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if probe.0 == 0 || probe.1.is_some() {
+        return;
+    }
+    match reserve_room(probe.0) {
+        Some(room) => {
+            probe.1 = Some(room);
+            probe.2 += 1;
+        }
+        None => probe.3 += 1,
+    }
+}
+
+/// Disarms [`arm_streamed_gap_probe`] and gives back what the probe took.
+#[doc(hidden)]
+#[must_use = "the probe is armed while the guard lives"]
+pub struct StreamedGapProbe(());
+
+#[cfg(feature = "cuda")]
+impl StreamedGapProbe {
+    /// `(taken, refused)`: the probe's asks the ledger granted and refused.
+    pub fn outcomes(&self) -> (u64, u64) {
+        let probe = STREAMED_GAP_PROBE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (probe.2, probe.3)
+    }
+}
+
+impl Drop for StreamedGapProbe {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            let mut probe = STREAMED_GAP_PROBE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *probe = (0, None, 0, 0);
+        }
+    }
+}
+
+/// Test only, not for production callers: between two steps of a streamed
+/// joint commit, before codeword `k + 1` is encoded, ask the ledger for
+/// `bytes` as another thread would, at each such gap until it is granted, and
+/// hold what it grants until the guard drops. For a test that runs alone in its process.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn arm_streamed_gap_probe(bytes: u64) -> StreamedGapProbe {
+    let mut probe = STREAMED_GAP_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *probe = (bytes, None, 0, 0);
+    StreamedGapProbe(())
 }
 
 /// What the streamed joint commits ([`commit_joint_streamed`]) promised the
