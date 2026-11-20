@@ -4353,8 +4353,9 @@ pub(crate) mod local_faults {
         LocalDrawsFirst,
         /// The fork does not absorb the local transcript's state.
         NoLocalState,
-        /// The fork absorbs the local state after the group index's draw
-        /// position moves: after the global ladders, not before them.
+        /// The fork absorbs the local state last: after the group's whole
+        /// batched walk (ladders, constraint phase and reductions), not
+        /// before it.
         LocalStateLast,
         /// A local group's tables weighed `λ^{3t}`, today's stride.
         TodaysWeights,
