@@ -862,7 +862,12 @@ struct PlanLocal {
 /// digest (its height, width, preprocessed count and every interaction), its
 /// AIR family (the name before its index: one family, one constraint set),
 /// and its constraints' degree and factor count. Two groups with one key
-/// split alike.
+/// split alike. A class plan's `shifted` flag is not in the key: it follows
+/// from the family's constraints, and no reader of a shared class plan reads
+/// it (the reductions take it from the group's own whole plan). The digest
+/// keeps groups of one family list at different heights apart; it is real
+/// (not zero) for every local group because the frame admits LOCAL_BYTES
+/// only in a group with a local sender.
 type ClassKey = Vec<([u8; 32], String, usize, usize)>;
 
 /// Every program of a block's tree with its artifacts and derived shape, level
@@ -2662,8 +2667,13 @@ fn class_key(
         .map(|((&t, layout), digest)| {
             let name = refs[t].name();
             let family = name.split('[').next().unwrap_or(name).to_string();
+            let digest = if local_fault!(KeyWithoutDigest) {
+                [0; 32]
+            } else {
+                *digest
+            };
             (
-                *digest,
+                digest,
                 family,
                 layout.shape().degree(),
                 layout.kinds().len(),
@@ -4466,6 +4476,10 @@ pub(crate) mod local_faults {
         HintedLocalCells,
         /// The local balance's shares follow the process's share knob.
         LocalShareKnob,
+        /// The class split's key leaves out the tables' digests (their
+        /// families, degrees and factor counts only), so groups of one
+        /// family list at different heights share one split.
+        KeyWithoutDigest,
     }
 
     std::thread_local! {
