@@ -3326,14 +3326,19 @@ fn store_promise_bytes(words: u64, narrow: bool, lens: &[usize]) -> u64 {
     words.saturating_add(narrow_store_staging(narrow, lens))
 }
 
-/// [`store_promise_bytes`] of `argued`'s retired prepared stack when the
-/// admission takes its promise: under resident pricing (which needs the upload
-/// once), on a card that keeps column stores; `None` otherwise (nothing to
-/// promise, the admission stands as planned).
+/// What the admission asks of `argued`'s retired prepared stack's store:
+/// `(promise, need)`, the promise it takes ([`store_promise_bytes`]) and the
+/// store's own plan ([`store_plan_need`]: the promise, a revive over the
+/// store and the upload once's margin), which must fit what the ledger has
+/// free for the promise to be taken, as the store's plan at the opening
+/// would ask. Under resident pricing (which needs the upload once), on a card
+/// that keeps column stores; `None` otherwise (nothing to promise, the
+/// admission stands as planned).
 fn admission_store_bytes<F, E, T, H>(
     argued: &Argued<F, E, T>,
     prepared: &[BlockPrepared<'_, F, H>],
-) -> Option<u64>
+    config: &ChainConfig,
+) -> Option<(u64, u64)>
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
     E: IsField,
@@ -3346,15 +3351,22 @@ where
     {
         return None;
     }
-    let q = prepared.iter().find(|q| {
-        q.group == argued.group && matches!(q.commitment, PreparedCommitment::Retired(_))
+    let (q, retired) = prepared.iter().find_map(|q| match q.commitment {
+        PreparedCommitment::Retired(r) if q.group == argued.group => Some((q, r)),
+        _ => None,
     })?;
     let lens: Vec<usize> = q.columns.iter().map(|c| c.len()).collect();
-    Some(store_promise_bytes(
+    let promise = store_promise_bytes(
         prepared_store_bytes(q.columns),
         argued.upload_once_narrow,
         &lens,
-    ))
+    );
+    let need = store_plan_need(
+        promise,
+        retired.revive_over_store_card_bytes(config),
+        argued.upload_once_margin,
+    );
+    Some((promise, need))
 }
 
 /// What the upload once's store plans to hold: the store, a revive over it,
@@ -4301,14 +4313,20 @@ where
         // Admitted on the store's price: the store's promise is taken now, so
         // the ledger cannot refuse the store once the openings run beside the
         // next argue. Refused, the group opens alone.
+        // The store's own plan must fit too (a store the plan at the opening
+        // would refuse is not promised, and the overlap priced on it is not
+        // taken: the group opens alone and its store's plan says no there).
         let planned_beside = planned_beside
-            && match admission_store_bytes(&argued, prepared) {
+            && match admission_store_bytes(&argued, prepared, config) {
                 None => true,
-                Some(bytes) => {
-                    let room = match overlap_faults.store_promise_refused_at == Some(p) {
-                        true => None,
-                        false => multilinear::gpu::reserve_room(bytes),
-                    };
+                Some((bytes, need)) => {
+                    let free = multilinear::gpu::reserve_budget()
+                        .saturating_sub(multilinear::gpu::ledger_reserved());
+                    let room =
+                        match overlap_faults.store_promise_refused_at == Some(p) || need > free {
+                            true => None,
+                            false => multilinear::gpu::reserve_room(bytes),
+                        };
                     stamps[g].store_promised = room.is_some();
                     stamps[g].store_promise_refused = room.is_none();
                     stamps[g].overlap_planned_out |= room.is_none();
