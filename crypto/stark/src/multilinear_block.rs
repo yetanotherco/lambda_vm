@@ -2079,10 +2079,7 @@ where
             ];
             stamp.commit_streamed_not_held = multilinear::gpu::streamed_not_held()
                 .since(not_held_before)
-                .add_back(
-                    stamp.joint_runs[2],
-                    multilinear::stacked_eval::round0_trees(stamp.polys, config).len(),
-                );
+                .add_back(multilinear::stacked_eval::round0_trees(stamp.polys, config).len());
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
             if upload_ahead && let Some(packed) = packing.take() {
