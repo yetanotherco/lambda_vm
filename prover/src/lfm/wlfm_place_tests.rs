@@ -813,10 +813,11 @@ fn a_store_the_card_refuses_copies_twice_with_the_same_bytes() {
 /// so the plan admitted the overlap on the store's price; the next group's
 /// columns priced): the group falls back to two copies beside the next
 /// argue, with the same bytes, under both families and with one and two
-/// stacked polynomials a group. The refused group opened beside the next
-/// argue (without a card the plan always admits: the openings are the
-/// host's); on a card it is stamped refused, not planned out, and without
-/// one nothing is refused.
+/// stacked polynomials a group. At one polynomial a group the refused group
+/// opened beside the next argue (without a card the plan always admits: the
+/// openings are the host's); at two the probe is one group and the refusal
+/// hits a multi-polynomial store opening alone. On a card the group is
+/// stamped refused, not planned out; without one nothing is refused.
 #[test]
 fn a_store_refused_inside_an_overlapped_opening_proves_the_same_bytes() {
     use stark::multilinear_block::OverlapFaults;
@@ -844,10 +845,6 @@ fn a_store_refused_inside_an_overlapped_opening_proves_the_same_bytes() {
             )
             .unwrap_or_else(|e| panic!("{family:?} polys {polys}: {e}"));
             assert!(got == want, "{family:?} polys {polys}: the held bytes");
-            assert!(
-                groups.len() >= 2,
-                "{family:?} polys {polys}: a next group to open beside"
-            );
             let first = &groups[0];
             let u = &first.upload_once;
             assert!(
@@ -858,12 +855,18 @@ fn a_store_refused_inside_an_overlapped_opening_proves_the_same_bytes() {
                 u.refused, card,
                 "{family:?} polys {polys}: refused on a card only"
             );
-            assert!(
-                first.overlapped,
-                "{family:?} polys {polys}: the refused group opened beside the next argue (planned \
-                 out {} at {} of {} B)",
-                first.overlap_planned_out, first.overlap_plan_need, first.overlap_plan_free
-            );
+            // At one polynomial a group the probe has two groups, so group 0
+            // opens beside group 1's argue; at two it is one group, which
+            // opens alone (its multi-polynomial store refused all the same).
+            if polys == 1 {
+                assert!(groups.len() >= 2, "{family:?}: a next group to open beside");
+                assert!(
+                    first.overlapped,
+                    "{family:?} polys {polys}: the refused group opened beside the next argue (planned \
+                     out {} at {} of {} B)",
+                    first.overlap_planned_out, first.overlap_plan_need, first.overlap_plan_free
+                );
+            }
         }
     }
 }
