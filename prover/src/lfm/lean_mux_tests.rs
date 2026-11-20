@@ -169,6 +169,7 @@ fn the_blake3_w_leg_takes_its_muxes_as_mux_rows() {
     let child = super::wlfm_leg::WlfmChild {
         artifacts: child_build.artifacts.clone(),
         num_public_words: proof.public_words.len(),
+        cap_mux: None,
     };
     let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the BLAKE3 leg emits");
     let muxes = count(&leg, |i| matches!(i, Instr::Mux { .. }));
@@ -218,6 +219,7 @@ fn the_blake3_w_leg_program_is_pinned() {
     let child = super::wlfm_leg::WlfmChild {
         artifacts: child_build.artifacts.clone(),
         num_public_words: proof.public_words.len(),
+        cap_mux: None,
     };
     let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the BLAKE3 leg emits");
     let digest = super::whir_chain_tests::program_digest(&leg);

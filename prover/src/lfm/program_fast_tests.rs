@@ -89,6 +89,7 @@ fn sources() -> Vec<(&'static str, SourceFn)> {
     let child = WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: 8,
+        cap_mux: None,
     };
     vec![
         ("trivial", Box::new(p::trivial_program_source)),

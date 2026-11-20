@@ -168,6 +168,10 @@ pub struct LfmBuilder {
     /// `LFM_BLAKE3`'s. Off by default: every program today emits what it
     /// emitted. See [`Self::with_b3_lean`].
     b3_lean: bool,
+    /// How a BLAKE3 opening is checked against its tree's cap, when the
+    /// program's deriver names it ([`Self::with_cap_mux`]); `None` takes the
+    /// process's knob (`merkle_cap::cap_mux`).
+    cap_mux: Option<super::merkle_cap::CapMux>,
     /// Cap tables emitted so far ([`Self::cap_table`]): the next one's tag.
     cap_tables: u32,
 }
@@ -208,6 +212,24 @@ impl LfmBuilder {
         );
         self.b3_lean = lean;
         self
+    }
+
+    /// Check BLAKE3 openings against their caps in `mode`, whatever the
+    /// process's knob says: a verifier's derivation names it, so its
+    /// environment cannot choose the program a proof is checked against.
+    /// Program shape, so chosen before emission like the wrap hash.
+    pub fn with_cap_mux(mut self, mode: super::merkle_cap::CapMux) -> Self {
+        assert!(
+            self.instrs.is_empty(),
+            "the cap check is program shape and must be chosen before emission"
+        );
+        self.cap_mux = Some(mode);
+        self
+    }
+
+    /// The cap check this program's deriver named ([`Self::with_cap_mux`]).
+    pub fn cap_mux(&self) -> Option<super::merkle_cap::CapMux> {
+        self.cap_mux
     }
 
     /// Whether this program's BLAKE3 compressions are the lean tables' rows:

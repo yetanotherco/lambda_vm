@@ -409,6 +409,7 @@ fn the_blake3_w_leg_walks_a_child_with_cap_reads() {
     let child = super::wlfm_leg::WlfmChild {
         artifacts: child_build.artifacts.clone(),
         num_public_words: proof.public_words.len(),
+        cap_mux: None,
     };
     let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the BLAKE3 leg emits");
     let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");

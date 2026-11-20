@@ -377,6 +377,7 @@ fn the_w_leg_walks_a_blake3_child_under_blake3_only() {
     let child = super::wlfm_leg::WlfmChild {
         artifacts: b3.artifacts,
         num_public_words: 8,
+        cap_mux: None,
     };
     let mut b = super::wlfm_leg::wlfm_leg_builder(super::wlfm::WlfmFamily::P1);
     let arena = b.declare_arena(0);
@@ -399,6 +400,7 @@ fn the_w_leg_executes_over_a_poseidon1_child_with_lean_tables() {
     let child = super::wlfm_leg::WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: proof.public_words.len(),
+        cap_mux: None,
     };
     let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the leg emits");
     let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");
@@ -570,6 +572,7 @@ fn a_cut_chip_round_trips_and_is_another_identity() {
     let child = super::wlfm_leg::WlfmChild {
         artifacts: a.clone(),
         num_public_words: proof.public_words.len(),
+        cap_mux: None,
     };
     let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the leg emits");
     let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");
@@ -801,6 +804,7 @@ fn the_legs_arena_in_pieces_is_its_arena_under_both_families() {
     let child_of = |build: &WlfmBuild, proof: &WlfmProof| WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: proof.public_words.len(),
+        cap_mux: None,
     };
     let mut most = 0;
     let lean = honest();
@@ -884,6 +888,7 @@ fn an_observed_prove_hands_out_the_next_levels_arena_group_by_group() {
             let child = WlfmChild {
                 artifacts: build.artifacts.clone(),
                 num_public_words: public.len(),
+                cap_mux: None,
             };
             let groups = child.artifacts.sizes.len();
             assert!(groups >= 2, "{family:?}: several groups");
@@ -961,6 +966,7 @@ fn the_next_level_streamed_beside_the_prove_is_the_same_level() {
         let child = WlfmChild {
             artifacts: build.artifacts.clone(),
             num_public_words: public.len(),
+            cap_mux: None,
         };
         let (leg, marks) = wlfm_leg_program_marked(&child).expect("the marked leg");
         assert!(marks.len() >= 3, "{family:?}: a front and several groups");

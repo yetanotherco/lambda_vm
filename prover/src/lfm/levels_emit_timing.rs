@@ -24,6 +24,7 @@ fn level_emission_split() {
     let child = WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: 8,
+        cap_mux: None,
     };
     for run in 0..3 {
         let t = Instant::now();
@@ -91,6 +92,7 @@ fn streamed_setup_split() {
     let child = WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: 8,
+        cap_mux: None,
     };
     let mut b = wlfm_leg_builder(WlfmFamily::B3);
     let arena = b.declare_arena(0);
