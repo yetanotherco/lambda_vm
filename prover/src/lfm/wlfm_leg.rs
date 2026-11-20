@@ -82,6 +82,9 @@ use crate::hash_pin::{BlockFamily, ProofFamily};
 pub struct WlfmChild {
     pub artifacts: WlfmArtifacts,
     pub num_public_words: usize,
+    /// The cap check the leg's BLAKE3 openings take, when the deriver named
+    /// it; `None` takes the process's knob (`merkle_cap::cap_mux`).
+    pub cap_mux: Option<super::merkle_cap::CapMux>,
 }
 
 /// The chain shape a W-leg walks for a stack of `n_stack` variables: the
@@ -126,6 +129,15 @@ pub fn wlfm_leg_builder(family: WlfmFamily) -> LfmBuilder {
     LfmBuilder::new()
         .with_wrap_hash(wlfm_wrap_hash(family))
         .with_b3_lean(family == WlfmFamily::B3)
+}
+
+/// [`wlfm_leg_builder`] for `child`, with the cap check its deriver named.
+fn child_leg_builder(child: &WlfmChild) -> LfmBuilder {
+    let b = wlfm_leg_builder(child.artifacts.family);
+    match child.cap_mux {
+        Some(mode) => b.with_cap_mux(mode),
+        None => b,
+    }
 }
 
 /// A stack's round-0 trees under the child's config, each a range of its
@@ -704,7 +716,7 @@ pub fn wlfm_leg_group(
 /// caller can land them as the child's prove opens its groups. The last mark is
 /// the arena's length.
 pub fn wlfm_leg_program_marked(child: &WlfmChild) -> Result<(LfmProgram, Vec<u32>), String> {
-    let mut b = wlfm_leg_builder(child.artifacts.family);
+    let mut b = child_leg_builder(child);
     let arena = b.declare_arena(0);
     let mut marks = Vec::new();
     let leg = emit_wlfm_leg_marked(&mut b, child, arena, Some(&mut marks))?;
@@ -728,7 +740,7 @@ pub fn wlfm_leg_program_marked(child: &WlfmChild) -> Result<(LfmProgram, Vec<u32
 /// each as a whole word: the second compression step's body
 /// ([`super::compress`]), and what a test executes a child's arena against.
 pub fn wlfm_leg_program(child: &WlfmChild) -> Result<LfmProgram, String> {
-    let mut b = wlfm_leg_builder(child.artifacts.family);
+    let mut b = child_leg_builder(child);
     let arena = b.declare_arena(0);
     let leg = emit_wlfm_leg(&mut b, child, arena)?;
     for word in &leg.publics {

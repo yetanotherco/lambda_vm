@@ -446,9 +446,10 @@ fn the_blake3_levels_driver_proves_a_small_block() {
     let plan = b3_plan(&elf, &run.base_proof, &format);
     verify_levels(&plan, WlfmFamily::B3, last)
         .expect("the block's own verifier accepts the last level");
-    // The public entry derives its own plan, prepared roots committed on the
-    // host, and accepts the same proof.
-    super::levels::verify_block_levels(
+    // The verifier's derivation (prepared roots committed on the host, the
+    // inverse share form), at this fixture's format and options, accepts the
+    // same proof.
+    super::levels::verify_block_levels_under(
         &elf,
         &opts,
         &format,
@@ -457,12 +458,12 @@ fn the_blake3_levels_driver_proves_a_small_block() {
         LevelStop::DEFAULT,
         last,
     )
-    .expect("the public entry accepts the last level");
+    .expect("the verifier's own plan accepts the last level");
     // A plan given one flipped prepared root (as a prover or a file could
     // hand it): the plan-taking call checks the proof against the programs
     // that plan defines, so its verdict follows the caller's roots — this
     // proof is refused there only because it was proved for the true ones.
-    // The public entry takes no plan, so no caller's roots reach it.
+    // The verifier's entries take no plan, so no caller's roots reach them.
     let mut roots: Vec<(usize, Vec<multilinear::whir_commit::Commitment>)> = plan
         .prepared()
         .iter()
@@ -1615,7 +1616,7 @@ fn rta_one_run(
     for (level, p) in run.levels.iter().zip(&run.proofs) {
         ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
     }
-    let ok_last = super::levels::verify_block_levels(
+    let ok_last = super::levels::verify_block_levels_under(
         &elf,
         &opts,
         &cfg.format,
@@ -2266,5 +2267,90 @@ fn no_production_code_builds_weakened_verifier_checks() {
     assert!(
         built.is_empty(),
         "production code builds a VerifierChecks other than ALL: {built:?}"
+    );
+}
+
+/// ★ The levels' public verifier derives its own plan, in a test GitHub CI
+/// runs (the one test that executes the entry is box tier). Read from the
+/// source:
+/// - both public entries go through `verify_block_levels_pinned`, and no
+///   public entry calls `level_plan` (whose prepared roots a caller passes);
+/// - the verifier's plan is `level_plan_with(.., None, true)`: prepared roots
+///   committed on the host and the inverse share form, and then the named cap
+///   check — and nothing on the verifier's path reads `share_inverse()` or
+///   `cap_mux()`, the process's knobs, outside the test-only entry;
+/// - the plan-taking calls stay crate-private: `verify_levels_to` is
+///   `pub(crate)` and `verify_levels` test-only.
+#[test]
+fn the_levels_verifier_derives_its_plan_and_takes_none() {
+    let src = include_str!("levels.rs");
+    let body = |name: &str| -> &str {
+        let at = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("levels.rs defines {name}"));
+        let rest = &src[at..];
+        let end = rest.find("\n}\n").expect("a body's end");
+        &rest[..end]
+    };
+    for public in ["verify_block_levels", "verify_block_levels_at"] {
+        let b = body(public);
+        assert!(
+            src.contains(&format!("\npub fn {public}(")),
+            "{public} is public"
+        );
+        assert!(
+            b.contains("verify_block_levels_pinned("),
+            "{public} verifies through the pinned body"
+        );
+        for forbidden in ["level_plan(", "share_inverse()", "cap_mux()", "Some("] {
+            assert!(!b.contains(forbidden), "{public} reads {forbidden}");
+        }
+    }
+    let plan = body("verifier_level_plan_with");
+    assert!(
+        plan.contains("None, true)") && plan.contains(".with_cap_mux(cap_mux)"),
+        "the verifier's plan: no prepared roots, the inverse share form, the named cap check"
+    );
+    for verifier in [
+        "verify_block_levels_pinned",
+        "verifier_level_plan",
+        "pin_family",
+    ] {
+        let b = body(verifier);
+        for knob in ["share_inverse()", "cap_mux()", "std::env"] {
+            assert!(!b.contains(knob), "{verifier} reads {knob}");
+        }
+    }
+    assert!(src.contains("\npub(crate) fn verify_levels_to("));
+    assert!(src.contains("#[cfg(test)]\npub(crate) fn verify_levels("));
+    assert!(src.contains("#[cfg(test)]\npub(crate) fn verify_block_levels_under("));
+    assert!(!src.contains("\npub fn verify_levels"));
+}
+
+/// The pinned format a family's verifier checks against: the BLAKE3 base's
+/// own constants (group size, GKR ladder) and the named round form on
+/// `B3`; a round form on `P1` refused.
+#[test]
+fn a_levels_verifier_pins_its_familys_base() {
+    use crate::block_whir::{B3_BASE_GROUP_POLYS, B3Rounds, BlockFormat};
+    use multilinear::whir_chain::GroupFold;
+    let pinned = BlockFormat::pinned_with(GroupFold::Indexed);
+    let b3 = super::levels::pin_family(pinned.clone(), WlfmFamily::B3, B3Rounds::WHIR3)
+        .expect("the BLAKE3 pin");
+    assert_eq!(b3.zf.base, BaseFormat::B3_WHIR);
+    assert_eq!(b3.group_polys, B3_BASE_GROUP_POLYS);
+    assert_eq!(b3.b3_rounds, B3Rounds::WHIR3);
+    assert_eq!(
+        b3.argue,
+        pinned
+            .argue
+            .with_ladder(crate::block_whir::B3_BASE_GKR_DEFAULT)
+    );
+    let p1 = super::levels::pin_family(pinned.clone(), WlfmFamily::P1, B3Rounds::Fri)
+        .expect("the Poseidon1 pin");
+    assert_eq!(p1.zf.base, pinned.zf.base);
+    assert!(
+        super::levels::pin_family(pinned, WlfmFamily::P1, B3Rounds::WHIR3).is_err(),
+        "a round form on the Poseidon1 base"
     );
 }

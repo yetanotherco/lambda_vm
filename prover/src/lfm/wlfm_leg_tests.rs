@@ -23,6 +23,7 @@ fn child_of(build: &WlfmBuild, words: usize) -> WlfmChild {
     WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: words,
+        cap_mux: None,
     }
 }
 

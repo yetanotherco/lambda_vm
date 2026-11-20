@@ -545,6 +545,7 @@ pub fn c1_child(c1: &WlfmArtifacts, layout: BlockLayout) -> WlfmChild {
     WlfmChild {
         artifacts: c1.clone(),
         num_public_words: layout.total(),
+        cap_mux: None,
     }
 }
 

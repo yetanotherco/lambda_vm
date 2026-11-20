@@ -757,6 +757,9 @@ pub struct WhirBlockPlan {
     /// ([`LfmBuilder::with_b3_lean`]): on for a BLAKE3 plan, whose programs
     /// only the block prover proves; meaningless under any other hash.
     b3_lean: bool,
+    /// The cap check its programs' BLAKE3 openings take, when the deriver
+    /// named it ([`Self::with_cap_mux`]); `None` takes the process's knob.
+    cap_mux: Option<super::merkle_cap::CapMux>,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
     groups: Vec<Vec<usize>>,
@@ -894,7 +897,7 @@ impl WhirBlockPlan {
     /// (`share_inverse`, [`emit_share`]) rather than the process's knob: the
     /// pinned verifier's derivation.
     #[allow(clippy::too_many_arguments)]
-    fn derive_full(
+    pub(crate) fn derive_full(
         elf_bytes: &[u8],
         proof_options: &crate::ProofOptions,
         format: &BlockFormat,
@@ -954,6 +957,29 @@ impl WhirBlockPlan {
         num_leaves: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
     ) -> Result<Self, String> {
+        Self::derive_blake3_with_share(
+            elf_bytes,
+            proof_options,
+            format,
+            statement,
+            num_leaves,
+            prepared_roots,
+            share_inverse(),
+        )
+    }
+
+    /// [`Self::derive_blake3`] with the leaves' share form named
+    /// (`share_inverse`, [`emit_share`]) rather than the process's knob: the
+    /// pinned levels verifier's derivation.
+    pub(crate) fn derive_blake3_with_share(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: usize,
+        prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+        share_inverse: bool,
+    ) -> Result<Self, String> {
         if format.zf.base != stark::proof::options::BaseFormat::B3_WHIR {
             return Err(format!(
                 "a BLAKE3 plan is over the 7-round BLAKE3 base, not {:?}",
@@ -969,7 +995,7 @@ impl WhirBlockPlan {
             BLOCK_FAN_IN,
             prepared_roots,
             usize::MAX,
-            share_inverse(),
+            share_inverse,
             super::edsl::WrapHash::Blake3,
         )
     }
@@ -1132,6 +1158,7 @@ impl WhirBlockPlan {
             statement_calls,
             wrap_hash,
             b3_lean: wrap_hash == super::edsl::WrapHash::Blake3,
+            cap_mux: None,
             public_output: statement.public_output.to_vec(),
             groups,
             prepared,
@@ -1213,9 +1240,25 @@ impl WhirBlockPlan {
     /// A leaf's builder: the tree's wrap hash (and under BLAKE3 the plan's
     /// compression rows).
     fn leaf_builder(&self) -> LfmBuilder {
-        LfmBuilder::new()
+        let b = LfmBuilder::new()
             .with_wrap_hash(self.wrap_hash)
-            .with_b3_lean(self.b3_lean)
+            .with_b3_lean(self.b3_lean);
+        match self.cap_mux {
+            Some(mode) => b.with_cap_mux(mode),
+            None => b,
+        }
+    }
+
+    /// This plan with its programs' cap check named `mode`, whatever the
+    /// process's knob says: what a verifier's derivation pins.
+    pub(crate) fn with_cap_mux(mut self, mode: super::merkle_cap::CapMux) -> Self {
+        self.cap_mux = Some(mode);
+        self
+    }
+
+    /// The cap check the deriver named ([`Self::with_cap_mux`]), if any.
+    pub(crate) fn cap_mux(&self) -> Option<super::merkle_cap::CapMux> {
+        self.cap_mux
     }
 
     /// Test only: this plan with its BLAKE3 compressions lowered to

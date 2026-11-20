@@ -926,6 +926,7 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
             ..a.clone()
         },
         num_public_words: honest.num_public_words,
+        cap_mux: None,
     };
     let why = wlfm_leg_program(&child).expect_err("a child the host refuses");
     println!("SHORT UNION CHILD: {why}");
@@ -950,6 +951,7 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
             ..a.clone()
         },
         num_public_words: honest.num_public_words,
+        cap_mux: None,
     };
     let why = wlfm_leg_program(&child).expect_err("a chain past the union bound");
     println!("SHORT UNION, COUNT RESIZED: {why}");

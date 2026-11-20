@@ -37,6 +37,7 @@
 use super::LfmWord;
 use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
+use super::merkle_cap::CapMux;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
     StackPlace, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof, WlfmProving, WlfmRate,
@@ -47,6 +48,7 @@ use super::wlfm_leg::{
 };
 use crate::block_whir::BlockWhirProof;
 use crate::hash_pin::{BlockFamily, ProofFamily};
+use multilinear::whir_chain::GroupFold;
 use stark::proof::options::BaseFormat;
 use std::sync::mpsc;
 
@@ -149,10 +151,32 @@ pub fn level_plan(
     family: WlfmFamily,
     prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
 ) -> Result<WhirBlockPlan, String> {
+    level_plan_with(
+        elf,
+        proof_options,
+        format,
+        statement,
+        family,
+        prepared_roots,
+        super::whir_block::share_inverse(),
+    )
+}
+
+/// [`level_plan`] with the leaves' share form named (`share_inverse`,
+/// `whir_block::emit_share`) rather than the process's knob.
+fn level_plan_with(
+    elf: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
+    share_inverse: bool,
+) -> Result<WhirBlockPlan, String> {
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
     let plan = match family {
-        WlfmFamily::P1 => WhirBlockPlan::derive_with(
+        WlfmFamily::P1 => WhirBlockPlan::derive_full(
             elf,
             proof_options,
             format,
@@ -160,10 +184,18 @@ pub fn level_plan(
             Some(1),
             super::whir_block::BLOCK_FAN_IN,
             prepared_roots,
+            super::whir_block::LEAF_P1_CAP,
+            share_inverse,
         )?,
-        WlfmFamily::B3 => {
-            WhirBlockPlan::derive_blake3(elf, proof_options, format, statement, 1, prepared_roots)?
-        }
+        WlfmFamily::B3 => WhirBlockPlan::derive_blake3_with_share(
+            elf,
+            proof_options,
+            format,
+            statement,
+            1,
+            prepared_roots,
+            share_inverse,
+        )?,
     };
     check_family(&plan, family)?;
     Ok(plan)
@@ -1079,6 +1111,7 @@ fn child_of_build(plan: &WhirBlockPlan, build: &WlfmBuild) -> WlfmChild {
     WlfmChild {
         artifacts: build.artifacts.clone(),
         num_public_words: plan.top_layout().total(),
+        cap_mux: plan.cap_mux(),
     }
 }
 
@@ -1178,13 +1211,166 @@ pub fn prove_levels(
     Ok((proofs, secs))
 }
 
-/// ★ The block's public verifier over its last level: level 1's plan derived
-/// here from the trusted ELF and the claimed statement, its prepared roots
-/// committed on the host ([`level_plan`] with `None`), never taken from a
-/// caller or a prover; then every level derived from that plan and `last`
-/// checked as [`verify_levels_to`] checks it. `proof_options`, `format`,
-/// `family` and `stop` are the caller's constants, never a proof's.
+/// ★ The block's public verifier over its last level, at the pinned format:
+/// [`verify_block_levels_at`] with every named choice at its pinned value —
+/// [`BlockFormat::pinned_with`](crate::block_whir::BlockFormat::pinned_with)
+/// `Indexed`'s blowup, leaf order, round-0 trees, leaf scale, leaf query, GKR
+/// packing, memory format and page runs; the BLAKE3 base's FRI round form;
+/// the packed cap check — and the default chain stop.
 pub fn verify_block_levels(
+    elf: &[u8],
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    last: &WlfmProof,
+) -> Result<(), String> {
+    let format = pin_family(
+        crate::block_whir::BlockFormat::pinned_with(GroupFold::Indexed),
+        family,
+        crate::block_whir::B3Rounds::Fri,
+    )?;
+    verify_block_levels_pinned(
+        elf,
+        &format,
+        statement,
+        family,
+        LevelStop::DEFAULT,
+        CapMux::Packed,
+        last,
+    )
+}
+
+/// ★ The block's public verifier over its last level, at the pinned format
+/// with the caller's NAMED choices (as the block tree's
+/// `whir_block::verify_block_tree_at` takes them), plus the BLAKE3 base's
+/// round form, the cap check and the chain stop. Every one is the verifier's
+/// constant: the proof carries none of them, the format's tag is in the
+/// statement, and a caller cannot hand in a format, proof options or a plan.
+/// Then level 1's plan is derived here ([`verify_block_levels_pinned`]): its
+/// prepared roots committed on the host, the base's options under the
+/// format's own WHIR format, the leaves' share form `p · (1/q)` — never
+/// `LFM_WHIR_SHARE_INVERSE` — and the named cap check — never
+/// `LAMBDA_VM_LFM_CAP_MUX`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_block_levels_at(
+    elf: &[u8],
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    stop: LevelStop,
+    last: &WlfmProof,
+    group: GroupFold,
+    blowup: crate::zf_format::WhirBlowup,
+    leaves: multilinear::whir_chain::LeafOrder,
+    trees: multilinear::whir_chain::Round0Trees,
+    leaf_scale: super::whir_block::LeafScale,
+    leaf_query: super::whir_chain::LeafQuery,
+    pack: multilinear::whir_chain::GkrPack,
+    memory: crate::tables::fused_memory::MemoryFormat,
+    page_run_log2: u8,
+    rounds: crate::block_whir::B3Rounds,
+    cap_mux: CapMux,
+) -> Result<(), String> {
+    let presets = super::whir_block::verifier_presets_at(
+        group,
+        blowup,
+        leaves,
+        trees,
+        leaf_scale,
+        leaf_query,
+        pack,
+        memory,
+        page_run_log2,
+    )?;
+    let format = pin_family(presets.format, family, rounds)?;
+    verify_block_levels_pinned(elf, &format, statement, family, stop, cap_mux, last)
+}
+
+/// A pinned block format moved onto `family`'s base: unchanged for
+/// [`WlfmFamily::P1`] (whose chains take no round form), and for
+/// [`WlfmFamily::B3`] the 7-round BLAKE3 base with its own constants — its
+/// group size ([`crate::block_whir::B3_BASE_GROUP_POLYS`]), its GKR ladder
+/// ([`crate::block_whir::B3_BASE_GKR_DEFAULT`]) and the round form `rounds` —
+/// never their environment knobs. The leaf order and round-0 trees are
+/// re-checked against the new base.
+pub(crate) fn pin_family(
+    mut format: crate::block_whir::BlockFormat,
+    family: WlfmFamily,
+    rounds: crate::block_whir::B3Rounds,
+) -> Result<crate::block_whir::BlockFormat, String> {
+    match family {
+        WlfmFamily::P1 => {
+            if rounds != crate::block_whir::B3Rounds::Fri {
+                return Err(format!(
+                    "the round form {rounds:?} is the BLAKE3 base's alone"
+                ));
+            }
+        }
+        WlfmFamily::B3 => {
+            format.zf.base = BaseFormat::B3_WHIR;
+            format.group_polys = crate::block_whir::B3_BASE_GROUP_POLYS;
+            format.b3_rounds = rounds;
+            format.argue = format
+                .argue
+                .with_ladder(crate::block_whir::B3_BASE_GKR_DEFAULT);
+        }
+    }
+    format.zf.check_leaves()?;
+    format.zf.check_trees()?;
+    check_base(&format.zf.base, family)?;
+    Ok(format)
+}
+
+/// The levels verifier's plan under `format`: level 1's plan with its
+/// prepared roots committed on the host (`None`), the base's options under
+/// `format.zf` (never the process's), the share form `p · (1/q)` and the cap
+/// check `cap_mux` — nothing read from the environment.
+pub(crate) fn verifier_level_plan(
+    elf: &[u8],
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    cap_mux: CapMux,
+) -> Result<WhirBlockPlan, String> {
+    let options = super::proof::block_base_options_under(&format.zf);
+    verifier_level_plan_with(elf, &options, format, statement, family, cap_mux)
+}
+
+/// [`verifier_level_plan`] under the caller's proof options: the fixture
+/// options a test proves its base under.
+fn verifier_level_plan_with(
+    elf: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    cap_mux: CapMux,
+) -> Result<WhirBlockPlan, String> {
+    Ok(
+        level_plan_with(elf, proof_options, format, statement, family, None, true)?
+            .with_cap_mux(cap_mux),
+    )
+}
+
+/// The verifier body under a pinned `format`: [`verifier_level_plan`], then
+/// [`verify_levels_to`].
+fn verify_block_levels_pinned(
+    elf: &[u8],
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    stop: LevelStop,
+    cap_mux: CapMux,
+    last: &WlfmProof,
+) -> Result<(), String> {
+    let plan = verifier_level_plan(elf, format, statement, family, cap_mux)?;
+    verify_levels_to(&plan, family, stop, last)
+}
+
+/// [`verify_block_levels`] under a format and proof options of the caller's:
+/// the fixture formats and options the tests prove at, and the process's cap
+/// check. The plan is still derived here (prepared roots on the host, the
+/// inverse share form). Test-only.
+#[cfg(test)]
+pub(crate) fn verify_block_levels_under(
     elf: &[u8],
     proof_options: &crate::ProofOptions,
     format: &crate::block_whir::BlockFormat,
@@ -1193,7 +1379,14 @@ pub fn verify_block_levels(
     stop: LevelStop,
     last: &WlfmProof,
 ) -> Result<(), String> {
-    let plan = level_plan(elf, proof_options, format, statement, family, None)?;
+    let plan = verifier_level_plan_with(
+        elf,
+        proof_options,
+        format,
+        statement,
+        family,
+        super::merkle_cap::cap_mux(),
+    )?;
     verify_levels_to(&plan, family, stop, last)
 }
 

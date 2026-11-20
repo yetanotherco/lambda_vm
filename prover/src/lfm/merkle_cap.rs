@@ -160,20 +160,21 @@ thread_local! {
     pub(crate) static CAP_MUX_OVERRIDE: std::cell::Cell<Option<CapMux>> = const { std::cell::Cell::new(None) };
 }
 
-/// The mode a cap authenticated on `b` checks its openings in: [`cap_mux`]'s
-/// under BLAKE3 (two `u32`-lane words a digest), [`CapMux::Plain`] under any
+/// The mode a cap authenticated on `b` checks its openings in: the one `b`'s
+/// deriver named (`LfmBuilder::with_cap_mux`), else [`cap_mux`]'s, under BLAKE3 (two `u32`-lane words a digest), [`CapMux::Plain`] under any
 /// other hash, and [`CapMux::Packed`] in place of [`CapMux::Indexed`] in a
 /// program that is not lean.
 fn mode(b: &LfmBuilder) -> CapMux {
     if b.wrap_hash() != edsl::WrapHash::Blake3 {
         return CapMux::Plain;
     }
+    let named = || b.cap_mux().unwrap_or_else(cap_mux);
     #[cfg(test)]
     let chosen = CAP_MUX_OVERRIDE
         .with(std::cell::Cell::get)
-        .unwrap_or_else(cap_mux);
+        .unwrap_or_else(named);
     #[cfg(not(test))]
-    let chosen = cap_mux();
+    let chosen = named();
     match chosen {
         CapMux::Indexed if !b.b3_lean() => CapMux::Packed,
         other => other,

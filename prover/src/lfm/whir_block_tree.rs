@@ -5362,6 +5362,7 @@ mod tests {
         for (file, src) in [
             ("whir_block.rs", block),
             ("whir_block_tree.rs", include_str!("whir_block_tree.rs")),
+            ("levels.rs", include_str!("levels.rs")),
         ] {
             let mut public = Vec::new();
             for (at, _) in src.match_indices("\npub fn verify") {
@@ -5372,6 +5373,16 @@ mod tests {
                     !params.contains("BlockFormat"),
                     "{file}: the public verifier {name} takes a BlockFormat"
                 );
+                // The levels' verifiers derive their plan and their options
+                // themselves: neither comes from a caller.
+                if file == "levels.rs" {
+                    for given in ["ProofOptions", "WhirBlockPlan", "Commitment"] {
+                        assert!(
+                            !params.contains(given),
+                            "{file}: the public verifier {name} takes a {given}"
+                        );
+                    }
+                }
                 if name.ends_with("_at") {
                     for choice in [
                         "GroupFold",
