@@ -1051,7 +1051,10 @@ impl<H: WhirHash> WlfmPrepared<H> {
                 p.group
             ));
         }
+        // Its opening's store sends the packed bytes only under the narrow
+        // store; without it they would sit on the host unread.
         let (narrow, packed) = narrow_parts(p.packed);
+        let packed = packed.filter(|_| narrow_store());
         Ok(WlfmPrepared {
             group: p.group,
             tables: p.tables,
