@@ -1431,10 +1431,23 @@ pub fn create_keccak_rnd_air_for(
 /// alone: no univariate proof commits it, so its univariate root is never
 /// read (a deferred zero root stands in).
 pub fn create_local_bytes_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    create_local_bytes_air_with(
+        proof_options,
+        crate::tables::local_bytes::bus_interactions(),
+    )
+}
+
+/// LOCAL_BYTES' AIR with `interactions` in place of its three receivers: a
+/// test's table of another definition (its columns and fixed columns
+/// LOCAL_BYTES').
+pub fn create_local_bytes_air_with(
+    proof_options: &ProofOptions,
+    interactions: Vec<BusInteraction>,
+) -> ConcreteVmAir<EmptyConstraints> {
     use crate::tables::local_bytes;
     build_air(
         local_bytes::cols::NUM_COLUMNS,
-        local_bytes::bus_interactions(),
+        interactions,
         proof_options,
         1,
         EmptyConstraints,

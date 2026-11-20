@@ -7377,11 +7377,14 @@ impl<'a> Packer<'a> {
                 stark::trace::TraceTable::from_columns_main(columns, 1)
             }
         };
-        let table = table_of(
+        // A test's wrong fixed column is committed as it stands (the
+        // verifier's check is what refuses it).
+        let table = table_of_checked(
             local.air,
             &mut trace,
             (local_bytes::cols::NUM_COLUMNS, local_bytes::LOG_ROWS),
             true,
+            local.fault != LocalBytesFault::WrongUnusedXor,
         )?;
         if let Some(ledger) = self.ledger {
             let b = memlog::table_bytes(&table);
