@@ -507,6 +507,40 @@ fn the_upload_once_proves_the_same_bytes_in_every_place() {
     }
 }
 
+/// ★ Box gate, its own process under `LAMBDA_VM_NO_GPU_COLUMNS=1` (read once
+/// a process, so never beside the other tests): with every column store kept
+/// off the card, the upload once uses no store and stamps none refused or
+/// planned out, in every place and family, and proves the held bytes. Without
+/// the word the test refuses to run rather than pass vacuously.
+#[test]
+#[ignore = "box gate: run alone with LAMBDA_VM_NO_GPU_COLUMNS=1"]
+fn under_no_gpu_columns_the_upload_once_stamps_no_refusal() {
+    assert!(
+        multilinear::gpu::columns_disabled(),
+        "run with LAMBDA_VM_NO_GPU_COLUMNS=1"
+    );
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let (_, _, build) = probe_placed(family, place);
+            let (got, groups) = streamed_once(&program, &build, &arenas, true, Default::default())
+                .unwrap_or_else(|e| panic!("{family:?} {place:?}: {e}"));
+            assert!(got == want, "{family:?} {place:?}: the held bytes");
+            assert!(
+                groups.iter().all(|s| !s.upload_once.used
+                    && !s.upload_once.refused
+                    && !s.upload_once.planned_out),
+                "{family:?} {place:?}: no store, none refused or planned out"
+            );
+        }
+    }
+}
+
 /// The upload once falls back to today's two copies, with the same bytes,
 /// where its plan refuses a group's store (a test's refusal): that group is
 /// stamped planned out and uses no store.
@@ -772,6 +806,65 @@ fn a_store_the_card_refuses_copies_twice_with_the_same_bytes() {
             u.refused, card,
             "group {place}: refused on a card only ({u:?})"
         );
+    }
+}
+
+/// A store the card refuses INSIDE an overlapped opening (resident pricing on,
+/// so the plan admitted the overlap on the store's price; the next group's
+/// columns priced): the group falls back to two copies beside the next
+/// argue, with the same bytes, under both families and with one and two
+/// stacked polynomials a group. The refused group opened beside the next
+/// argue (without a card the plan always admits: the openings are the
+/// host's); on a card it is stamped refused, not planned out, and without
+/// one nothing is refused.
+#[test]
+fn a_store_refused_inside_an_overlapped_opening_proves_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let card = multilinear::gpu::reserve_budget() > 0;
+    super::wlfm::set_overlap_resident_for_test(Some(true));
+    super::wlfm::set_overlap_next_columns_for_test(Some(true));
+    for polys in [1, 2] {
+        let _groups = test_format::set_group_polys(polys);
+        for family in [WlfmFamily::P1, WlfmFamily::B3] {
+            let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+            let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+                .expect("the held build proves");
+            let (_, _, retired) = probe_placed(family, StackPlace::CardRetired);
+            let (got, groups) = streamed_once(
+                &program,
+                &retired,
+                &arenas,
+                true,
+                OverlapFaults {
+                    upload_once_card_refuses_at: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{family:?} polys {polys}: {e}"));
+            assert!(got == want, "{family:?} polys {polys}: the held bytes");
+            assert!(
+                groups.len() >= 2,
+                "{family:?} polys {polys}: a next group to open beside"
+            );
+            let first = &groups[0];
+            let u = &first.upload_once;
+            assert!(
+                !u.used && !u.planned_out,
+                "{family:?} polys {polys}: no store ({u:?})"
+            );
+            assert_eq!(
+                u.refused, card,
+                "{family:?} polys {polys}: refused on a card only"
+            );
+            assert!(
+                first.overlapped,
+                "{family:?} polys {polys}: the refused group opened beside the next argue (planned \
+                 out {} at {} of {} B)",
+                first.overlap_planned_out, first.overlap_plan_need, first.overlap_plan_free
+            );
+        }
     }
 }
 
