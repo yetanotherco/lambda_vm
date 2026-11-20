@@ -857,6 +857,97 @@ fn the_blake3_driver_uploading_once_proves_the_same_level_bytes() {
     }
 }
 
+/// [`the_blake3_driver_uploading_once_proves_the_same_level_bytes`] with each
+/// store sent narrow (`LAMBDA_VM_LEVELS_NARROW_STORE=1` in the process's
+/// environment, which the test refuses to run without): the same level bytes
+/// as held stacks; on a card some store went up narrow and none was refused.
+/// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind, narrow store"]
+fn the_blake3_driver_with_a_narrow_store_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_stacks_for_test};
+    use super::wlfm::{StackPlace, narrow_store, set_upload_once_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_upload_once_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    assert!(narrow_store(), "run with LAMBDA_VM_LEVELS_NARROW_STORE=1");
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
+        set_upload_once_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let stamps: Vec<_> = run
+        .times
+        .stamps
+        .iter()
+        .flat_map(|st| st.groups.iter().map(|g| g.upload_once))
+        .collect();
+    let used = stamps.iter().filter(|u| u.used).count();
+    let narrow = stamps.iter().filter(|u| u.used && u.narrow).count();
+    let refused = stamps.iter().filter(|u| u.refused).count();
+    println!(
+        "LEVELS NARROW STORE: {used} stores used · {narrow} narrow · {refused} refused · {} planned out \
+         · words {} B · crossed {} B",
+        stamps.iter().filter(|u| u.planned_out).count(),
+        stamps
+            .iter()
+            .filter(|u| u.used)
+            .map(|u| u.bytes)
+            .sum::<u64>(),
+        stamps
+            .iter()
+            .filter(|u| u.used)
+            .map(|u| if u.narrow { u.packed_bytes } else { u.bytes })
+            .sum::<u64>(),
+    );
+    assert_eq!(refused, 0, "no store refused by the card");
+    if multilinear::gpu::reserve_budget() > 0 {
+        assert!(
+            used > 0,
+            "on a card, some retired stack's columns went up once"
+        );
+        assert_eq!(narrow, used, "every store used went up narrow");
+    }
+    let held = {
+        let _held = set_stacks_for_test(Some(StackPlace::Card));
+        derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+    };
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS NARROW STORE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
@@ -1723,6 +1814,17 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
                 None => String::new(),
             },
         );
+        if s.upload_once.used {
+            let u = s.upload_once;
+            println!(
+                "{tag} STORE {g}: narrow {} · words {:.3} GB · crossed {:.3} GB · pack {:.4}s · up {:.4}s",
+                u.narrow,
+                u.bytes as f64 / 1e9,
+                if u.narrow { u.packed_bytes } else { u.bytes } as f64 / 1e9,
+                u.pack_secs,
+                u.upload_secs
+            );
+        }
     }
 }
 
