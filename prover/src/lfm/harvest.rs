@@ -100,13 +100,18 @@ pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
     fork: &mut Fam::Transcript,
     lookup_challenges: &[FEE],
 ) -> Result<HostTable, String> {
-    use stark::domain::new_verifier_domain;
+    use stark::domain::try_new_verifier_domain;
     use stark::verifier::IsStarkVerifier;
     type Verifier<F, E, PI, Fam> =
         stark::verifier::GenericVerifier<F, E, PI, <Fam as crate::hash_pin::ProofFamily>::Stark>;
 
     let trace_length = view.trace_length();
-    let domain = new_verifier_domain(air, trace_length);
+    let domain = try_new_verifier_domain(air, trace_length).ok_or_else(|| {
+        format!(
+            "table {index}: trace length {trace_length} is not a power of two whose LDE fits \
+             the field's two-adic subgroup"
+        )
+    })?;
     let layout = Verifier::<Gl, Ext3, (), Fam>::ood_layout(air);
     let challenges = Verifier::<Gl, Ext3, (), Fam>::replay_rounds_after_round_1(
         air,

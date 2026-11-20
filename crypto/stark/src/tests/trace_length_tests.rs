@@ -1,0 +1,338 @@
+//! The host verifier's check of a proof's claimed trace length.
+//!
+//! A proof states its own `trace_length`, and the verifier derives the LDE
+//! size, the blowup and the FRI fold layout from it. Without a bound a claim of
+//! `2^62 + 2^j` rows at blowup 4 makes `trace_length · blowup` wrap (release
+//! builds) to `2^(j+2)`, the honest LDE size of a `2^j`-row trace. The blowup
+//! then reads as `0`, so its log is 64: nothing folds, and the final
+//! polynomial carries as many coefficients as the codeword has points, so it
+//! interpolates any DEEP function and the low-degree test is vacuous.
+//!
+//! [`forged_fibonacci_proof`] builds that proof: an honest Fibonacci proof's
+//! trees and openings, a false public input, a composition value that
+//! satisfies the out-of-domain identity at the claimed length, and a final
+//! polynomial interpolating the resulting DEEP codeword. The verifier must
+//! refuse it on the trace length alone.
+
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField};
+
+use crate::domain::{VerifierDomain, checked_lde_length, try_new_verifier_domain};
+use crate::examples::simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs};
+use crate::fri::fri_decommit::FriDecommitment;
+use crate::leaf_layout::LeafLayout;
+use crate::proof::options::ProofOptions;
+use crate::proof::stark::{DeepPolynomialOpening, StarkProof};
+use crate::proof::view::StarkProofView;
+use crate::prover::{IsStarkProver, Prover};
+use crate::traits::AIR;
+use crate::verifier::{Challenges, IsStarkVerifier, Verifier};
+
+type F = GoldilocksField;
+type Felt = FieldElement<F>;
+type Pi = FibonacciPublicInputs<F>;
+type V = Verifier<F, F, Pi>;
+type Proof = StarkProof<F, F, Pi>;
+
+const ROWS_LOG: u32 = 3;
+const ROWS: usize = 1 << ROWS_LOG;
+const BLOWUP: usize = 4;
+const COSET_OFFSET: u64 = 3;
+/// Enough queries that the honest proof opens every one of the 16 row pairs
+/// of its 32-point LDE (checked below), so the forger holds an opening for
+/// any query index the forged transcript draws.
+const QUERIES: usize = 200;
+
+/// The claimed length: `4 · (2^62 + 2^3)` wraps to `2^5`, the honest LDE size.
+const WRAPPED_ROWS: usize = (1 << 62) + ROWS;
+
+fn options() -> ProofOptions {
+    ProofOptions {
+        blowup_factor: BLOWUP as u8,
+        fri_number_of_queries: QUERIES,
+        coset_offset: COSET_OFFSET,
+        grinding_factor: 0,
+        ..ProofOptions::default_test_options()
+    }
+}
+
+fn honest_pi() -> Pi {
+    Pi {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    }
+}
+
+/// The false statement: a Fibonacci run starting from (5, 7), proved with the
+/// trace of the run from (1, 1).
+fn forged_pi() -> Pi {
+    Pi {
+        a0: Felt::from(5u64),
+        a1: Felt::from(7u64),
+    }
+}
+
+fn transcript() -> DefaultTranscript<F> {
+    DefaultTranscript::<F>::new(&[])
+}
+
+/// The verifier's transcript after round 1 of a single-table, no-LogUp proof.
+fn round_1_transcript(proof: &Proof) -> DefaultTranscript<F> {
+    let mut t = transcript();
+    t.append_bytes(&proof.lde_trace_main_merkle_root);
+    t
+}
+
+/// The domain the unbounded verifier derives from `trace_length`: the product
+/// with the blowup wraps, exactly as a release build computes it.
+fn wrapped_domain(trace_length: usize) -> VerifierDomain<F> {
+    let lde_length = trace_length.wrapping_mul(BLOWUP);
+    let root = |len: usize| F::get_primitive_root_of_unity(len.trailing_zeros() as u64).unwrap();
+    VerifierDomain {
+        root_order: trace_length.trailing_zeros(),
+        trace_length,
+        lde_length,
+        trace_primitive_root: root(trace_length),
+        lde_primitive_root: root(lde_length),
+        coset_offset: Felt::from(COSET_OFFSET),
+    }
+}
+
+fn replay(air: &FibonacciAIR<F>, proof: &Proof, domain: &VerifierDomain<F>) -> Challenges<F> {
+    V::replay_rounds_after_round_1(
+        air,
+        StarkProofView::Owned(proof),
+        &proof.public_inputs,
+        domain,
+        &mut round_1_transcript(proof),
+        Vec::new(),
+        &V::ood_layout(air),
+    )
+}
+
+/// `Σ βᵢ (t(z) − vᵢ) / (z − g^{stepᵢ})`: the boundary half of the composition
+/// polynomial at `z` (step 2's sum), for public inputs `pi` at `trace_length`.
+fn boundary_at_z(
+    air: &FibonacciAIR<F>,
+    pi: &Pi,
+    trace_length: usize,
+    domain: &VerifierDomain<F>,
+    ood_row: &[Felt],
+    challenges: &Challenges<F>,
+) -> Felt {
+    air.boundary_constraints(pi, &[], None, trace_length)
+        .constraints
+        .iter()
+        .zip(&challenges.boundary_coeffs)
+        .map(|(c, beta)| {
+            let den = (challenges.z - domain.trace_primitive_root.pow(c.step as u64))
+                .inv()
+                .unwrap();
+            (ood_row[c.col] - c.value) * den * beta
+        })
+        .fold(Felt::zero(), |acc, x| acc + x)
+}
+
+/// An honest proof of the 8-row Fibonacci run from (1, 1).
+fn honest_proof(air: &FibonacciAIR<F>) -> Proof {
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::one(), Felt::one()], ROWS);
+    Prover::prove(air, &mut trace, &honest_pi(), &mut transcript()).expect("honest prove")
+}
+
+/// The forged proof of [`forged_pi`], claiming [`WRAPPED_ROWS`] rows. Every
+/// tree root and every opening is the honest proof's.
+fn forged_fibonacci_proof(air: &FibonacciAIR<F>) -> Proof {
+    let honest = honest_proof(air);
+    assert!(
+        V::verify(&honest, air, &mut transcript()),
+        "setup: the honest proof verifies"
+    );
+    let honest_domain = wrapped_domain(ROWS);
+    let domain = wrapped_domain(WRAPPED_ROWS);
+    assert_eq!(
+        domain.lde_length, honest_domain.lde_length,
+        "setup: the claimed length's LDE wraps to the honest one"
+    );
+    assert_eq!(domain.root_order, honest_domain.root_order);
+    let pairs = domain.lde_length / 2;
+
+    // Every row pair's honest opening, by query index.
+    let honest_iotas = replay(air, &honest, &honest_domain).iotas;
+    let mut by_iota: Vec<Option<DeepPolynomialOpening<F, F>>> = vec![None; pairs];
+    for (q, &iota) in honest_iotas.iter().enumerate() {
+        by_iota[iota] = Some(honest.deep_poly_openings[q].clone());
+    }
+    let by_iota: Vec<_> = by_iota
+        .into_iter()
+        .map(|o| o.expect("setup: the honest proof opens every row pair"))
+        .collect();
+
+    let mut forged = honest.clone();
+    forged.trace_length = WRAPPED_ROWS;
+    forged.public_inputs = forged_pi();
+    forged.fri_layers_merkle_roots.clear();
+    forged.fri_final_poly_coeffs.clear();
+    forged.nonce = None;
+
+    // The composition value at z that the out-of-domain identity needs at
+    // the claimed length and the false public inputs. One transition
+    // constraint: its term at the honest length is the honest claim minus the
+    // honest boundary sum, and only its zerofier depends on the length.
+    let ch = replay(air, &forged, &domain);
+    assert_eq!(
+        ch.z,
+        replay(air, &honest, &honest_domain).z,
+        "setup: same z"
+    );
+    assert_eq!(air.constraints_meta().len(), 1);
+    assert_eq!(forged.composition_poly_parts_ood_evaluation.len(), 1);
+    let ood_row = forged.trace_ood_evaluations.get_row(0).to_vec();
+    let zerofier = |n: usize| {
+        crate::constraints::zerofier::evaluate_zerofier(
+            &air.constraints_meta()[0],
+            &ch.z,
+            &domain.trace_primitive_root,
+            n,
+        )
+    };
+    let honest_claim = honest.composition_poly_parts_ood_evaluation[0];
+    let transition_honest =
+        honest_claim - boundary_at_z(air, &honest_pi(), ROWS, &domain, &ood_row, &ch);
+    let transition_claimed =
+        transition_honest * zerofier(WRAPPED_ROWS) * zerofier(ROWS).inv().unwrap();
+    forged.composition_poly_parts_ood_evaluation[0] =
+        boundary_at_z(air, &forged_pi(), WRAPPED_ROWS, &domain, &ood_row, &ch) + transition_claimed;
+
+    // The DEEP codeword at every point under the forged challenges, from the
+    // honest openings, and the final polynomial that interpolates it: as many
+    // coefficients as points.
+    let mut ch = replay(air, &forged, &domain);
+    ch.iotas = (0..pairs).collect();
+    let mut every_pair = forged.clone();
+    every_pair.deep_poly_openings = by_iota.clone();
+    let layout = V::ood_layout(air);
+    let view = StarkProofView::Owned(&every_pair);
+    let ood_full = layout.reconstruct_full(
+        view.trace_ood_evaluations().row_major_data(),
+        view.trace_ood_evaluations().width(),
+        view.trace_ood_next_evaluations().row_major_data(),
+    );
+    let (deep, deep_sym) = V::reconstruct_deep_composition_poly_evaluations_for_layout(
+        &ch,
+        &domain,
+        view,
+        &ood_full,
+        layout.next_row_cols(),
+        layout.step_size(),
+        LeafLayout::RowPair,
+    )
+    .expect("DEEP at every pair");
+    let codeword: Vec<Felt> = deep
+        .iter()
+        .zip(&deep_sym)
+        .flat_map(|(x, sym)| [*x, *sym])
+        .collect();
+    forged.fri_final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, F>(
+        &codeword,
+        &Felt::from(COSET_OFFSET),
+        domain.lde_length.trailing_zeros(),
+    );
+
+    // The query indices now drawn, each answered by the honest opening there;
+    // no FRI layer to open.
+    let iotas = replay(air, &forged, &domain).iotas;
+    forged.deep_poly_openings = iotas.iter().map(|&i| by_iota[i].clone()).collect();
+    forged.query_list = vec![
+        FriDecommitment {
+            layers_auth_paths: Vec::new(),
+            layers_evaluations_sym: Vec::new(),
+        };
+        QUERIES
+    ];
+    forged
+}
+
+/// A proof of a false Fibonacci statement whose claimed trace length wraps
+/// the LDE size is refused. Without the length check a release build accepts
+/// it (the forger's replay itself trips a debug assertion, so the forgery is
+/// only built in release).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "the forgery needs release arithmetic; a debug build panics building it"
+)]
+fn wrapped_trace_length_forgery_is_refused() {
+    let air = FibonacciAIR::<F>::new(&options());
+    let forged = forged_fibonacci_proof(&air);
+    assert!(
+        !V::verify(&forged, &air, &mut transcript()),
+        "a proof claiming 2^62 + 2^3 rows (LDE wraps to 2^5) of a false statement was accepted"
+    );
+}
+
+/// The honest proof with only its claimed length changed: refused in every
+/// build, before any arithmetic on the length (a debug build used to panic on
+/// the wrapping multiply instead).
+#[test]
+fn claimed_lengths_no_proof_can_have_are_refused() {
+    let air = FibonacciAIR::<F>::new(&options());
+    let honest = honest_proof(&air);
+    assert!(V::verify(&honest, &air, &mut transcript()));
+    for claimed in [
+        0,
+        ROWS - 1,
+        ROWS + 1,
+        3 * ROWS,
+        WRAPPED_ROWS,
+        1 << 31,
+        1 << 62,
+        1 << 63,
+        usize::MAX,
+    ] {
+        let mut proof = honest.clone();
+        proof.trace_length = claimed;
+        assert!(
+            !V::verify(&proof, &air, &mut transcript()),
+            "claimed trace length {claimed} was accepted"
+        );
+    }
+}
+
+/// The bound itself: a power of two whose LDE fits Goldilocks' 2^32 subgroup.
+#[test]
+fn checked_lde_length_bounds() {
+    // The largest LDE: 2^32 points, at every blowup.
+    assert_eq!(checked_lde_length::<F>(1 << 30, 4), Some(1 << 32));
+    assert_eq!(checked_lde_length::<F>(1 << 31, 2), Some(1 << 32));
+    assert_eq!(checked_lde_length::<F>(1 << 32, 1), Some(1 << 32));
+    assert_eq!(checked_lde_length::<F>(1, 4), Some(4));
+    // One past it.
+    assert_eq!(checked_lde_length::<F>(1 << 31, 4), None);
+    assert_eq!(checked_lde_length::<F>(1 << 32, 2), None);
+    assert_eq!(checked_lde_length::<F>(1 << 33, 1), None);
+    // Not a power of two.
+    assert_eq!(checked_lde_length::<F>(0, 4), None);
+    assert_eq!(checked_lde_length::<F>(12, 4), None);
+    assert_eq!(checked_lde_length::<F>((1 << 30) - 1, 4), None);
+    assert_eq!(checked_lde_length::<F>(WRAPPED_ROWS, 4), None);
+    assert_eq!(checked_lde_length::<F>(8, 3), None);
+    assert_eq!(checked_lde_length::<F>(8, 0), None);
+    // Products that overflow `usize`.
+    assert_eq!(checked_lde_length::<F>(1 << 62, 4), None);
+    assert_eq!(checked_lde_length::<F>(1 << 63, 2), None);
+}
+
+/// The verifier's domain at `air`'s blowup (4): the largest claim gets its
+/// 2^32-point LDE; one past it, and any wrapping claim, gets none.
+#[test]
+fn verifier_domain_refuses_out_of_range_lengths() {
+    let air = FibonacciAIR::<F>::new(&options());
+    let max = try_new_verifier_domain(&air, 1 << 30).expect("2^30 rows at blowup 4");
+    assert_eq!(max.lde_length, 1 << 32);
+    assert_eq!(max.trace_length, 1 << 30);
+    assert!(try_new_verifier_domain(&air, 1 << 31).is_none());
+    assert!(try_new_verifier_domain(&air, WRAPPED_ROWS).is_none());
+    assert!(try_new_verifier_domain(&air, 12).is_none());
+    assert!(try_new_verifier_domain(&air, 0).is_none());
+}
