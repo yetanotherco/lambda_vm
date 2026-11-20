@@ -364,8 +364,9 @@ fn blake3_level0_census_on_a_real_block() {
     assert_eq!(cfg.format.zf.base, BaseFormat::B3_WHIR);
     let opts = super::proof::block_base_options();
     let t = std::time::Instant::now();
-    // Under local lookups (`LAMBDA_VM_B3_BASE_LOCAL=keccak`) the base is a
-    // proof of its own kind: either kind is held as one type.
+    // Under local lookups (the BLAKE3 base's default; `LAMBDA_VM_B3_BASE_LOCAL=off`
+    // turns them off) the base is a proof of its own kind: either kind is held
+    // as one type.
     let proof: crate::block_whir::AnyBlockWhirProof = crate::base_only::with_permit(|| {
         if cfg.format.local_lookups() {
             let mut proof = crate::block_whir::prove_block_whir_local_observed_led(

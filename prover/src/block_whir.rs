@@ -863,13 +863,29 @@ pub fn gkr_ladder_tag_word(ladder: GkrLadder) -> &'static str {
     }
 }
 
-/// The knob that proves and verifies the BLAKE3 base with KECCAK_RND's byte
-/// lookups argued per group ([`KeccakRndForm::LeanLocal`]); both sides of one
-/// process read it, and the tag names it (`/LL1`): see
-/// [`b3_base_local_setting`]. The BLAKE3 base's alone.
+/// The knob over the BLAKE3 base's KECCAK_RND byte lookups: argued per group
+/// ([`KeccakRndForm::LeanLocal`], the default, [`B3_BASE_LOCAL_DEFAULT`]) or
+/// in the global bus (`off`, [`KeccakRndForm::Lean`]); both sides of one
+/// process read it, and the tag names local lookups (`/LL1`): see
+/// [`b3_base_local_setting`]. The BLAKE3 base's alone: asking for local
+/// lookups on another base is a configuration error.
 ///
 /// [`KeccakRndForm::LeanLocal`]: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal
+/// [`KeccakRndForm::Lean`]: crate::tables::keccak_rnd::KeccakRndForm::Lean
 pub const B3_BASE_LOCAL_ENV: &str = "LAMBDA_VM_B3_BASE_LOCAL";
+
+/// Whether the BLAKE3 base argues KECCAK_RND's byte lookups per group when
+/// [`B3_BASE_LOCAL_ENV`] is unset: yes. The levels verifier pins the same
+/// value ([`B3_BASE_KECCAK_RND`]).
+pub const B3_BASE_LOCAL_DEFAULT: bool = true;
+
+/// KECCAK_RND's form on the BLAKE3 base at the default
+/// ([`B3_BASE_LOCAL_DEFAULT`]): the form the levels verifier pins.
+pub const B3_BASE_KECCAK_RND: crate::tables::keccak_rnd::KeccakRndForm = if B3_BASE_LOCAL_DEFAULT {
+    crate::tables::keccak_rnd::KeccakRndForm::LeanLocal
+} else {
+    crate::tables::keccak_rnd::KeccakRndForm::Lean
+};
 
 /// The knob that, under local lookups ([`B3_BASE_LOCAL_ENV`]), lets phase
 /// A's lane run each local group's local argue beside the commits, one bin
@@ -892,15 +908,16 @@ pub fn local_lane_setting(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// [`B3_BASE_LOCAL_ENV`]'s value: unset, `0` or `off` is off (today's
-/// format); `keccak` argues KECCAK_RND's byte lookups per group. Anything
-/// else is refused.
-pub fn b3_base_local_setting(value: Option<&str>) -> Result<bool, String> {
+/// [`B3_BASE_LOCAL_ENV`]'s value: unset is `None` (the base's default,
+/// [`B3_BASE_LOCAL_DEFAULT`] on the BLAKE3 base, off on any other); `0` or
+/// `off` is off (KECCAK_RND's byte lookups in the global bus); `keccak`
+/// argues them per group. Anything else is refused.
+pub fn b3_base_local_setting(value: Option<&str>) -> Result<Option<bool>, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
-        None => Ok(false),
+        None => Ok(None),
         Some(v) => match v.as_str() {
-            "0" | "off" => Ok(false),
-            "keccak" => Ok(true),
+            "0" | "off" => Ok(Some(false)),
+            "keccak" => Ok(Some(true)),
             other => Err(format!(
                 "{B3_BASE_LOCAL_ENV}={other:?}: expected 0, off or keccak"
             )),
@@ -909,10 +926,10 @@ pub fn b3_base_local_setting(value: Option<&str>) -> Result<bool, String> {
 }
 
 /// The BLAKE3 base's local lookups in this process ([`b3_base_local_setting`]
-/// of [`B3_BASE_LOCAL_ENV`]), read once; a refused value aborts the process
-/// at its first read, as [`b3_base_rounds`] does.
-pub fn b3_base_local() -> bool {
-    static LOCAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// of [`B3_BASE_LOCAL_ENV`]; `None` unset), read once; a refused value aborts
+/// the process at its first read, as [`b3_base_rounds`] does.
+pub fn b3_base_local() -> Option<bool> {
+    static LOCAL: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     *LOCAL.get_or_init(|| {
         let value = match std::env::var(B3_BASE_LOCAL_ENV) {
             Ok(v) => Some(v),
@@ -1040,13 +1057,16 @@ impl BlockFormat {
                 },
             ),
             group: GroupFold::Indexed,
-            // KECCAK_RND's byte lookups argued per group under the BLAKE3
-            // base's knob ([`b3_base_local`]); the knob on any other base is
-            // a configuration error.
+            // KECCAK_RND's byte lookups on the BLAKE3 base: per group unless
+            // its knob ([`b3_base_local`]) says `off`
+            // ([`B3_BASE_KECCAK_RND`] unset); on any other base in the
+            // global bus, and the knob asking there for local lookups is a
+            // configuration error.
             keccak_rnd: match (zf.base == BaseFormat::B3_WHIR, b3_base_local()) {
-                (true, true) => crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
-                (_, false) => crate::tables::keccak_rnd::KeccakRndForm::Lean,
-                (false, true) => {
+                (true, None) => B3_BASE_KECCAK_RND,
+                (true, Some(true)) => crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+                (_, Some(false)) | (false, None) => crate::tables::keccak_rnd::KeccakRndForm::Lean,
+                (false, Some(true)) => {
                     eprintln!(
                         "{B3_BASE_LOCAL_ENV} asks for local lookups: they are the BLAKE3 base's alone"
                     );
