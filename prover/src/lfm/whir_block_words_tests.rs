@@ -609,7 +609,7 @@ fn mix_statement(
         stark::multilinear_block::block_groups(&shapes, config.format.stack, format.group_polys)
             .expect("groups");
     let mut at = 0u32;
-    let groups: Vec<Vec<u32>> = sizes
+    let mut groups: Vec<Vec<u32>> = sizes
         .iter()
         .map(|&size| {
             let g = (at..at + size as u32).collect();
@@ -617,6 +617,27 @@ fn mix_statement(
             g
         })
         .collect();
+    // Under local lookups, one LOCAL_BYTES table of 2^16 rows after every
+    // other table, closing each group that holds a local sender, in group
+    // order (the frame's `check_local_groups`). Under any other format the
+    // statement is unchanged.
+    let mut rows = rows;
+    if format.local_lookups() {
+        let senders: Vec<bool> = airs
+            .air_refs()
+            .iter()
+            .map(|air| crate::tables::local_bytes::sends_local(air.bus_interactions()))
+            .collect();
+        let base = rows.len();
+        let mut j = 0usize;
+        for group in &mut groups {
+            if group.iter().any(|&i| senders[i as usize]) {
+                group.push((base + j) as u32);
+                rows.push(crate::tables::local_bytes::NUM_ROWS);
+                j += 1;
+            }
+        }
+    }
     OwnedBlockStatement {
         table_num_vars: rows.iter().map(|r| r.trailing_zeros() as u8).collect(),
         runtime_page_ranges: ranges,
@@ -3056,4 +3077,210 @@ fn every_route_of_a_plan_with_page_blocks_is_held_and_its_leaves_emit() {
             .unwrap_or_else(|e| panic!("table {t} ({}): {e}", air.name()));
     }
     emit_leaves(&plan).expect("every leaf emits");
+}
+
+/// ★ The leaf of a plan under local lookups, pinned in the default tier: it
+/// derives and emits from a hand-built statement — KECCAK and
+/// KECCAK_RND beside the small split mix, one LOCAL_BYTES closing the
+/// KECCAK_RND group — with no proof, so a digest pin of it can run in the
+/// default tier; and every one of the leaf's local checks moves the local
+/// leaf's digest while the non-local leaves' digests stay.
+#[test]
+fn a_local_leaf_is_pinned_without_a_proof() {
+    use super::local_faults::{self, Fault as LocalFault};
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat {
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..p1_format(MemoryFormat::Split, LeafScale::Fixed)
+    };
+    assert!(format.local_lookups(), "the format argues local lookups");
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    let rnd: &[(usize, usize)] = &[(1 << 8, 1)];
+    let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+    mix.push(("KECCAK", keccak));
+    mix.push(("KECCAK_RND", rnd));
+    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let groups = owned.groups.len();
+    let plan = WhirBlockPlan::derive(elf, &opts, &format, owned.view(), Some(groups))
+        .expect("the local plan derives from a hand-built statement");
+    let digests = |fault: LocalFault| -> Vec<String> {
+        local_faults::with(fault, || {
+            (0..plan.partition().num_leaves())
+                .map(|k| {
+                    super::super::whir_chain_tests::program_digest(
+                        &plan.leaf_program(k).expect("the leaf emits"),
+                    )
+                })
+                .collect()
+        })
+    };
+    let honest = digests(LocalFault::None);
+    println!(
+        "LOCAL LEAF PIN: {} groups, {} leaves, id {:02x?}, digests {honest:?}",
+        groups,
+        honest.len(),
+        &plan.id()[..8]
+    );
+    // A deleted or moved local check in the production emission moves it.
+    // Re-bless with two builds when the leaf changes on purpose.
+    const PIN: &str = "4988330484d8b0a145d8f3db83fe497b37f9f117e092081a6ed5c174640b10d7";
+    assert_eq!(
+        honest,
+        vec![PIN.to_string()],
+        "the local leaf's pinned digest"
+    );
+    let refs = plan.frame.airs.air_refs();
+    let local_leaves: Vec<usize> = (0..plan.partition().num_leaves())
+        .filter(|&k| {
+            plan.partition().leaf(k).iter().any(|&g| {
+                plan.groups[g]
+                    .iter()
+                    .any(|&t| refs[t].name().starts_with("LOCAL_BYTES["))
+            })
+        })
+        .collect();
+    assert_eq!(local_leaves.len(), 1, "one leaf holds the local group");
+    for fault in [
+        LocalFault::NoLocalBalance,
+        LocalFault::NoLocalBytesRoute,
+        LocalFault::NoLocalRoots,
+        LocalFault::NoLocalAnswers,
+        LocalFault::NoLocalDigests,
+        LocalFault::LocalDrawsFirst,
+        LocalFault::NoLocalState,
+        LocalFault::LocalStateLast,
+        LocalFault::TodaysWeights,
+        LocalFault::LocalBytesXorAsOr,
+    ] {
+        let moved = digests(fault);
+        for k in 0..honest.len() {
+            if local_leaves.contains(&k) {
+                assert_ne!(
+                    moved[k], honest[k],
+                    "{fault:?}: the local leaf's digest moves"
+                );
+            } else {
+                assert_eq!(moved[k], honest[k], "{fault:?}: a non-local leaf stays");
+            }
+        }
+    }
+}
+
+/// ★ The derive-time static receiver check is the plan's own — with the frame's AIR set holding a
+/// LOCAL_BYTES whose `LocalAreBytes` receiver reads a committed column (its
+/// own `MU_AND`), the plan refuses to derive, naming the check; with the
+/// check switched off (the leaf's `NoReceiverCheck`) the same statement
+/// derives. Pins the CALL in `derive_under`, which the unit test of the
+/// function alone does not.
+#[test]
+fn the_plan_refuses_a_dynamic_local_receiver_in_its_air_set() {
+    use super::local_faults::{self, Fault as LocalFault};
+    use crate::tables::local_bytes::{self, cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat {
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..p1_format(MemoryFormat::Split, LeafScale::Fixed)
+    };
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    let rnd: &[(usize, usize)] = &[(1 << 8, 1)];
+    let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+    mix.push(("KECCAK", keccak));
+    mix.push(("KECCAK_RND", rnd));
+    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let groups = owned.groups.len();
+    let direct = |column: usize| BusValue::Packed {
+        start_column: column,
+        packing: Packing::Direct,
+    };
+    let mut interactions = local_bytes::bus_interactions();
+    interactions[0] = BusInteraction::receiver(
+        BusId::LocalAreBytes,
+        Multiplicity::Column(cols::MU_ARE_BYTES),
+        vec![direct(cols::X), direct(cols::MU_AND)],
+    );
+    let derive =
+        || WhirBlockPlan::derive(elf, &opts, &format, owned.view(), Some(groups)).map(|_| ());
+    assert_eq!(derive(), Ok(()), "the honest LOCAL_BYTES derives");
+    crate::LOCAL_BYTES_INTERACTIONS_FOR_TEST.with(|c| *c.borrow_mut() = Some(interactions));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (
+            derive(),
+            local_faults::with(LocalFault::NoReceiverCheck, derive),
+        )
+    }));
+    crate::LOCAL_BYTES_INTERACTIONS_FOR_TEST.with(|c| *c.borrow_mut() = None);
+    let (refused, control) = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    println!("LOCAL DYNAMIC RECEIVER: {refused:?} · control {control:?}");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("LocalReceiverNotFixed")),
+        "the plan refuses a dynamic local receiver: {refused:?}"
+    );
+    assert_eq!(control, Ok(()), "with the check off the plan derives");
+}
+
+/// ★ The BLAKE3 twin of
+/// [`a_local_leaf_is_pinned_without_a_proof`] — the same
+/// hand-built local statement under the 7-round BLAKE3 base, one leaf
+/// (`derive_blake3`), so the byte sponge's arm of the local transcript is
+/// pinned too; every local fault moves the leaf.
+#[test]
+fn a_blake3_local_leaf_is_pinned_without_a_proof() {
+    use super::local_faults::{self, Fault as LocalFault};
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let p1 = p1_format(MemoryFormat::Split, LeafScale::Fixed);
+    let format = BlockFormat {
+        zf: p1.zf.with_base(stark::proof::options::BaseFormat::B3_WHIR),
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..p1
+    };
+    assert!(format.local_lookups(), "the format argues local lookups");
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    let rnd: &[(usize, usize)] = &[(1 << 8, 1)];
+    let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+    mix.push(("KECCAK", keccak));
+    mix.push(("KECCAK_RND", rnd));
+    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let plan = WhirBlockPlan::derive_blake3(elf, &opts, &format, owned.view(), 1, None)
+        .expect("the BLAKE3 local plan derives from a hand-built statement");
+    let digest = |fault: LocalFault| -> String {
+        local_faults::with(fault, || {
+            super::super::whir_chain_tests::program_digest(
+                &plan.leaf_program(0).expect("the leaf emits"),
+            )
+        })
+    };
+    let honest = digest(LocalFault::None);
+    println!(
+        "B3 LOCAL LEAF PIN: {} groups, id {:02x?}, digest {honest}",
+        owned.groups.len(),
+        &plan.id()[..8]
+    );
+    // Re-bless with two builds when the leaf changes on purpose.
+    const PIN: &str = "e4da2cfe70bd22a19ebc84f32dbcab0b37628db893b70eea677d459d58a5b761";
+    assert_eq!(honest, PIN, "the BLAKE3 local leaf's pinned digest");
+    for fault in [
+        LocalFault::NoLocalBalance,
+        LocalFault::NoLocalBytesRoute,
+        LocalFault::NoLocalRoots,
+        LocalFault::NoLocalAnswers,
+        LocalFault::NoLocalDigests,
+        LocalFault::LocalDrawsFirst,
+        LocalFault::NoLocalState,
+        LocalFault::LocalStateLast,
+        LocalFault::TodaysWeights,
+        LocalFault::LocalBytesXorAsOr,
+    ] {
+        assert_ne!(
+            digest(fault),
+            honest,
+            "{fault:?}: the local leaf's digest moves"
+        );
+    }
 }
