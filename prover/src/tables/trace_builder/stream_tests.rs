@@ -2237,3 +2237,64 @@ fn an_ecdas_table_is_estimated_at_its_forms_columns() {
         }
     }
 }
+
+/// ★ The units' ECDAS tables under the limb form refuse a broken step in the
+/// table's own job (`ecdas_cut_generator`, `ecdas_whole_job`): with one step's
+/// λ moved, exactly one table's job fails, naming the step and the relation,
+/// whether ECDAS is cut into tables or built whole; every job of the real steps
+/// builds. Under the byte form nothing is checked and every job builds.
+#[test]
+fn a_broken_ecdas_step_fails_its_own_tables_job_under_the_limb_form() {
+    use crate::tables::ecdas::{CompactEcdasOp, EcdasForm};
+    use crate::tables::gpack::TraceForm;
+    let ops = crate::tests::ecdas_halves_tests::real_ops();
+    let n = ops.len();
+    assert!(n > 16, "{n} steps");
+    let k = n / 2 + 1;
+    let mut bad = ops.clone();
+    bad[k].step.lambda[3] ^= 1;
+    let list = |ops: &[crate::tables::ecdas::EcdasOperation]| {
+        Arc::new(super::BlockVec::from_vec(
+            ops.iter().map(CompactEcdasOp::from_op).collect::<Vec<_>>(),
+        ))
+    };
+    let failures = |ops: &Arc<super::BlockVec<CompactEcdasOp>>, rows: usize, form: EcdasForm| {
+        super::cut_units_try(
+            super::family("ECDAS"),
+            ops,
+            rows,
+            Default::default(),
+            false,
+            TraceForm::Wide,
+            super::ecdas_cut_generator(form),
+            |ops| super::ecdas_whole_job(ops, form),
+        )
+        .expect("units")
+        .into_iter()
+        .filter_map(|unit| match unit {
+            super::Unit::Build { job, .. } => job().err(),
+            super::Unit::Streamed { .. } => None,
+        })
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+    };
+    // Whole (no cut), one table, and cut into tables of 8 rows.
+    for rows in [0, n.next_power_of_two(), 8] {
+        assert!(
+            failures(&list(&ops), rows, EcdasForm::Halves).is_empty(),
+            "rows {rows}: real steps"
+        );
+        let failed = failures(&list(&bad), rows, EcdasForm::Halves);
+        assert_eq!(failed.len(), 1, "rows {rows}: {failed:?}");
+        assert!(
+            failed[0].contains(&format!("timestamp {}", 1000 + k))
+                && failed[0].contains("λ's relation does not hold"),
+            "rows {rows}: {}",
+            failed[0]
+        );
+        assert!(
+            failures(&list(&bad), rows, EcdasForm::Bytes).is_empty(),
+            "rows {rows}: the byte form"
+        );
+    }
+}

@@ -1084,8 +1084,7 @@ impl<'a> StepBytes<'a> {
 
     /// The row's carries under [`EcdasForm::Halves`], λ's, xR's and yR's.
     /// A step whose relations do not hold gets carries its table refuses; the
-    /// finish refuses such a step before any table is built
-    /// ([`check_halves_rows`]).
+    /// finish's fill refuses such a step ([`Self::halves_carries_checked`]).
     pub(crate) fn halves_carries(&self) -> [[i64; HALVES_CARRIES]; 3] {
         self.terms().map(|t| {
             let (carries, exact) = halves_chain(&t);
@@ -1094,51 +1093,30 @@ impl<'a> StepBytes<'a> {
         })
     }
 
-    /// Why the limb form cannot lay this row out, if it cannot: one of its
-    /// three relations does not hold exactly, or a carry's high part is not a
-    /// byte (its `AreBytes` lookup would count a truncated value).
-    fn halves_problem(&self) -> Option<String> {
+    /// [`Self::halves_carries`], with why the limb form cannot lay this row
+    /// out, if it cannot: one of its three relations does not hold exactly,
+    /// or a carry's high part is not a byte (its `AreBytes` lookup would count
+    /// a truncated value). The same chains, read once.
+    pub(crate) fn halves_carries_checked(&self) -> ([[i64; HALVES_CARRIES]; 3], Option<String>) {
         const RELATIONS: [&str; 3] = ["λ's", "xR's", "yR's"];
-        for (name, terms) in RELATIONS.iter().zip(self.terms()) {
-            let (carries, exact) = halves_chain(&terms);
-            if !exact {
-                return Some(format!("{name} relation does not hold"));
+        let mut problem = None;
+        let terms = self.terms();
+        let carries = std::array::from_fn(|i| {
+            let (carries, exact) = halves_chain(&terms[i]);
+            if problem.is_none() {
+                if !exact {
+                    problem = Some(format!("{} relation does not hold", RELATIONS[i]));
+                } else if let Some(&c) = carries
+                    .iter()
+                    .find(|&&c| !(0..1 << 8).contains(&split_carry(c).1))
+                {
+                    problem = Some(format!("{} carry {c} is out of range", RELATIONS[i]));
+                }
             }
-            if let Some(&c) = carries
-                .iter()
-                .find(|&&c| !(0..1 << 8).contains(&split_carry(c).1))
-            {
-                return Some(format!("{name} carry {c} is out of range"));
-            }
-        }
-        None
+            carries
+        });
+        (carries, problem)
     }
-}
-
-/// The limb form's check of the steps it is about to lay out
-/// ([`EcdasForm::Halves`]): every step's relations hold exactly and every
-/// carry's high part is a byte. A step that fails would be written as a row
-/// its constraints refuse; the finish refuses it here instead, naming the
-/// step, before any ECDAS table is built. The byte form does not need it.
-pub(crate) fn check_halves_rows<'r, R: EcdasRow + 'r>(
-    rows: impl IntoIterator<Item = &'r R>,
-) -> Result<(), String> {
-    for (k, row) in rows.into_iter().enumerate() {
-        let s = row.step_bytes();
-        if s.op == DEFERRED_ECREC_OP {
-            return Err(format!(
-                "ECDAS step {k} (timestamp {}): a deferred ECREC call's row reached the ECDAS table",
-                s.timestamp
-            ));
-        }
-        if let Some(problem) = s.halves_problem() {
-            return Err(format!(
-                "ECDAS step {k} (timestamp {}) under the limb form: {problem}",
-                s.timestamp
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// A row as a builder holds it ([`EcdasOperation`] or [`CompactEcdasOp`]):
@@ -1214,7 +1192,10 @@ pub(crate) fn halves_rows_written_packed(form: TraceForm) -> bool {
 
 /// [`generate_ecdas_rows_of`] in `ecdas`'s form, each row read as it is held
 /// ([`EcdasRow`]): the byte form widens it to its op, the limb form reads its
-/// bytes in place.
+/// bytes in place. Unchecked: a broken step is laid out as the carries its
+/// constraints refuse (what the tamper tests build); the finish builds with
+/// [`try_generate_ecdas_rows_in`].
+#[cfg(test)]
 pub(crate) fn generate_ecdas_rows_in<R: EcdasRow + Sync>(
     rows: &[R],
     num_rows: usize,
@@ -1223,26 +1204,75 @@ pub(crate) fn generate_ecdas_rows_in<R: EcdasRow + Sync>(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     match ecdas {
         EcdasForm::Bytes => generate_ecdas_rows_of(rows, num_rows, form, EcdasRow::as_op),
-        EcdasForm::Halves => generate_halves_rows_of(rows, num_rows, form),
+        EcdasForm::Halves => generate_halves_rows_of(rows, num_rows, form, false).0,
+    }
+}
+
+/// The finish's ECDAS table in `ecdas`'s form, refusing under [`EcdasForm::Halves`] a table
+/// with a step the limb form cannot lay out: one whose relations do not hold
+/// exactly, whose carry's high part is not a byte, or a deferred ECREC call's
+/// row. The check reads the carries the fill computes anyway, row by row, so
+/// it costs no pass of its own. The error names the step (its row in this
+/// table and its timestamp) and the relation; the byte form needs no check.
+pub(crate) fn try_generate_ecdas_rows_in<R: EcdasRow + Sync>(
+    rows: &[R],
+    num_rows: usize,
+    form: TraceForm,
+    ecdas: EcdasForm,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
+    match ecdas {
+        EcdasForm::Bytes => Ok(generate_ecdas_rows_of(
+            rows,
+            num_rows,
+            form,
+            EcdasRow::as_op,
+        )),
+        EcdasForm::Halves => match generate_halves_rows_of(rows, num_rows, form, true) {
+            (table, None) => Ok(table),
+            (_, Some(problem)) => Err(problem),
+        },
     }
 }
 
 /// An ECDAS table of `num_rows` rows under [`EcdasForm::Halves`]: `rows` (a
 /// step a row), then the padding rows, whose carries are zero (`LO = 0`,
-/// `HI = 2^23 / 2^16`).
+/// `HI = 2^23 / 2^16`). With `check`, the first step the limb form cannot lay
+/// out, named ([`try_generate_ecdas_rows_in`]).
 fn generate_halves_rows_of<R: EcdasRow + Sync>(
     rows: &[R],
     num_rows: usize,
     form: TraceForm,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    check: bool,
+) -> (
+    TraceTable<GoldilocksField, GoldilocksExtension>,
+    Option<String>,
+) {
     use halves_cols as h;
     let n = rows.len();
     let (_, hi_zero) = split_carry(0);
-    generate_main!(form, &WIDTHS_HALVES, num_rows, h::NUM_COLUMNS, |table| {
+    // The fill can run twice (a packed write that misses its widths is
+    // written again); the first problem is kept.
+    let problem = std::cell::RefCell::new(None::<String>);
+    let note = |row_idx: usize, timestamp: u64, what: String| {
+        let mut p = problem.borrow_mut();
+        if p.is_none() {
+            *p = Some(format!(
+                "ECDAS step {row_idx} (timestamp {timestamp}) {what}"
+            ));
+        }
+    };
+    let table = generate_main!(form, &WIDTHS_HALVES, num_rows, h::NUM_COLUMNS, |table| {
         for (row_idx, row) in rows.iter().enumerate() {
             let s = row.step_bytes();
-            debug_assert_ne!(
-                s.op, DEFERRED_ECREC_OP,
+            if check && s.op == DEFERRED_ECREC_OP {
+                note(
+                    row_idx,
+                    s.timestamp,
+                    "is a deferred ECREC call's row, which reached the ECDAS table".into(),
+                );
+            }
+            debug_assert!(
+                check || s.op != DEFERRED_ECREC_OP,
                 "a deferred ECREC call's row reached the ECDAS table"
             );
             table.set_dword_wl(row_idx, h::TIMESTAMP_0, s.timestamp);
@@ -1258,10 +1288,22 @@ fn generate_halves_rows_of<R: EcdasRow + Sync>(
             table.set_bytes(row_idx, h::Q0, s.q[0]);
             table.set_bytes(row_idx, h::Q1, s.q[1]);
             table.set_bytes(row_idx, h::Q2, s.q[2]);
-            for (carries, &(lo, hi, _)) in s.halves_carries().iter().zip(&h::RELATIONS) {
+            let carries = if check {
+                let (carries, broken) = s.halves_carries_checked();
+                if let Some(what) = broken {
+                    note(row_idx, s.timestamp, format!("under the limb form: {what}"));
+                }
+                carries
+            } else {
+                s.halves_carries()
+            };
+            for (carries, &(lo, hi, _)) in carries.iter().zip(&h::RELATIONS) {
                 for (k, &c) in carries.iter().enumerate() {
                     let (l, high) = split_carry(c);
-                    debug_assert!((0..1 << 8).contains(&high), "carry {c} out of range");
+                    debug_assert!(
+                        check || (0..1 << 8).contains(&high),
+                        "carry {c} out of range"
+                    );
                     table.set_u64(row_idx, lo + k, l);
                     table.set_fe(row_idx, hi + k, fe_from_i64(high));
                 }
@@ -1278,7 +1320,8 @@ fn generate_halves_rows_of<R: EcdasRow + Sync>(
                 }
             }
         }
-    })
+    });
+    (table, problem.into_inner())
 }
 
 /// The bytes the limb form checks, in the order they are paired: `ROUND`, λ,

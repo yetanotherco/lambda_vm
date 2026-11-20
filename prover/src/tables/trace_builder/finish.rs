@@ -2045,11 +2045,21 @@ impl<'a> FinishPlan<'a> {
         };
         let ecdas_form = skip.ecdas_form;
         let gen_ecdases = || {
-            if ecdas_form == ecdas::EcdasForm::Halves {
-                ecdas::check_halves_rows(ecdas_ops.parts().flatten()).map_err(Error::Prover)?;
-            }
-            if skip.ecdas_rows > 0 {
-                return cut_tables(
+            // Under the limb form each table's fill refuses a step it cannot
+            // lay out (`ecdas::try_generate_ecdas_rows_in`); the generators
+            // here return tables, so the first refusal is kept and returned.
+            let refused = std::sync::Mutex::new(None::<String>);
+            let generate = |rows: &[_], num_rows, form| {
+                ecdas::try_generate_ecdas_rows_in(rows, num_rows, form, ecdas_form).unwrap_or_else(
+                    |problem| {
+                        let mut first = refused.lock().unwrap_or_else(|e| e.into_inner());
+                        first.get_or_insert(problem);
+                        streamed_placeholder()
+                    },
+                )
+            };
+            let tables = if skip.ecdas_rows > 0 {
+                cut_tables(
                     &ecdas_ops,
                     skip.ecdas_rows,
                     skip.cut_padding,
@@ -2059,15 +2069,18 @@ impl<'a> FinishPlan<'a> {
                         ecdas::EcdasForm::Bytes => ecdas::rows_written_packed,
                         ecdas::EcdasForm::Halves => ecdas::halves_rows_written_packed,
                     },
-                    |rows, num_rows, form| {
-                        ecdas::generate_ecdas_rows_in(rows, num_rows, form, ecdas_form)
-                    },
-                );
+                    generate,
+                )
+            } else {
+                generate_optional(&ecdas_ops.whole(), |rows| {
+                    let num_rows = rows.len().next_power_of_two().max(4);
+                    generate(rows, num_rows, TraceForm::Wide)
+                })
+            }?;
+            match refused.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                Some(problem) => Err(Error::Prover(problem)),
+                None => Ok(tables),
             }
-            generate_optional(&ecdas_ops.whole(), |rows| {
-                let num_rows = rows.len().next_power_of_two().max(4);
-                ecdas::generate_ecdas_rows_in(rows, num_rows, TraceForm::Wide, ecdas_form)
-            })
         };
         // HINT table. Absent entirely for programs that make no hint ecalls.
         let gen_hints = || {
@@ -2327,6 +2340,10 @@ type Job<'a> = Box<dyn FnOnce() -> Result<Table, Error> + Send + 'a>;
 /// A one-row-an-op family's cut generator: (ops, rows, form) → table.
 type CutGenerator<'a, T> =
     std::sync::Arc<dyn Fn(&[T], usize, TraceForm) -> Table + Send + Sync + 'a>;
+
+/// [`CutGenerator`] that can refuse its table.
+type TryCutGenerator<'a, T> =
+    std::sync::Arc<dyn Fn(&[T], usize, TraceForm) -> Result<Table, Error> + Send + Sync + 'a>;
 
 /// A wave's slot: a unit's AIR position and, for a table, its number among
 /// the rest's tables, its family and its job.
@@ -2606,6 +2623,52 @@ fn cut_units<'a, T: Clone + Send + Sync + 'a>(
     generate: CutGenerator<'a, T>,
     whole: impl FnOnce(std::sync::Arc<BlockVec<T>>) -> Job<'a>,
 ) -> Result<Vec<Unit<'a>>, Error> {
+    cut_units_try(
+        family,
+        ops,
+        rows,
+        padding,
+        pack,
+        form,
+        std::sync::Arc::new(move |ops: &[T], rows, form| Ok(generate(ops, rows, form))),
+        whole,
+    )
+}
+
+/// ECDAS's cut generator in the units: its tables in `form`, each refusing a
+/// step the limb form cannot lay out ([`ecdas::try_generate_ecdas_rows_in`]).
+fn ecdas_cut_generator<'a>(form: ecdas::EcdasForm) -> TryCutGenerator<'a, ecdas::CompactEcdasOp> {
+    std::sync::Arc::new(move |rows: &[ecdas::CompactEcdasOp], num_rows, trace| {
+        ecdas::try_generate_ecdas_rows_in(rows, num_rows, trace, form).map_err(Error::Prover)
+    })
+}
+
+/// ECDAS's whole table in the units (no cut), refusing as
+/// [`ecdas_cut_generator`]'s tables do.
+fn ecdas_whole_job<'a>(
+    ops: std::sync::Arc<BlockVec<ecdas::CompactEcdasOp>>,
+    form: ecdas::EcdasForm,
+) -> Job<'a> {
+    Box::new(move || {
+        let rows = ops.whole();
+        let num_rows = rows_of(rows.len());
+        ecdas::try_generate_ecdas_rows_in(&rows, num_rows, TraceForm::Wide, form)
+            .map_err(Error::Prover)
+    })
+}
+
+/// [`cut_units`] with a generator that can refuse a table (its job's error).
+#[allow(clippy::too_many_arguments)]
+fn cut_units_try<'a, T: Clone + Send + Sync + 'a>(
+    family: usize,
+    ops: &std::sync::Arc<BlockVec<T>>,
+    rows: usize,
+    padding: CutPadding,
+    pack: bool,
+    form: TraceForm,
+    generate: TryCutGenerator<'a, T>,
+    whole: impl FnOnce(std::sync::Arc<BlockVec<T>>) -> Job<'a>,
+) -> Result<Vec<Unit<'a>>, Error> {
     let n = ops.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -2628,7 +2691,7 @@ fn cut_units<'a, T: Clone + Send + Sync + 'a>(
         return Ok(vec![Unit::Build {
             family,
             rows: total,
-            job: Box::new(move || Ok(packed_if(pack, generate(&ops.whole(), total, form)))),
+            job: Box::new(move || Ok(packed_if(pack, generate(&ops.whole(), total, form)?))),
         }]);
     }
     Ok((0..padding.tables(n, rows))
@@ -2642,7 +2705,7 @@ fn cut_units<'a, T: Clone + Send + Sync + 'a>(
                 job: Box::new(move || {
                     Ok(packed_if(
                         pack,
-                        generate(&ops.range(first, end), rows, form),
+                        generate(&ops.range(first, end), rows, form)?,
                     ))
                 }) as Job<'a>,
             }
@@ -3000,31 +3063,18 @@ impl<'a> FinishPlan<'a> {
         drop(ecsm_ops);
         let ecdas_ops = Arc::clone(&shared.ecdas_ops);
         let ecdas_form = skip.ecdas_form;
-        if ecdas_form == ecdas::EcdasForm::Halves {
-            ecdas::check_halves_rows(ecdas_ops.parts().flatten()).map_err(Error::Prover)?;
-        }
-        units.extend(cut_units(
+        // Under the limb form each ECDAS table's job refuses a step its fill
+        // cannot lay out (`ecdas::try_generate_ecdas_rows_in`), on the units'
+        // workers beside the other tables.
+        units.extend(cut_units_try(
             family("ECDAS"),
             &ecdas_ops,
             skip.ecdas_rows,
             skip.cut_padding,
             pack,
             form,
-            Arc::new(move |rows: &[ecdas::CompactEcdasOp], num_rows, form| {
-                ecdas::generate_ecdas_rows_in(rows, num_rows, form, ecdas_form)
-            }),
-            |ops| {
-                Box::new(move || {
-                    let rows = ops.whole();
-                    let num_rows = rows_of(rows.len());
-                    Ok(ecdas::generate_ecdas_rows_in(
-                        &rows,
-                        num_rows,
-                        TraceForm::Wide,
-                        ecdas_form,
-                    ))
-                })
-            },
+            ecdas_cut_generator(ecdas_form),
+            |ops| ecdas_whole_job(ops, ecdas_form),
         )?);
         drop(ecdas_ops);
         let hint_ops = Arc::clone(&shared.hint_ops);
