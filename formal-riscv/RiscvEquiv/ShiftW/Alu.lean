@@ -6,10 +6,10 @@ import RiscvEquiv.AluBus
 
 The SHIFT clause of `Alu.Guarantees` at `word = 1` (flag byte `opsel(SHIFT) + 1 + 32·signed +
 64·direction`). CPU32 sends the low word of `rs1`, zero- or sign-extended (hypothesis `ha`),
-and the low word of `rs2`, sign-extended, of which only the shift amount mod 32 matters
-(hypothesis `hb`). It keeps the low word of the result, which it sign-extends to 64 bits before
-writing `rd`. So the theorems conclude about `outLo`: it is Sail's 32-bit result. The sign
-extension is the CPU32 side and is not covered here.
+and the low word of `rs2`, extended the same way, of which only the shift amount mod 32
+matters (hypothesis `hb`). It keeps the low word of the result, which it sign-extends to 64
+bits before writing `rd`. So the theorems conclude about `outLo`: it is Sail's 32-bit result.
+The sign extension is the CPU32 side and is not covered here.
 
 Each theorem instantiates `shift_word_alu_low` (`AluBus.lean`) at the flags of its
 instruction. The immediate versions are the register ones with `b = shamt`.

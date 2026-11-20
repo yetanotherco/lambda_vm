@@ -6,6 +6,8 @@
 # The Sail compiler, whose Lean backend translates the spec to Lean. Pinned to the head of
 # rems-project/sail#1823, which splits the `instruction` type so that it compiles on Lean
 # v4.35.0 (leanprover/lean4#8930). Move it to a commit of Sail's main once that PR is merged.
+# The PR's branch is on an older Sail, so the model asks for lean-sail v9 and Lean v4.29.0; on
+# main they move up (lean-sail v10), so after re-pinning rebuild formal-riscv.
 SAIL_REPO=https://github.com/rems-project/sail.git
 SAIL_COMMIT=6515cf4b7ab057610270d0a3e1c7edb1d4173a69
 
