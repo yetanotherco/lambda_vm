@@ -1320,6 +1320,41 @@ mod tests {
         assert_ne!(unpack_absorb_cv(&swapped), cv);
     }
 
+    /// Past one chunk, `Blake3Std` is the `blake3` crate's own chunk state run
+    /// past `CHUNK_LEN` and finalized as the root: an external anchor for the
+    /// one-chunk chain beyond the 1,024 bytes where it is `blake3::hash`, at the
+    /// joint leaves' lengths (1,088 / 1,600 / 2,112 bytes), at a final
+    /// polynomial's transcript segment (32 + 512·24 bytes) and at lengths that
+    /// end mid-block. The crate's chunk state counts its blocks in a `u8` and
+    /// asserts the chunk length in debug builds, so this runs in release builds
+    /// (as CI runs this crate's tests) and below 256 blocks.
+    #[test]
+    fn past_one_chunk_blake3_std_is_the_crates_chunk_state_run_on() {
+        if cfg!(debug_assertions) {
+            return;
+        }
+        for &len in &[1025usize, 1088, 1600, 2112, 4097, 12_320, 16_320, 16_383] {
+            let msg = message(len);
+            #[allow(deprecated)]
+            let anchor = *blake3::guts::ChunkState::new(0)
+                .update(&msg)
+                .finalize(true)
+                .as_bytes();
+            let ours: [u8; 32] = <Blake3Std as digest::Digest>::digest(&msg).into();
+            assert_eq!(ours, anchor, "Blake3Std at {len} bytes");
+            assert_eq!(
+                blake3_chain_rounds(&msg, crate::hash::blake3::BLAKE3_STANDARD_ROUNDS),
+                anchor,
+                "the chain at {len} bytes"
+            );
+            assert_ne!(
+                anchor,
+                *blake3::hash(&msg).as_bytes(),
+                "not the crate's tree at {len} bytes"
+            );
+        }
+    }
+
     /// The `digest` route and the free function are the same hash — the backends
     /// reach this type through `Digest`, the KATs above through `blake3_chain`.
     #[test]
