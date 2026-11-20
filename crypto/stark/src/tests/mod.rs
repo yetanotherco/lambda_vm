@@ -33,6 +33,7 @@ pub mod small_trace_tests;
 pub mod subcoset_device_tests;
 pub mod table_transpose_tests;
 pub mod terminal_tests;
+pub mod trace_length_tests;
 pub mod trace_test_helpers;
 #[cfg(feature = "cuda")]
 pub mod warm_device_tests;

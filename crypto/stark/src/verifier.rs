@@ -10,7 +10,7 @@ use crate::merkle_caps::{StarkCaps, TableTreeChecks, TreeCheck};
 pub use crate::proof::view::PiDeserializer;
 use crate::{
     config::Commitment,
-    domain::new_verifier_domain,
+    domain::try_new_verifier_domain,
     lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{ArchivedMultiProof, MultiProof},
     proof::view::{
@@ -1845,6 +1845,9 @@ pub trait IsStarkVerifier<
             return None;
         }
         for (air, proof) in airs.iter().zip(proofs.view_iter()) {
+            if !crate::domain::trace_length_in_range(*air, proof.trace_length()) {
+                return None;
+            }
             if air.is_preprocessed() {
                 let layout = Self::leaf_layout(*air, proof.trace_length());
                 transcript.append_bytes(&air.precomputed_commitment_for(layout)?);
@@ -1901,9 +1904,21 @@ pub trait IsStarkVerifier<
             // polynomial's degree space and weakening the low-degree test. Reject any
             // proof whose advertised part count disagrees with the AIR.
             let trace_length = proof.trace_length();
-            if trace_length == 0
-                || proof.composition_poly_parts_ood_evaluation().len()
-                    != air.composition_poly_degree_bound(trace_length) / trace_length
+            // Soundness: the claimed length is the proof's, and the LDE size,
+            // the blowup log and the FRI fold layout are all derived from it.
+            // Refuse a length no honest proof has (not a power of two, or an
+            // LDE that overflows or exceeds the two-adic subgroup) before any
+            // of that arithmetic runs: a product that wraps would leave the
+            // FRI check with nothing to fold, accepting any codeword.
+            if !crate::domain::trace_length_in_range(*air, trace_length) {
+                error!(
+                    "Table {idx}: claimed trace length {trace_length} is not a power of two \
+                     whose LDE fits the field's two-adic subgroup"
+                );
+                return false;
+            }
+            if proof.composition_poly_parts_ood_evaluation().len()
+                != air.composition_poly_degree_bound(trace_length) / trace_length
             {
                 return false;
             }
@@ -2362,7 +2377,13 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_verifier_domain(air, proof.trace_length());
+        // The claimed length was range-checked in Phase A; a direct caller gets
+        // the same check here, and a rejection rather than a panic.
+        let Some(domain) = try_new_verifier_domain(air, proof.trace_length()) else {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Claimed trace length does not fit the field's two-adic subgroup");
+            return false;
+        };
 
         // Verify there are enough queries
         if proof.query_list_len() < air.options().fri_number_of_queries {
