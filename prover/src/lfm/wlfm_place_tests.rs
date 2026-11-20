@@ -443,6 +443,7 @@ impl Drop for UploadOnceRestore {
     fn drop(&mut self) {
         super::wlfm::set_upload_once_for_test(None);
         super::wlfm::set_overlap_resident_for_test(None);
+        super::wlfm::set_overlap_next_columns_for_test(None);
         super::wlfm::set_overlap_planned_for_test(None);
         super::wlfm::set_overlap_faults_for_test(Default::default());
     }
@@ -613,6 +614,84 @@ fn the_overlap_priced_resident_proves_the_same_bytes_in_every_place() {
                 );
             }
         }
+    }
+}
+
+/// Pricing the next group's columns in the planned overlap
+/// (`LAMBDA_VM_LEVELS_OVERLAP_NEXT_COLUMNS`) moves no byte: in every place and
+/// under both families, with the upload once and the resident pricing on
+/// (where the term binds), the level-shaped probe proves the held build's
+/// bytes with the term on and off, and nothing is refused. On a card, over
+/// retired stacks (the planned overlap's place), the probe's one planned
+/// transition needs exactly the other group's columns more with the term on
+/// (8 bytes a cell): the term reaches the plan, once.
+#[test]
+fn the_overlap_pricing_the_next_columns_proves_the_same_bytes_in_every_place() {
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    super::wlfm::set_overlap_resident_for_test(Some(true));
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let (_, _, build) = probe_placed(family, place);
+            let mut stamps = Vec::new();
+            for on in [false, true] {
+                super::wlfm::set_overlap_next_columns_for_test(Some(on));
+                let (got, groups) =
+                    streamed_once(&program, &build, &arenas, true, Default::default())
+                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+                assert!(
+                    got == want,
+                    "{family:?} {place:?} next columns priced {on}: the held bytes"
+                );
+                assert!(
+                    groups.iter().all(|s| !s.upload_once.refused),
+                    "{family:?} {place:?} {on}: no store refused"
+                );
+                stamps.push(groups);
+            }
+            if card && place == StackPlace::CardRetired {
+                let (off, on) = (&stamps[0], &stamps[1]);
+                assert_eq!(off.len(), 2, "{family:?}: the probe's two groups");
+                let planned: Vec<usize> =
+                    (0..2).filter(|&g| off[g].overlap_plan_need > 0).collect();
+                assert_eq!(planned.len(), 1, "{family:?}: one planned transition");
+                let (g, next) = (planned[0], 1 - planned[0]);
+                assert_eq!(
+                    on[g].overlap_plan_need - off[g].overlap_plan_need,
+                    on[next].cells as u64 * 8,
+                    "{family:?}: the next group's columns, once"
+                );
+            }
+        }
+    }
+}
+
+/// The next-columns pricing knob's name; it is on by default, and only `0`
+/// turns it off.
+#[test]
+fn the_overlap_next_columns_knob_is_named_and_on_by_default() {
+    use super::wlfm::{OVERLAP_NEXT_COLUMNS_ENV, overlap_next_columns, overlap_next_columns_word};
+    assert_eq!(
+        OVERLAP_NEXT_COLUMNS_ENV,
+        "LAMBDA_VM_LEVELS_OVERLAP_NEXT_COLUMNS"
+    );
+    if std::env::var_os(OVERLAP_NEXT_COLUMNS_ENV).is_none() {
+        assert!(overlap_next_columns());
+    }
+    for (word, on) in [
+        (None, true),
+        (Some(""), true),
+        (Some("1"), true),
+        (Some("no"), true),
+        (Some("0"), false),
+        (Some(" 0 "), false),
+    ] {
+        assert_eq!(overlap_next_columns_word(word), on, "{word:?}");
     }
 }
 

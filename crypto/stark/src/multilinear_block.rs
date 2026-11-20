@@ -1744,6 +1744,10 @@ where
     /// retired prepared stack's revive over its store
     /// ([`Self::with_overlap_priced_resident`]); `false` unless set.
     overlap_resident: bool,
+    /// The planned overlap prices the next group's columns when they go up at
+    /// that group's own turn ([`Self::with_overlap_next_columns_priced`]);
+    /// `false` unless set.
+    overlap_next_columns: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2177,6 +2181,7 @@ where
             overlap_planned: false,
             upload_once: false,
             overlap_resident: false,
+            overlap_next_columns: false,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2248,6 +2253,19 @@ where
     /// once it changes nothing. The same proof.
     pub fn with_overlap_priced_resident(mut self, on: bool) -> Self {
         self.overlap_resident = on;
+        self
+    }
+
+    /// The planned overlap adds the next group's columns to a transition's
+    /// need when they are not on the card yet ([`next_columns_bytes`]): with
+    /// the upload beside off (retired stacks) they go up at that group's own
+    /// turn, after the plan and before the openings start beside its argue,
+    /// so neither the ledger nor the commit's growth holds them when the plan
+    /// reads (`false`, the default: today's plan, which covers them only with
+    /// its slack). Only the plan moves: where they no longer fit, the group
+    /// opens alone. The same proof.
+    pub fn with_overlap_next_columns_priced(mut self, on: bool) -> Self {
+        self.overlap_next_columns = on;
         self
     }
 
@@ -3029,13 +3047,16 @@ const OVERLAP_MARGIN_BYTES: u64 = 1 << 30;
 /// priced resident, [`RetiredStack::revive_card_bytes`]; the two run one after
 /// the other), the
 /// next group's argue bounded by [`OVERLAP_ARGUE_OVER_COMMIT`] of its phase-A
-/// commit's growth, and a margin, against what the ledger's budget has free
-/// now (the group's columns still on the card). Without a card (no budget) the
-/// openings are the host's and always fit.
+/// commit's growth, the next group's columns when they are not on the card yet
+/// (`next_columns`, [`next_columns_bytes`]), and a margin, against what the
+/// ledger's budget has free now (the group's columns still on the card); the
+/// sum is [`overlap_plan`]'s. Without a card (no budget) the openings are the
+/// host's and always fit.
 fn overlap_fits<F, E, T, H>(
     argued: &Argued<F, E, T>,
     prepared: &[BlockPrepared<'_, F, H>],
     next: &GroupStamps,
+    next_columns: u64,
     config: &ChainConfig,
 ) -> (bool, u64, u64)
 where
@@ -3066,18 +3087,60 @@ where
             _ => None,
         })
         .unwrap_or(0);
+    overlap_plan(
+        own.max(theirs),
+        next.commit_reserved.saturating_sub(next.commit_base),
+        next_columns,
+        budget,
+        multilinear::gpu::ledger_reserved(),
+    )
+}
+
+/// The planned overlap's sum for one transition, `(fits, need, free)`: the
+/// opened group's `openings`, the next group's argue as
+/// [`OVERLAP_ARGUE_OVER_COMMIT`] of its phase-A commit's growth
+/// (`next_commit_growth`, stamped after that group's columns went up, so it
+/// never holds them), the next group's columns not yet on the card
+/// (`next_columns`), and [`OVERLAP_MARGIN_BYTES`], against the budget less
+/// what the ledger holds now (`reserved`). No budget (no card): always fits.
+fn overlap_plan(
+    openings: u64,
+    next_commit_growth: u64,
+    next_columns: u64,
+    budget: u64,
+    reserved: u64,
+) -> (bool, u64, u64) {
+    if budget == 0 {
+        return (true, 0, 0);
+    }
     let (num, den) = OVERLAP_ARGUE_OVER_COMMIT;
-    let argue = next
-        .commit_reserved
-        .saturating_sub(next.commit_base)
-        .saturating_mul(num)
-        / den;
-    let need = own
-        .max(theirs)
+    let argue = next_commit_growth.saturating_mul(num) / den;
+    let need = openings
         .saturating_add(argue)
+        .saturating_add(next_columns)
         .saturating_add(OVERLAP_MARGIN_BYTES);
-    let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+    let free = budget.saturating_sub(reserved);
     (need <= free, need, free)
+}
+
+/// The card's bytes a cell of a group's store: one 8-byte word, whatever the
+/// table's width on the host (a narrow or record table is widened on the
+/// card; the upload promises `cells × 8`, plus a staging that is gone before
+/// the openings start).
+const STORE_WORD_BYTES: u64 = 8;
+
+/// What the next group's columns (`cells`, [`GroupStamps::cells`]) add to a
+/// transition's plan ([`overlap_plan`]): their store when they go up at that
+/// group's own turn, after the plan and before the openings start beside its
+/// argue; nothing when they are `up` already (the ledger holds them, or the
+/// card refused them beside the argue and they stay on the host), or when the
+/// plan does not price them (`priced` off: today's plan).
+fn next_columns_bytes(cells: usize, up: bool, priced: bool) -> u64 {
+    if up || !priced {
+        0
+    } else {
+        (cells as u64).saturating_mul(STORE_WORD_BYTES)
+    }
 }
 
 /// Whether the planned overlap prices a retired prepared stack's revive over
@@ -3572,6 +3635,7 @@ where
         overlap_planned,
         upload_once,
         overlap_resident,
+        overlap_next_columns,
         sched,
         ood,
         ood_unbound,
@@ -3940,7 +4004,16 @@ where
             && overlap_planned
             && !latched
             && next_g.is_some_and(|next| {
-                let (fits, need, free) = overlap_fits(&argued, prepared, &stamps[next], config);
+                // The next group's columns are on the card now when they went
+                // up beside this argue (`pre_uploaded`, or refused there and
+                // left on the host); otherwise they go up at its own turn.
+                let next_columns = next_columns_bytes(
+                    stamps[next].cells,
+                    pre_uploaded.is_some(),
+                    overlap_next_columns,
+                );
+                let (fits, need, free) =
+                    overlap_fits(&argued, prepared, &stamps[next], next_columns, config);
                 let fits = fits && overlap_faults.overlap_refused_at != Some(p);
                 stamps[g].overlap_planned_out = !fits;
                 stamps[g].overlap_plan_need = need;
@@ -5239,5 +5312,96 @@ mod upload_once_rule_tests {
         assert!(!super::priced_resident(false, true));
         assert!(!super::priced_resident(true, false));
         assert!(!super::priced_resident(false, false));
+    }
+}
+
+#[cfg(test)]
+mod overlap_plan_tests {
+    use super::{OVERLAP_MARGIN_BYTES, next_columns_bytes, overlap_plan};
+
+    const GIB: u64 = 1 << 30;
+    /// Level 1's group 1 on a real median block (397 410 304 cells, its
+    /// stamps): 2.96 GiB of columns on the card.
+    const MEDIAN_GROUP_CELLS: usize = 397_410_304;
+
+    /// The next group's columns cost their store, one 8-byte word a cell, only
+    /// when they go up at that group's own turn and the plan prices them.
+    #[test]
+    fn the_next_groups_columns_are_priced_only_when_they_go_up_at_its_turn() {
+        let cells = MEDIAN_GROUP_CELLS;
+        assert_eq!(next_columns_bytes(cells, false, true), cells as u64 * 8);
+        assert_eq!(next_columns_bytes(cells, true, true), 0, "already up");
+        assert_eq!(next_columns_bytes(cells, false, false), 0, "today's plan");
+        assert_eq!(next_columns_bytes(cells, true, false), 0);
+        assert_eq!(next_columns_bytes(0, false, true), 0);
+        assert_eq!(next_columns_bytes(usize::MAX, false, true), u64::MAX);
+    }
+
+    /// The plan's need is the openings, 5/4 of the next commit's growth, the
+    /// next group's columns and the margin, each once; free is the budget less
+    /// the ledger; it fits up to equality, and without a card always.
+    #[test]
+    fn the_overlap_plan_adds_the_next_groups_columns_to_its_need() {
+        let columns = next_columns_bytes(MEDIAN_GROUP_CELLS, false, true);
+        let (_, without, free) = overlap_plan(3 * GIB, 12 * GIB, 0, 26 * GIB, 6 * GIB);
+        let (_, with, free_with) = overlap_plan(3 * GIB, 12 * GIB, columns, 26 * GIB, 6 * GIB);
+        assert_eq!(without, 3 * GIB + 15 * GIB + OVERLAP_MARGIN_BYTES);
+        assert_eq!(
+            with - without,
+            columns,
+            "the term is added once, outside the 5/4"
+        );
+        assert_eq!(
+            (free, free_with),
+            (20 * GIB, 20 * GIB),
+            "free reads the ledger alone"
+        );
+        let exact = 3 * GIB + 15 * GIB + columns + OVERLAP_MARGIN_BYTES;
+        assert_eq!(
+            overlap_plan(3 * GIB, 12 * GIB, columns, exact + 6 * GIB, 6 * GIB),
+            (true, exact, exact),
+            "need equal to free fits"
+        );
+        assert_eq!(
+            overlap_plan(3 * GIB, 12 * GIB, columns, exact + 6 * GIB - 1, 6 * GIB),
+            (false, exact, exact - 1)
+        );
+        assert_eq!(
+            overlap_plan(3 * GIB, 12 * GIB, columns, 0, 6 * GIB),
+            (true, 0, 0)
+        );
+        assert_eq!(
+            overlap_plan(u64::MAX, u64::MAX, u64::MAX, 26 * GIB, 6 * GIB),
+            (false, u64::MAX, 20 * GIB),
+            "saturates, never wraps into a fit"
+        );
+    }
+
+    /// The review's shape: with resident pricing the opened group's prepared
+    /// revive is its store and room only, and the slack of 5/4 over a real
+    /// ratio of 1.19 on 12 GiB of growth (1.7 GiB with the margin) does not
+    /// cover the median group's 2.96 GiB of columns. Today's plan admits the
+    /// transition; priced, it opens alone.
+    #[test]
+    fn the_next_groups_columns_turn_a_transition_the_slack_admitted_into_one_alone() {
+        let columns = next_columns_bytes(MEDIAN_GROUP_CELLS, false, true);
+        let (openings, growth, budget, ledger) = (3 * GIB, 12 * GIB, 26 * GIB, 6 * GIB);
+        let (today, need, free) = overlap_plan(openings, growth, 0, budget, ledger);
+        assert!(today && need == 19 * GIB && free == 20 * GIB);
+        // What the card holds through the transition at a real ratio of 1.19:
+        // the openings, the argue's growth, the columns and the ledger now.
+        let held = openings + growth * 119 / 100 + columns + ledger;
+        assert!(held > budget, "today's admission overruns the budget");
+        let (priced, _, _) = overlap_plan(openings, growth, columns, budget, ledger);
+        assert!(!priced, "priced, the transition opens alone");
+        // Up beside the argue already (the upload beside on), nothing changes.
+        let (up, _, _) = overlap_plan(
+            openings,
+            growth,
+            next_columns_bytes(MEDIAN_GROUP_CELLS, true, true),
+            budget,
+            ledger,
+        );
+        assert!(up);
     }
 }
