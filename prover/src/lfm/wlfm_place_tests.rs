@@ -809,34 +809,42 @@ fn the_narrow_store_proves_the_same_bytes_in_every_place() {
     }
 }
 
-/// The narrow-commit knob's name; it is off by default, and only `1` (one
-/// pageable copy a run) and `2` (the pinned staging) turn it on.
+/// The narrow-commit knob's name; it is on by default in the form
+/// `NARROW_COMMIT_DEFAULT`, `0` turns it off, and `1` (one pageable copy a run)
+/// and `2` (the pinned staging) pick a form.
 #[test]
-fn the_narrow_commit_knob_is_named_and_off_by_default() {
+fn the_narrow_commit_knob_is_named_and_on_by_default() {
     use super::wlfm::{
-        NARROW_COMMIT_ENV, narrow_commit, narrow_commit_mode_word, narrow_commit_word,
+        NARROW_COMMIT_DEFAULT, NARROW_COMMIT_ENV, narrow_commit, narrow_commit_mode_word,
+        narrow_commit_word,
     };
     assert_eq!(NARROW_COMMIT_ENV, "LAMBDA_VM_LEVELS_NARROW_COMMIT");
+    assert!(matches!(NARROW_COMMIT_DEFAULT, 1 | 2));
     if std::env::var_os(NARROW_COMMIT_ENV).is_none() {
-        assert!(!narrow_commit());
-        assert!(!super::wlfm::narrow_commit_staged());
+        assert!(narrow_commit());
+        assert_eq!(
+            super::wlfm::narrow_commit_staged(),
+            NARROW_COMMIT_DEFAULT == 2
+        );
     }
     for (word, on) in [
-        (None, false),
-        (Some(""), false),
+        (None, true),
+        (Some(""), true),
         (Some("0"), false),
-        (Some("on"), false),
+        (Some(" 0 "), false),
+        (Some("on"), true),
         (Some("1"), true),
         (Some(" 1 "), true),
         (Some("2"), true),
-        (Some("3"), false),
+        (Some("3"), true),
     ] {
         assert_eq!(narrow_commit_word(word), on, "{word:?}");
     }
+    assert_eq!(narrow_commit_mode_word(Some("0")), 0);
     assert_eq!(narrow_commit_mode_word(Some("1")), 1);
     assert_eq!(narrow_commit_mode_word(Some(" 2 ")), 2);
-    assert_eq!(narrow_commit_mode_word(Some("3")), 0);
-    assert_eq!(narrow_commit_mode_word(None), 0);
+    assert_eq!(narrow_commit_mode_word(Some("3")), NARROW_COMMIT_DEFAULT);
+    assert_eq!(narrow_commit_mode_word(None), NARROW_COMMIT_DEFAULT);
 }
 
 /// ★ Committing the prepared stacks from their columns sent narrow
