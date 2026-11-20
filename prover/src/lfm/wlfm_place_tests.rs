@@ -847,10 +847,10 @@ fn the_narrow_commit_knob_is_named_and_on_by_default() {
     assert_eq!(narrow_commit_mode_word(None), NARROW_COMMIT_DEFAULT);
 }
 
-/// The narrow pack's knobs: their names; two threads and no nice by default;
-/// only `1` turns either on.
+/// The narrow pack's knobs: their names; one thread and no nice by default;
+/// only `2` turns two threads on, only `1` the nice.
 #[test]
-fn the_narrow_pack_knobs_are_named_and_off_by_default() {
+fn the_narrow_pack_knobs_are_named_and_one_thread_by_default() {
     use super::levels::{
         NARROW_PACK_NICE_ENV, NARROW_PACK_THREADS_ENV, narrow_pack_nice_word, narrow_pack_settings,
         narrow_pack_threads_word,
@@ -863,18 +863,25 @@ fn the_narrow_pack_knobs_are_named_and_off_by_default() {
     if std::env::var_os(NARROW_PACK_THREADS_ENV).is_none()
         && std::env::var_os(NARROW_PACK_NICE_ENV).is_none()
     {
-        assert_eq!(narrow_pack_settings(), (2, false));
+        assert_eq!(narrow_pack_settings(), (1, false));
     }
-    for (word, threads, nice) in [
-        (None, 2, false),
-        (Some(""), 2, false),
-        (Some("0"), 2, false),
-        (Some("2"), 2, false),
-        (Some("on"), 2, false),
-        (Some("1"), 1, true),
-        (Some(" 1 "), 1, true),
+    for (word, threads) in [
+        (None, 1),
+        (Some(""), 1),
+        (Some("0"), 1),
+        (Some("1"), 1),
+        (Some("on"), 1),
+        (Some("2"), 2),
+        (Some(" 2 "), 2),
     ] {
         assert_eq!(narrow_pack_threads_word(word), threads, "{word:?}");
+    }
+    for (word, nice) in [
+        (None, false),
+        (Some("0"), false),
+        (Some("2"), false),
+        (Some("1"), true),
+    ] {
         assert_eq!(narrow_pack_nice_word(word), nice, "{word:?}");
     }
 }

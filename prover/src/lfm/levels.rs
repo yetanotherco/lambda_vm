@@ -641,16 +641,16 @@ pub(crate) fn prepare_level(
 
 /// The threads a level's host part packs its prepared stacks narrow on
 /// ([`super::wlfm::WlfmPrebuild::hold_narrow_packs`]), beside the base's
-/// phase B: two by default, not the shared pool, which phase B binds (a pooled
-/// gather there cost phase B about one for one); one under
-/// [`NARROW_PACK_THREADS_ENV`].
-const NARROW_PACK_THREADS: usize = 2;
+/// phase B: one by default, which halves the pack's memory traffic beside
+/// phase B against two and still ends well before the base on a large block;
+/// two under [`NARROW_PACK_THREADS_ENV`]. Never the shared pool, which phase
+/// B binds (a pooled gather there cost phase B about one for one).
+const NARROW_PACK_THREADS: usize = 1;
 
-/// `LAMBDA_VM_LEVELS_NARROW_PACK_THREADS=1`: the narrow commit's pack ahead
-/// runs on one thread instead of [`NARROW_PACK_THREADS`], half the memory
-/// traffic and cycles beside phase B at any time, for about twice as long. Any
-/// other word keeps two. The same packed bytes, so the same proof. Read once a
-/// process.
+/// `LAMBDA_VM_LEVELS_NARROW_PACK_THREADS=2`: the narrow commit's pack ahead
+/// runs on two threads instead of [`NARROW_PACK_THREADS`]'s one: done in about
+/// half the time, at twice the memory traffic beside phase B. Any other word
+/// keeps one. The same packed bytes, so the same proof. Read once a process.
 pub const NARROW_PACK_THREADS_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_PACK_THREADS";
 
 /// `LAMBDA_VM_LEVELS_NARROW_PACK_NICE=1`: the narrow commit's pack threads run
@@ -659,12 +659,11 @@ pub const NARROW_PACK_THREADS_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_PACK_THREADS"
 /// a process.
 pub const NARROW_PACK_NICE_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_PACK_NICE";
 
-/// [`NARROW_PACK_THREADS_ENV`]'s word: one thread for `1`, two otherwise.
+/// [`NARROW_PACK_THREADS_ENV`]'s word: two threads for `2`, one otherwise.
 pub fn narrow_pack_threads_word(word: Option<&str>) -> usize {
-    if super::wlfm_knobs::knob_word_on(word) {
-        1
-    } else {
-        NARROW_PACK_THREADS
+    match word.map(str::trim) {
+        Some("2") => 2,
+        _ => NARROW_PACK_THREADS,
     }
 }
 
