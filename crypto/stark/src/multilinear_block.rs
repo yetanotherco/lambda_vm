@@ -252,6 +252,13 @@ pub struct GroupStamps {
     /// included). Bytes; 0 without a device.
     pub commit_base: u64,
     pub commit_reserved: u64,
+    /// What a card commit of the group would hold at most
+    /// ([`multilinear::stacked_eval::commit_card_bytes`]), and how many of the
+    /// process's commits fell back to the host while the group committed: the
+    /// planned overlap's stand-in for a growth it did not see
+    /// ([`planned_commit_growth`]).
+    pub commit_priced: u64,
+    pub commit_host_fallbacks: u64,
     /// The group's columns were to go up beside the previous group's commit
     /// and the ledger refused them; they went up after it.
     pub ahead_refused: bool,
@@ -1996,6 +2003,8 @@ where
             let layout = global_layout(&shapes, config.format.stack)?;
             stamp.polys = layout.num_polys();
             stamp.commit_base = multilinear::gpu::ledger_reserved();
+            stamp.commit_priced = multilinear::stacked_eval::commit_card_bytes(&layout, config);
+            let fallbacks_before = multilinear::gpu::host_fallbacks();
             multilinear::gpu::reset_reserved_window();
             // Handles, not field elements: a table held narrow is read on the
             // host only by a host fallback.
@@ -2090,6 +2099,8 @@ where
             stamp.ood_counts = committed.ood_counts;
             ood.push(committed.ood);
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
+            stamp.commit_host_fallbacks =
+                multilinear::gpu::host_fallbacks().saturating_sub(fallbacks_before);
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
             if upload_ahead && let Some(packed) = packing.take() {
@@ -3089,7 +3100,11 @@ where
         .unwrap_or(0);
     overlap_plan(
         own.max(theirs),
-        next.commit_reserved.saturating_sub(next.commit_base),
+        planned_commit_growth(
+            next.commit_reserved.saturating_sub(next.commit_base),
+            next.commit_priced,
+            next.commit_host_fallbacks,
+        ),
         next_columns,
         budget,
         multilinear::gpu::ledger_reserved(),
@@ -3121,6 +3136,20 @@ fn overlap_plan(
         .saturating_add(OVERLAP_MARGIN_BYTES);
     let free = budget.saturating_sub(reserved);
     (need <= free, need, free)
+}
+
+/// The next group's commit growth as the planned overlap reads it: the growth
+/// the ledger measured, unless a commit fell back to the host while the group
+/// committed (`host_fallbacks`). Such a commit grew the ledger by almost
+/// nothing, which would plan its argue at almost nothing; it is read as at
+/// least a card commit of the group (`priced`) instead. Measured ≥ priced
+/// keeps the measured.
+fn planned_commit_growth(measured: u64, priced: u64, host_fallbacks: u64) -> u64 {
+    if host_fallbacks > 0 {
+        measured.max(priced)
+    } else {
+        measured
+    }
 }
 
 /// The card's bytes a cell of a group's store: one 8-byte word, whatever the
@@ -5317,7 +5346,7 @@ mod upload_once_rule_tests {
 
 #[cfg(test)]
 mod overlap_plan_tests {
-    use super::{OVERLAP_MARGIN_BYTES, next_columns_bytes, overlap_plan};
+    use super::{OVERLAP_MARGIN_BYTES, next_columns_bytes, overlap_plan, planned_commit_growth};
 
     const GIB: u64 = 1 << 30;
     /// Level 1's group 1 on a real median block (397 410 304 cells, its
@@ -5403,5 +5432,35 @@ mod overlap_plan_tests {
             ledger,
         );
         assert!(up);
+    }
+
+    /// A group whose commit fell back to the host is planned as a card commit
+    /// of it, not at the almost nothing it grew the ledger by; a card commit's
+    /// own growth is read as measured, whatever the price.
+    #[test]
+    fn a_commit_that_fell_back_to_the_host_is_planned_as_a_card_commit() {
+        let priced = 12 * GIB;
+        assert_eq!(planned_commit_growth(64 << 20, priced, 1), priced);
+        assert_eq!(planned_commit_growth(64 << 20, priced, 3), priced);
+        assert_eq!(
+            planned_commit_growth(13 * GIB, priced, 1),
+            13 * GIB,
+            "measured above the price"
+        );
+        assert_eq!(
+            planned_commit_growth(64 << 20, priced, 0),
+            64 << 20,
+            "a card commit: measured"
+        );
+        assert_eq!(planned_commit_growth(9 * GIB, priced, 0), 9 * GIB);
+        // Through the plan: the fallen-back group's argue is 5/4 of the price.
+        let (_, need, _) = overlap_plan(
+            3 * GIB,
+            planned_commit_growth(64 << 20, priced, 1),
+            0,
+            26 * GIB,
+            6 * GIB,
+        );
+        assert_eq!(need, 3 * GIB + 15 * GIB + OVERLAP_MARGIN_BYTES);
     }
 }
