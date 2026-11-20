@@ -580,7 +580,8 @@ pub(crate) fn joined_validation(
 }
 
 /// A level's host part ([`prepare_wlfm`]), its chip prefixes packed with it
-/// when it holds its chips as records: nothing here waits for the card.
+/// when it holds its chips as records and [`pack_after_commit`] is off:
+/// nothing here waits for the card.
 pub(crate) fn prepare_level(
     program: &LfmProgram,
     family: WlfmFamily,
@@ -588,16 +589,61 @@ pub(crate) fn prepare_level(
 ) -> Result<WlfmPrebuild, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, level_levers(family), rounds)?;
-    if super::wlfm::chip_records() {
+    if super::wlfm::chip_records() && !pack_after_commit() {
         pre.hold_chip_prefixes()?;
     }
     Ok(pre)
 }
 
-/// A prepared level committed where [`stack_place`] puts it.
+/// A prepared level committed where [`stack_place`] puts it; under
+/// [`pack_after_commit`], its chip prefixes packed then, from the same
+/// columns.
 pub(crate) fn commit_level(pre: WlfmPrebuild, level: usize) -> Result<WlfmBuild, String> {
     let place = stack_place(pre.prepared_cells(), level, stacks_forced()?);
-    pre.commit(place)
+    let mut build = pre.commit(place)?;
+    if super::wlfm::chip_records() && pack_after_commit() {
+        build.hold_chip_prefixes()?;
+    }
+    Ok(build)
+}
+
+/// `LAMBDA_VM_LEVELS_PACK_AFTER_COMMIT=1`: a level's chip prefixes are packed
+/// after its stacks are committed ([`commit_level`]), on the pool the base no
+/// longer holds, instead of in its host part ([`prepare_level`]), which runs
+/// beside the base's phase B and ends before the commit can start. The commit
+/// reads the stacks' columns and never the prefixes, and the prefixes are the
+/// same words either way (`a_prebuilds_chip_prefixes_are_the_builds`), so the
+/// same proofs. Level 1's commit starts at the later of the base's end and its
+/// host part's end, so this takes the pack off that chain. Off by default
+/// (and for any word but `1`) until its timing gate. Read once a process.
+pub const PACK_AFTER_COMMIT_ENV: &str = "LAMBDA_VM_LEVELS_PACK_AFTER_COMMIT";
+
+std::thread_local! {
+    /// A test's [`pack_after_commit`] on this thread.
+    static PACK_AFTER_COMMIT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`pack_after_commit`] forced on this thread (`None` restores
+/// the knob).
+#[doc(hidden)]
+pub fn set_pack_after_commit_for_test(on: Option<bool>) {
+    PACK_AFTER_COMMIT_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`PACK_AFTER_COMMIT_ENV`] is on (or this thread's test override).
+pub fn pack_after_commit() -> bool {
+    if let Some(on) = PACK_AFTER_COMMIT_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        pack_after_commit_word(super::wlfm_knobs::env_word(PACK_AFTER_COMMIT_ENV).as_deref())
+    })
+}
+
+/// [`PACK_AFTER_COMMIT_ENV`]'s word: on only for `1`.
+pub fn pack_after_commit_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
 }
 
 /// Whether a chain whose last level (its `count`-th) built `last` goes on.

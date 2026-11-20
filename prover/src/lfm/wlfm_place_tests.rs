@@ -216,6 +216,70 @@ fn a_prebuilds_chip_prefixes_are_the_builds() {
     }
 }
 
+/// The pack-after-commit knob's name; it is off by default, and only `1`
+/// turns it on.
+#[test]
+fn the_pack_after_commit_knob_is_named_and_off_by_default() {
+    use super::levels::{PACK_AFTER_COMMIT_ENV, pack_after_commit, pack_after_commit_word};
+    assert_eq!(PACK_AFTER_COMMIT_ENV, "LAMBDA_VM_LEVELS_PACK_AFTER_COMMIT");
+    if std::env::var_os(PACK_AFTER_COMMIT_ENV).is_none() {
+        assert!(!pack_after_commit());
+    }
+    for (word, on) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("yes"), false),
+        (Some("1"), true),
+        (Some(" 1 "), true),
+    ] {
+        assert_eq!(pack_after_commit_word(word), on, "{word:?}");
+    }
+}
+
+/// ★ A level whose chip prefixes are packed after its commit
+/// (`LAMBDA_VM_LEVELS_PACK_AFTER_COMMIT`) holds, table for table, the
+/// prefixes its host part packs before the commit, under both families: the
+/// prove reads the same words either way. Its host part packs nothing.
+#[test]
+fn a_level_packing_after_its_commit_holds_the_prefixes_packed_before() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::levels::set_pack_after_commit_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let _records = test_format::set_chip_records(true);
+    for (program, family) in [
+        (super::wlfm_tests::honest(), WlfmFamily::P1),
+        (super::b3l_wlfm_tests::honest(), WlfmFamily::B3),
+    ] {
+        let mut builds = Vec::new();
+        for after in [false, true] {
+            super::levels::set_pack_after_commit_for_test(Some(after));
+            let pre = super::levels::prepare_level(&program, family, None)
+                .unwrap_or_else(|e| panic!("{family:?} {after}: prepares: {e}"));
+            assert_eq!(
+                pre.chip_prefix_secs() > 0.0,
+                !after,
+                "{family:?} {after}: the host part packs only before the commit"
+            );
+            let build = super::levels::commit_level(pre, 1)
+                .unwrap_or_else(|e| panic!("{family:?} {after}: commits: {e}"));
+            builds.push(build);
+        }
+        assert!(
+            builds[0].chip_prefixes().iter().any(Option::is_some),
+            "{family:?}: the fixture has chip tables"
+        );
+        assert!(
+            builds[0].chip_prefixes() == builds[1].chip_prefixes(),
+            "{family:?}: the same prefixes"
+        );
+    }
+}
+
 /// The levels' card pad knob: unset or empty is no pad, a whole number of
 /// MiB is that many bytes, anything else is refused.
 #[test]

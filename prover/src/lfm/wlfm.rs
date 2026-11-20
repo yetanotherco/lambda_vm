@@ -1422,6 +1422,11 @@ impl WlfmPrebuild {
             .sum()
     }
 
+    /// The seconds [`Self::hold_chip_prefixes`] took (0 before it ran).
+    pub fn chip_prefix_secs(&self) -> f64 {
+        self.chip_prefix_secs
+    }
+
     /// The seconds [`prepare_wlfm`] took.
     pub fn secs(&self) -> f64 {
         self.secs
