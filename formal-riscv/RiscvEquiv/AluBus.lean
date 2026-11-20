@@ -37,11 +37,12 @@ lemma shiftResult_word_amt (s d x s₁ s₂ : ℕ) (h : s₁ % 32 = s₂ % 32) :
 
 /-- A SHIFT message with `word = 0` and flags `signed = s`, `direction = d` carries
 `shiftResult` of its operands. SHIFT reads only the low byte of the shift amount; mod 64 it is
-the low bits of `b`. No range hypotheses: SHIFT range-checks its operands itself. -/
+the low bits of `b`, so `hb` asks only for the amount mod 64. No range hypotheses: SHIFT
+range-checks its operands itself. -/
 lemma shift_alu (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (s d : ℕ) (hs : s < 2) (hd : d < 2) (hflags : m.flags.val = opselSHIFT + 32 * s + 64 * d)
     (x : ℕ) (b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = x)
-    (hb : dword m.in2Lo m.in2Hi = b.toNat) :
+    (hb : dword m.in2Lo m.in2Hi % 64 = b.toNat % 64) :
     dword m.outLo m.outHi = Alu.shiftResult 0 s d x b.toNat := by
   obtain ⟨-, -, hshift⟩ := hg
   obtain ⟨-, -, hout⟩ := hshift 0 s d (by norm_num) hs hd (by simpa using hflags)
@@ -85,14 +86,22 @@ lemma lt_alu_bit (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     mul_zero, add_zero]
 
 /-- An EQ message with flag `invert = i` carries `eqBit i` of its operands. The result travels
-as `(bit, 0)`. -/
+as `(bit, 0)`. EQ needs all four words range-checked, but the high ones follow from `ha` and `hb`
+(the operands are below `2^64`), so only the low words are hypotheses. -/
 lemma eq_alu_bit (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
+    (h1 : m.in1Lo.val < 2^32) (h3 : m.in2Lo.val < 2^32)
     (i : ℕ) (hi : i < 2) (hflags : m.flags.val = opselEQ + 64 * i)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     dword m.outLo m.outHi = Alu.eqBit i a.toNat b.toNat := by
+  have h2 : m.in1Hi.val < 2^32 := by
+    have := a.isLt
+    rw [dword] at ha
+    omega
+  have h4 : m.in2Hi.val < 2^32 := by
+    have := b.isLt
+    rw [dword] at hb
+    omega
   obtain ⟨-, heq, -⟩ := hg
   obtain ⟨hhi, hlo⟩ := heq i hi hflags h1 h2 h3 h4
   have hbit := eqBit_lt_two i a.toNat b.toNat

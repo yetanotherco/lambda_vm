@@ -50,8 +50,9 @@ In one line: Sail = `*Pure`, `*Pure` = Clean function, Clean function = what arr
 
 `AluBus.lean` is shared: one lemma per clause of `Alu.Guarantees` (SHIFT, SHIFT with
 `word = 1`, LT, EQ) that reads a message's result as a natural. Each `Alu.lean` instantiates
-one of them at its flags, so it is one line per instruction. Each clause takes only the range
-hypotheses its chip's spec assumes: none for SHIFT, the low words for LT, all four for EQ.
+one of them at its flags, so it is one line per instruction. Each lemma takes only the range
+hypotheses that do not follow from elsewhere: none for SHIFT (it range-checks its operands), the
+low words for LT (it range-checks the high ones) and EQ (the high ones follow from `ha`, `hb`).
 
 `FreeM.lean` is shared by the `Sail.lean` files: the Sail model runs in a free monad, and
 `FreeM.lean` proves its monad laws, which lean-sail does not provide, so the proofs can
@@ -80,7 +81,9 @@ Done so far:
   rewritten, the committed model still builds, but it can no longer be regenerated until `PINS`
   moves to Sail's main.
 - That the Clean model matches the Rust circuit is checked by `prover/src/tests/lean_diff.rs`,
-  a randomized test, not a proof.
+  a randomized test, not a proof. For LT it is an exact match except the two deltas documented
+  in `../formal/README.md` (`μ` is a bit in Lean and a byte in Rust); the `SLT`, `SLTU`, `SLTI`,
+  `SLTIU` and `BLT`/`BGE`/`BLTU`/`BGEU` theorems use that clause.
 - The PC and the register file are not modeled on the circuit side yet: that needs the CPU in
   Clean. Steps 1 to 3 connect values only.
 - Word shifts: only the 32-bit result (`outLo`) is connected. The sign extension to 64 bits

@@ -39,6 +39,6 @@ jobs:
 
       - name: Model is up to date
         run: |
-          paths="LeanRV64D LeanRV64D.lean lakefile.toml lean-toolchain"
+          paths="LeanRV64D LeanRV64D.lean lakefile.toml lean-toolchain LICENCE"
           git status --porcelain -- $paths
           test -z "$(git status --porcelain -- $paths)"
