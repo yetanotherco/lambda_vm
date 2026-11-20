@@ -3441,6 +3441,51 @@ mod tests {
         );
     }
 
+    /// A claimed trace length out of range — not a power of two, one doubling
+    /// past the largest LDE, a wrapping claim, the top bit — in any table of an
+    /// epoch or of the global proof is refused, with no panic: the epoch's
+    /// commit-bus replay and the STARK verifier both check it before deriving
+    /// anything from it.
+    #[test]
+    fn an_out_of_range_trace_length_in_a_continuation_is_refused() {
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let opts = ProofOptions::default_test_options();
+        let mut bundle = prove_continuation(&elf_bytes, &[], 4, &opts).unwrap();
+        assert!(bundle.num_epochs() > 1, "the run splits");
+        assert!(
+            matches!(verify_continuation(&elf_bytes, &bundle, &opts), Ok(Some(_))),
+            "the control: the honest bundle verifies"
+        );
+        let lengths = [0usize, 24, 1 << 32, (1 << 63) + 8, 1 << 63];
+        let last = bundle.epochs.len() - 1;
+        for epoch in [0, last] {
+            for table in 0..bundle.epochs[epoch].proof.proofs.len() {
+                let honest = bundle.epochs[epoch].proof.proofs[table].trace_length;
+                for &claimed in &lengths {
+                    bundle.epochs[epoch].proof.proofs[table].trace_length = claimed;
+                    let verdict = verify_continuation(&elf_bytes, &bundle, &opts);
+                    bundle.epochs[epoch].proof.proofs[table].trace_length = honest;
+                    assert!(
+                        !matches!(verdict, Ok(Some(_))),
+                        "epoch {epoch} table {table} at length {claimed} was accepted"
+                    );
+                }
+            }
+        }
+        for table in 0..bundle.global.proofs.len() {
+            let honest = bundle.global.proofs[table].trace_length;
+            for &claimed in &lengths {
+                bundle.global.proofs[table].trace_length = claimed;
+                let verdict = verify_continuation(&elf_bytes, &bundle, &opts);
+                bundle.global.proofs[table].trace_length = honest;
+                assert!(
+                    !matches!(verdict, Ok(Some(_))),
+                    "global table {table} at length {claimed} was accepted"
+                );
+            }
+        }
+    }
+
     // The pipeline's PANIC path: a loud device abort is a panic on the prover
     // thread, not an `Err`. Before the guard it wedged the pipeline — the
     // builders stopped on their dead sender and the producer blocked forever

@@ -182,6 +182,8 @@ pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
 #[cfg(test)]
+pub mod trace_length_tests;
+#[cfg(test)]
 pub mod trace_test_helpers;
 #[cfg(test)]
 pub mod verifier_pin_tests;
