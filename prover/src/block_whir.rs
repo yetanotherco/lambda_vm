@@ -2686,6 +2686,77 @@ pub struct BlockStamps {
     /// The page-locked pool at phase A's end, when it is asked for
     /// ([`multilinear::pinned`]).
     pub pinned: Option<multilinear::pinned::Stats>,
+    /// Under the schedstat stamps, the kernel's huge-page and compaction
+    /// counters and the process's own at the streamed prove's start, phase A's
+    /// end and phase B's end, and the openings beside an argue's own threads
+    /// over phase B ([`ThpProbe`]).
+    pub thp_probe: Option<[ThpProbe; 3]>,
+    pub openings_beside: [u64; 4],
+}
+
+/// A reading for the THP probe: `/proc/vmstat`'s huge-page and compaction
+/// counters and `/proc/self/stat`'s minor faults and user and system ticks
+/// (Linux; zeros elsewhere). A measurement, never a byte of a proof.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThpProbe {
+    pub vm: [u64; THP_VMSTAT.len()],
+    pub minflt: u64,
+    pub utime: u64,
+    pub stime: u64,
+}
+
+/// The `/proc/vmstat` counters the probe reads, in order.
+pub const THP_VMSTAT: [&str; 7] = [
+    "thp_fault_alloc",
+    "thp_fault_fallback",
+    "compact_stall",
+    "compact_fail",
+    "compact_success",
+    "thp_collapse_alloc",
+    "thp_split_page",
+];
+
+impl ThpProbe {
+    pub fn now() -> Self {
+        let mut probe = Self::default();
+        if let Ok(text) = std::fs::read_to_string("/proc/vmstat") {
+            probe.vm = vmstat_counters(&text);
+        }
+        if let Some([minflt, utime, stime]) = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|t| process_stat(&t))
+        {
+            (probe.minflt, probe.utime, probe.stime) = (minflt, utime, stime);
+        }
+        probe
+    }
+}
+
+/// [`THP_VMSTAT`]'s counters out of a `/proc/vmstat` text (0 for one it
+/// lacks).
+fn vmstat_counters(text: &str) -> [u64; THP_VMSTAT.len()] {
+    std::array::from_fn(|k| {
+        text.lines()
+            .find_map(|l| {
+                l.strip_prefix(THP_VMSTAT[k])?
+                    .strip_prefix(' ')?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// A `stat` line's minor faults and user and system ticks (fields 10, 14, 15).
+fn process_stat(text: &str) -> Option<[u64; 3]> {
+    let rest = text.get(text.rfind(')')? + 1..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    Some([
+        f.get(7)?.parse().ok()?,
+        f.get(11)?.parse().ok()?,
+        f.get(12)?.parse().ok()?,
+    ])
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -3475,6 +3546,7 @@ impl BlockStamps {
         out.push_str(&self.overlap_line());
         if self.phase_b_sched {
             out.push_str(&self.sched_line());
+            out.push_str(&self.thp_line());
         }
         // Phase A's ledger and its upload: what each group's upload took, what
         // the committer paid of it, and what the commit promised beside it.
@@ -3672,6 +3744,41 @@ impl BlockStamps {
             wait[..3].iter().sum::<f64>(),
             list(&cpu),
             list(&wait),
+        )
+    }
+
+    /// The THP probe's line: each counter's growth over phase A (the
+    /// streamed prove's start to phase A's end) and phase B, the process's
+    /// faults and ticks the same, and the openings beside an argue's own
+    /// threads over phase B.
+    fn thp_line(&self) -> String {
+        let Some([s0, s1, s2]) = self.thp_probe else {
+            return "BLOCK THP PROBE: unavailable\n".to_string();
+        };
+        let span = |a: &ThpProbe, b: &ThpProbe| -> String {
+            let vm: Vec<String> = THP_VMSTAT
+                .iter()
+                .enumerate()
+                .map(|(k, name)| format!("{name} +{}", b.vm[k].saturating_sub(a.vm[k])))
+                .collect();
+            format!(
+                "{} · minor faults +{} · user +{:.2}s · system +{:.2}s",
+                vm.join(" · "),
+                b.minflt.saturating_sub(a.minflt),
+                b.utime.saturating_sub(a.utime) as f64 / 100.0,
+                b.stime.saturating_sub(a.stime) as f64 / 100.0
+            )
+        };
+        let o = self.openings_beside;
+        format!(
+            "BLOCK THP PROBE: phase A [{}] · phase B [{}] · openings beside an argue {} on their threads: minor \
+             faults +{} · user +{:.2}s · system +{:.2}s\n",
+            span(&s0, &s1),
+            span(&s1, &s2),
+            o[0],
+            o[1],
+            o[2] as f64 / 100.0,
+            o[3] as f64 / 100.0
         )
     }
 
@@ -8186,6 +8293,8 @@ fn prove_streamed(
     let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
+    let thp_probe = phase_b_sched_from_env();
+    let probe_start = thp_probe.then(ThpProbe::now);
     // A measurement ([`KECCAK_RND_ARRIVALS_ENV`]): when each KECCAK_RND table's
     // operations are all in, as the windows are taken.
     let arrivals =
@@ -9477,6 +9586,8 @@ fn prove_streamed(
         stamps.layout = laid.layout.clone();
         stamps.layout.gpack = (options.gpack, gpack::counts());
         stamps.phase_a = start.elapsed().as_secs_f64();
+        let probe_a = thp_probe.then(ThpProbe::now);
+        let openings_before = stark::multilinear_block::openings_beside_counters();
         stamps.pinned = multilinear::pinned::stats();
         if let Some(ledger) = ledger {
             ledger.line("phase A end");
@@ -9850,6 +9961,12 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        if let (Some(s0), Some(s1)) = (probe_start, probe_a) {
+            stamps.thp_probe = Some([s0, s1, ThpProbe::now()]);
+            let after = stark::multilinear_block::openings_beside_counters();
+            stamps.openings_beside =
+                std::array::from_fn(|k| after[k].saturating_sub(openings_before[k]));
+        }
         // The order as phase B took it, when the lead moved groups.
         let order = match lead.and_then(PhaseBLead::taken) {
             Some(taken) if taken.order.len() == order.len() => taken.order,
@@ -13607,5 +13724,21 @@ mod close_before_bitwise_tests {
         assert!(!past_budget(&[small], small, cap, 8).expect("a layout"));
         assert!(past_budget(&[small], bitwise, cap, 8).expect("a layout"));
         assert!(past_budget(&[small, small], small, cap, 1).expect("a layout"));
+    }
+}
+
+#[cfg(test)]
+mod thp_probe_tests {
+    /// The probe reads its counters out of fixed `/proc/vmstat` and `stat`
+    /// texts: a missing counter reads 0, and the command may hold spaces and
+    /// parentheses.
+    #[test]
+    fn the_thp_probe_reads_vmstat_and_stat_texts() {
+        let vm = "nr_free_pages 5\nthp_fault_alloc 12\nthp_fault_fallback 3\ncompact_stall 7\n\
+                  compact_fail 1\ncompact_success 6\nthp_collapse_alloc_failed 9\nthp_collapse_alloc 2\n";
+        assert_eq!(super::vmstat_counters(vm), [12, 3, 7, 1, 6, 2, 0]);
+        let stat = "77 (a (b) c) R 1 2 3 4 5 6 1000 0 2 0 300 40 0 0";
+        assert_eq!(super::process_stat(stat), Some([1000, 300, 40]));
+        assert_eq!(super::process_stat("77 (x) R 1"), None);
     }
 }

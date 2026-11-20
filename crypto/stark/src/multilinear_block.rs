@@ -2490,6 +2490,43 @@ fn thread_schedstat() -> Option<(u64, u64)> {
     parse_schedstat(&std::fs::read_to_string("/proc/thread-self/schedstat").ok()?)
 }
 
+/// The calling thread's minor faults and user and system ticks
+/// (`/proc/thread-self/stat` fields 10, 14 and 15, Linux); `None` where the
+/// file does not read. A measurement under the schedstat stamps.
+fn thread_stat() -> Option<[u64; 3]> {
+    parse_thread_stat(&std::fs::read_to_string("/proc/thread-self/stat").ok()?)
+}
+
+/// A `stat` line's minor faults and user and system ticks: fields 10, 14 and
+/// 15, counted after the command, which sits in parentheses and may hold
+/// spaces.
+fn parse_thread_stat(text: &str) -> Option<[u64; 3]> {
+    let rest = text.get(text.rfind(')')? + 1..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // `f[0]` is field 3 (the state).
+    Some([
+        f.get(7)?.parse().ok()?,
+        f.get(11)?.parse().ok()?,
+        f.get(12)?.parse().ok()?,
+    ])
+}
+
+/// Under the schedstat stamps, what the openings run beside an argue cost
+/// their own threads, since the process started: openings counted, minor
+/// faults, user ticks, system ticks.
+static OPENINGS_BESIDE: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// [`OPENINGS_BESIDE`] read: `[openings, minor faults, user ticks, system
+/// ticks]`. Zeros unless the schedstat stamps were on.
+pub fn openings_beside_counters() -> [u64; 4] {
+    std::array::from_fn(|k| OPENINGS_BESIDE[k].load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// A schedstat line's first two fields: CPU ns and run-queue delay ns.
 fn parse_schedstat(text: &str) -> Option<(u64, u64)> {
     let mut fields = text.split_whitespace().map(|w| w.parse::<u64>().ok());
@@ -3814,9 +3851,19 @@ where
                             panic!("a test's opening thread panics");
                         }
                         let fails = overlap_faults.open_fails == Some(earlier.place);
+                        let stat_before = sched.then(thread_stat).flatten();
                         let (opened, stacked) = open_group::<F, E, T, H>(
                             earlier, its_tables, prepared, deviations, config, false, fails,
                         )?;
+                        if let (Some(b), Some(a)) = (stat_before, sched.then(thread_stat).flatten())
+                        {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            OPENINGS_BESIDE[0].fetch_add(1, Relaxed);
+                            for k in 0..3 {
+                                OPENINGS_BESIDE[k + 1]
+                                    .fetch_add(a[k].saturating_sub(b[k]), Relaxed);
+                            }
+                        }
                         on_group(GroupOpened {
                             group: earlier.group,
                             roots: roots_ref,
@@ -4713,6 +4760,16 @@ mod spill_tests {
 
     /// A schedstat line reads as its CPU and run-queue delay nanoseconds; a
     /// line that is not one reads as nothing.
+    #[test]
+    fn a_thread_stat_line_reads_its_faults_and_ticks() {
+        use super::parse_thread_stat;
+        // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+        let line = "4242 (the (odd) name) S 1 2 3 4 5 6 777 0 1 0 88 99 0 0 20 0 1 0";
+        assert_eq!(parse_thread_stat(line), Some([777, 88, 99]));
+        assert_eq!(parse_thread_stat("4242 (short) S 1 2"), None);
+        assert_eq!(parse_thread_stat("no parenthesis"), None);
+    }
+
     #[test]
     fn a_schedstat_line_reads_as_cpu_and_run_queue_delay() {
         use super::parse_schedstat;
