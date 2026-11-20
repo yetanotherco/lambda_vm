@@ -630,7 +630,33 @@ pub(crate) fn prepare_level(
     if super::wlfm::chip_records() {
         pre.hold_chip_prefixes()?;
     }
+    if super::wlfm::narrow_commit() {
+        match narrow_pack_pool() {
+            Some(pool) => pool.install(|| pre.hold_narrow_packs()),
+            None => pre.hold_narrow_packs(),
+        }
+    }
     Ok(pre)
+}
+
+/// The threads a level's host part packs its prepared stacks narrow on
+/// ([`super::wlfm::WlfmPrebuild::hold_narrow_packs`]), beside the base's
+/// phase B: two, not the shared pool, which phase B binds (a pooled gather
+/// there cost phase B about one for one).
+const NARROW_PACK_THREADS: usize = 2;
+
+/// [`NARROW_PACK_THREADS`]' pool, made once; `None` if it cannot be (the
+/// pack then runs on the caller's pool).
+fn narrow_pack_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(NARROW_PACK_THREADS)
+            .thread_name(|k| format!("narrow-pack-{k}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// A prepared level committed where [`stack_place`] puts it.

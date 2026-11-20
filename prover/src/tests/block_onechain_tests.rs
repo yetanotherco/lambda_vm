@@ -907,6 +907,7 @@ fn prepared_roots_on_the_host_cost() {
                 group: 0,
                 tables: tables.clone(),
                 columns: columns.clone(),
+                packed: None,
             };
             let mut format = BlockFormat::pinned();
             format.zf.whir_trees = round0;

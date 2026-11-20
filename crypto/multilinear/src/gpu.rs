@@ -5006,6 +5006,19 @@ pub fn pack_store<F>(columns: &[&crate::mle::Mle<F>]) -> Option<PackedStore>
 where
     F: math::field::traits::IsField + 'static,
 {
+    let evals: Vec<&[math::field::element::FieldElement<F>]> =
+        columns.iter().map(|c| c.evals()).collect();
+    pack_store_fields(&evals)
+}
+
+/// [`pack_store`] of columns held as field elements (a prepared stack's
+/// before its commit makes them `Mle`s): the same bytes for the same words.
+pub fn pack_store_fields<F>(
+    columns: &[&[math::field::element::FieldElement<F>]],
+) -> Option<PackedStore>
+where
+    F: math::field::traits::IsField + 'static,
+{
     use math::field::goldilocks::GoldilocksField;
 
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>()
@@ -5018,7 +5031,7 @@ where
     let raw: Vec<&[u64]> = columns
         .iter()
         .map(|column| unsafe {
-            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+            core::slice::from_raw_parts(column.as_ptr() as *const u64, column.len())
         })
         .collect();
     let lens: Vec<usize> = raw.iter().map(|c| c.len()).collect();
@@ -5040,7 +5053,21 @@ where
 /// or when the card refuses; the stamp's `pack_secs` is the packed store's.
 #[cfg(feature = "cuda")]
 pub fn upload_packed_store(packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
-    upload_packed_on(packed, None)
+    upload_packed_on(packed, None, false)
+}
+
+/// [`upload_packed_store`] with each run's bytes copied through the card's
+/// double-buffered pinned staging instead of one pageable copy a run
+/// (`math_cuda::columns::DeviceColumns::upload_store_tables_staged`). The
+/// same store.
+#[cfg(feature = "cuda")]
+pub fn upload_packed_store_staged(packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    upload_packed_on(packed, None, true)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_packed_store_staged(_packed: &PackedStore) -> Option<(ResidentColumns, NarrowStore)> {
+    None
 }
 
 /// [`upload_packed_store`] into a promise taken before (`room`: the words and
@@ -5052,7 +5079,7 @@ pub fn upload_packed_store_in(
     packed: &PackedStore,
     room: DeviceRoom,
 ) -> Option<(ResidentColumns, NarrowStore)> {
-    upload_packed_on(packed, Some(room))
+    upload_packed_on(packed, Some(room), false)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -5067,6 +5094,7 @@ pub fn upload_packed_store_in(
 fn upload_packed_on(
     packed: &PackedStore,
     prepaid: Option<DeviceRoom>,
+    staged: bool,
 ) -> Option<(ResidentColumns, NarrowStore)> {
     use math_cuda::columns::TableUpload;
 
@@ -5088,6 +5116,7 @@ fn upload_packed_on(
         })
         .collect();
     let store = match prepaid {
+        None if staged => math_cuda::columns::DeviceColumns::upload_store_tables_staged(&uploads)?,
         None => math_cuda::columns::DeviceColumns::upload_store_tables(&uploads)?,
         Some(DeviceRoom(room)) => {
             math_cuda::columns::DeviceColumns::upload_store_tables_in(&uploads, room)?

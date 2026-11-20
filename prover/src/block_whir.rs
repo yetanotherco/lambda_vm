@@ -4556,6 +4556,9 @@ pub(crate) struct NarrowCommit {
     pub(crate) words: u64,
     pub(crate) sent: bool,
     pub(crate) upload_secs: f64,
+    /// The bytes were packed ahead, in the level's host part
+    /// ([`GroupStack::pack_narrow`]), not on the commit's path.
+    pub(crate) packed_ahead: bool,
 }
 
 /// What a narrow commit keeps free on the card beside its store and its own
@@ -4569,9 +4572,20 @@ pub(crate) struct GroupStack {
     /// `(position in the proof's table order, AIR index, prefix length)`.
     pub(crate) tables: Vec<(usize, usize, usize)>,
     pub(crate) columns: Vec<Vec<FieldElement<F>>>,
+    /// The columns packed narrow ahead of the commit (in the level's host
+    /// part, beside the base's phase B), for [`commit_group_narrow`] to send
+    /// without packing them on its path; `None` packs there.
+    pub(crate) packed: Option<multilinear::gpu::PackedStore>,
 }
 
 impl GroupStack {
+    /// [`Self::packed`] made now: the stack's columns packed narrow, on
+    /// whatever pool the caller runs this on.
+    pub(crate) fn pack_narrow(&mut self) {
+        let raw: Vec<&[FieldElement<F>]> = self.columns.iter().map(Vec::as_slice).collect();
+        self.packed = multilinear::gpu::pack_store_fields(&raw);
+    }
+
     /// The stack's shapes, one `(columns, variables)` per table: what its layout
     /// is built from.
     pub(crate) fn shapes(&self) -> Vec<(usize, usize)> {
@@ -4608,6 +4622,7 @@ pub(crate) fn group_stacks(
             group: g,
             tables: Vec::new(),
             columns: Vec::new(),
+            packed: None,
         };
         for &table in group {
             let table = table as usize;
@@ -4784,13 +4799,15 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false, false)
+    commit_group_where::<H>(stack, config, false, false, false)
 }
 
 /// [`commit_group`] with the columns sent to the card narrow: packed on the
-/// host once (`multilinear::gpu::pack_store`), widened on the card into a
+/// host once (in the level's host part when [`GroupStack::packed`] holds them,
+/// else here; `multilinear::gpu::pack_store`), widened on the card into a
 /// store, and committed from that store, where today the commit copies the
-/// wide columns in. The same words at the same places, so the same roots.
+/// wide columns in; under `staged` each packed run goes up through the card's
+/// pinned staging. The same words at the same places, so the same roots.
 /// Where there is no card, or the plan (the store, its staging, a card
 /// commit's price and a margin, against what the ledger has free) or the card
 /// says no, it commits as [`commit_group`] does; the packed bytes are kept
@@ -4798,8 +4815,9 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
 pub(crate) fn commit_group_narrow<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
+    staged: bool,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false, true)
+    commit_group_where::<H>(stack, config, false, true, staged)
 }
 
 /// Whether a narrow commit's store fits: its words, the largest run's packed
@@ -4819,7 +4837,7 @@ pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, true, false)
+    commit_group_where::<H>(stack, config, true, false, false)
 }
 
 fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
@@ -4827,9 +4845,11 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
     config: &multilinear::whir_chain::ChainConfig,
     on_host: bool,
     narrow: bool,
+    staged: bool,
 ) -> Result<GroupPrepared<H>, Error> {
     let shapes = stack.shapes();
     let group = stack.group;
+    let prepacked = stack.packed;
     let columns: Vec<Mle<F>> = stack
         .columns
         .into_iter()
@@ -4839,14 +4859,20 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let borrowed = multilinear::stacking::borrow(&columns);
     let budget = multilinear::gpu::reserve_budget();
+    // Packed ahead (the level's host part) when it fits these columns; else
+    // packed here.
     let mut packed = (narrow && !on_host && budget > 0 && !multilinear::gpu::columns_disabled())
-        .then(|| multilinear::gpu::pack_store(&borrowed))
+        .then(|| match prepacked.filter(|p| p.fits(&borrowed)) {
+            Some(p) => Some((p, true)),
+            None => multilinear::gpu::pack_store(&borrowed).map(|p| (p, false)),
+        })
         .flatten()
-        .map(|store| NarrowCommit {
+        .map(|(store, ahead)| NarrowCommit {
             store,
             words: borrowed.iter().map(|c| c.len() as u64 * 8).sum(),
             sent: false,
             upload_secs: 0.0,
+            packed_ahead: ahead,
         });
     let store = match packed.as_mut() {
         Some(p) => {
@@ -4859,7 +4885,12 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
             let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
             if narrow_commit_fits(p.words, staging, price, free) {
                 let t = Instant::now();
-                let store = multilinear::gpu::upload_packed_store(&p.store).map(|(s, _)| s);
+                let store = if staged {
+                    multilinear::gpu::upload_packed_store_staged(&p.store)
+                } else {
+                    multilinear::gpu::upload_packed_store(&p.store)
+                }
+                .map(|(s, _)| s);
                 p.sent = store.is_some();
                 p.upload_secs = t.elapsed().as_secs_f64();
                 store

@@ -140,6 +140,48 @@ pub(crate) fn widen_col_major_into(
     Ok(())
 }
 
+/// [`widen_col_major_into`] with the packed bytes copied through the
+/// backend's double-buffered pinned staging ([`crate::device::htod_staged`])
+/// instead of one pageable copy: the host fills one pinned buffer while the
+/// last one's DMA drains. The same words at the same places.
+pub(crate) fn widen_col_major_into_staged(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    t: NarrowInput,
+    rows: usize,
+    cols: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
+    assert_eq!(t.rows, rows, "packed trace: rows");
+    assert_eq!(t.widths.len(), cols, "packed trace: columns");
+    let cells = rows * cols;
+    assert_eq!(dst.len(), cells, "packed trace: destination size");
+    if cells == 0 {
+        return Ok(());
+    }
+    // SAFETY: `htod_staged` writes every byte below before the widen reads it,
+    // in stream order.
+    let mut data_dev = unsafe { stream.alloc::<u8>(t.data.len()) }?;
+    crate::device::htod_staged(stream, t.data, &mut data_dev.slice_mut(..))?;
+    let offsets_dev = stream.clone_htod(t.offsets)?;
+    let widths_dev = stream.clone_htod(t.widths)?;
+    let cfg =
+        LaunchConfig::for_num_elems(u32::try_from(cells).expect("packed trace: cells fit u32"));
+    let (rows_u64, cols_u64) = (rows as u64, cols as u64);
+    unsafe {
+        stream
+            .launch_builder(&be.widen_narrow_col_major)
+            .arg(&data_dev)
+            .arg(&offsets_dev)
+            .arg(&widths_dev)
+            .arg(dst)
+            .arg(&rows_u64)
+            .arg(&cols_u64)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// [`widen_col_major_into`] on a stream of its own, downloaded: the device's
 /// column-major widen, for the round-trip tests.
 pub fn widen_col_major_to_host(
