@@ -540,13 +540,14 @@ fn a_false_answer_its_chain_carries_has_no_execution() {
                 continue;
             }
             let f = fixture_with(case, group, FEE::zero(), FEE::one());
-            assert!(
-                !host_accepts(&f, &f.claims.answers),
-                "{case:?} {group:?}: a false answer its chain carries, host"
-            );
+            let host = host_accepts(&f, &f.claims.answers);
             assert!(
                 runs(&program(&f), arena(&f, &f.claims.answers)).is_err(),
                 "{case:?} {group:?}: a false answer its chain carries executed"
+            );
+            assert!(
+                !host,
+                "{case:?} {group:?}: a false answer its chain carries, host"
             );
         }
     }
