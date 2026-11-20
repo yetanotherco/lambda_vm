@@ -3158,12 +3158,12 @@ where
         .iter()
         .find_map(|q| match q.commitment {
             PreparedCommitment::Retired(r) if q.group == argued.group => {
-                Some(if argued.overlap_resident {
-                    prepared_store_bytes(q.columns)
-                        .saturating_add(r.revive_card_bytes(config, true))
-                } else {
-                    r.revive_card_bytes(config, false)
-                })
+                Some(prepared_revive_price(
+                    argued.overlap_resident,
+                    prepared_store_bytes(q.columns),
+                    r.revive_over_store_card_bytes(config),
+                    r.revive_whole_card_bytes(config),
+                ))
             }
             _ => None,
         })
@@ -3242,6 +3242,23 @@ fn next_columns_bytes(cells: usize, up: bool, priced: bool) -> u64 {
     }
 }
 
+/// The planned overlap's price of a retired prepared stack's revive: under
+/// resident pricing, its store's bytes and a revive over the store
+/// (`over_store`); otherwise a revive that encodes whole codewords (`whole`).
+fn prepared_revive_price(resident: bool, store: u64, over_store: u64, whole: u64) -> u64 {
+    if resident {
+        store.saturating_add(over_store)
+    } else {
+        whole
+    }
+}
+
+/// What the upload once's store plans to hold: the store, a revive over it,
+/// and a margin.
+fn store_plan_need(store: u64, over_store: u64, margin: u64) -> u64 {
+    store.saturating_add(over_store).saturating_add(margin)
+}
+
 /// Whether the planned overlap prices a retired prepared stack's revive over
 /// its store: only with the upload once on, which is what makes the store
 /// ([`BlockCommitted::with_overlap_priced_resident`]).
@@ -3294,9 +3311,7 @@ where
         return None;
     }
     let bytes = prepared_store_bytes(columns);
-    upload.need = bytes
-        .saturating_add(retired.revive_card_bytes(config, true))
-        .saturating_add(margin);
+    upload.need = store_plan_need(bytes, retired.revive_over_store_card_bytes(config), margin);
     upload.free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
     if upload.need > upload.free {
         upload.planned_out = true;
@@ -5403,6 +5418,31 @@ mod spill_tests {
 
 #[cfg(test)]
 mod upload_once_rule_tests {
+    /// Resident pricing prices a retired prepared stack as its store plus a
+    /// revive over the store, and nothing of the whole-codeword price; off,
+    /// the whole-codeword price alone.
+    #[test]
+    fn the_resident_price_is_the_store_and_a_revive_over_it() {
+        let (store, over, whole) = (2_480 << 20, 600 << 20, 9_000 << 20);
+        assert_eq!(
+            super::prepared_revive_price(true, store, over, whole),
+            store + over
+        );
+        assert_eq!(
+            super::prepared_revive_price(false, store, over, whole),
+            whole
+        );
+        assert_eq!(
+            super::prepared_revive_price(true, u64::MAX, over, whole),
+            u64::MAX
+        );
+        assert_eq!(
+            super::store_plan_need(store, over, 1 << 30),
+            store + over + (1 << 30)
+        );
+        assert_eq!(super::store_plan_need(u64::MAX, over, 1), u64::MAX);
+    }
+
     /// The planned overlap prices a prepared revive over the store only with
     /// the upload once on: with it off there is no store to price.
     #[test]
