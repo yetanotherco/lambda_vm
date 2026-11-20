@@ -217,38 +217,6 @@ pub fn checked_lde_length<F: IsFFTField>(
     (u64::from(lde_length.trailing_zeros()) <= F::TWO_ADICITY).then_some(lde_length)
 }
 
-/// Test only: the control of the trace-length tests. Under [`with`], the one
-/// length it names passes [`checked_lde_length`] with its product WRAPPED, as
-/// the verifier computed it before the check existed; every other length is
-/// checked as always. Thread-local, so no other test sees it.
-#[cfg(test)]
-pub(crate) mod wrapped_length {
-    use std::cell::Cell;
-
-    std::thread_local! {
-        static ALLOWED: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    pub(crate) fn allowed(trace_length: usize) -> bool {
-        ALLOWED.with(|c| c.get() == Some(trace_length))
-    }
-
-    /// Runs `f` with `trace_length` let through wrapped. Its callers build the
-    /// forgery, which only a release build can.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
-    pub(crate) fn with<R>(trace_length: usize, f: impl FnOnce() -> R) -> R {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                ALLOWED.with(|c| c.set(None));
-            }
-        }
-        ALLOWED.with(|c| c.set(Some(trace_length)));
-        let _reset = Reset;
-        f()
-    }
-}
-
 /// Whether a proof of `air` can claim `trace_length` rows: [`checked_lde_length`]
 /// at `air`'s blowup. The verifier's check on every sub-proof's claimed length,
 /// before anything is derived from it.
@@ -312,4 +280,36 @@ where
 {
     try_new_verifier_domain(air, trace_length)
         .expect("trace length must be a power of two whose LDE fits the field's two-adic subgroup")
+}
+
+/// Test only: the control of the trace-length tests. Under [`with`], the one
+/// length it names passes [`checked_lde_length`] with its product WRAPPED, as
+/// the verifier computed it before the check existed; every other length is
+/// checked as always. Thread-local, so no other test sees it.
+#[cfg(test)]
+pub(crate) mod wrapped_length {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static ALLOWED: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn allowed(trace_length: usize) -> bool {
+        ALLOWED.with(|c| c.get() == Some(trace_length))
+    }
+
+    /// Runs `f` with `trace_length` let through wrapped. Its callers build the
+    /// forgery, which only a release build can.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub(crate) fn with<R>(trace_length: usize, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ALLOWED.with(|c| c.set(None));
+            }
+        }
+        ALLOWED.with(|c| c.set(Some(trace_length)));
+        let _reset = Reset;
+        f()
+    }
 }
