@@ -263,6 +263,7 @@ fn prove_block_placed(
                 (&commitments[k]).into()
             },
             columns,
+            packed: None,
         })
         .collect();
     let mut block = BlockCommitted::commit::<H, <H as WhirHash>::Sponge>(

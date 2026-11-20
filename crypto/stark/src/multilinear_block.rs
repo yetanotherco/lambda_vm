@@ -151,6 +151,9 @@ pub struct UploadOnce {
     pub narrow: bool,
     pub packed_bytes: u64,
     pub pack_secs: f64,
+    /// The narrow store sent the bytes packed at the stack's commit
+    /// ([`BlockPrepared::packed`]): no pack here, `pack_secs` 0.
+    pub prepacked: bool,
 }
 
 /// What a group cost, for the readout. Seconds of wall time on the prover's
@@ -1449,6 +1452,11 @@ where
     pub commitment: PreparedCommitment<'a, F, H>,
     /// The tables' prefixes, concatenated in `tables`' order.
     pub columns: &'a [&'a Mle<F>],
+    /// `columns` packed narrow when the stack was committed
+    /// (`multilinear::gpu::pack_store`): under
+    /// [`BlockCommitted::with_prepared_store_narrow`] a retired stack's store
+    /// sends these bytes instead of packing again. `None` packs there.
+    pub packed: Option<&'a multilinear::gpu::PackedStore>,
 }
 
 /// Where a [`BlockPrepared`] stack's commitment is when its group opens it.
@@ -3274,6 +3282,7 @@ fn upload_once_store<F>(
     columns: &[&multilinear::mle::Mle<F>],
     config: &ChainConfig,
     ask: StoreAsk,
+    packed: Option<&multilinear::gpu::PackedStore>,
     upload: &mut UploadOnce,
 ) -> Option<multilinear::gpu::ResidentColumns>
 where
@@ -3313,10 +3322,20 @@ where
         (true, _) => None,
         (false, false) => multilinear::gpu::upload_store_columns(columns),
         (false, true) => {
-            multilinear::gpu::upload_store_columns_narrow(columns).map(|(store, stamp)| {
+            let prepacked = packed.filter(|p| p.fits(columns));
+            match prepacked {
+                Some(p) => multilinear::gpu::upload_packed_store(p),
+                None => multilinear::gpu::upload_store_columns_narrow(columns),
+            }
+            .map(|(store, stamp)| {
                 upload.narrow = true;
+                upload.prepacked = prepacked.is_some();
                 upload.packed_bytes = stamp.packed_bytes;
-                upload.pack_secs = stamp.pack_secs;
+                upload.pack_secs = if prepacked.is_some() {
+                    0.0
+                } else {
+                    stamp.pack_secs
+                };
                 store
             })
         }
@@ -3517,6 +3536,7 @@ where
                         card_refuses_by_test: argued.upload_once_card_refuses,
                         narrow: argued.upload_once_narrow,
                     },
+                    p.packed,
                     &mut upload,
                 ),
                 _ => None,
