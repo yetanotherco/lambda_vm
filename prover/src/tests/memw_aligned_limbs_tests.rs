@@ -873,6 +873,21 @@ fn pinned_block_airs() -> crate::VmAirs {
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
     let opts = stark::proof::options::ProofOptions::default_test_options();
+    let mut airs = pinned_block_airs_without_fused(&program, &opts);
+    // One table of each fused memory kind (the production prover's memory
+    // format; the pinned verifier's is split): MEM_LOAD and MEM_STORE check
+    // memory themselves, so every census here reads them too.
+    airs.with_fused_memory(&opts, [1, 1]);
+    airs
+}
+
+/// [`pinned_block_airs`] before the fused memory tables are added: the split
+/// memory format's tables.
+#[cfg(feature = "parallel")]
+fn pinned_block_airs_without_fused(
+    program: &executor::elf::Elf,
+    opts: &stark::proof::options::ProofOptions,
+) -> crate::VmAirs {
     let counts = crate::TableCounts {
         cpu: 1,
         lt: 1,
@@ -899,18 +914,18 @@ fn pinned_block_airs() -> crate::VmAirs {
         ecrec: 1,
     };
     let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
-        &program,
+        program,
         &[],
         0,
         1 << 20,
     )
     .expect("pages");
     let inputs =
-        crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
+        crate::BlockAirInputs::new(opts, program, vec![1 << 10], &[]).expect("the AIR inputs");
     let format = crate::block_whir::BlockFormat::pinned();
-    let mut airs = crate::block_airs(
-        &program,
-        &opts,
+    crate::block_airs(
+        program,
+        opts,
         &pages,
         &counts,
         &inputs,
@@ -918,12 +933,7 @@ fn pinned_block_airs() -> crate::VmAirs {
         format.memw_aligned,
         format.registers,
         format.ecdas,
-    );
-    // One table of each fused memory kind (the production prover's memory
-    // format; the pinned verifier's is split): MEM_LOAD and MEM_STORE check
-    // memory themselves, so every census here reads them too.
-    airs.with_fused_memory(&opts, [1, 1]);
-    airs
+    )
 }
 
 /// A table's family: its AIR's name without the index.
@@ -1074,6 +1084,120 @@ const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
         "μ_lo + μ_hi, each a byte by ARE_BYTES at weight 1",
     ),
     ("SHIFT", "Column(25)", "a bit column"),
+];
+
+/// The block verifier's AIRs under the pinned forms with the word memory
+/// format's tables in place of the split ones (one of each word table), as
+/// [`pinned_block_airs`] has the fused ones.
+#[cfg(feature = "parallel")]
+fn word_format_block_airs() -> crate::VmAirs {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let mut airs = pinned_block_airs_without_fused(&program, &opts);
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &[],
+        0,
+        1 << 20,
+    )
+    .expect("pages");
+    airs.with_word_memory(&opts, [1; 7], &pages)
+        .expect("the word tables");
+    airs
+}
+
+/// ★ [`every_half_word_sender_weighs_one_a_bit_or_a_bounded_count`] under the
+/// word memory format (opt-in): the `IS_HALF` senders only the word tables
+/// add, each classified, and BITWISE still the only receiver.
+#[cfg(feature = "parallel")]
+#[test]
+fn every_half_word_sender_of_the_word_format_weighs_a_bit() {
+    use std::collections::BTreeSet;
+    let airs = word_format_block_airs();
+    let refs = airs.air_refs();
+    let senders: BTreeSet<(String, String)> = refs
+        .iter()
+        .flat_map(|air| {
+            air.bus_interactions()
+                .iter()
+                .filter(|i| i.bus_id == BusId::IsHalfword as u64 && i.is_sender)
+                .map(|i| (family(air.name()), format!("{:?}", i.multiplicity)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let seen: BTreeSet<(String, String)> = PINNED_HALF_WORD_SENDERS
+        .iter()
+        .map(|(t, m, _)| (t.to_string(), m.to_string()))
+        .collect();
+    let new: Vec<(String, String)> = senders.difference(&seen).cloned().collect();
+    for (table, m) in &new {
+        println!("IS_HALF SENDER (words) {table}: {m}");
+    }
+    let pinned: Vec<(String, String)> = PINNED_WORD_FORMAT_HALF_WORD_SENDERS
+        .iter()
+        .map(|(t, m, _)| (t.to_string(), m.to_string()))
+        .collect();
+    assert_eq!(
+        new, pinned,
+        "the word format's IS_HALF senders moved: classify them"
+    );
+    let receivers: BTreeSet<String> = refs
+        .iter()
+        .filter(|air| {
+            air.bus_interactions()
+                .iter()
+                .any(|i| i.bus_id == BusId::IsHalfword as u64 && !i.is_sender)
+        })
+        .map(|air| family(air.name()))
+        .collect();
+    assert_eq!(
+        receivers.into_iter().collect::<Vec<_>>(),
+        ["BITWISE"],
+        "the only IS_HALF receiver under the word format is BITWISE"
+    );
+}
+
+/// [`every_half_word_sender_of_the_word_format_weighs_a_bit`]'s census: the
+/// word format's `IS_HALF` senders that the split and fused census does not
+/// hold, `(table, multiplicity, why it is never negative)`.
+#[cfg(feature = "parallel")]
+const PINNED_WORD_FORMAT_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
+    ("COPY_W", "Column(11)", "μ, a bit column"),
+    (
+        "ECREC_W",
+        "Column(10)",
+        "OK, a bit column (ECREC's constraints, which ECREC_W runs)",
+    ),
+    ("KECCAK_W", "Column(402)", "μ, a bit column"),
+    ("KECCAK_W", "Column(404)", "LAST, a bit column"),
+    (
+        "MEMW_W",
+        "Sum(9, 10)",
+        "μ_write + μ_access, a bit (IS_BIT on each and on the sum)",
+    ),
+    (
+        "MEM_LOAD2W",
+        "Column(45)",
+        "μ = Σ OFF_k, each OFF_k IS_BIT (`word_cpu::one_hot_constraints`): an integer in 0..=8",
+    ),
+    ("MEM_LOAD8", "Column(7)", "μ, a bit column"),
+    (
+        "MEM_LOADW",
+        "Column(30)",
+        "μ = Σ OFF_k, each OFF_k IS_BIT (`word_cpu::one_hot_constraints`): an integer in 0..=8",
+    ),
+    (
+        "MEM_STORE2W",
+        "Column(46)",
+        "μ = Σ OFF_k, each OFF_k IS_BIT (`word_cpu::one_hot_constraints`): an integer in 0..=8",
+    ),
+    ("MEM_STORE8", "Column(11)", "μ, a bit column"),
+    (
+        "MEM_STOREW",
+        "Column(30)",
+        "μ = Σ OFF_k, each OFF_k IS_BIT (`word_cpu::one_hot_constraints`): an integer in 0..=8",
+    ),
 ];
 
 /// A message's elements as affine forms over the main columns, read off the
