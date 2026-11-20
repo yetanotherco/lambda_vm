@@ -281,6 +281,10 @@ pub(crate) struct TablePairWires<'a> {
     pub(crate) local: Option<PairWires<'a>>,
 }
 
+/// A tree's (or a cut table's combined) claim after its ladder: its point,
+/// `p̃` and `q̃`.
+pub(crate) type ClassClaim = (Vec<Ext>, Ext, Ext);
+
 /// ★ Phase G over one LogUp class, emitted — the host's `verify_ladders`: per
 /// bin of `plan`, its trees' outputs absorbed, its ladder, each cut table's
 /// chunks combined at its `s'`. Returns per plan entry its claim
@@ -294,7 +298,7 @@ pub(crate) fn emit_ladders(
     gkr: &[Vec<LadderStepWires>],
     plan: &ArguePlan,
     ladder: GkrLadder,
-) -> (Vec<(Vec<Ext>, Ext, Ext)>, Vec<(Ext, Ext)>) {
+) -> (Vec<ClassClaim>, Vec<(Ext, Ext)>) {
     let n = plan.shapes.len();
     assert_eq!(bus_outputs.len(), plan.trees(), "one bus output per tree");
     assert_eq!(gkr.len(), plan.bins.len(), "one ladder per bin");
