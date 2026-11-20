@@ -159,19 +159,6 @@ def ensemble : Ensemble (F p) unit where
       simp [AluC]
   verifier_channels := by simp [circuit_norm]
 
-/-- `msg_eval`, in the form `simp` leaves an evaluated message in. -/
-lemma msg_eval_array {M : TypeMap} [ProvableType M] (env : Environment (F p))
-    (x : M (Expression (F p))) :
-    Array.map (Expression.eval env) (toElements x).toArray = (toElements (eval env x)).toArray := by
-  rw [← Vector.toArray_map]
-  exact msg_eval env x
-
-lemma isMinMsg_eval (env : Environment (F p)) (m : Alu.Msg (Expression (F p))) :
-    isMinMsg (Array.map (fun x => Expression.eval env x) (toElements m).toArray) =
-      decide ((eval env m).flags = 9) := by
-  rw [show (fun x => Expression.eval env x) = Expression.eval env from rfl, msg_eval_array,
-    isMinMsg_toElements]
-
 lemma areBytesTable_guarantees (x y : F p) :
     Bitwise.areBytesTable.Guarantees (x, y) ↔ x.val < 2^8 ∧ y.val < 2^8 := Iff.rfl
 
