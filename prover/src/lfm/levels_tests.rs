@@ -1509,6 +1509,40 @@ fn rta_one_run(
     println!("RTA TAMPER: a changed word of the last level refused {refused}");
     assert!(ok_base && ok_levels && ok_last, "everything verifies");
     assert!(refused, "a tampered last level is refused");
+    // Off the clock, a box row (`RTA_IDENTITY=host`, with
+    // `LAMBDA_VM_DETERMINISTIC_GRIND=1`): every level proved again over the
+    // same base with its prepared stacks on the host must give the same bytes
+    // as the run's, whatever placement, upload once and overlap pricing the
+    // run took (the large's retired path among them).
+    if std::env::var("RTA_IDENTITY").is_ok_and(|v| v.trim() == "host") {
+        assert!(
+            std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+            "the identity needs the deterministic grind"
+        );
+        let host = {
+            let _host = super::levels::set_stacks_for_test(Some(StackPlace::Host));
+            super::levels::derive_levels_to(&run.plan, family, LevelStop::Levels(levels), false)
+                .expect("the levels derive on the host")
+        };
+        let (proofs, _) = super::levels::prove_levels(&run.plan, &host, &run.base_proof)
+            .expect("the levels prove");
+        assert_eq!(proofs.len(), run.proofs.len(), "as many levels");
+        for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+            let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+            let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+            println!(
+                "RTA IDENTITY level {}: {} B · equal {}",
+                k + 1,
+                a.len(),
+                a[..] == b[..]
+            );
+            assert!(
+                a[..] == b[..],
+                "level {}: the host-placed stacks' bytes",
+                k + 1
+            );
+        }
+    }
 }
 
 /// One run of level 1 over a block's first `k` groups
