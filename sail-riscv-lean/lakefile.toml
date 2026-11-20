@@ -1,0 +1,13 @@
+name = "Lean_RV64D"
+defaultTargets = ["LeanRV64D"]
+moreLeanArgs = ["--tstack=400000"]
+
+[[lean_lib]]
+name = "LeanRV64D"
+leanOptions.weak.linter.style.nameCheck = false
+moreLeancArgs= ["-fbracket-depth=500"]
+
+[[require]]
+name = "Sail"
+git = "https://github.com/rems-project/lean-sail"
+rev = "v9"

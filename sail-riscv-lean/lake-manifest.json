@@ -1,0 +1,15 @@
+{"version": "1.1.0",
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"url": "https://github.com/rems-project/lean-sail",
+   "type": "git",
+   "subDir": null,
+   "scope": "",
+   "rev": "aa1671114862bbb41b5b1253711f787ab4dcd0de",
+   "name": "Sail",
+   "manifestFile": "lake-manifest.json",
+   "inputRev": "v9",
+   "inherited": false,
+   "configFile": "lakefile.toml"}],
+ "name": "Lean_RV64D",
+ "lakeDir": ".lake"}
