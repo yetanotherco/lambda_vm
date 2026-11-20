@@ -3291,3 +3291,208 @@ fn every_local_sender_of_a_local_air_set_is_keccak_rnd() {
         "a local sender outside KECCAK_RND is named: {found:?}"
     );
 }
+
+/// ★ Each local group's class split, taken once at derive and shared by groups
+/// of one definition, is the split of its own tables: for every group of a
+/// hand-built local statement with several KECCAK_RND groups, the plan's
+/// classes equal a fresh `Shapes::classes` over the group (members and plans,
+/// and each member's interactions in the class), two groups share a split
+/// exactly when their definitions (their class keys) are equal, and a group
+/// with no local lookup has none.
+#[test]
+fn the_plans_local_class_splits_are_each_groups_own() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat {
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..p1_format(MemoryFormat::Split, LeafScale::Fixed)
+    };
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    // KECCAK_RND tables tall enough that the packer gives each a group.
+    let rnd: &[(usize, usize)] = &[(1 << 16, 8)];
+    let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+    mix.push(("KECCAK", keccak));
+    mix.push(("KECCAK_RND", rnd));
+    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let groups = owned.groups.len();
+    let plan = WhirBlockPlan::derive(elf, &opts, &format, owned.view(), Some(groups))
+        .expect("the local plan derives");
+    let planning = super::batched_cap(&plan.frame.config)
+        .expect("a config")
+        .expect("batched");
+    let local = plan.local.as_ref().expect("a local plan");
+    let refs = plan.frame.airs.air_refs();
+    let mut locals = Vec::new();
+    let mut keys = Vec::new();
+    for g in 0..plan.num_groups() {
+        let sends = plan.groups[g].iter().any(|&t| {
+            refs[t]
+                .bus_interactions()
+                .iter()
+                .any(|i| local.buses.contains(&i.bus_id))
+        });
+        let Some(classes) = plan.local_classes(g) else {
+            assert!(!sends, "group {g} argues local lookups and has no classes");
+            continue;
+        };
+        assert!(sends, "group {g} has classes and argues no local lookup");
+        let shapes = Shapes::build(&refs, &plan.frame.shapes, &plan.groups[g]).expect("shapes");
+        let fresh = shapes
+            .classes(&local.buses, planning)
+            .expect("a fresh split");
+        for (name, mine, theirs) in [
+            ("global", &classes.global, &fresh.global),
+            ("local", &classes.local, &fresh.local),
+        ] {
+            assert_eq!(mine.members, theirs.members, "group {g} {name} members");
+            assert_eq!(mine.plan, theirs.plan, "group {g} {name} plan");
+            assert_eq!(
+                mine.buses.iter().map(Vec::len).collect::<Vec<_>>(),
+                theirs.buses.iter().map(Vec::len).collect::<Vec<_>>(),
+                "group {g} {name} interactions"
+            );
+        }
+        let start: usize = plan.groups[..g].iter().map(Vec::len).sum();
+        let key = super::class_key(
+            &plan.groups[g],
+            &refs,
+            &shapes,
+            &local.digests[start..start + plan.groups[g].len()],
+        );
+        keys.push((g, key));
+        locals.push(g);
+    }
+    println!(
+        "LOCAL CLASS SPLITS: {} groups, local {locals:?}",
+        plan.num_groups()
+    );
+    assert!(
+        locals.len() >= 2,
+        "the statement holds several local groups: {locals:?}"
+    );
+    // One split a definition: two groups share their split exactly when
+    // their keys are equal.
+    let mut equal_pairs = 0;
+    for (i, (g, key)) in keys.iter().enumerate() {
+        for (h, other) in &keys[i + 1..] {
+            let same = std::sync::Arc::ptr_eq(
+                plan.local_classes(*g).expect("classes"),
+                plan.local_classes(*h).expect("classes"),
+            );
+            assert_eq!(same, key == other, "groups {g} and {h}");
+            equal_pairs += usize::from(same);
+        }
+    }
+    println!("LOCAL CLASS SPLITS: {equal_pairs} pairs share a split");
+}
+
+/// PROBE (not a gate; relative stamps inside one process on a shared box):
+/// the plan's derivation and the closed level-1 program's walk under today's
+/// format (C) and under local lookups (L), back to back, `LOCAL_PROBE_REPEATS`
+/// times (default 3), over a hand-built BLAKE3 statement with many KECCAK_RND
+/// groups (`LOCAL_PROBE_RND` tables of 2^16 rows, default 40). Prints each
+/// repeat's seconds, the medians and L / C, and the parts the derivation used
+/// to repeat: one group's class split, and routing every table against routing
+/// the receiving ones.
+#[test]
+#[ignore = "a timing probe: run it alone, read its ratios"]
+fn probe_the_local_derivation_and_walk_against_todays() {
+    use std::time::Instant;
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let repeats: usize = std::env::var("LOCAL_PROBE_REPEATS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(3);
+    let tables: usize = std::env::var("LOCAL_PROBE_RND")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(40);
+    let b3 = |form| {
+        let p1 = p1_format(MemoryFormat::Split, LeafScale::Fixed);
+        BlockFormat {
+            zf: p1.zf.with_base(stark::proof::options::BaseFormat::B3_WHIR),
+            keccak_rnd: form,
+            ..p1
+        }
+    };
+    let arms = [
+        ("C", b3(crate::tables::keccak_rnd::KeccakRndForm::Lean)),
+        ("L", b3(crate::tables::keccak_rnd::KeccakRndForm::LeanLocal)),
+    ];
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    let rnd_runs = [(1usize << 16, tables)];
+    let statements: Vec<_> = arms
+        .iter()
+        .map(|(_, format)| {
+            let opts = super::super::proof::block_base_options_under(&format.zf);
+            let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+            mix.push(("KECCAK", keccak));
+            mix.push(("KECCAK_RND", &rnd_runs));
+            (opts.clone(), mix_statement(elf, &opts, format, &mix, 2, 0))
+        })
+        .collect();
+    let mut secs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); 2];
+    for r in 0..repeats {
+        for (a, (name, format)) in arms.iter().enumerate() {
+            let (opts, owned) = &statements[a];
+            let t = Instant::now();
+            let plan = WhirBlockPlan::derive_blake3(elf, opts, format, owned.view(), 1, None)
+                .expect("the plan derives");
+            let derive = t.elapsed().as_secs_f64();
+            let (_, _, (walk, _)) = plan
+                .closed_block_program_marked_timed(false)
+                .expect("the program emits");
+            let locals = (0..plan.num_groups())
+                .filter(|&g| plan.local_classes(g).is_some())
+                .count();
+            println!(
+                "LOCAL PROBE {name} repeat {r}: groups {} · local groups {locals} · derive {derive:.3}s · walk {walk:.3}s",
+                plan.num_groups()
+            );
+            secs[a].push((derive, walk));
+            if a == 1 && r == 0 {
+                // The parts the derivation repeated before: one class split,
+                // and routing every table.
+                let refs = plan.frame.airs.air_refs();
+                let local = plan.local.as_ref().expect("local");
+                let planning = super::batched_cap(&plan.frame.config)
+                    .expect("config")
+                    .expect("batched");
+                if let Some(g) = (0..plan.num_groups()).find(|&g| plan.local_classes(g).is_some()) {
+                    let shapes =
+                        Shapes::build(&refs, &plan.frame.shapes, &plan.groups[g]).expect("shapes");
+                    let t = Instant::now();
+                    let _ = shapes.classes(&local.buses, planning).expect("split");
+                    println!(
+                        "LOCAL PROBE one class split: {:.4}s",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                let first_page =
+                    crate::block_whir::first_page_index(&plan.frame.airs).expect("pages");
+                let t = Instant::now();
+                for (t_, air) in refs.iter().enumerate() {
+                    let _ = super::route_of(&plan, *air, t_, first_page).expect("a route");
+                }
+                println!(
+                    "LOCAL PROBE routing every table: {:.4}s ({} tables)",
+                    t.elapsed().as_secs_f64(),
+                    refs.len()
+                );
+            }
+        }
+    }
+    let med = |v: &[(f64, f64)], k: usize| {
+        let mut x: Vec<f64> = v.iter().map(|p| if k == 0 { p.0 } else { p.1 }).collect();
+        x.sort_by(f64::total_cmp);
+        x[x.len() / 2]
+    };
+    for (k, what) in [(0, "derive"), (1, "walk")] {
+        let (c, l) = (med(&secs[0], k), med(&secs[1], k));
+        println!(
+            "LOCAL PROBE MEDIAN {what}: C {c:.3}s · L {l:.3}s · L / C {:.3} · L - C {:+.3}s",
+            l / c,
+            l - c
+        );
+    }
+}

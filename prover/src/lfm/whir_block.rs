@@ -848,7 +848,19 @@ fn local_share_inverse(knob: bool) -> bool {
 struct PlanLocal {
     buses: Vec<u64>,
     digests: Vec<[u8; 32]>,
+    /// Each group's two LogUp classes ([`Shapes::classes`]), `None` for a
+    /// group that argues no local lookup: split once at derive, shared by
+    /// groups of one definition, and read by the cost, the emission and the
+    /// arena words.
+    classes: Vec<Option<std::sync::Arc<GroupClasses>>>,
 }
+
+/// What a group's class split is a function of, table by table: the table's
+/// digest (its height, width, preprocessed count and every interaction), its
+/// AIR family (the name before its index: one family, one constraint set),
+/// and its constraints' degree and factor count. Two groups with one key
+/// split alike.
+type ClassKey = Vec<([u8; 32], String, usize, usize)>;
 
 /// Every program of a block's tree with its artifacts and derived shape, level
 /// by level (the leaves first, the top last): what a prover proves and a
@@ -1049,7 +1061,7 @@ impl WhirBlockPlan {
         // Local lookups by the deriver's format: the static receiver check
         // (every receiver of a local bus reads fixed columns only), then every
         // table's digest from the deriver's own AIRs.
-        let local = if format.local_lookups() {
+        let mut local = if format.local_lookups() {
             Some(plan_local(&frame, statement.groups, base)?)
         } else {
             None
@@ -1136,14 +1148,53 @@ impl WhirBlockPlan {
         let refs = frame.airs.air_refs();
         let mut costs = Vec::with_capacity(groups.len());
         let mut cost_parts = Vec::with_capacity(groups.len());
+        // Each local group's class split, memoised by its definition.
+        let mut class_memo: Vec<(ClassKey, std::sync::Arc<GroupClasses>)> = Vec::new();
+        let mut group_classes: Vec<Option<std::sync::Arc<GroupClasses>>> =
+            Vec::with_capacity(groups.len());
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
             let entry = SpongeEntry::fresh_for(wrap_hash);
+            // A group argues local lookups when any of its tables has an
+            // interaction on a local bus: the host's `group_is_local`, read
+            // off the AIRs (a statement's interactions are its AIR's).
             let local_group = match &local {
-                Some(local) if owned.is_local(&local.buses) => Some(local),
+                Some(local)
+                    if list.iter().any(|&t| {
+                        refs[t]
+                            .bus_interactions()
+                            .iter()
+                            .any(|i| local.buses.contains(&i.bus_id))
+                    }) =>
+                {
+                    Some(local)
+                }
                 _ => None,
             };
+            let classes = match (local_group, batched_cap(config)?) {
+                (Some(local), Some(planning)) => {
+                    let start = groups[..g].iter().map(Vec::len).sum::<usize>();
+                    let key = class_key(
+                        list,
+                        &refs,
+                        &owned,
+                        &local.digests[start..start + list.len()],
+                    );
+                    let classes = match class_memo.iter().find(|(k, _)| *k == key) {
+                        Some((_, classes)) => classes.clone(),
+                        None => {
+                            let classes =
+                                std::sync::Arc::new(owned.classes(&local.buses, planning)?);
+                            class_memo.push((key, classes.clone()));
+                            classes
+                        }
+                    };
+                    Some(classes)
+                }
+                _ => None,
+            };
+            group_classes.push(classes.clone());
             let (tables, local_perms): (usize, Option<usize>) =
                 match (batched_cap(config)?, local_group) {
                     (None, None) => (
@@ -1164,7 +1215,7 @@ impl WhirBlockPlan {
                         None,
                     ),
                     (Some(planning), Some(local)) => {
-                        let classes = owned.classes(&local.buses, planning)?;
+                        let classes = classes.as_ref().expect("a local group's classes");
                         let start = groups[..g].iter().map(Vec::len).sum::<usize>();
                         let layout = &frame.stack_layouts[g];
                         let own = local_transcript_perms(
@@ -1230,6 +1281,9 @@ impl WhirBlockPlan {
             cost_parts.push([tables, opening, prepared_perms]);
         }
         drop(refs);
+        if let Some(local) = &mut local {
+            local.classes = group_classes;
+        }
         let id = crate::statement::elf_digest(&statement_bytes);
         // The partition comes after the rows are measured, over a plan whose
         // partition the measuring never reads.
@@ -1262,8 +1316,24 @@ impl WhirBlockPlan {
             let refs = plan.frame.airs.air_refs();
             let first_page = first_page_index(&plan.frame.airs).map_err(|e| format!("{e:?}"))?;
             for (g, list) in plan.groups.iter().enumerate() {
-                let owned = Shapes::build(&refs, &plan.frame.shapes, list)?;
-                let checked: Vec<usize> = list
+                // The check reads local receivers alone: a table with none
+                // passes it whatever its route, so only the tables with one
+                // are routed.
+                let receiving: Vec<usize> = list
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        refs[t]
+                            .bus_interactions()
+                            .iter()
+                            .any(|i| !i.is_sender && local.buses.contains(&i.bus_id))
+                    })
+                    .collect();
+                if receiving.is_empty() {
+                    continue;
+                }
+                let owned = Shapes::build(&refs, &plan.frame.shapes, &receiving)?;
+                let checked: Vec<usize> = receiving
                     .iter()
                     .map(|&t| route_of(&plan, refs[t], t, first_page).map(|r| r.columns_checked()))
                     .collect::<Result<_, _>>()?;
@@ -1340,6 +1410,15 @@ impl WhirBlockPlan {
         LfmBuilder::new()
             .with_wrap_hash(self.wrap_hash)
             .with_b3_lean(self.b3_lean)
+    }
+
+    /// Group `g`'s two LogUp classes under local lookups, `None` for a group
+    /// that argues no local lookup or a plan without them.
+    fn local_classes(&self, g: usize) -> Option<&std::sync::Arc<GroupClasses>> {
+        self.local
+            .as_ref()
+            .and_then(|local| local.classes.get(g))
+            .and_then(Option::as_ref)
     }
 
     /// Test only: this plan with its leaves' share form `inverse`
@@ -2437,12 +2516,6 @@ impl<'a> Shapes<'a> {
             .map_err(|e| format!("local lookups: {e:?}"))
     }
 
-    /// Whether these tables argue local lookups on `buses`: any has an
-    /// interaction on one — the host's `group_is_local`, called.
-    pub(crate) fn is_local(&self, buses: &[u64]) -> bool {
-        stark::multilinear_block::group_is_local(&self.statements(), buses)
-    }
-
     /// The tables' two LogUp classes under `buses` — the host's
     /// `ClassTables::split`, called — each with its members' interactions in
     /// it as the leg reads them and its plan, the host's `argue_plan_packed`
@@ -2525,6 +2598,31 @@ impl GroupClasses {
     }
 }
 
+/// Group `list`'s [`ClassKey`]: its tables' digests (`digests`, in `list`'s
+/// order), AIR families, constraint degrees and factor counts (`owned`'s
+/// layouts over `list`).
+fn class_key(
+    list: &[usize],
+    refs: &[&DynAir<'_>],
+    owned: &Shapes<'_>,
+    digests: &[[u8; 32]],
+) -> ClassKey {
+    list.iter()
+        .zip(&owned.layouts)
+        .zip(digests)
+        .map(|((&t, layout), digest)| {
+            let name = refs[t].name();
+            let family = name.split('[').next().unwrap_or(name).to_string();
+            (
+                *digest,
+                family,
+                layout.shape().degree(),
+                layout.kinds().len(),
+            )
+        })
+        .collect()
+}
+
 /// The plan's local lookups over `frame` and the statement's `groups`
 /// ([`PlanLocal`]): every table's digest by the host verifier's function,
 /// under the base's transcript hash. The static receiver check is the
@@ -2560,7 +2658,11 @@ fn plan_local(
             frame.order.len()
         ));
     }
-    Ok(PlanLocal { buses, digests })
+    Ok(PlanLocal {
+        buses,
+        digests,
+        classes: Vec::new(),
+    })
 }
 
 /// PERMUTATIONS a local group's own transcript costs: the commit-time
@@ -3201,9 +3303,7 @@ pub(crate) fn local_challenges_program(
     g: usize,
 ) -> Result<LfmProgram, String> {
     let local = plan.local.as_ref().ok_or("a plan without local lookups")?;
-    let refs = plan.frame.airs.air_refs();
-    let owned = Shapes::build(&refs, &plan.frame.shapes, &plan.groups[g])?;
-    if !owned.is_local(&local.buses) {
+    if plan.local_classes(g).is_none() {
         return Err(format!("group {g} argues no local lookup"));
     }
     let mut b = plan.leaf_builder();
@@ -3236,7 +3336,7 @@ struct LocalLeaf {
     alpha: Ext,
     /// Per table, its local claim (`None` off the local class).
     claims: Vec<Option<(Vec<Ext>, Ext, Ext)>>,
-    classes: GroupClasses,
+    classes: std::sync::Arc<GroupClasses>,
 }
 
 /// ★ `multilinear_block::local_challenges` and `batched::verify_local`,
@@ -3259,7 +3359,7 @@ fn emit_local_argue(
     plan: &WhirBlockPlan,
     g: usize,
     local: &PlanLocal,
-    owned: &Shapes<'_>,
+    classes: std::sync::Arc<GroupClasses>,
     planning: BatchedPlanning,
     roots: &[Cell],
     answers: &[Ext],
@@ -3290,7 +3390,6 @@ fn emit_local_argue(
         z,
         alpha,
     } = emit_local_challenges(b, plan, g, local, roots, answers);
-    let classes = owned.classes(&local.buses, planning)?;
     let store =
         super::whir_batch::hint_local_shaped(b, arena, at, &classes.local.plan, planning.ladder());
     let (member_claims, _) = super::whir_batch::emit_ladders(
@@ -3519,24 +3618,21 @@ fn emit_leaf_over(
         let group_roots = &carried[dw * root_at..dw * (root_at + trees.len())];
         // A group under local lookups argues its local class first, on its
         // own transcript: its commit-time one, continued.
-        let local = match (&plan.local, batched_cap(config)?) {
-            (Some(local), Some(planning)) if owned.is_local(&local.buses) => {
-                Some(emit_local_argue(
-                    b,
-                    plan,
-                    g,
-                    local,
-                    &owned,
-                    planning,
-                    group_roots,
-                    &answers[answer_at..answer_at + layout.num_polys()],
-                    arena,
-                    &mut at,
-                )?)
-            }
-            (Some(local), None) if owned.is_local(&local.buses) => {
-                return Err("local lookups are argued batched alone".to_string());
-            }
+        // (The plan derived each local group's classes, batched: a local
+        // format argued per table is refused at derive.)
+        let local = match (&plan.local, batched_cap(config)?, plan.local_classes(g)) {
+            (Some(local), Some(planning), Some(classes)) => Some(emit_local_argue(
+                b,
+                plan,
+                g,
+                local,
+                classes.clone(),
+                planning,
+                group_roots,
+                &answers[answer_at..answer_at + layout.num_polys()],
+                arena,
+                &mut at,
+            )?),
             _ => None,
         };
 
@@ -4062,14 +4158,14 @@ pub fn group_arena_words(
                 }
                 // A group's share as phase B hands it over carries no local
                 // argue for a group that argues no local lookup.
-                (Some(plan_local), None) if !owned.is_local(&plan_local.buses) => None,
+                (Some(_), None) if plan.local_classes(g).is_none() => None,
                 (Some(_), None) => {
                     return Err(format!(
                         "group {g} argues local lookups and carries no local argue"
                     ));
                 }
-                (Some(plan_local), Some(local)) if owned.is_local(&plan_local.buses) => {
-                    let classes = owned.classes(&plan_local.buses, planning)?;
+                (Some(_), Some(local)) if plan.local_classes(g).is_some() => {
+                    let classes = plan.local_classes(g).expect("a local group's classes");
                     let expected =
                         super::whir_batch::local_words(&classes.local.plan, planning.ladder());
                     if local.bus_outputs.len() != classes.local.plan.trees()
@@ -4090,7 +4186,7 @@ pub fn group_arena_words(
                             words.len()
                         ));
                     }
-                    Some(classes.global.plan)
+                    Some(classes.global.plan.clone())
                 }
                 (Some(_), Some(local)) => {
                     if !local.is_empty() {
