@@ -1178,10 +1178,31 @@ pub fn prove_levels(
     Ok((proofs, secs))
 }
 
-/// ★ The block's verifier over its last level: every level derived on the
-/// host from `plan` ([`derive_levels`]), `last` verified against the last
-/// level's artifacts, and its words claiming the block.
-pub fn verify_levels(
+/// ★ The block's public verifier over its last level: level 1's plan derived
+/// here from the trusted ELF and the claimed statement, its prepared roots
+/// committed on the host ([`level_plan`] with `None`), never taken from a
+/// caller or a prover; then every level derived from that plan and `last`
+/// checked as [`verify_levels_to`] checks it. `proof_options`, `format`,
+/// `family` and `stop` are the caller's constants, never a proof's.
+pub fn verify_block_levels(
+    elf: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    stop: LevelStop,
+    last: &WlfmProof,
+) -> Result<(), String> {
+    let plan = level_plan(elf, proof_options, format, statement, family, None)?;
+    verify_levels_to(&plan, family, stop, last)
+}
+
+/// The block's verifier over its last level, against a plan the caller
+/// derived: every level derived on the host from `plan` ([`derive_levels`]),
+/// `last` verified against the last level's artifacts, and its words claiming
+/// the block. It trusts `plan`, its prepared roots included, so it is not a
+/// public entry: [`verify_block_levels`] derives the plan itself.
+pub(crate) fn verify_levels(
     plan: &WhirBlockPlan,
     family: WlfmFamily,
     last: &WlfmProof,
@@ -1190,7 +1211,7 @@ pub fn verify_levels(
 }
 
 /// [`verify_levels`] under the chain stop `stop` (the verifier's constant).
-pub fn verify_levels_to(
+pub(crate) fn verify_levels_to(
     plan: &WhirBlockPlan,
     family: WlfmFamily,
     stop: LevelStop,
