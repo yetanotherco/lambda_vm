@@ -3248,10 +3248,13 @@ fn emit_local_argue(
         planning.ladder(),
     );
     // The local balance, over every local tree's output (a cut table's chunks
-    // each), as the host sums them.
+    // each), as the host sums them, in an accumulator of its own (never the
+    // leaf's published share). Each share is `p · (1/q)` whatever the
+    // process's share knob: `ediv(p, q)` would leave a share free at
+    // `p = q = 0`.
     let mut sum: Option<Ext> = None;
     for (p, q) in &store.bus_outputs {
-        let share = emit_share(b, *p, *q, plan.share_inverse);
+        let share = emit_share(b, *p, *q, true);
         sum = Some(match sum {
             None => share,
             Some(running) => b.eadd(running, share),
