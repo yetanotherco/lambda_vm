@@ -895,22 +895,23 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
     }
 }
 
-/// The resident-pricing knob's name; it is off by default, and only `1`
-/// turns it on.
+/// The resident-pricing knob's name; it is on by default (with F1's next
+/// columns and the store's promise taken at admission), and only `0` turns
+/// it off.
 #[test]
-fn the_overlap_resident_knob_is_named_and_off_by_default() {
+fn the_overlap_resident_knob_is_named_and_on_by_default() {
     use super::wlfm::{OVERLAP_RESIDENT_ENV, overlap_resident, overlap_resident_word};
     assert_eq!(OVERLAP_RESIDENT_ENV, "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT");
     if std::env::var_os(OVERLAP_RESIDENT_ENV).is_none() {
-        assert!(!overlap_resident());
+        assert!(overlap_resident());
     }
     for (word, on) in [
-        (None, false),
-        (Some(""), false),
-        (Some("0"), false),
-        (Some("yes"), false),
+        (None, true),
+        (Some(""), true),
         (Some("1"), true),
-        (Some(" 1 "), true),
+        (Some("no"), true),
+        (Some("0"), false),
+        (Some(" 0 "), false),
     ] {
         assert_eq!(overlap_resident_word(word), on, "{word:?}");
     }
@@ -1032,6 +1033,70 @@ fn a_store_refused_inside_an_overlapped_opening_proves_the_same_bytes() {
                      out {} at {} of {} B)",
                     first.overlap_planned_out, first.overlap_plan_need, first.overlap_plan_free
                 );
+            }
+        }
+    }
+}
+
+/// ★ The store's promise taken when the plan admits an overlap on the
+/// store's price (resident pricing, on by default with the next columns):
+/// refused at the admission (a test's refusal, on a card), the group opens
+/// alone with the same bytes, stamped refused and planned out, and its store
+/// still goes up by its own plan; admitted, a group that opened beside the
+/// next argue had its promise, and its store went up into it. Without a card
+/// no promise is asked for. Both families, the probe at one stacked
+/// polynomial a group (two groups).
+#[test]
+fn a_store_promise_refused_at_admission_opens_the_group_alone_with_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    super::wlfm::set_overlap_resident_for_test(Some(true));
+    super::wlfm::set_overlap_next_columns_for_test(Some(true));
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        let (_, _, retired) = probe_placed(family, StackPlace::CardRetired);
+        for refuse in [false, true] {
+            let faults = OverlapFaults {
+                store_promise_refused_at: refuse.then_some(0),
+                ..Default::default()
+            };
+            let (got, groups) = streamed_once(&program, &retired, &arenas, true, faults)
+                .unwrap_or_else(|e| panic!("{family:?} {refuse}: {e}"));
+            assert!(got == want, "{family:?} refused {refuse}: the held bytes");
+            assert!(groups.len() >= 2, "{family:?}: a next group to open beside");
+            let first = &groups[0];
+            assert!(
+                groups.iter().all(|s| !s.upload_once.refused),
+                "{family:?} {refuse}: no store refused by the card"
+            );
+            if !card {
+                assert!(
+                    groups
+                        .iter()
+                        .all(|s| !s.store_promised && !s.store_promise_refused),
+                    "{family:?} {refuse}: no promise without a card"
+                );
+            } else if refuse {
+                assert!(
+                    first.store_promise_refused && first.overlap_planned_out && !first.overlapped,
+                    "{family:?}: the refused promise opened the group alone"
+                );
+                assert!(
+                    !first.upload_once.promised,
+                    "{family:?}: no promise to spend"
+                );
+            } else {
+                for s in groups.iter().filter(|s| s.overlapped) {
+                    assert!(
+                        s.store_promised && s.upload_once.promised && s.upload_once.used,
+                        "{family:?}: an admitted group's store went up into its promise"
+                    );
+                }
             }
         }
     }

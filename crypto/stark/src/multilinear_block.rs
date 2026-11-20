@@ -154,6 +154,9 @@ pub struct UploadOnce {
     /// The narrow store sent the bytes packed at the stack's commit
     /// ([`BlockPrepared::packed`]): no pack here, `pack_secs` 0.
     pub prepacked: bool,
+    /// The store went up into the promise its overlap's plan took at
+    /// admission ([`GroupStamps::store_promised`]): no plan or ledger here.
+    pub promised: bool,
 }
 
 /// What a group cost, for the readout. Seconds of wall time on the prover's
@@ -237,6 +240,12 @@ pub struct GroupStamps {
     pub overlap_planned_out: bool,
     pub overlap_plan_need: u64,
     pub overlap_plan_free: u64,
+    /// Under resident pricing, the plan admitted the group's openings beside
+    /// the next argue and took its prepared store's promise then
+    /// (`store_promised`), or the card refused that promise and the group
+    /// opened alone (`store_promise_refused`, with `overlap_planned_out`).
+    pub store_promised: bool,
+    pub store_promise_refused: bool,
     /// Under [`BlockCommitted::with_prepared_upload_once`], the group's retired
     /// prepared stack's store ([`UploadOnce`]).
     pub upload_once: UploadOnce,
@@ -1704,6 +1713,10 @@ pub struct OverlapFaults {
     /// Under the upload once: the card refuses the store of the group at this
     /// place once its plan has said yes (on a card only: the plan is a card's).
     pub upload_once_card_refuses_at: Option<usize>,
+    /// Under resident pricing: the card refuses the store's promise the plan
+    /// asks for when it admits the group at this place beside the next argue
+    /// (on a card only: without one no promise is asked for).
+    pub store_promise_refused_at: Option<usize>,
 }
 
 /// Every count of a promise the card refused, or of a wait on every stream at
@@ -2320,9 +2333,11 @@ where
     /// (the columns' bytes) and the revive's promises over a resident stack
     /// ([`RetiredStack::revive_card_bytes`] with `resident`; on coset leaves no
     /// codeword), instead of a revive that copies the columns in and encodes
-    /// whole codewords (`false`, the default). Only the plan moves: where it
-    /// now fits, the group opens beside the next argue. Without the upload
-    /// once it changes nothing. The same proof.
+    /// whole codewords (`false`, the default). Where it now fits, the group
+    /// opens beside the next argue, and the admission takes the store's
+    /// promise then (refused, the group opens alone), so the store goes up
+    /// into it and the ledger cannot refuse it inside the overlap. Without the
+    /// upload once it changes nothing. The same proof.
     pub fn with_overlap_priced_resident(mut self, on: bool) -> Self {
         self.overlap_resident = on;
         self
@@ -3040,6 +3055,10 @@ where
     /// The planned overlap prices its prepared revive over the upload once's
     /// store ([`BlockCommitted::with_overlap_priced_resident`]).
     overlap_resident: bool,
+    /// The promise of its prepared store taken when the plan admitted its
+    /// openings beside the next argue on the store's price: the store goes up
+    /// into it, so the ledger cannot refuse it after the admission.
+    store_promise: Option<multilinear::gpu::DeviceRoom>,
 }
 
 /// A group's openings done: its opening, its prepared one when it has one,
@@ -3299,6 +3318,45 @@ fn narrow_store_staging(narrow: bool, lens: &[usize]) -> u64 {
     }
 }
 
+/// The promise a group's prepared store takes when the planned overlap admits
+/// its openings on the store's price: the store's words, and under the narrow
+/// store the largest run's packed bytes, which sit on the card while it
+/// widens ([`narrow_store_staging`]).
+fn store_promise_bytes(words: u64, narrow: bool, lens: &[usize]) -> u64 {
+    words.saturating_add(narrow_store_staging(narrow, lens))
+}
+
+/// [`store_promise_bytes`] of `argued`'s retired prepared stack when the
+/// admission takes its promise: under resident pricing (which needs the upload
+/// once), on a card that keeps column stores; `None` otherwise (nothing to
+/// promise, the admission stands as planned).
+fn admission_store_bytes<F, E, T, H>(
+    argued: &Argued<F, E, T>,
+    prepared: &[BlockPrepared<'_, F, H>],
+) -> Option<u64>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    E: IsField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    if !argued.overlap_resident
+        || multilinear::gpu::reserve_budget() == 0
+        || multilinear::gpu::columns_disabled()
+    {
+        return None;
+    }
+    let q = prepared.iter().find(|q| {
+        q.group == argued.group && matches!(q.commitment, PreparedCommitment::Retired(_))
+    })?;
+    let lens: Vec<usize> = q.columns.iter().map(|c| c.len()).collect();
+    Some(store_promise_bytes(
+        prepared_store_bytes(q.columns),
+        argued.upload_once_narrow,
+        &lens,
+    ))
+}
+
 /// What the upload once's store plans to hold: the store, a revive over it,
 /// and a margin.
 fn store_plan_need(store: u64, over_store: u64, margin: u64) -> u64 {
@@ -3350,6 +3408,7 @@ fn upload_once_store<F>(
     config: &ChainConfig,
     ask: StoreAsk,
     packed: Option<&multilinear::gpu::PackedStore>,
+    promise: Option<multilinear::gpu::DeviceRoom>,
     upload: &mut UploadOnce,
 ) -> Option<multilinear::gpu::ResidentColumns>
 where
@@ -3380,19 +3439,29 @@ where
         margin,
     );
     upload.free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
-    if upload.need > upload.free {
+    // A promise taken at the overlap's admission is the plan: the store goes
+    // up into it.
+    upload.promised = promise.is_some();
+    if promise.is_none() && upload.need > upload.free {
         upload.planned_out = true;
         return None;
     }
     let t = Instant::now();
     let store = match (card_refuses_by_test, narrow) {
         (true, _) => None,
-        (false, false) => multilinear::gpu::upload_store_columns(columns),
+        (false, false) => match promise {
+            Some(room) => multilinear::gpu::upload_store_columns_in(columns, room),
+            None => multilinear::gpu::upload_store_columns(columns),
+        },
         (false, true) => {
             let prepacked = packed.filter(|p| p.fits(columns));
-            match prepacked {
-                Some(p) => multilinear::gpu::upload_packed_store(p),
-                None => multilinear::gpu::upload_store_columns_narrow(columns),
+            match (prepacked, promise) {
+                (Some(p), Some(room)) => multilinear::gpu::upload_packed_store_in(p, room),
+                (Some(p), None) => multilinear::gpu::upload_packed_store(p),
+                (None, Some(room)) => {
+                    multilinear::gpu::upload_store_columns_narrow_in(columns, room)
+                }
+                (None, None) => multilinear::gpu::upload_store_columns_narrow(columns),
             }
             .map(|(store, stamp)| {
                 upload.narrow = true;
@@ -3604,6 +3673,7 @@ where
                         narrow: argued.upload_once_narrow,
                     },
                     p.packed,
+                    argued.store_promise.take(),
                     &mut upload,
                 ),
                 _ => None,
@@ -4204,6 +4274,7 @@ where
             upload_once_card_refuses: overlap_faults.upload_once_card_refuses_at == Some(p),
             upload_once_narrow: store_narrow,
             overlap_resident: priced_resident(upload_once, overlap_resident),
+            store_promise: None,
         };
         // Under the planned overlap (retired stacks, the overlap otherwise off),
         // each transition by its own plan.
@@ -4227,6 +4298,24 @@ where
                 stamps[g].overlap_plan_free = free;
                 fits
             });
+        // Admitted on the store's price: the store's promise is taken now, so
+        // the ledger cannot refuse the store once the openings run beside the
+        // next argue. Refused, the group opens alone.
+        let planned_beside = planned_beside
+            && match admission_store_bytes(&argued, prepared) {
+                None => true,
+                Some(bytes) => {
+                    let room = match overlap_faults.store_promise_refused_at == Some(p) {
+                        true => None,
+                        false => multilinear::gpu::reserve_room(bytes),
+                    };
+                    stamps[g].store_promised = room.is_some();
+                    stamps[g].store_promise_refused = room.is_none();
+                    stamps[g].overlap_planned_out |= room.is_none();
+                    argued.store_promise = room;
+                    argued.store_promise.is_some()
+                }
+            };
         if (overlapping || planned_beside) && !latched && next_g.is_some() {
             // Opened beside the next group's argue.
             prev = Some(argued);
@@ -5544,6 +5633,21 @@ mod upload_once_rule_tests {
         assert!(!super::priced_resident(false, true));
         assert!(!super::priced_resident(true, false));
         assert!(!super::priced_resident(false, false));
+    }
+
+    /// The promise an admission takes for a group's store: its words, and
+    /// under the narrow store the largest run's words at 8 bytes besides.
+    #[test]
+    fn a_stores_promise_is_its_words_and_a_narrow_runs_staging() {
+        let run = multilinear::narrow::STORE_RUN_CELLS;
+        let lens = vec![run / 4; 6];
+        let words: u64 = lens.iter().map(|&n| n as u64 * 8).sum();
+        assert_eq!(super::store_promise_bytes(words, false, &lens), words);
+        assert_eq!(
+            super::store_promise_bytes(words, true, &lens),
+            words + run as u64 * 8
+        );
+        assert_eq!(super::store_promise_bytes(u64::MAX, true, &lens), u64::MAX);
     }
 
     /// A narrow store's plan adds its largest run's words at 8 bytes (what

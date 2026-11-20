@@ -2913,9 +2913,9 @@ pub fn upload_once_word(word: Option<&str>) -> bool {
     !super::wlfm_knobs::knob_word_off(word)
 }
 
-/// [`OVERLAP_RESIDENT_ENV`]'s word: on only for `1`.
+/// [`OVERLAP_RESIDENT_ENV`]'s word: on unless it is `0`.
 pub fn overlap_resident_word(word: Option<&str>) -> bool {
-    super::wlfm_knobs::knob_word_on(word)
+    !super::wlfm_knobs::knob_word_off(word)
 }
 
 pub const UPLOAD_ONCE_ENV: &str = "LAMBDA_VM_LEVELS_UPLOAD_ONCE";
@@ -2942,18 +2942,20 @@ pub fn upload_once() -> bool {
     *ON.get_or_init(|| upload_once_word(super::wlfm_knobs::env_word(UPLOAD_ONCE_ENV).as_deref()))
 }
 
-/// `LAMBDA_VM_LEVELS_OVERLAP_RESIDENT=1`: under [`UPLOAD_ONCE_ENV`], phase B's
-/// planned overlap prices a retired prepared stack's revive as the upload once
-/// makes it (its store and a revive over resident columns, no codeword on
-/// coset leaves) rather than as a revive that copies and encodes whole
-/// codewords
-/// ([`multilinear_block::BlockCommitted::with_overlap_priced_resident`]). Only
-/// the plan moves: a group whose openings now fit opens beside the next argue.
-/// Nothing without the upload once. The same proof. Only the W-LFM prover
-/// reads it. Off by default (and for any word but `1`): the plan it tightens
-/// covered the next group's columns, which go up beside the argue it plans
-/// for, only with the cushion it removes; [`OVERLAP_NEXT_COLUMNS_ENV`] prices
-/// them. Read once a process.
+/// `LAMBDA_VM_LEVELS_OVERLAP_RESIDENT` (on unless `0`): under
+/// [`UPLOAD_ONCE_ENV`], phase B's planned overlap prices a retired prepared
+/// stack's revive as the upload once makes it (its store and a revive over
+/// resident columns, no codeword on coset leaves) rather than as a revive that
+/// copies and encodes whole codewords
+/// ([`multilinear_block::BlockCommitted::with_overlap_priced_resident`]), and
+/// when it admits a group's openings beside the next argue on that price it
+/// takes the store's promise then, so the store goes up into it and the
+/// ledger cannot refuse it later (a refused promise opens the group alone).
+/// Only the plan and the store's promise move. Nothing without the upload
+/// once. The same proof. Only the W-LFM prover reads it. On by default,
+/// together with [`OVERLAP_NEXT_COLUMNS_ENV`]: that term alone makes the
+/// plan honest at the cost of an overlap this price wins back. Only `0` turns
+/// it off. Read once a process.
 pub const OVERLAP_RESIDENT_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT";
 
 thread_local! {

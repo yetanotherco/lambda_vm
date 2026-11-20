@@ -156,7 +156,7 @@ impl DeviceColumns {
     /// `None` when the card will not promise the room, in which case every
     /// caller uploads its own copy as before.
     pub fn upload(columns: &[&[u64]]) -> Option<Self> {
-        Self::upload_on(columns, true)
+        Self::upload_on(columns, true, None)
     }
 
     /// [`Self::upload`] for a store off the argue surface (a retired prepared
@@ -165,20 +165,44 @@ impl DeviceColumns {
     /// it is not a device fallback and is not counted as one, nor as argue
     /// bytes.
     pub fn upload_store(columns: &[&[u64]]) -> Option<Self> {
-        Self::upload_on(columns, false)
+        Self::upload_on(columns, false, None)
     }
 
-    fn upload_on(columns: &[&[u64]], argue: bool) -> Option<Self> {
+    /// [`Self::upload_store`] into a promise taken before (`room`, at least
+    /// the columns' bytes): no reservation is asked for here, so the ledger
+    /// cannot refuse it. What the promise holds past the columns' bytes is
+    /// given back. `None` (the promise given back with it) when the room is
+    /// short or the card fails the copy.
+    pub fn upload_store_in(columns: &[&[u64]], room: DeviceReservation) -> Option<Self> {
+        Self::upload_on(columns, false, Some(room))
+    }
+
+    fn upload_on(
+        columns: &[&[u64]],
+        argue: bool,
+        prepaid: Option<DeviceReservation>,
+    ) -> Option<Self> {
         if columns.is_empty() {
             return None;
         }
         let total: usize = columns.iter().map(|c| c.len()).sum();
         let be = backend().ok()?;
-        let Some(room) = be.reserve(total as u64 * 8) else {
-            if argue {
-                crate::device::note_device_fallback();
+        let words = total as u64 * 8;
+        let room = match prepaid {
+            Some(room) if room.bytes() >= words => {
+                room.shrink(room.bytes() - words);
+                room
             }
-            return None;
+            Some(_) => return None,
+            None => {
+                let Some(room) = be.reserve(words) else {
+                    if argue {
+                        crate::device::note_device_fallback();
+                    }
+                    return None;
+                };
+                room
+            }
         };
         if argue {
             crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
@@ -281,7 +305,7 @@ impl DeviceColumns {
 
     /// [`Self::upload_tables`] as it is with `LAMBDA_VM_CARD_ROWS` off.
     pub(crate) fn upload_tables_today(tables: &[TableUpload<'_>]) -> Option<Self> {
-        Self::upload_tables_on(tables, true)
+        Self::upload_tables_on(tables, true, None)
     }
 
     /// [`Self::upload_tables`] for a store off the argue surface, as
@@ -297,10 +321,33 @@ impl DeviceColumns {
         {
             return None;
         }
-        Self::upload_tables_on(tables, false)
+        Self::upload_tables_on(tables, false, None)
     }
 
-    fn upload_tables_on(tables: &[TableUpload<'_>], argue: bool) -> Option<Self> {
+    /// [`Self::upload_store_tables`] into a promise taken before (`room`, at
+    /// least the tables' words plus the largest packed table's bytes, which
+    /// sit on the card while it widens): nothing is reserved here, and the
+    /// staging's part of the promise is given back once the tables are up.
+    /// `None` (the promise given back with it) when the room is short or the
+    /// card fails the upload.
+    pub fn upload_store_tables_in(
+        tables: &[TableUpload<'_>],
+        room: DeviceReservation,
+    ) -> Option<Self> {
+        if tables
+            .iter()
+            .any(|table| matches!(table, TableUpload::Records(_)))
+        {
+            return None;
+        }
+        Self::upload_tables_on(tables, false, Some(room))
+    }
+
+    fn upload_tables_on(
+        tables: &[TableUpload<'_>],
+        argue: bool,
+        prepaid: Option<DeviceReservation>,
+    ) -> Option<Self> {
         let total: usize = tables.iter().map(TableUpload::cells).sum();
         if total == 0
             || tables.iter().any(|table| {
@@ -310,12 +357,7 @@ impl DeviceColumns {
             return None;
         }
         let be = backend().ok()?;
-        let Some(room) = be.reserve(total as u64 * 8) else {
-            if argue {
-                crate::device::note_device_fallback();
-            }
-            return None;
-        };
+        let words = total as u64 * 8;
         // The packed bytes (or records) sit on the card only while their
         // table widens (or fills), one table at a time in stream order:
         // promised for the largest of them.
@@ -328,7 +370,23 @@ impl DeviceColumns {
             })
             .max()
             .unwrap_or(0);
+        // A promise taken before covers the words and the staging; the
+        // staging's part goes back once the tables are up.
+        let (room, prepaid) = match prepaid {
+            Some(room) if room.bytes() >= words.saturating_add(staging) => (room, true),
+            Some(_) => return None,
+            None => {
+                let Some(room) = be.reserve(words) else {
+                    if argue {
+                        crate::device::note_device_fallback();
+                    }
+                    return None;
+                };
+                (room, false)
+            }
+        };
         let _staging = match staging {
+            _ if prepaid => None,
             0 => None,
             bytes => {
                 let Some(promise) = be.reserve(bytes) else {
@@ -386,6 +444,9 @@ impl DeviceColumns {
             }
         }
         stream.synchronize().ok()?;
+        if prepaid {
+            room.shrink(room.bytes() - words);
+        }
         clocks.into_iter().for_each(TableClock::add);
         // A fill whose records it refused (a CPU log at a pc with no DECODE
         // row): the card declines the group, and its readers take the host's
