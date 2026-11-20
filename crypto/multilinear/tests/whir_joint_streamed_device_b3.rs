@@ -466,9 +466,9 @@ fn a_streamed_groups_add_back_is_what_the_batched_commit_held() {
             );
             assert_eq!(gpu::host_fallbacks(), fallbacks, "{polys}: no host commit");
             let runs = gpu::joint_streamed_builds() - streamed;
-            let add_back = gpu::streamed_not_held()
-                .since(not_held)
-                .add_back(runs, trees);
+            let counted = gpu::streamed_not_held().since(not_held);
+            assert_eq!(counted.runs, runs, "{polys}: every streamed build counted");
+            let add_back = counted.add_back(trees);
             (grew, runs, add_back, committed.roots())
         };
         let (batched, runs_off, add_back_off, batched_roots) = commit(false);
