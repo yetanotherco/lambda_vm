@@ -299,6 +299,19 @@ fn the_frame_refuses_local_bytes_out_of_place() {
             "{what}"
         );
         assert!(!verify(&p, &elf, &local()), "{what}");
+        // The recursion's plan derives through the same frame: no leaf is
+        // derived over a statement the host verifier refuses.
+        assert!(
+            crate::lfm::whir_block::WhirBlockPlan::derive(
+                &elf,
+                &opts(),
+                &local(),
+                p.statement(),
+                None
+            )
+            .is_err(),
+            "{what}: the recursion's plan"
+        );
     };
     let first = k[0];
     refused(
@@ -366,11 +379,11 @@ fn the_frame_refuses_local_bytes_out_of_place() {
     }
 }
 
-/// The recursion's plan refuses a base under local lookups (its leaf
-/// verifies no local argue).
+/// The recursion's plan derives over a base under local lookups (its leaf
+/// verifies each group's local argue, `lfm::whir_block_local_tests`).
 #[test]
 #[ignore = "proves a real block: box tier, run with --ignored --test-threads=1"]
-fn the_recursion_refuses_a_base_under_local_lookups() {
+fn the_recursion_derives_a_plan_over_a_base_under_local_lookups() {
     let elf = elf();
     let proof = prove_local(&elf);
     let plan = crate::lfm::whir_block::WhirBlockPlan::derive(
@@ -380,7 +393,7 @@ fn the_recursion_refuses_a_base_under_local_lookups() {
         proof.statement(),
         None,
     );
-    assert!(plan.is_err());
+    assert!(plan.is_ok(), "{:?}", plan.err());
 }
 
 /// Phase A's lane moves no byte on a real block: the block proved with the

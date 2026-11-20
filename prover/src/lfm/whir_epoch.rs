@@ -171,6 +171,11 @@ pub enum PreprocessedRoute<'a> {
     /// `4·(i + 1)` of `2^num_vars` rows, whose extension is `4 + 4·Σ_k 2^k·r_k`
     /// ([`super::preprocessed::emit_timestamp_ramp`]) — no opening, no fold.
     Timestamp { num_vars: usize },
+    /// LOCAL_BYTES (`tables::local_bytes`): `X`, `Y`, `X ∧ Y` and `X ⊕ Y` over
+    /// the 16 index bits by closed form
+    /// ([`super::preprocessed::emit_local_bytes_preprocessed`]): BITWISE's form
+    /// on its byte pair, with no third operand.
+    LocalBytes,
 }
 
 /// One table's preprocessed plan: what a prepared opening settled, and how
@@ -311,6 +316,12 @@ pub fn emit_table_walk(
     walk
 }
 
+/// A table's reduced point and column values, borrowed.
+struct PointValues<'a> {
+    point: &'a [Ext],
+    column_values: &'a [Ext],
+}
+
 /// One table's preprocessed columns, checked against the values its own
 /// argument settled on.
 pub(crate) fn emit_preprocessed_leg(
@@ -320,8 +331,54 @@ pub(crate) fn emit_preprocessed_leg(
     shape: &TableShape<'_>,
     verdict: &TableVerdictWires,
 ) {
+    emit_preprocessed_leg_at(
+        b,
+        plan,
+        slot_of,
+        shape,
+        &verdict.point,
+        &verdict.column_values,
+    );
+}
+
+/// [`emit_preprocessed_leg`] at a table's reduced `point` and `column_values`,
+/// whatever bus the table argued on.
+pub(crate) fn emit_preprocessed_leg_at(
+    b: &mut LfmBuilder,
+    plan: &PreprocessedPlan<'_>,
+    slot_of: &[usize],
+    shape: &TableShape<'_>,
+    point: &[Ext],
+    column_values: &[Ext],
+) {
+    let verdict = PointValues {
+        point,
+        column_values,
+    };
     let columns: &[&[FE]] = match &plan.route {
         PreprocessedRoute::None => return,
+        PreprocessedRoute::LocalBytes => {
+            assert_eq!(
+                plan.settled, 0,
+                "LOCAL_BYTES' columns are covered by the closed form, not by an opening"
+            );
+            #[cfg(test)]
+            if super::whir_block::local_faults::get()
+                == super::whir_block::local_faults::Fault::NoLocalBytesRoute
+            {
+                return;
+            }
+            let targets = preprocessed_targets(
+                slot_of,
+                shape.kinds,
+                crate::tables::local_bytes::NUM_PRECOMPUTED_COLS,
+            );
+            let values = super::preprocessed::emit_local_bytes_preprocessed(b, verdict.point);
+            for (value, &target) in values.iter().zip(&targets) {
+                b.assert_eq_ext(*value, verdict.column_values[target]);
+            }
+            return;
+        }
         PreprocessedRoute::Bitwise => {
             // The closed form covers all eleven at once, so a settled prefix
             // over them would be two checks on one column rather than none.

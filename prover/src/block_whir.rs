@@ -2726,6 +2726,18 @@ impl LocalPart for LocalArgues {
     }
 }
 
+/// A proof of either kind, as a pipeline that proves either format carries
+/// it: `None` for today's, the local argues under local lookups.
+impl LocalPart for Option<LocalArgues> {
+    fn local_argues(&self) -> Option<&[LocalArgue<E>]> {
+        self.as_deref()
+    }
+}
+
+/// A block proof of either kind ([`LocalPart`] for `Option<LocalArgues>`):
+/// what the recursion's pipelines hold, whichever format they proved.
+pub type AnyBlockWhirProof = BlockWhirProof<Option<LocalArgues>>;
+
 /// Where a block's prove spent its time, for the readout. Seconds.
 #[derive(Clone, Debug, Default)]
 pub struct BlockStamps {
@@ -5196,6 +5208,23 @@ pub fn prove_block_whir(
     )
 }
 
+/// A prover's wrong LOCAL_BYTES tables ([`Deviations::local_bytes`]), each
+/// proved honestly over: what one check alone must refuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum LocalBytesFault {
+    #[default]
+    None,
+    /// `MU_ARE_BYTES` one more at the byte pair `(1, 2)`: a lookup received
+    /// that no table sent — a false lookup's mirror. Only the group's local
+    /// balance sees it.
+    OneMoreReceived,
+    /// `X ⊕ Y` one more at the first row no XOR lookup reads (`MU_XOR` zero
+    /// there): the table is not the verifier's, its lookups still balance.
+    /// Only the fixed-column check sees it.
+    WrongUnusedXor,
+}
+
 /// What a test makes the prover do wrong, for the verifier to refuse. The
 /// default is an honest prover.
 #[derive(Default)]
@@ -5224,6 +5253,9 @@ pub(crate) struct Deviations {
     /// (`Some(true)`) or leaves them to phase B (`Some(false)`), instead of
     /// the knob ([`LOCAL_LANE_ENV`]). The proof is the same.
     pub local_lane: Option<bool>,
+    /// Under local lookups: every LOCAL_BYTES table made wrong
+    /// ([`LocalBytesFault`]) and proved honestly over.
+    pub local_bytes: LocalBytesFault,
     /// Faults in phase B's overlap ([`multilinear_block::OverlapFaults`]).
     pub overlap_faults: multilinear_block::OverlapFaults,
     /// Between the phases, the first narrow table's width map made wrong, so
@@ -7134,6 +7166,8 @@ struct Packer<'a> {
 /// groups' counts and the LOCAL_BYTES tables made so far.
 struct LocalPack<'a> {
     air: AirRef<'a>,
+    /// A test's wrong tables ([`Deviations::local_bytes`]).
+    fault: LocalBytesFault,
     /// The main open group's counts, and KECCAK_RND's own open group's.
     open: Option<LocalCounts>,
     own: Option<LocalCounts>,
@@ -7317,10 +7351,32 @@ impl<'a> Packer<'a> {
         bytes: &mut usize,
         places: Option<&mut Vec<Option<usize>>>,
     ) -> Result<(), Error> {
-        let (Some(counts), Some(local)) = (counts, self.local.as_mut()) else {
+        let (Some(mut counts), Some(local)) = (counts, self.local.as_mut()) else {
             return Ok(());
         };
-        let mut trace = counts.trace();
+        let mut trace = match local.fault {
+            LocalBytesFault::None => counts.trace(),
+            LocalBytesFault::OneMoreReceived => {
+                counts.are_bytes[local_bytes::row_of(1, 2)] += 1;
+                counts.trace()
+            }
+            LocalBytesFault::WrongUnusedXor => {
+                let row = counts.xor.iter().position(|&m| m == 0).ok_or_else(|| {
+                    Error::Prover("every LOCAL_BYTES row is an XOR lookup's".to_string())
+                })?;
+                let mut columns = local_bytes::preprocessed_columns();
+                columns[local_bytes::cols::XOR][row] += FieldElement::<F>::one();
+                for column in [&counts.are_bytes, &counts.and, &counts.xor] {
+                    columns.push(
+                        column
+                            .iter()
+                            .map(|&m| FieldElement::<F>::from(u64::from(m)))
+                            .collect(),
+                    );
+                }
+                stark::trace::TraceTable::from_columns_main(columns, 1)
+            }
+        };
         let table = table_of(
             local.air,
             &mut trace,
@@ -9667,6 +9723,7 @@ fn prove_streamed(
                     close_ahead: close_ahead.clone(),
                     local: format.local_lookups().then(|| LocalPack {
                         air: stream_airs.local_bytes.as_ref(),
+                        fault: deviations.local_bytes,
                         open: None,
                         own: None,
                         made: 0,
@@ -10939,10 +10996,8 @@ pub(crate) struct BlockFrame {
     pub(crate) stack_layouts: Vec<multilinear::stacking::StackedLayout>,
     pub(crate) domains: Vec<multilinear::whir::Domain<F>>,
     /// Under local lookups ([`BlockFormat::local_lookups`]): the index of the
-    /// first LOCAL_BYTES table, after every other ([`check_local_groups`]).
-    /// Read by the tests today, and by the in-guest plan once it verifies
-    /// local argues.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// first LOCAL_BYTES table, after every other ([`check_local_groups`]):
+    /// where the in-guest plan routes their fixed columns.
     pub(crate) local_base: Option<usize>,
 }
 

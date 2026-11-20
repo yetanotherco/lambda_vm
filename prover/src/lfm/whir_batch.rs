@@ -237,6 +237,69 @@ pub fn emit_batched_argue(
     assert_eq!(proof.factor_values.len(), n, "factor values per table");
     assert_eq!(proof.reduces.len(), n, "a reduction slot per table");
 
+    // ── G ──
+    let (claims, outputs) = emit_ladders(b, transcript, proof.bus_outputs, proof.gkr, plan, ladder);
+    let pairs: Vec<TablePairWires<'_>> = shapes
+        .iter()
+        .zip(&claims)
+        .map(|(shape, claim)| TablePairWires {
+            global: Some(PairWires {
+                claim,
+                bus: shape.bus,
+                z,
+                alpha_powers,
+            }),
+            local: None,
+        })
+        .collect();
+    let tables = emit_argue_rest(b, transcript, proof, shapes, plan, &pairs, false, beta);
+    BatchedVerdictWires {
+        bus_outputs: outputs,
+        tables,
+    }
+}
+
+/// One bus pair of a table in the C phase, as wires: the claim its class's
+/// ladders left (`(point, p̃, q̃)`), its interactions in that class, and the
+/// class's challenges.
+#[derive(Clone, Copy)]
+pub(crate) struct PairWires<'a> {
+    pub(crate) claim: &'a (Vec<Ext>, Ext, Ext),
+    pub(crate) bus: &'a [stark::multilinear_logup::InteractionShape<
+        crate::tables::types::GoldilocksExtension,
+    >],
+    pub(crate) z: Ext,
+    pub(crate) alpha_powers: &'a [Ext],
+}
+
+/// A table's bus pairs in the C phase — the host's `TablePairs`: the
+/// global pair at `λ, λ²` and the local pair at `λ³, λ⁴`, each when the
+/// table has an interaction in that class. Every table has at least one.
+#[derive(Clone, Copy)]
+pub(crate) struct TablePairWires<'a> {
+    pub(crate) global: Option<PairWires<'a>>,
+    pub(crate) local: Option<PairWires<'a>>,
+}
+
+/// ★ Phase G over one LogUp class, emitted — the host's `verify_ladders`: per
+/// bin of `plan`, its trees' outputs absorbed, its ladder, each cut table's
+/// chunks combined at its `s'`. Returns per plan entry its claim
+/// `(point, p̃, q̃)` and its output (a cut table's chunks added as one
+/// fraction). `plan` is over the class's members, so its entry `k` is the
+/// class's `k`-th member.
+pub(crate) fn emit_ladders(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    bus_outputs: &[(Ext, Ext)],
+    gkr: &[Vec<LadderStepWires>],
+    plan: &ArguePlan,
+    ladder: GkrLadder,
+) -> (Vec<(Vec<Ext>, Ext, Ext)>, Vec<(Ext, Ext)>) {
+    let n = plan.shapes.len();
+    assert_eq!(bus_outputs.len(), plan.trees(), "one bus output per tree");
+    assert_eq!(gkr.len(), plan.bins.len(), "one ladder per bin");
+    let proof = LadderWires { bus_outputs, gkr };
+
     // ── G: per bin, its trees' outputs, then its ladder, then each cut
     // table's chunks combined ──
     let mut claims: Vec<Option<(Vec<Ext>, Ext, Ext)>> = vec![None; n];
@@ -388,12 +451,63 @@ pub fn emit_batched_argue(
         .into_iter()
         .map(|o| o.expect("every table has its output"))
         .collect();
+    (claims, outputs)
+}
+
+/// The ladders' messages a class carries: every tree's output and one
+/// ladder a bin.
+struct LadderWires<'a> {
+    bus_outputs: &'a [(Ext, Ext)],
+    gkr: &'a [Vec<LadderStepWires>],
+}
+
+/// ★ Phases C and Rd of the host's `verify_argue_classed`, emitted, from the
+/// claims every table's pairs left: `ξ`, every global claim then every local
+/// claim (table order each), `λ`, one front-loaded sumcheck of
+/// `Σ_t w_t·f_t` with `w_t = λ^{5t}` when `local` (the group argues local
+/// lookups) and `λ^{3t}` otherwise, each table's rules rebuilt at the
+/// sumcheck's point (`C`, then its global pair at `λ, λ²` and its local pair
+/// at `λ³, λ⁴` when present, each pair at its own `eq` weight slot), the
+/// factor values absorbed, then each table's reduction. `plan` is the plan
+/// over every table of the group (its `n_max`, `D_max` and shifts; the
+/// host's `full_shapes`). Returns each table's point and column claims.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_argue_rest(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    proof: &BatchedArgueWires<'_>,
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    pairs: &[TablePairWires<'_>],
+    local: bool,
+    beta: Ext,
+) -> Vec<(Vec<Ext>, Vec<Ext>)> {
+    let n = shapes.len();
+    assert_eq!(plan.shapes.len(), n, "the plan is over these tables");
+    assert_eq!(pairs.len(), n, "one pair set per table");
+    assert!(
+        pairs
+            .iter()
+            .all(|p| p.global.is_some() || p.local.is_some()),
+        "every table argues in a class"
+    );
+    assert!(
+        local || pairs.iter().all(|p| p.local.is_none()),
+        "a local pair only in a group that argues local lookups"
+    );
+    assert_eq!(proof.factor_values.len(), n, "factor values per table");
+    assert_eq!(proof.reduces.len(), n, "a reduction slot per table");
 
     // ── C: one front-loaded sumcheck ──
     let xi: Vec<Ext> = (0..plan.num_vars)
         .map(|_| transcript.sample_ext(b))
         .collect();
-    for (_, p, q) in &claims {
+    for pair in pairs
+        .iter()
+        .filter_map(|p| p.global)
+        .chain(pairs.iter().filter_map(|p| p.local))
+    {
+        let (_, p, q) = pair.claim;
         transcript.absorb_ext(b, *p);
         transcript.absorb_ext(b, *q);
     }
@@ -410,11 +524,43 @@ pub fn emit_batched_argue(
 
     let lambda2 = b.emul(lambda, lambda);
     let lambda3 = b.emul(lambda2, lambda);
-    let weights = emit_challenge_powers(b, lambda3, n);
+    // A table's share `λ^{st}`: stride 3 (`C, N, D`), or 5 in a group that
+    // argues local lookups (`N^L, D^L` after them) — the host's
+    // `table_weights`, by the group's kind, never by the table's.
+    let (lambda4, stride) = if local {
+        let lambda4 = b.emul(lambda3, lambda);
+        let lambda5 = b.emul(lambda4, lambda);
+        (Some(lambda4), lambda5)
+    } else {
+        (None, lambda3)
+    };
+    #[cfg(test)]
+    let stride = match (local, super::whir_block::local_faults::get()) {
+        (true, super::whir_block::local_faults::Fault::TodaysWeights) => lambda3,
+        _ => stride,
+    };
+    let weights = emit_challenge_powers(b, stride, n);
+    // `λ^j` for a pair's `j`: the global pair's `(1, 2)`, the local's `(3, 4)`.
+    let pair_powers = |first: usize| -> (Ext, Ext) {
+        match first {
+            1 => (lambda, lambda2),
+            _ => (lambda3, lambda4.expect("a local pair in a local group")),
+        }
+    };
     let mut claimed: Option<Ext> = None;
-    for (t, (_, p, q)) in claims.iter().enumerate() {
-        let inner = b.emul(lambda, *p);
-        let inner = b.emul_add(lambda2, *q, inner);
+    for (t, pair) in pairs.iter().enumerate() {
+        let mut inner: Option<Ext> = None;
+        for (first, pair) in [(1, pair.global), (3, pair.local)] {
+            let Some(pair) = pair else { continue };
+            let (_, p, q) = pair.claim;
+            let (lp, lq) = pair_powers(first);
+            let with_p = match inner {
+                None => b.emul(lp, *p),
+                Some(acc) => b.emul_add(lp, *p, acc),
+            };
+            inner = Some(b.emul_add(lq, *q, with_p));
+        }
+        let inner = inner.expect("every table argues in a class");
         claimed = Some(match claimed {
             None => inner,
             Some(acc) => b.emul_add(weights[t], inner, acc),
@@ -439,8 +585,10 @@ pub fn emit_batched_argue(
         let num_vars = shape.num_vars;
         let at = &r[..num_vars];
         let (weight_r, weight_z) = weight_slots(shape.kinds.len());
-        let (claim_point, _, _) = &claims[t];
-        let row_point = &claim_point[claim_point.len() - num_vars..];
+        let present: Vec<(usize, PairWires<'_>)> = [(1, pairs[t].global), (3, pairs[t].local)]
+            .into_iter()
+            .filter_map(|(first, pair)| pair.map(|pair| (first, pair)))
+            .collect();
         let mut public: Vec<Ext> = shape
             .ir
             .public_selectors()
@@ -448,24 +596,35 @@ pub fn emit_batched_argue(
             .map(|selector| emit_selector(b, *selector, at))
             .collect();
         public.push(emit_eq_eval(b, &xi[..num_vars], at));
-        public.push(emit_eq_eval(b, row_point, at));
+        // Each pair's `eq` weight at its claim's row point, in pair order:
+        // the weight slots after the zerocheck's.
+        for (_, pair) in &present {
+            let (claim_point, _, _) = pair.claim;
+            let row_point = &claim_point[claim_point.len() - num_vars..];
+            public.push(emit_eq_eval(b, row_point, at));
+        }
         let values = weave(shape.kinds, &proof.factor_values[t], &public);
         let combined = emit_combine(b, shape.ir, &betas[..shape.ir.num_roots()], &values);
         let zerocheck = b.emul(values[weight_r], combined);
-        let bus = emit_claim_statements(
-            b,
-            shape.bus,
-            &BusInputs {
-                claim_point,
-                num_row_vars: num_vars,
-                z,
-                alpha_powers,
-                values: &values,
-                weight: weight_z,
-            },
-        );
-        let value = b.emul_add(lambda, bus.numerator, zerocheck);
-        let value = b.emul_add(lambda2, bus.denominator, value);
+        let mut value = zerocheck;
+        for (k, (first, pair)) in present.iter().enumerate() {
+            let (claim_point, _, _) = pair.claim;
+            let bus = emit_claim_statements(
+                b,
+                pair.bus,
+                &BusInputs {
+                    claim_point,
+                    num_row_vars: num_vars,
+                    z: pair.z,
+                    alpha_powers: pair.alpha_powers,
+                    values: &values,
+                    weight: weight_z + k,
+                },
+            );
+            let (ln, ld) = pair_powers(*first);
+            value = b.emul_add(ln, bus.numerator, value);
+            value = b.emul_add(ld, bus.denominator, value);
+        }
         let term = match suffix[num_vars] {
             Some(padding) if num_vars < plan.num_vars => b.emul(value, padding),
             _ => value,
@@ -510,11 +669,7 @@ pub fn emit_batched_argue(
             _ => panic!("table {t}: a reduction is present exactly for a table with a shift"),
         }
     }
-
-    BatchedVerdictWires {
-        bus_outputs: outputs,
-        tables,
-    }
+    tables
 }
 
 /// A table's column claims when every committed factor reads its column
@@ -593,17 +748,103 @@ pub fn batched_argue_cost(
     ladder: GkrLadder,
     entry: SpongeEntry,
 ) -> TableCost {
-    let n = shapes.len();
+    let pairs: Vec<CostPairs<'_>> = shapes
+        .iter()
+        .map(|shape| CostPairs {
+            global: Some(shape.bus),
+            local: None,
+        })
+        .collect();
     let mut leg = Cost::default();
     let mut schedule = SpongeSchedule::new(entry);
+    let mut degrees: Vec<usize> = Vec::new();
+    ladders_cost(&mut leg, &mut schedule, &mut degrees, plan, ladder);
+    argue_rest_cost(
+        &mut leg,
+        &mut schedule,
+        &mut degrees,
+        shapes,
+        plan,
+        &pairs,
+        false,
+    );
+    finish_cost(leg, schedule, degrees)
+}
+
+/// [`batched_argue_cost`] for a group under local lookups
+/// ([`emit_argue_rest`] with `local`): G over the global class's plan
+/// (`global`), then C and Rd over every table of `plan` with each table's
+/// pairs. The local ladders run on the group's own sponge: their cost is
+/// [`local_argue_cost`]'s.
+pub(crate) fn batched_argue_cost_classed(
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    global: &ArguePlan,
+    pairs: &[CostPairs<'_>],
+    ladder: GkrLadder,
+    entry: SpongeEntry,
+) -> TableCost {
+    let mut leg = Cost::default();
+    let mut schedule = SpongeSchedule::new(entry);
+    let mut degrees: Vec<usize> = Vec::new();
+    ladders_cost(&mut leg, &mut schedule, &mut degrees, global, ladder);
+    argue_rest_cost(
+        &mut leg,
+        &mut schedule,
+        &mut degrees,
+        shapes,
+        plan,
+        pairs,
+        true,
+    );
+    finish_cost(leg, schedule, degrees)
+}
+
+/// A table's bus pairs as the cost reads them: its interactions in each
+/// class it argues in.
+#[derive(Clone, Copy)]
+pub(crate) struct CostPairs<'a> {
+    pub(crate) global: Option<
+        &'a [stark::multilinear_logup::InteractionShape<
+            crate::tables::types::GoldilocksExtension,
+        >],
+    >,
+    pub(crate) local: Option<
+        &'a [stark::multilinear_logup::InteractionShape<
+            crate::tables::types::GoldilocksExtension,
+        >],
+    >,
+}
+
+impl<'a> CostPairs<'a> {
+    fn count(&self) -> usize {
+        usize::from(self.global.is_some()) + usize::from(self.local.is_some())
+    }
+
+    fn buses(
+        &self,
+    ) -> impl Iterator<
+        Item = &'a [stark::multilinear_logup::InteractionShape<
+            crate::tables::types::GoldilocksExtension,
+        >],
+    > {
+        self.global.into_iter().chain(self.local)
+    }
+}
+
+/// Phase G's cost over one class's `plan` ([`emit_ladders`]).
+fn ladders_cost(
+    leg: &mut Cost,
+    schedule: &mut SpongeSchedule,
+    degrees: &mut Vec<usize>,
+    plan: &ArguePlan,
+    ladder: GkrLadder,
+) {
     let one = FEE::one();
     let zero = FEE::zero();
-    let mut degrees: Vec<usize> = Vec::new();
-
-    // ── G ──
     for bin in &plan.bins {
         let heights = tree_heights(plan, bin);
-        absorb_ext(&mut leg, &mut schedule, 2 * heights.len());
+        absorb_ext(leg, schedule, 2 * heights.len());
         for step in ladder_steps(&heights, ladder) {
             let LadderStep {
                 parent: i,
@@ -611,15 +852,15 @@ pub fn batched_argue_cost(
                 ref relations,
             } = step;
             let active = relations.len();
-            draw_ext(&mut leg, &mut schedule, 1);
+            draw_ext(leg, schedule, 1);
             for _ in 0..i {
-                absorb_ext(&mut leg, &mut schedule, degree);
-                draw_ext(&mut leg, &mut schedule, 1);
+                absorb_ext(leg, schedule, degree);
+                draw_ext(leg, schedule, 1);
             }
-            absorb_ext(&mut leg, &mut schedule, 4 * step.halves());
+            absorb_ext(leg, schedule, 4 * step.halves());
             draw_ext(
-                &mut leg,
-                &mut schedule,
+                leg,
+                schedule,
                 1 + usize::from(step.draws_second_challenge()),
             );
 
@@ -645,25 +886,41 @@ pub fn batched_argue_cost(
                 continue;
             }
             let ell = chunks.combine_vars();
-            draw_ext(&mut leg, &mut schedule, ell);
-            eq_evals_cost(ell, &mut leg);
+            draw_ext(leg, schedule, ell);
+            eq_evals_cost(ell, leg);
             leg.ops(2 * chunks.count + ((1usize << ell) - chunks.count));
             leg.ops(3 * (chunks.count - 1));
         }
     }
+}
 
+/// Phases C and Rd's cost ([`emit_argue_rest`]).
+fn argue_rest_cost(
+    leg: &mut Cost,
+    schedule: &mut SpongeSchedule,
+    degrees: &mut Vec<usize>,
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    pairs: &[CostPairs<'_>],
+    local: bool,
+) {
+    let one = FEE::one();
+    let zero = FEE::zero();
     // ── C ──
-    draw_ext(&mut leg, &mut schedule, plan.num_vars);
-    absorb_ext(&mut leg, &mut schedule, 2 * n);
-    draw_ext(&mut leg, &mut schedule, 1);
+    let n = shapes.len();
+    let lanes: usize = pairs.iter().map(|p| p.count()).sum();
+    draw_ext(leg, schedule, plan.num_vars);
+    absorb_ext(leg, schedule, 2 * lanes);
+    draw_ext(leg, schedule, 1);
     for _ in 0..plan.num_vars {
-        absorb_ext(&mut leg, &mut schedule, plan.degree);
-        draw_ext(&mut leg, &mut schedule, 1);
+        absorb_ext(leg, schedule, plan.degree);
+        draw_ext(leg, schedule, 1);
     }
-    leg.ops(2);
+    // λ², λ³, and under local lookups λ⁴ and λ⁵.
+    leg.ops(if local { 4 } else { 2 });
     leg.constant(one);
     leg.ops(challenge_powers_rows(n));
-    leg.ops(3 * n - 1);
+    leg.ops(2 * lanes + n - 1);
     leg.ops(plan.num_vars * sumcheck_round_rows(plan.degree));
     if plan.num_vars > 0 {
         degrees.push(plan.degree);
@@ -677,9 +934,9 @@ pub fn batched_argue_cost(
     for (t, shape) in shapes.iter().enumerate() {
         let num_vars = shape.num_vars;
         for selector in shape.ir.public_selectors() {
-            selector_cost(*selector, num_vars, &mut leg);
+            selector_cost(*selector, num_vars, leg);
         }
-        leg.ops(2 * eq_eval_rows_again(num_vars));
+        leg.ops((1 + pairs[t].count()) * eq_eval_rows_again(num_vars));
         leg.ops(combine_rows(shape.ir) - dag_constant_rows(shape.ir));
         for step in shape.ir.steps_as_ops() {
             if let multilinear::program::Op::Fixed(value) = step {
@@ -698,8 +955,10 @@ pub fn batched_argue_cost(
             leg.constant(zero);
         }
         leg.op();
-        leg.merge(&claim_statements_cost(shape.bus, num_vars));
-        leg.ops(2);
+        for bus in pairs[t].buses() {
+            leg.merge(&claim_statements_cost(bus, num_vars));
+            leg.ops(2);
+        }
         if num_vars < plan.num_vars {
             leg.op();
         }
@@ -710,7 +969,7 @@ pub fn batched_argue_cost(
     leg.ops(ASSERT_ROWS);
     leg.constant(zero);
     let factor_values: usize = shapes.iter().map(|s| s.sources().len()).sum();
-    absorb_ext(&mut leg, &mut schedule, factor_values);
+    absorb_ext(leg, schedule, factor_values);
 
     // ── Rd ──
     for (t, shape) in shapes.iter().enumerate() {
@@ -748,7 +1007,11 @@ pub fn batched_argue_cost(
             }
         }
     }
+}
 
+/// The Newton constants of every sumcheck degree and the sponge's
+/// capacities, added to a leg's cost.
+fn finish_cost(mut leg: Cost, schedule: SpongeSchedule, degrees: Vec<usize>) -> TableCost {
     for d in degrees {
         for value in newton_constants(d) {
             leg.constant(value);
@@ -811,17 +1074,24 @@ pub(crate) fn batched_words(
     plan: &ArguePlan,
     ladder: GkrLadder,
 ) -> usize {
+    batched_words_classed(shapes, plan, plan, ladder)
+}
+
+/// [`batched_words`] for a group whose global class argues its ladders under
+/// `ladders` (the class's plan; `plan` is over every table).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn batched_words_classed(
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    ladders: &ArguePlan,
+    ladder: GkrLadder,
+) -> usize {
     assert_eq!(
         plan.shapes.len(),
         shapes.len(),
         "the plan is over these tables"
     );
-    let mut words = 2 * plan.trees();
-    for bin in &plan.bins {
-        for step in ladder_steps(&tree_heights(plan, bin), ladder) {
-            words += step.parent * step.degree + 4 * step.halves();
-        }
-    }
+    let mut words = local_words(ladders, ladder);
     words += plan.num_vars * plan.degree;
     words += shapes.iter().map(|s| s.sources().len()).sum::<usize>();
     for (t, shape) in shapes.iter().enumerate() {
@@ -846,6 +1116,21 @@ pub(crate) fn hint_batched_shaped(
     plan: &ArguePlan,
     ladder: GkrLadder,
 ) -> BatchedStore {
+    hint_batched_classed(b, arena, at, shapes, plan, plan, ladder)
+}
+
+/// [`hint_batched_shaped`] for a group whose global class argues its ladders
+/// under `ladders` (the class's plan; `plan` is over every table).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn hint_batched_classed(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    ladders: &ArguePlan,
+    ladder: GkrLadder,
+) -> BatchedStore {
     let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
         (0..count)
             .map(|_| {
@@ -855,17 +1140,17 @@ pub(crate) fn hint_batched_shaped(
             })
             .collect()
     };
-    let bus_outputs = (0..plan.trees())
+    let bus_outputs = (0..ladders.trees())
         .map(|_| {
             let pq = take(b, 2);
             (pq[0], pq[1])
         })
         .collect();
-    let gkr = plan
+    let gkr = ladders
         .bins
         .iter()
         .map(|bin| {
-            ladder_steps(&tree_heights(plan, bin), ladder)
+            ladder_steps(&tree_heights(ladders, bin), ladder)
                 .iter()
                 .map(|step| LadderStepWires {
                     sumcheck: (0..step.parent).map(|_| take(b, step.degree)).collect(),
@@ -934,6 +1219,230 @@ pub(crate) fn push_batched_words(
         }
         words.extend(reduce.column_values.iter().map(ext_word));
     }
+}
+
+/// One LogUp class of a group's tables, as the leg reads it — the host's
+/// `ClassTables::split`: the tables that argue in it (group order), each
+/// one's interactions in the class (its AIR's order), and the class's plan
+/// (`argue_plan_packed` over the members' class statements, the host's own).
+pub(crate) struct ClassShapes {
+    pub(crate) members: Vec<usize>,
+    pub(crate) buses: Vec<
+        Vec<stark::multilinear_logup::InteractionShape<crate::tables::types::GoldilocksExtension>>,
+    >,
+    pub(crate) plan: ArguePlan,
+}
+
+impl ClassShapes {
+    /// Where table `t` sits among the members, when it argues in the class.
+    pub(crate) fn member(&self, t: usize) -> Option<usize> {
+        self.members.iter().position(|&m| m == t)
+    }
+}
+
+/// A group's local argue's wires — every local tree's output, then one
+/// ladder a bin of the local plan — hinted with every count from the plan,
+/// never from a proof.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) struct LocalStore {
+    pub(crate) bus_outputs: Vec<(Ext, Ext)>,
+    pub(crate) gkr: Vec<Vec<LadderStepWires>>,
+}
+
+/// Words a local argue over `plan` takes, in [`hint_local_shaped`]'s order:
+/// what [`push_local_words`] must write.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn local_words(plan: &ArguePlan, ladder: GkrLadder) -> usize {
+    let mut words = 2 * plan.trees();
+    for bin in &plan.bins {
+        for step in ladder_steps(&tree_heights(plan, bin), ladder) {
+            words += step.parent * step.degree + 4 * step.halves();
+        }
+    }
+    words
+}
+
+/// Hints a local argue's wires from `arena` at `at`, in [`push_local_words`]'
+/// order: the local trees' outputs, then each bin's ladder (each step's
+/// rounds, then its active trees' halves).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn hint_local_shaped(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    plan: &ArguePlan,
+    ladder: GkrLadder,
+) -> LocalStore {
+    let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
+        (0..count)
+            .map(|_| {
+                let wire = b.hint_word(arena, *at).as_ext();
+                *at += 1;
+                wire
+            })
+            .collect()
+    };
+    let bus_outputs = (0..plan.trees())
+        .map(|_| {
+            let pq = take(b, 2);
+            (pq[0], pq[1])
+        })
+        .collect();
+    let gkr = plan
+        .bins
+        .iter()
+        .map(|bin| {
+            ladder_steps(&tree_heights(plan, bin), ladder)
+                .iter()
+                .map(|step| LadderStepWires {
+                    sumcheck: (0..step.parent).map(|_| take(b, step.degree)).collect(),
+                    halves: (0..step.halves())
+                        .map(|_| {
+                            let h = take(b, 4);
+                            [h[0], h[1], h[2], h[3]]
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+        .collect();
+    LocalStore { bus_outputs, gkr }
+}
+
+/// A local argue's words, in [`hint_local_shaped`]'s order.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn push_local_words(
+    words: &mut Vec<super::word::LfmWord>,
+    argue: &stark::multilinear_table::batched::LocalArgue<
+        crate::tables::types::GoldilocksExtension,
+    >,
+) {
+    use super::word::ext_word;
+    for (p, q) in &argue.bus_outputs {
+        words.extend([ext_word(p), ext_word(q)]);
+    }
+    for ladder in &argue.gkr {
+        for step in &ladder.layers {
+            for round in &step.sumcheck.rounds {
+                words.extend(round.evaluations.iter().map(ext_word));
+            }
+            for h in &step.halves {
+                words.extend([h.p_lo, h.p_hi, h.q_lo, h.q_hi].iter().map(ext_word));
+            }
+        }
+    }
+}
+
+/// The local ladders' cost ([`emit_ladders`] over the local `plan`), on the
+/// group's own sponge `schedule` — continued from its commit-time transcript
+/// by the caller — and the schedule left after them.
+pub(crate) fn local_ladders_cost(
+    plan: &ArguePlan,
+    ladder: GkrLadder,
+    mut schedule: SpongeSchedule,
+) -> TableCost {
+    let mut leg = Cost::default();
+    let mut degrees: Vec<usize> = Vec::new();
+    ladders_cost(&mut leg, &mut schedule, &mut degrees, plan, ladder);
+    finish_cost(leg, schedule, degrees)
+}
+
+/// What a group's local argue hands its C phase, as wires: per table, its
+/// local claim (`None` off the local class) and its local interactions, and
+/// the group's `(z_g, α_g^p)`.
+pub(crate) struct LocalPairs<'a> {
+    pub(crate) claims: &'a [Option<(Vec<Ext>, Ext, Ext)>],
+    pub(crate) class: &'a ClassShapes,
+    pub(crate) z: Ext,
+    pub(crate) alpha_powers: &'a [Ext],
+}
+
+/// ★ A block group's tables under local lookups: G over the global class on
+/// the group's fork (`global`), then C and Rd over every table with its
+/// local pair (`local`, from the group's own ladders) — the host's
+/// `verify_argue_classed` — and each table's preprocessed leg, as
+/// [`emit_batched_walk`]. The walk's outputs are the global class's members'
+/// (the block's bus), in member order.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_batched_walk_classed(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    store: &BatchedStore,
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    global: &ClassShapes,
+    local: &LocalPairs<'_>,
+    ladder: GkrLadder,
+    plans: &[super::whir_epoch::PreprocessedPlan<'_>],
+    slots: &[&[usize]],
+    z: Ext,
+    alpha_powers: &[Ext],
+    beta: Ext,
+) -> super::whir_epoch::TableWalk {
+    let n = shapes.len();
+    assert_eq!(n, plans.len(), "one preprocessed plan per table");
+    assert_eq!(n, slots.len(), "one slot map per table");
+    assert_eq!(local.claims.len(), n, "a local claim slot per table");
+    let (claims, outputs) = emit_ladders(
+        b,
+        transcript,
+        &store.bus_outputs,
+        &store.gkr,
+        &global.plan,
+        ladder,
+    );
+    let pairs: Vec<TablePairWires<'_>> = (0..n)
+        .map(|t| TablePairWires {
+            global: global.member(t).map(|k| PairWires {
+                claim: &claims[k],
+                bus: &global.buses[k],
+                z,
+                alpha_powers,
+            }),
+            local: local.claims[t].as_ref().map(|claim| PairWires {
+                claim,
+                bus: &local.class.buses[local
+                    .class
+                    .member(t)
+                    .expect("a table with a local claim is a local member")],
+                z: local.z,
+                alpha_powers: local.alpha_powers,
+            }),
+        })
+        .collect();
+    let reduces = store.reduces();
+    let tables = emit_argue_rest(
+        b,
+        transcript,
+        &BatchedArgueWires {
+            bus_outputs: &store.bus_outputs,
+            gkr: &store.gkr,
+            constraint: &store.constraint,
+            factor_values: &store.factor_values,
+            reduces: &reduces,
+        },
+        shapes,
+        plan,
+        &pairs,
+        true,
+        beta,
+    );
+    let mut walk = super::whir_epoch::TableWalk {
+        outputs,
+        points: Vec::with_capacity(n),
+        widths: Vec::with_capacity(n),
+        values: Vec::new(),
+    };
+    for (t, (point, columns)) in tables.into_iter().enumerate() {
+        super::whir_epoch::emit_preprocessed_leg_at(
+            b, &plans[t], slots[t], &shapes[t], &point, &columns,
+        );
+        walk.widths.push(columns.len());
+        walk.values.extend(columns.iter().copied());
+        walk.points.push(point);
+    }
+    walk
 }
 
 /// ★ A block group's tables, batched: [`emit_batched_argue`] on the group's
