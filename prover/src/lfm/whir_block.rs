@@ -3939,8 +3939,8 @@ pub fn leaf_arena_under(
 /// its prepared opening. A group's words depend on nothing else, so a leaf can
 /// be fed each group as phase B finishes it. Refuses the shapes the plan does
 /// not derive, as [`block_leaf_arena`] does: under local lookups a local
-/// group's local argue of the plan's shape, an empty one for any other group;
-/// none at all without them.
+/// group's local argue of the plan's shape, an empty one (or none, as phase B
+/// hands a group over) for any other group; none at all without them.
 #[allow(clippy::too_many_arguments)]
 pub fn group_arena_words(
     plan: &WhirBlockPlan,
@@ -3987,9 +3987,12 @@ pub fn group_arena_words(
                         "group {g} carries a local argue under a plan without local lookups"
                     ));
                 }
+                // A group's share as phase B hands it over carries no local
+                // argue for a group that argues no local lookup.
+                (Some(plan_local), None) if !owned.is_local(&plan_local.buses) => None,
                 (Some(_), None) => {
                     return Err(format!(
-                        "group {g} carries no local argue under local lookups"
+                        "group {g} argues local lookups and carries no local argue"
                     ));
                 }
                 (Some(plan_local), Some(local)) if owned.is_local(&plan_local.buses) => {

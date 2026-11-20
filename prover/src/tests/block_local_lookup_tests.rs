@@ -291,6 +291,19 @@ fn the_frame_refuses_local_bytes_out_of_place() {
     let plain = (0..honest.groups.len())
         .find(|g| !k.contains(g))
         .expect("a group with no local sender");
+    let plan_of = |p: &BlockWhirProof<LocalArgues>| {
+        crate::lfm::whir_block::WhirBlockPlan::derive(
+            &elf,
+            &opts(),
+            &local(),
+            p.statement(),
+            Some(p.groups.len()),
+        )
+    };
+    assert!(
+        plan_of(&honest).is_ok(),
+        "the honest statement's plan derives"
+    );
     let refused = |edit: &dyn Fn(&mut BlockWhirProof<LocalArgues>), what: &str| {
         let mut p = honest.clone();
         edit(&mut p);
@@ -301,16 +314,11 @@ fn the_frame_refuses_local_bytes_out_of_place() {
         assert!(!verify(&p, &elf, &local()), "{what}");
         // The recursion's plan derives through the same frame: no leaf is
         // derived over a statement the host verifier refuses.
+        let plan = plan_of(&p);
         assert!(
-            crate::lfm::whir_block::WhirBlockPlan::derive(
-                &elf,
-                &opts(),
-                &local(),
-                p.statement(),
-                None
-            )
-            .is_err(),
-            "{what}: the recursion's plan"
+            plan.as_ref().is_err_and(|e| e.starts_with("statement:")),
+            "{what}: the recursion's plan, by its frame: {:?}",
+            plan.err()
         );
     };
     let first = k[0];
@@ -386,12 +394,14 @@ fn the_frame_refuses_local_bytes_out_of_place() {
 fn the_recursion_derives_a_plan_over_a_base_under_local_lookups() {
     let elf = elf();
     let proof = prove_local(&elf);
+    // One group a leaf: the rule's leaf heights hold this small format's
+    // KECCAK_W group in no leaf, whatever the format.
     let plan = crate::lfm::whir_block::WhirBlockPlan::derive(
         &elf,
         &opts(),
         &local(),
         proof.statement(),
-        None,
+        Some(proof.groups.len()),
     );
     assert!(plan.is_ok(), "{:?}", plan.err());
 }

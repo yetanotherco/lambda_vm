@@ -25,8 +25,8 @@
 //! (`Deviations`) are the prove's own.
 
 use crate::block_whir::{
-    self, AnyBlockWhirProof, BlockFormat, BlockRefusal, BlockWhirProof, Deviations, LocalArgues,
-    LocalBytesFault, LocalPart,
+    self, AnyBlockWhirProof, BlockFormat, BlockWhirProof, Deviations, LocalArgues, LocalBytesFault,
+    LocalPart,
 };
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use crate::tables::keccak_rnd::KeccakRndForm;
@@ -120,9 +120,11 @@ fn honest(format: &BlockFormat) -> BlockWhirProof<LocalArgues> {
     .clone()
 }
 
-/// The host verifier's reading of `proof` under `format`.
-fn host<L: LocalPart>(proof: &BlockWhirProof<L>, format: &BlockFormat) -> Result<(), BlockRefusal> {
-    permitted(format, || {
+/// The host verifier's reading of `proof` under `format`: `Ok` it accepts,
+/// else why not (a refusal before the proof is read, or the check that
+/// refused it).
+fn host<L: LocalPart>(proof: &BlockWhirProof<L>, format: &BlockFormat) -> Result<(), String> {
+    match permitted(format, || {
         block_whir::verify_block_whir_traced(
             proof,
             &elf(),
@@ -131,12 +133,16 @@ fn host<L: LocalPart>(proof: &BlockWhirProof<L>, format: &BlockFormat) -> Result
             false,
             stark::multilinear_table::batched::VerifierChecks::ALL,
         )
-    })
-    .expect("the statement frames")
+    }) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(refusal)) => Err(format!("{refusal:?}")),
+        Err(e) => Err(format!("before the proof: {e:?}")),
+    }
 }
 
 /// The recursion's plan over `statement` under `format`: one leaf (the
-/// closed program's) under BLAKE3, the rule's leaves under Poseidon1.
+/// closed program's) under BLAKE3, one group a leaf under Poseidon1 (the
+/// rule's heights hold a small format's KECCAK_W group in no leaf).
 fn plan_under(
     format: &BlockFormat,
     statement: block_whir::BlockStatement<'_>,
@@ -144,7 +150,13 @@ fn plan_under(
     if format.zf.base == BaseFormat::B3_WHIR {
         WhirBlockPlan::derive_blake3(&elf(), &opts(), format, statement, 1, None)
     } else {
-        WhirBlockPlan::derive(&elf(), &opts(), format, statement, None)
+        WhirBlockPlan::derive(
+            &elf(),
+            &opts(),
+            format,
+            statement,
+            Some(statement.groups.len()),
+        )
     }
 }
 
@@ -200,7 +212,7 @@ fn run_leaf<L: LocalPart>(
 }
 
 /// ★ THE LEAF GATE under local lookups, under the BLAKE3 base (one leaf) and
-/// the Poseidon1 base (the rule's leaves): the host verifier accepts the
+/// the Poseidon1 base (one group a leaf): the host verifier accepts the
 /// base; every leaf executes over it, and their shares cancel (the block's
 /// bus closes across them, which only leaves that verified every group
 /// against the host's challenges give); the one-leaf plan's closed program
@@ -215,7 +227,7 @@ fn the_leaves_of_a_local_base_execute_and_close_the_bus() {
     ] {
         let label = format!("{:?}", format.zf.base.hash);
         let proof = honest(&format);
-        assert_eq!(host(&proof, &format).map_err(|e| format!("{e:?}")), Ok(()));
+        assert_eq!(host(&proof, &format), Ok(()));
         let locals = local_groups(&proof);
         assert!(
             !locals.is_empty(),
@@ -403,12 +415,9 @@ fn a_false_local_lookup_is_refused_by_the_leafs_local_balance() {
     let refusal = host(&forged, &format);
     println!("LOCAL REC FALSE LOOKUP host: {refusal:?}");
     assert!(
-        matches!(
-            refusal,
-            Err(BlockRefusal::Proof(
-                multilinear::Error::LocalImbalance { .. }
-            ))
-        ),
+        refusal
+            .as_ref()
+            .is_err_and(|e| e.starts_with("Proof(LocalImbalance")),
         "the host refuses for the local balance: {refusal:?}"
     );
     let plan = plan_under(&format, forged.statement()).expect("the plan derives");
@@ -503,35 +512,27 @@ fn a_base_drawing_its_local_challenges_before_its_roots_is_refused() {
     .unwrap_or_else(|e| panic!("the leaf without the roots accepts its twin: {e}"));
 }
 
-/// ★ Local argues faulted at the prove (a local claim absorbed off by one; two
-/// tables' local claims traded in the constraint phase) and the honest base
-/// tampered after it (a local tree's output, a local ladder's half, a local
-/// group's commit-time answer) are refused by the host and have no execution
-/// in the leaf that holds the group.
+/// ★ A local argue faulted at the prove (a local claim absorbed off by one in
+/// the constraint phase) and the honest base tampered after it (a local
+/// tree's output, a local ladder's half, a local group's commit-time answer)
+/// are refused by the host and have no execution in the leaf that holds the
+/// group. (Two tables' local claims traded is the host's test, over tables of
+/// one height: a block's K group pairs KECCAK_RND with LOCAL_BYTES, of
+/// another height, and its prover cannot trade them.)
 #[test]
 #[ignore = "proves a small block under local lookups; box tier"]
 fn faulted_and_tampered_local_argues_are_refused() {
     let format = b3_local();
     let honest = honest(&format);
     let g = local_groups(&honest)[0];
-    let n = honest.groups[g].len();
     let mut sites: Vec<(String, BlockWhirProof<LocalArgues>)> = Vec::new();
-    for (what, faults) in [
-        (
-            "a local claim absorbed off by one",
-            ProverFaults {
-                local_tamper_claim: Some(0),
-                ..ProverFaults::default()
-            },
-        ),
-        (
-            "two tables' local claims traded",
-            ProverFaults {
-                local_swap_claims: Some((0, n - 1)),
-                ..ProverFaults::default()
-            },
-        ),
-    ] {
+    for (what, faults) in [(
+        "a local claim absorbed off by one",
+        ProverFaults {
+            local_tamper_claim: Some(0),
+            ..ProverFaults::default()
+        },
+    )] {
         let proof = prove_local(
             &format,
             &Deviations {
@@ -722,4 +723,58 @@ fn the_local_bytes_closed_form_is_its_columns_extension() {
             "seed {seed}: the mutant"
         );
     }
+}
+
+/// ★ THE STATIC RECEIVER CHECK at derive time: a LOCAL_BYTES whose
+/// `LocalAreBytes` receiver reads a committed column (its own `MU_AND`) is
+/// refused by the plan's group check — a group's own challenges could argue
+/// any false lookup into such a receiver — and LOCAL_BYTES itself passes.
+/// Not blind: with the check dropped, the dynamic receiver passes.
+#[test]
+fn a_dynamic_local_receiver_is_refused_by_the_plans_static_check() {
+    use crate::tables::local_bytes::{self, LOCAL_BUSES, cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+    use stark::traits::AIR;
+    let opts = opts();
+    let direct = |column: usize| BusValue::Packed {
+        start_column: column,
+        packing: Packing::Direct,
+    };
+    let fixed = crate::test_utils::create_local_bytes_air(&opts);
+    let mut interactions = local_bytes::bus_interactions();
+    interactions[0] = BusInteraction::receiver(
+        BusId::LocalAreBytes,
+        Multiplicity::Column(cols::MU_ARE_BYTES),
+        vec![direct(cols::X), direct(cols::MU_AND)],
+    );
+    let dynamic = crate::test_utils::create_local_bytes_air_with(&opts, interactions);
+    let check = |air: &dyn AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >| {
+        let refs = [air];
+        let shapes = [(air.trace_layout().0, local_bytes::LOG_ROWS)];
+        let owned = super::whir_block::Shapes::build(&refs, &shapes, &[0]).expect("the shapes");
+        owned.check_local_receivers(&refs, &LOCAL_BUSES)
+    };
+    assert_eq!(
+        check(&fixed),
+        Ok(()),
+        "LOCAL_BYTES reads fixed columns only"
+    );
+    let refused = check(&dynamic);
+    println!("LOCAL REC DYNAMIC RECEIVER: {refused:?}");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("LocalReceiverNotFixed")),
+        "a receiver on a committed column: {refused:?}"
+    );
+    assert_eq!(
+        local_faults::with(Fault::NoReceiverCheck, || check(&dynamic)),
+        Ok(()),
+        "the mutant check passes it"
+    );
 }
