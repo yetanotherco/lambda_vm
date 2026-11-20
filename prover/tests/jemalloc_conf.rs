@@ -24,7 +24,11 @@ use tikv_jemalloc_ctl::raw;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The same string the two production sites export, character for character.
+/// The same string the production site exports, character for character, on
+/// each system.
+#[cfg(target_os = "linux")]
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:always\0";
+#[cfg(not(target_os = "linux"))]
 const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 #[allow(non_upper_case_globals)]
@@ -77,4 +81,32 @@ fn jemalloc_never_purge_is_compiled_in() {
          missing, misspelled, or was not read, and a binary built this way \
          unmaps muzzy pages immediately"
     );
+}
+
+/// On Linux the compiled conf also asks for transparent huge pages:
+/// `opt.thp` and `opt.metadata_thp` read back `always`. A misspelled word is
+/// ignored by jemalloc with a warning, and leaves the default (`default` /
+/// `disabled`) here.
+#[cfg(target_os = "linux")]
+#[test]
+fn jemalloc_transparent_huge_pages_are_compiled_in() {
+    for var in ["_RJEM_MALLOC_CONF", "MALLOC_CONF"] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set in this process's environment; unset it and re-run"
+        );
+    }
+    let read = |name: &[u8]| -> String {
+        // SAFETY: the name is NUL-terminated and the option is a `const char *`
+        // jemalloc keeps for the process's life.
+        let ptr: *const std::ffi::c_char =
+            unsafe { raw::read(name) }.expect("the option is readable");
+        assert!(!ptr.is_null(), "the option is set");
+        // SAFETY: a non-null option string is NUL-terminated.
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(read(b"opt.thp\0"), "always", "opt.thp");
+    assert_eq!(read(b"opt.metadata_thp\0"), "always", "opt.metadata_thp");
 }
