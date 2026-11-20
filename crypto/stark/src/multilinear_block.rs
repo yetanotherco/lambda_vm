@@ -3091,7 +3091,12 @@ where
 /// hold, `commit_streamed_not_held`): on the levels' real median the argue
 /// grew by 0.6–1.19 of it (level 1's group 1: 14.34 GiB against 12.0), so
 /// 5/4. The streamed bytes are added back so the plan reads the group's size,
-/// not how its commit held its codewords.
+/// not how its commit held its codewords. Under the two-layer ladder the same
+/// block's level 1 (held there, so this plan is not read) grew its argue by
+/// 0.60–1.13 of its commit over 12 runs, counting only argues no opening ran
+/// beside (group 2: 11.41 GiB against 10.08): 5/4 still bounds them, with
+/// 0.12 of the commit to spare at the widest. The retired large's ratio, where
+/// the plan is read, is still to be re-read.
 const OVERLAP_ARGUE_OVER_COMMIT: (u64, u64) = (5, 4);
 
 /// The planned argue of the group stamped `next`: [`OVERLAP_ARGUE_OVER_COMMIT`]
