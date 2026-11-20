@@ -767,6 +767,15 @@ pub(crate) fn cpu_heights_from_traces(traces: &Traces) -> Vec<usize> {
     traces.cpus.iter().map(|t| t.num_rows()).collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread, every LOCAL_BYTES AIR the frame builds takes
+    /// these interactions in place of its three receivers (a LOCAL_BYTES of
+    /// another definition, for the tests of the plan's static check).
+    pub(crate) static LOCAL_BYTES_INTERACTIONS_FOR_TEST: std::cell::RefCell<Option<Vec<stark::lookup::BusInteraction>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// All VM AIR instances, grouped by table.
 pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
@@ -1751,6 +1760,17 @@ impl VmAirs {
     pub(crate) fn with_local_bytes(&mut self, opts: &ProofOptions, count: usize) {
         self.local_bytes = (0..count)
             .map(|j| {
+                // A test's LOCAL_BYTES of another definition
+                // ([`LOCAL_BYTES_INTERACTIONS_FOR_TEST`]).
+                #[cfg(test)]
+                if let Some(interactions) =
+                    LOCAL_BYTES_INTERACTIONS_FOR_TEST.with(|c| c.borrow().clone())
+                {
+                    return Box::new(
+                        crate::test_utils::create_local_bytes_air_with(opts, interactions)
+                            .with_name(&format!("LOCAL_BYTES[{j}]")),
+                    ) as VmAir;
+                }
                 Box::new(
                     crate::test_utils::create_local_bytes_air(opts)
                         .with_name(&format!("LOCAL_BYTES[{j}]")),
