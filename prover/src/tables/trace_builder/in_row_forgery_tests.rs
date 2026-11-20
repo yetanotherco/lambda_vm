@@ -1303,3 +1303,498 @@ fn the_pc_chains_end_is_the_verifiers_constants() {
         }
     }
 }
+
+/// ★ The in-row PC edge has no step check of its own: it consumes the PC token
+/// at `ts − 3 + 3·pc_double_read`, and only `IS_BIT(pc_double_read)` (a CPU
+/// constraint) keeps that at `ts − 3` or `ts`. This forged build sets
+/// `pc_double_read = 4/3` on a padding row (its PC edge then consumes at
+/// `ts + 1` the token it produces itself) and bridges the chain past it with
+/// one keep-alive `(255, ts − 3) → (255, ts + 1)`: every bus balances (the
+/// keep-alive's two `IS_HALF` limbs are in range, a recount the prover makes),
+/// so the bit constraint is the only check that refuses it. A cycle of real
+/// rows (a loop's body and its taken backward branch) detaches the same way,
+/// which would let a prover run a loop iteration off the PC chain.
+#[test]
+fn the_pc_edge_rests_on_the_pc_double_read_bit_alone() {
+    let (program, mut traces) = honest("all_instructions_64");
+
+    // A padding row (pc = next_pc = 1) with a row after it.
+    let heights = crate::cpu_heights_from_traces(&traces);
+    let bases = cpu::timestamp_bases(&heights);
+    let (t, r) = (0..traces.cpus.len())
+        .flat_map(|t| (0..traces.cpus[t].num_rows()).map(move |r| (t, r)))
+        .find(|&(t, r)| {
+            let table = &traces.cpus[t];
+            r + 1 < table.num_rows() && get(table, r, cpu_cols::PC_0) == cpu::CPU_PADDING_PC
+        })
+        .expect("a padding row with a row after it");
+    let ts = bases[t] + get(&traces.cpus[t], r, cpu_cols::TIMESTAMP);
+    let four_thirds = FE::from(4u64) * FE::from(3u64).inv().expect("3 is invertible");
+    set(
+        &mut traces.cpus[t],
+        r,
+        cpu_cols::PC_DOUBLE_READ,
+        four_thirds,
+    );
+
+    // One residual padding row (μ = 0) made the bridging keep-alive.
+    let (rt, rr) = (0..traces.memw_registers.len())
+        .flat_map(|t| (0..traces.memw_registers[t].num_rows()).map(move |r| (t, r)))
+        .find(|&(t, r)| {
+            let table = &traces.memw_registers[t];
+            [res::MU_READ, res::MU_WRITE, res::MU_KEEP]
+                .iter()
+                .all(|&c| get(table, r, c) == 0)
+        })
+        .expect("a residual padding row");
+    for (c, v) in [
+        (res::REG, 255u64),
+        (res::TS_0, ts + 1),
+        (res::TS_1, 0),
+        (res::VAL_0, cpu::CPU_PADDING_PC),
+        (res::VAL_1, 0),
+        (res::OLD_0, cpu::CPU_PADDING_PC),
+        (res::OLD_1, 0),
+        (res::D0, 3),
+        (res::D1, 0),
+        (res::MU_KEEP, 1),
+    ] {
+        set_u64(&mut traces.memw_registers[rt], rr, c, v);
+    }
+
+    let forged = left(&program, &mut traces, &|_| None);
+    println!("PC EDGE: pc_double_read = 4/3 at CPU[{t}] row {r} (ts {ts}): {forged}");
+    assert!(
+        forged.accepted(),
+        "every bus balances with pc_double_read = 4/3 and one keep-alive: {forged}"
+    );
+    let pdr = *traces.cpus[t].get_main(r, cpu_cols::PC_DOUBLE_READ);
+    assert_ne!(
+        pdr * (pdr - FE::one()),
+        FE::zero(),
+        "only IS_BIT(pc_double_read) refuses it"
+    );
+    assert!(
+        crate::constraints::cpu::BIT_FLAG_COLUMNS.contains(&cpu_cols::PC_DOUBLE_READ),
+        "the bit constraint on pc_double_read is in the CPU's set"
+    );
+}
+
+/// Every instruction kind at a spread of register fields, as `(kind, instruction)`.
+fn every_instruction() -> Vec<(
+    &'static str,
+    executor::vm::instruction::decoding::Instruction,
+)> {
+    use executor::vm::instruction::decoding::{
+        ArithOp, Comparison, CsrOp, Instruction, LoadStoreWidth,
+    };
+    let ops = [
+        ArithOp::Add,
+        ArithOp::Sub,
+        ArithOp::Xor,
+        ArithOp::Or,
+        ArithOp::And,
+        ArithOp::ShiftLeftLogical,
+        ArithOp::ShiftRightLogical,
+        ArithOp::ShiftRightArith,
+        ArithOp::SetLessThan,
+        ArithOp::SetLessThanU,
+        ArithOp::Mul,
+        ArithOp::MulHigh,
+        ArithOp::MulHighSignedUnsigned,
+        ArithOp::MulHighUnsigned,
+        ArithOp::Div,
+        ArithOp::DivUnsigned,
+        ArithOp::Remainder,
+        ArithOp::RemainderUnsigned,
+    ];
+    let widths = [
+        LoadStoreWidth::Byte,
+        LoadStoreWidth::Half,
+        LoadStoreWidth::Word,
+        LoadStoreWidth::DoubleWord,
+        LoadStoreWidth::ByteUnsigned,
+        LoadStoreWidth::HalfUnsigned,
+        LoadStoreWidth::WordUnsigned,
+    ];
+    let conds = [
+        Comparison::Equal,
+        Comparison::NotEqual,
+        Comparison::LessThan,
+        Comparison::GreaterOrEqual,
+        Comparison::LessThanUnsigned,
+        Comparison::GreaterOrEqualUnsigned,
+    ];
+    let csrs = [
+        CsrOp::CSRRW,
+        CsrOp::CSRRS,
+        CsrOp::CSRRC,
+        CsrOp::CSRRWI,
+        CsrOp::CSRRSI,
+        CsrOp::CSRRCI,
+    ];
+    let mut all = Vec::new();
+    for a in 0..32u32 {
+        for b in [0u32, 1, 5, 17, 31] {
+            for op in ops {
+                all.push((
+                    "Arith",
+                    Instruction::Arith {
+                        dst: a,
+                        src1: b,
+                        src2: a ^ 1,
+                        op,
+                    },
+                ));
+                all.push((
+                    "Arith",
+                    Instruction::Arith {
+                        dst: b,
+                        src1: a,
+                        src2: b,
+                        op,
+                    },
+                ));
+                all.push((
+                    "ArithImm",
+                    Instruction::ArithImm {
+                        dst: a,
+                        src: b,
+                        imm: -1,
+                        op,
+                    },
+                ));
+                all.push((
+                    "ArithImm",
+                    Instruction::ArithImm {
+                        dst: b,
+                        src: a,
+                        imm: 7,
+                        op,
+                    },
+                ));
+                all.push((
+                    "ArithW",
+                    Instruction::ArithW {
+                        dst: a,
+                        src1: b,
+                        src2: a,
+                        op,
+                    },
+                ));
+                all.push((
+                    "ArithW",
+                    Instruction::ArithW {
+                        dst: b,
+                        src1: a,
+                        src2: b,
+                        op,
+                    },
+                ));
+                all.push((
+                    "ArithImmW",
+                    Instruction::ArithImmW {
+                        dst: a,
+                        src: b,
+                        imm: 3,
+                        op,
+                    },
+                ));
+                all.push((
+                    "ArithImmW",
+                    Instruction::ArithImmW {
+                        dst: b,
+                        src: a,
+                        imm: 3,
+                        op,
+                    },
+                ));
+            }
+            all.push(("JAL", Instruction::JumpAndLink { dst: a, offset: 8 }));
+            all.push((
+                "JALR",
+                Instruction::JumpAndLinkRegister {
+                    base: b,
+                    dst: a,
+                    offset: 4,
+                },
+            ));
+            all.push((
+                "JALR",
+                Instruction::JumpAndLinkRegister {
+                    base: a,
+                    dst: b,
+                    offset: 4,
+                },
+            ));
+            for width in widths {
+                all.push((
+                    "Store",
+                    Instruction::Store {
+                        src: a,
+                        offset: 0,
+                        base: b,
+                        width,
+                    },
+                ));
+                all.push((
+                    "Store",
+                    Instruction::Store {
+                        src: b,
+                        offset: 0,
+                        base: a,
+                        width,
+                    },
+                ));
+                all.push((
+                    "Load",
+                    Instruction::Load {
+                        dst: a,
+                        offset: 0,
+                        base: b,
+                        width,
+                    },
+                ));
+                all.push((
+                    "Load",
+                    Instruction::Load {
+                        dst: b,
+                        offset: 0,
+                        base: a,
+                        width,
+                    },
+                ));
+            }
+            for cond in conds {
+                all.push((
+                    "Branch",
+                    Instruction::Branch {
+                        src1: a,
+                        src2: b,
+                        cond,
+                        offset: 8,
+                    },
+                ));
+                all.push((
+                    "Branch",
+                    Instruction::Branch {
+                        src1: b,
+                        src2: a,
+                        cond,
+                        offset: 8,
+                    },
+                ));
+            }
+            for op in csrs {
+                all.push((
+                    "CSR",
+                    Instruction::CSR {
+                        csr: 0x300,
+                        src: a,
+                        dst: b,
+                        op,
+                    },
+                ));
+                all.push((
+                    "CSR",
+                    Instruction::CSR {
+                        csr: 0x300,
+                        src: b,
+                        dst: a,
+                        op,
+                    },
+                ));
+            }
+        }
+        all.push((
+            "LUI",
+            Instruction::LoadUpperImm {
+                dst: a,
+                imm: 0x1000,
+            },
+        ));
+        all.push((
+            "AUIPC",
+            Instruction::AddUpperImmToPc {
+                dst: a,
+                imm: 0x1000,
+            },
+        ));
+    }
+    all.push(("ECALL", Instruction::EcallEbreak));
+    all.push(("FENCE", Instruction::Fence));
+    all
+}
+
+/// ★ DECODE over every instruction kind and register field, independent of any
+/// program (unlike [`decode_never_flags_a_read_or_write_of_x0`]): no flag on
+/// x0; `rs2` and `rd` below 32; `rs1` is 255 (the PC) only on JAL and AUIPC,
+/// where it is read and `pc_double_read` is set, and 17 on ECALL; no word
+/// instruction names a register past x31 (CPU32 sends `2·rs`, `2·rd` as they
+/// are).
+#[test]
+fn decode_flags_no_x0_and_names_the_pc_only_on_jal_and_auipc() {
+    use crate::tables::types::ShrunkDecode;
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    for (kind, instruction) in every_instruction() {
+        let d = ShrunkDecode::from_instruction(instruction, 4);
+        *kinds.entry(kind).or_default() += 1;
+        assert!(
+            !(d.read_register1 && d.rs1 == 0),
+            "{kind}: {instruction:?} reads x0 on rs1"
+        );
+        assert!(
+            !(d.read_register2 && d.rs2 == 0),
+            "{kind}: {instruction:?} reads x0 on rs2"
+        );
+        assert!(
+            !(d.write_register && d.rd == 0),
+            "{kind}: {instruction:?} writes x0"
+        );
+        assert!(d.rs2 < 32 && d.rd < 32, "{kind}: {instruction:?}: {d:?}");
+        match d.rs1 {
+            255 => assert!(
+                matches!(kind, "JAL" | "AUIPC") && d.read_register1,
+                "{kind}: {instruction:?} names x255"
+            ),
+            r => assert!(r < 32, "{kind}: {instruction:?} names x{r}"),
+        }
+        if kind == "ECALL" {
+            assert!(d.read_register1 && d.rs1 == 17 && d.ecall, "{d:?}");
+        }
+        // The CPU's pc_double_read is `read_register1 ∧ rs1 = 255` off word instructions.
+        let pdr = !d.word_instr && d.read_register1 && d.rs1 == 255;
+        assert_eq!(
+            pdr,
+            matches!(kind, "JAL" | "AUIPC"),
+            "{kind}: {instruction:?}"
+        );
+        if d.word_instr {
+            assert!(d.rs1 < 32 && d.rs2 < 32 && d.rd < 32, "{kind}: {d:?}");
+        }
+    }
+    println!("DECODE KINDS CHECKED: {kinds:?}");
+    assert_eq!(kinds.len(), 14, "every instruction kind: {kinds:?}");
+}
+
+// ---- registers routed to MEMW_A under the production pair (in-row registers, MEMW_A in limbs) ------------------------
+
+/// The in-row build of `program`'s run with MEMW_A in the limbs form, as the
+/// pinned block format builds it.
+fn in_row_limbs_build(program: &Elf, logs: &[Log]) -> Traces {
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    windowed(program, logs, &MaxRowsConfig::small(), 1000, &|b| {
+        b.register_format(RegisterFormat::InRow)
+            .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
+            .expect("before any window")
+    })
+}
+
+/// MEMW_A's interactions in the limbs form, for every MEMW_A table, with
+/// `edit` applied (the nets' own AIRs take the per-table STARK's form).
+fn memw_a_limbs(edit: fn(&mut Vec<BusInteraction>)) -> Over {
+    use crate::tables::memw_aligned::{MemwAlignedOrder, bus_interactions_for};
+    Box::new(move |name: &str| {
+        name.starts_with("MEMW_A[").then(|| {
+            let mut list = bus_interactions_for(MemwAlignedOrder::Limbs);
+            edit(&mut list);
+            list
+        })
+    })
+}
+
+/// The limbs' high-limb lookup, `IS_HALF[STEP_1]`, taken out: a witness mutant.
+fn without_the_high_limb(list: &mut Vec<BusInteraction>) {
+    use crate::tables::memw_aligned::cols as aligned;
+    let before = list.len();
+    list.retain(|i| {
+        !(i.bus_id == u64::from(BusId::IsHalfword) && i.columns_read().contains(&aligned::STEP_1))
+    });
+    assert_eq!(list.len(), before - 1, "one IS_HALF[STEP_1] lookup");
+}
+
+/// A residual register read of the honest limbs build of `test_keccak_multi`
+/// taken out and its MEMW message received by a new MEMW_A row in the limbs
+/// form instead, the read's REG consumer re-pointed past it (so the REG and
+/// MEMW buses balance). `old_ts_is_ts`: the row's old token is its own new one
+/// (a self-loop), its limbs set to `STEP_0 + 2^16·STEP_1 = p − 1`.
+fn register_routed_to_memw_a_limbs(old_ts_is_ts: bool) -> (Elf, Traces, Over) {
+    use crate::tables::memw_aligned::{self, AlignedRow, MemwAlignedOrder, cols as aligned};
+    let (program, logs) = run("test_keccak_multi");
+    let mut traces = in_row_limbs_build(&program, &logs);
+    let over = memw_a_limbs(|_| {});
+    let control = left(&program, &mut traces, &*over);
+    assert!(control.accepted(), "the honest limbs build: {control}");
+    let (row, consumer) = residual_rows(&traces)
+        .into_iter()
+        .filter(|r| r.read && !r.keep && r.reg != 255 && read_keeps_value(&traces, r.node))
+        .map(|r| (r, consumer_of(&traces, r.reg, r.ts)))
+        .find(|(r, c)| in_slot_reach(&traces, *c, r.old_ts) && r.ts < 1 << 32)
+        .expect("a residual read");
+    let (table, r) = residual_mut(&mut traces, row.node);
+    let val = [
+        get(table, r, res::VAL_0) as u32,
+        get(table, r, res::VAL_1) as u32,
+    ];
+    let op = super::build_reg_fallback(2 * row.reg, val, val, row.ts, row.old_ts, true);
+    let aligned_row =
+        AlignedRow::from_memw(&op, MemwAlignedOrder::Limbs).expect("an aligned row in limbs");
+    assert!(aligned_row.limbs(), "the row is in the limbs form");
+    set_u64(table, r, res::MU_READ, 0);
+    repoint(&mut traces, consumer, row.old_ts);
+    let mut memw_a = memw_aligned::generate_memw_aligned_trace(&[aligned_row]);
+    if old_ts_is_ts {
+        set_u64(&mut memw_a, 0, aligned::STEP_0, 0);
+        set_u64(&mut memw_a, 0, aligned::STEP_1, (P - 1) >> 16);
+    }
+    traces.memw_aligneds.push(memw_a);
+    (program, traces, over)
+}
+
+/// ★ A register access routed to MEMW_A in the limbs form under the in-row
+/// register format: MEMW_A's `IS_REGISTER` column is free, so a row may take
+/// a chip's register read. Its MEMW and REG buses balance, it asks no
+/// comparison of the ALU bus (the limbs replace the LT lookup) and its limbs
+/// are in range, but its old register token is left on the Memory bus: no
+/// table produces a register token there under the in-row format, so the
+/// chain it would consume from has no start.
+#[test]
+fn a_register_routed_to_memw_a_in_limbs_leaves_a_token_no_table_starts() {
+    let (program, mut traces, over) = register_routed_to_memw_a_limbs(false);
+    let forged = left(&program, &mut traces, &*over);
+    println!("REGISTER ROUTED TO MEMW_A (limbs): {forged}");
+    assert!(
+        forged.buses.is_empty() && forged.out_of_range.is_empty(),
+        "the MEMW, REG and ALU buses balance and the limbs are in range: {forged}"
+    );
+    assert!(
+        forged.memory_registers.iter().any(|(_, net)| *net > 0),
+        "a register token consumed on the Memory bus that no table produced: {forged}"
+    );
+}
+
+/// ★ The closed loop of the same routing: the MEMW_A row consumes the very
+/// register token it produces, so the Memory bus balances too. The limbs then
+/// read `STEP_0 + 2^16·STEP_1 = p − 1`, and the high limb's `IS_HALF` lookup
+/// alone refuses it; with that one lookup taken out every bus balances.
+#[test]
+fn a_register_self_loop_through_memw_a_in_limbs_is_refused_by_its_high_limb() {
+    let (program, mut traces, _) = register_routed_to_memw_a_limbs(true);
+    let over = memw_a_limbs(|_| {});
+    let forged = left(&program, &mut traces, &*over);
+    println!("REGISTER SELF-LOOP THROUGH MEMW_A (limbs): {forged}");
+    assert!(
+        forged.buses.is_empty() && forged.memory_registers.is_empty(),
+        "only the range check refuses it: {forged}"
+    );
+    assert_eq!(
+        forged.out_of_range,
+        vec![(P - 1) >> 16],
+        "the high limb is out of range: {forged}"
+    );
+    let without = left(&program, &mut traces, &*memw_a_limbs(without_the_high_limb));
+    assert!(
+        without.accepted(),
+        "without the high limb's lookup the self-loop balances: {without}"
+    );
+}
