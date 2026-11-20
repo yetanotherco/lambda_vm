@@ -3128,6 +3128,8 @@ const OVERLAP_ARGUE_OVER_COMMIT: (u64, u64) = (5, 4);
 /// of its phase-A commit's growth as the batched commit holds it — the
 /// ledger's growth plus what a streamed commit did not hold
 /// ([`GroupStamps::commit_streamed_not_held`]).
+/// The plan itself reads the growth ([`overlap_plan`]); a test reads this.
+#[cfg(test)]
 pub(crate) fn overlap_argue_bytes(next: &GroupStamps) -> u64 {
     let (num, den) = OVERLAP_ARGUE_OVER_COMMIT;
     overlap_commit_growth(next).saturating_mul(num) / den
