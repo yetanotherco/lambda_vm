@@ -606,6 +606,92 @@ fn local_lookups_survive_live_regeneration() {
     }
 }
 
+/// ★ Live regeneration across KECCAK_RND's forms: regen=Always (every table
+/// it can dropped and rebuilt) proves the bytes of the prove without
+/// regeneration, and verifies, under today's lean form and under local
+/// lookups, with KECCAK_RND built at the finish or streamed, memory split or
+/// in words. The lean arms always held; the local ones refused until a
+/// dropped table was named by its block index (each LOCAL_BYTES table sits in
+/// its group but after every other table in the block).
+#[test]
+#[ignore = "box tier: proves a block sixteen times, run with --ignored --test-threads=1 and \
+            LAMBDA_VM_DETERMINISTIC_GRIND=1"]
+fn live_regeneration_proves_the_same_bytes_under_lean_and_local_lookups() {
+    use crate::block_whir::regen::RegenMode;
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tests::block_whir_tests::{records_fill_lock, streamed};
+    let _fills = records_fill_lock();
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    for form in [KeccakRndForm::Lean, KeccakRndForm::LeanLocal] {
+        for (memory, stream_keccak_rnd) in [
+            (MemoryFormat::Split, false),
+            (MemoryFormat::Split, true),
+            (MemoryFormat::Words, false),
+            (MemoryFormat::Words, true),
+        ] {
+            let format = BlockFormat {
+                registers: crate::tables::register::RegisterFormat::InRow,
+                memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+                ecdas: crate::tables::ecdas::EcdasForm::Halves,
+                ..format(form)
+            }
+            .with_memory(memory)
+            .with_page_run(0);
+            let elf = asm_elf_bytes(match memory {
+                MemoryFormat::Words => "test_keccak256",
+                _ => "test_keccak_multi",
+            });
+            let what = format!("{form:?}, {memory:?}, KECCAK_RND streamed {stream_keccak_rnd}");
+            let mut o = streamed(crate::tables::MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = 3;
+            o.drop_streamed_ops = true;
+            let deviations = Deviations {
+                card_fill: Some(false),
+                card_fill_streamed: Some([false, false]),
+                stream_keccak_rnd: Some(stream_keccak_rnd),
+                word_stream: Some(memory == MemoryFormat::Words),
+                ..Deviations::default()
+            };
+            // (bytes, regeneration's readout) of the prove under `mode`.
+            let prove = |mode: RegenMode| -> (Vec<u8>, block_whir::BlockStamps) {
+                let mut o = o.clone();
+                o.regen = Some(mode);
+                let fail = |e: crate::Error| -> ! { panic!("{what}, {mode:?}: {e:?}") };
+                if form.byte_lookups_local() {
+                    let (proof, stamps) =
+                        prove_block_whir_local_with(&elf, &[], &opts(), &format, &o, &deviations)
+                            .unwrap_or_else(|e| fail(e));
+                    assert!(verify(&proof, &elf, &format), "{what}, {mode:?}: verifies");
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                        .expect("serialize")
+                        .to_vec();
+                    (bytes, stamps)
+                } else {
+                    let (proof, stamps) =
+                        prove_block_whir_with(&elf, &[], &opts(), &format, &o, &deviations)
+                            .unwrap_or_else(|e| fail(e));
+                    assert!(verify(&proof, &elf, &format), "{what}, {mode:?}: verifies");
+                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                        .expect("serialize")
+                        .to_vec();
+                    (bytes, stamps)
+                }
+            };
+            let (plain, _) = prove(RegenMode::Off);
+            let (dropped, stamps) = prove(RegenMode::Always);
+            let r = stamps.regen.as_ref().expect("live regeneration's readout");
+            assert_eq!((r.mismatches, r.failed), (0, 0), "{what}: {:?}", r.lines);
+            assert!(r.error.is_none(), "{what}: {:?}", r.lines);
+            assert!(r.dropped > 0, "{what}: nothing dropped: {:?}", r.lines);
+            assert!(dropped == plain, "{what}: the bytes moved");
+            eprintln!("REGEN MATRIX {what}: {} dropped, the same bytes", r.dropped);
+        }
+    }
+}
+
 /// ★ Where the LOCAL_BYTES tables sit ([`block_whir::check_local_groups`]),
 /// on hand-written groups (no proof): tables 0–3 the run's (0 and 2 send a
 /// local lookup), 4 and 5 LOCAL_BYTES. The honest packing passes; each
