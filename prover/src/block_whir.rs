@@ -6201,6 +6201,16 @@ fn prove_block_whir_inner(
                 .map_or("unread".to_string(), |b| format!("{b} bytes"))
         );
     }
+    if multilinear::pinned::stats().is_some() {
+        eprintln!(
+            "BLOCK PINNED POOL ARENAS: {} (LAMBDA_VM_POOL_ARENA)",
+            if multilinear::pinned::arena_by_class() {
+                "by size class"
+            } else {
+                "by thread"
+            }
+        );
+    }
     // The same tally by where the bytes come from (process wide so far).
     let sources = multilinear::pinned::upload_sources();
     if sources.iter().any(|&(_, bytes, _)| bytes > 0) {
