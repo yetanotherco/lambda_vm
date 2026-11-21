@@ -32,6 +32,51 @@ fn the_pool_exec_logs_knob_is_named_and_off_by_default() {
     set_pool_exec_logs_for_test(None);
 }
 
+/// The card test's block: the spin guest at 100 000 spins (200 013 cycles), in
+/// windows of 2^15 logs (1.3 MB a buffer, past the pool's smallest binding
+/// allocation, so 7 windows), every table capped at 2^16 rows (a few chunks
+/// a table, far under the block's 1024 groups: `MaxRowsConfig::small()`'s 32
+/// rows a chunk closed 1025 groups and the layout refused it).
+fn pooled_logs_fixture() -> (
+    Vec<u8>,
+    Vec<u8>,
+    crate::block_whir::BlockFormat,
+    crate::block_whir::BlockOptions,
+) {
+    let elf = crate::test_utils::asm_elf_bytes("test_private_input_spin");
+    let mut input = 100_000u32.to_le_bytes().to_vec();
+    input.extend_from_slice(b"pooled!!");
+    let format = super::block_whir_tests::many_groups();
+    let o =
+        super::block_whir_tests::streamed(crate::tables::MaxRowsConfig::uniform(1 << 16), 5, 15);
+    (elf, input, format, o)
+}
+
+/// The card test's block on the host (no pool, the knob off): it proves and
+/// verifies under the block's group cap, in at least 6 windows. Its group
+/// count is printed. Box or build server; ignored for its prove's time.
+#[test]
+#[ignore = "proves a 200 000-cycle block on the host: the card test's fixture"]
+fn the_pooled_logs_fixture_proves_on_the_host_under_the_group_cap() {
+    use crate::block_whir::{Deviations, prove_block_whir_with, verify_block_whir};
+    let (elf, input, format, o) = pooled_logs_fixture();
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let (proof, stamps) =
+        prove_block_whir_with(&elf, &input, &opts, &format, &o, &Deviations::default())
+            .expect("the block proves");
+    assert!(
+        verify_block_whir(&proof, &elf, &opts, &format).unwrap_or(false),
+        "the proof verifies"
+    );
+    let groups = proof.proof.columns.len();
+    assert!(groups < 1024, "{groups} groups");
+    assert!(stamps.executor.windows >= 6, "{:?}", stamps.executor);
+    println!(
+        "POOLED LOGS FIXTURE: {groups} groups · {} windows · proved and verified on the host",
+        stamps.executor.windows
+    );
+}
+
 /// A stand-in for the driver's page-locking, for the host test.
 #[cfg(feature = "cuda")]
 fn stand_in_lock(_ptr: *mut u8, _len: usize) -> bool {
@@ -248,8 +293,6 @@ fn pooled_executor_log_buffers_hold_the_same_logs_survive_a_purge_and_spill_when
 #[ignore = "card: locks a page-locked pool for the whole process; run alone, deterministic grind"]
 fn pooled_executor_logs_prove_the_same_bytes_on_the_card() {
     use crate::block_whir::{BlockWhirProof, Deviations, prove_block_whir_with, verify_block_whir};
-    use crate::tables::MaxRowsConfig;
-    use crate::test_utils::asm_elf_bytes;
     use stark::proof::options::ProofOptions;
 
     struct Restore;
@@ -271,11 +314,7 @@ fn pooled_executor_logs_prove_the_same_bytes_on_the_card() {
     );
     let pool = math_cuda::pinned::lock_pool().expect("the pool locked");
     assert_eq!((pool.pieces, pool.refused), (1, 0), "{pool:?}");
-    // 200 013 cycles in windows of 2^15 logs, 1.3 MB a buffer.
-    let elf = asm_elf_bytes("test_private_input_spin");
-    let input = spin_input(100_000);
-    let format = super::block_whir_tests::many_groups();
-    let o = super::block_whir_tests::streamed(MaxRowsConfig::small(), 5, 15);
+    let (elf, input, format, o) = pooled_logs_fixture();
     let opts = ProofOptions::default_test_options();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
