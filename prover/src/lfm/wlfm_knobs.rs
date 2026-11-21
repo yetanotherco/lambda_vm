@@ -109,6 +109,44 @@ pub fn tail() -> bool {
     *ON.get_or_init(|| tail_word(std::env::var(TAIL_ENV).ok().as_deref()))
 }
 
+/// `LAMBDA_VM_LEVELS_UNTRIMMED=1`: [`TAIL_ENV`]'s second half alone, every card
+/// reading inside the levels taken without trimming the pool; the lean fill
+/// as its own knob says. Off by default (and for any word but `1`); the same
+/// bytes. Read once a process.
+pub const UNTRIMMED_ENV: &str = "LAMBDA_VM_LEVELS_UNTRIMMED";
+
+/// A test's [`untrimmed_only`], process wide (0 the knob, 1 off, 2 on).
+static UNTRIMMED_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`UNTRIMMED_ENV`] forced for the whole process (`None`
+/// restores the knob). A test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_untrimmed_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    UNTRIMMED_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`UNTRIMMED_ENV`] alone is on (or a test's override).
+fn untrimmed_only() -> bool {
+    match UNTRIMMED_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| knob_word_on(std::env::var(UNTRIMMED_ENV).ok().as_deref()))
+}
+
+/// Whether the level driver reads the card inside the levels without
+/// trimming the pool: [`UNTRIMMED_ENV`] or [`TAIL_ENV`].
+pub fn levels_untrimmed() -> bool {
+    untrimmed_only() || tail()
+}
+
 /// Whether the level driver fills level 1's lean round tables beside its
 /// execution: [`LEAN_BESIDE_ENV`], [`TAIL_ENV`], or a test's override.
 pub fn lean_beside() -> bool {

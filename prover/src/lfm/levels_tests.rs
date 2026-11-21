@@ -1185,24 +1185,40 @@ fn the_levels_tail_knob_is_named_and_off_by_default() {
     }
 }
 
-/// ★ The levels' tail taken off the path (`LAMBDA_VM_LEVELS_TAIL`: level 1's
-/// lean tables filled beside its execution, every card reading inside the
-/// levels untrimmed) proves the same level bytes: a small BLAKE3 block driven
-/// with the knob on proves each level's bytes as [`prove_levels`] does over
-/// the same base; level 1's fill took the lean prefill, the base-end reading
-/// skipped its trim, and every reading inside the levels did. With the knob
-/// off, no reading skipped one. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; run
-/// alone (the override is process wide).
+/// The untrimmed-readings knob's name; it is off by default, and only `1`
+/// turns it on.
 #[test]
-#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_levels_untrimmed_knob_is_named_and_off_by_default() {
+    use super::wlfm_knobs::{TAIL_ENV, UNTRIMMED_ENV, knob_word_on, levels_untrimmed};
+    assert_eq!(UNTRIMMED_ENV, "LAMBDA_VM_LEVELS_UNTRIMMED");
+    if std::env::var_os(UNTRIMMED_ENV).is_none() && std::env::var_os(TAIL_ENV).is_none() {
+        assert!(!levels_untrimmed());
+    }
+    assert!(knob_word_on(Some("1")) && !knob_word_on(Some("0")) && !knob_word_on(None));
+}
+
+/// ★ The levels' tail taken off the path, in parts and whole
+/// (`LAMBDA_VM_LEVELS_UNTRIMMED`: every card reading inside the levels
+/// untrimmed; `LAMBDA_VM_WLFM_LEAN_BESIDE`: level 1's lean tables filled
+/// beside its execution; `LAMBDA_VM_LEVELS_TAIL`: both) proves the same level
+/// bytes: a small BLAKE3 block driven under each proves each level's bytes as
+/// [`prove_levels`] does over the same base. Every knob off is today's driver:
+/// no reading skipped its trim, the base-end reading trimmed, no lean
+/// prefill. Untrimmed (alone or in the tail): the base-end reading and every
+/// reading inside the levels skipped theirs. The tail: level 1's fill took the
+/// lean prefill. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; run alone (the
+/// overrides are process wide).
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels four times; box tier, deterministic grind"]
 fn the_blake3_driver_with_the_tail_off_the_path_proves_the_same_level_bytes() {
     use super::b3l_tables::{B3lHold, test_hold};
     use super::levels::{prove_block_levels, untrimmed_readings};
-    use super::wlfm_knobs::set_tail_for_test;
+    use super::wlfm_knobs::{set_tail_for_test, set_untrimmed_for_test};
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
             set_tail_for_test(None);
+            set_untrimmed_for_test(None);
         }
     }
     assert!(
@@ -1213,8 +1229,9 @@ fn the_blake3_driver_with_the_tail_off_the_path_proves_the_same_level_bytes() {
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = ProofOptions::default_test_options();
-    let drive = |on: bool| {
-        set_tail_for_test(Some(on));
+    let drive = |tail: bool, untrimmed: bool| {
+        set_tail_for_test(Some(tail));
+        set_untrimmed_for_test(Some(untrimmed));
         let before = untrimmed_readings();
         let run = prove_block_levels(
             &elf,
@@ -1231,32 +1248,51 @@ fn the_blake3_driver_with_the_tail_off_the_path_proves_the_same_level_bytes() {
         (run, untrimmed_readings() - before)
     };
     let _restore = Restore;
-    let (off, none) = drive(false);
-    assert_eq!(none, 0, "the knob off skips no trim");
-    let (run, skipped) = drive(true);
-    let (_, trimmed) = run.times.settle_base_end.expect("the base-end reading");
-    assert!(!trimmed, "the base-end reading skipped its trim");
-    assert!(
-        skipped >= 3,
-        "the readings inside the levels skipped theirs ({skipped})"
-    );
-    assert!(
-        run.times.lean_prefilled,
-        "level 1's fill took the lean prefill"
-    );
-    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
-    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
-    assert_eq!(proofs.len(), run.proofs.len());
-    for (k, ((a, b), c)) in run.proofs.iter().zip(&proofs).zip(&off.proofs).enumerate() {
-        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
-        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
-        let c = rkyv::to_bytes::<rkyv::rancor::Error>(c).expect("serializes");
+    // Every knob off: today's driver.
+    let (off, none) = drive(false, false);
+    assert_eq!(none, 0, "the knobs off skip no trim");
+    let (_, trimmed) = off.times.settle_base_end.expect("the base-end reading");
+    assert!(trimmed, "the knobs off: the base-end reading trimmed");
+    assert!(!off.times.lean_prefilled, "the knobs off: no lean prefill");
+    let held = derive_levels(&off.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (want, _) = prove_levels(&off.plan, &held, &off.base_proof).expect("the levels prove");
+    let bytes = |p: &super::wlfm::WlfmProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serializes")
+            .to_vec()
+    };
+    for (k, (a, b)) in off.proofs.iter().zip(&want).enumerate() {
         assert!(
-            a[..] == b[..] && a[..] == c[..],
-            "level {}: the same proof bytes",
+            bytes(a) == bytes(b),
+            "off, level {}: the levels prover's bytes",
             k + 1
         );
-        println!("LEVELS TAIL IDENTITY level {}: {} B equal", k + 1, a.len());
+    }
+    for (tail, untrimmed, what) in [(false, true, "untrimmed"), (true, false, "the tail")] {
+        let (run, skipped) = drive(tail, untrimmed);
+        let (_, trimmed) = run.times.settle_base_end.expect("the base-end reading");
+        assert!(!trimmed, "{what}: the base-end reading skipped its trim");
+        assert!(
+            skipped >= 3,
+            "{what}: the readings inside the levels skipped theirs ({skipped})"
+        );
+        assert_eq!(
+            run.times.lean_prefilled, tail,
+            "{what}: the lean prefill only under the tail"
+        );
+        assert_eq!(run.proofs.len(), want.len(), "{what}: the levels");
+        for (k, (a, b)) in run.proofs.iter().zip(&want).enumerate() {
+            assert!(
+                bytes(a) == bytes(b),
+                "{what}, level {}: the same proof bytes",
+                k + 1
+            );
+            println!(
+                "LEVELS TAIL IDENTITY {what} level {}: {} B equal",
+                k + 1,
+                bytes(a).len()
+            );
+        }
     }
 }
 
