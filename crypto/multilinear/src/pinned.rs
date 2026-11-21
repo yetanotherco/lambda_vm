@@ -17,6 +17,18 @@ pub fn with_pinned<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// [`with_pinned`] for the executor's window buffers: their allocation comes
+/// from the pool's arena of their own (`math_cuda::pinned::PoolClass::ExecLogs`),
+/// whatever thread makes it, so a buffer freed after one run is the next run's
+/// instead of more of the pool carved out.
+pub fn with_pinned_logs<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "cuda")]
+    let _scope = math_cuda::pinned::scope_in(math_cuda::pinned::PoolClass::ExecLogs, bytes);
+    #[cfg(not(feature = "cuda"))]
+    let _ = bytes;
+    f()
+}
+
 /// A list in the page-locked pool gives its capacity past its length back,
 /// once nothing grows it: pool it would hold and never write. In place, so it
 /// stays page-locked; a list outside the pool is left as it is. The bytes
