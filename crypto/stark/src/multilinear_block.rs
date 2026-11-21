@@ -1368,9 +1368,13 @@ impl BlockSpill {
     }
 }
 
-/// Live regeneration on a block (D-WHIR-NODISK §2.1). `droppable(t)` is the
-/// rank of the table at block index `t` when phase B can rebuild its columns
-/// (a streamed chunk: its place in the hand-out), `None` otherwise. Phase A
+/// Live regeneration on a block (D-WHIR-NODISK §2.1). `droppable(p)` is the
+/// rank of the table at place `p` in phase A's order of tables (the groups'
+/// tables one after another, as they are committed) when phase B can rebuild
+/// its columns (a streamed chunk: its place in the hand-out), `None`
+/// otherwise. A place is not always the table's block index (under local
+/// lookups each local group's LOCAL_BYTES table sits in its group but after
+/// every other table in the block): the caller maps one to the other. Phase A
 /// drops such a table instead of keeping it: its packed columns
 /// leave the host after their digest, on a thread of their own, and a
 /// [`RegenSlot`] in `window` stands for them; phase B waits on the slot before
@@ -1596,8 +1600,8 @@ impl BlockRegen {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The class and rank of the table at block index `index`, when it may
-    /// be dropped (a class with no window may not).
+    /// The class and rank of the table at place `index` in phase A's order of
+    /// tables, when it may be dropped (a class with no window may not).
     pub fn rank_of(&self, index: usize) -> Option<(usize, u64)> {
         (self.droppable)(index).filter(|&(class, _)| class < self.windows.len())
     }

@@ -586,9 +586,10 @@ struct Recorded {
     rest_base: Option<usize>,
     /// When phase A commits the streamed chunks in another order than the
     /// hand-out's (KECCAK_RND's own groups,
-    /// [`Recorder::commits_out_of_order`]): each block index's hand-out place
-    /// (`None`: not a streamed chunk), as its group closes. `None`: the same
-    /// order, so a block index is its hand-out place.
+    /// [`Recorder::commits_out_of_order`]): the hand-out place of each table
+    /// in phase A's order of tables (`None`: not a streamed chunk, or a
+    /// LOCAL_BYTES table), as its group closes. `None`: the same order, so a
+    /// table's block index is its hand-out place.
     block_ranks: Option<Vec<Option<usize>>>,
 }
 
