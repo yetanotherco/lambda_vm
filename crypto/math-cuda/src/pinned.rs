@@ -228,8 +228,59 @@ pub fn with_source<R>(source: UploadSource, f: impl FnOnce() -> R) -> R {
 }
 
 const SOURCES: usize = UploadSource::ALL.len();
-static SOURCE_BYTES: [AtomicU64; SOURCES] = [const { AtomicU64::new(0) }; SOURCES];
-static SOURCE_PINNED: [AtomicU64; SOURCES] = [const { AtomicU64::new(0) }; SOURCES];
+
+/// The upload tallies' places in a [`Tally`]: all bytes, those from the pool,
+/// then each source's bytes and each source's bytes from the pool.
+const TALLY_BYTES: usize = 0;
+const TALLY_PINNED: usize = 1;
+const TALLY_SOURCE: usize = 2;
+const TALLY_SOURCE_PINNED: usize = 2 + SOURCES;
+const TALLIES: usize = 2 + 2 * SOURCES;
+
+/// One thread's upload tallies: written by that thread alone (a load and a
+/// store, no read-modify-write on a line another thread writes), summed by a
+/// reader ([`tally`]); a line of its own, so no two threads' tallies share a
+/// cache line.
+#[repr(align(128))]
+struct Tally([AtomicU64; TALLIES]);
+
+/// Every thread's [`Tally`] that ever counted an upload (kept past its
+/// thread's end, so nothing counted is lost).
+static TALLIES_OF_THREADS: std::sync::Mutex<Vec<std::sync::Arc<Tally>>> =
+    std::sync::Mutex::new(Vec::new());
+
+std::thread_local! {
+    /// This thread's [`Tally`], registered at its first upload.
+    static MY_TALLY: std::sync::Arc<Tally> = {
+        let mine = std::sync::Arc::new(Tally([const { AtomicU64::new(0) }; TALLIES]));
+        TALLIES_OF_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(std::sync::Arc::clone(&mine));
+        mine
+    };
+}
+
+/// Adds `bytes` to this thread's tally `at` and `also`; a thread being torn
+/// down (its tally gone) counts nothing.
+fn count(at: usize, also: usize, bytes: u64) {
+    let _ = MY_TALLY.try_with(|t| {
+        for k in [at, also] {
+            let slot = &t.0[k];
+            slot.store(slot.load(Ordering::Relaxed) + bytes, Ordering::Relaxed);
+        }
+    });
+}
+
+/// The sum of every thread's tally `at`.
+fn tally(at: usize) -> u64 {
+    TALLIES_OF_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|t| t.0[at].load(Ordering::Relaxed))
+        .sum()
+}
 
 /// The bytes [`note_upload`] saw by source so far in this process, and how
 /// many of them came from the pool: `(source, bytes, from the pool)`.
@@ -239,8 +290,8 @@ pub fn upload_sources() -> Vec<(UploadSource, u64, u64)> {
         .map(|&s| {
             (
                 s,
-                SOURCE_BYTES[s as usize].load(Ordering::Relaxed),
-                SOURCE_PINNED[s as usize].load(Ordering::Relaxed),
+                tally(TALLY_SOURCE + s as usize),
+                tally(TALLY_SOURCE_PINNED + s as usize),
             )
         })
         .collect()
@@ -255,11 +306,13 @@ pub fn note_upload(ptr: *const u8, bytes: usize) {
 
 /// [`note_upload`] under `source`.
 pub fn note_upload_from(source: UploadSource, ptr: *const u8, bytes: usize) {
-    UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-    SOURCE_BYTES[source as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    count(TALLY_BYTES, TALLY_SOURCE + source as usize, bytes as u64);
     if POOL_READY.load(Ordering::Acquire) && is_pinned(ptr, bytes) {
-        UPLOAD_PINNED.fetch_add(bytes as u64, Ordering::Relaxed);
-        SOURCE_PINNED[source as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+        count(
+            TALLY_PINNED,
+            TALLY_SOURCE_PINNED + source as usize,
+            bytes as u64,
+        );
         let _ = PENDING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
             Some(p.saturating_sub(bytes as u64))
         });
@@ -611,8 +664,8 @@ pub fn stats() -> Stats {
         lock_seconds: LOCK_NANOS.load(Ordering::Relaxed) as f64 * 1e-9,
         carved_bytes: CURSOR.load(Ordering::Relaxed) as u64,
         spilled_bytes: SPILLED_BYTES.load(Ordering::Relaxed),
-        upload_bytes: UPLOAD_BYTES.load(Ordering::Relaxed),
-        upload_pinned: UPLOAD_PINNED.load(Ordering::Relaxed),
+        upload_bytes: tally(TALLY_BYTES),
+        upload_pinned: tally(TALLY_PINNED),
         pending_most: PENDING_MOST.load(Ordering::Relaxed),
         held_bytes: live_bytes(),
         requested_bytes: REQUESTED.load(Ordering::Relaxed),
@@ -626,8 +679,6 @@ pub fn stats() -> Stats {
 static POOL_LOCKED: AtomicU64 = AtomicU64::new(0);
 static LOCK_NANOS: AtomicU64 = AtomicU64::new(0);
 static SPILLED_BYTES: AtomicU64 = AtomicU64::new(0);
-static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
-static UPLOAD_PINNED: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static PENDING_MOST: AtomicU64 = AtomicU64::new(0);
 static REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -1378,6 +1429,88 @@ mod tests {
         // The same address: the freed extent taken again, not more of the
         // pool (the cursor itself moves under the module's other tests).
         assert_eq!(again, first, "the freed buffer, taken again");
+    }
+
+    /// The upload tallies under many threads: per thread, every upload of
+    /// every thread is counted once (the sums are exact), by source.
+    #[test]
+    fn upload_tallies_from_many_threads_sum_exactly() {
+        let threads = 8usize;
+        let per = 1000u64;
+        let before = tally(TALLY_SOURCE + UploadSource::CycleLists as usize);
+        let before_all = tally(TALLY_BYTES);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(move || {
+                    for _ in 0..per {
+                        note_upload_from(UploadSource::CycleLists, std::ptr::null(), 3);
+                    }
+                });
+            }
+        });
+        let got = tally(TALLY_SOURCE + UploadSource::CycleLists as usize) - before;
+        assert_eq!(
+            got,
+            threads as u64 * per * 3,
+            "every thread's every upload, once"
+        );
+        assert!(
+            tally(TALLY_BYTES) - before_all >= got,
+            "all bytes count them too"
+        );
+    }
+
+    /// The tally's cost under contention: `threads` threads each counting
+    /// `calls` uploads at once, per thread (today's [`count`]) against one
+    /// shared atomic add (the old `UPLOAD_BYTES`) and two (the old tally with a
+    /// shared slot a source). Prints each one's cost a call; fails when the
+    /// per-thread tally costs more than the single shared add. Timing: run
+    /// alone.
+    #[test]
+    #[ignore = "timing: run alone"]
+    fn per_thread_upload_tallies_cost_no_more_than_one_shared_add() {
+        static SHARED_A: AtomicU64 = AtomicU64::new(0);
+        static SHARED_B: [AtomicU64; SOURCES] = [const { AtomicU64::new(0) }; SOURCES];
+        let threads = 16usize;
+        let calls = 200_000usize;
+        let run = |k: usize| {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let barrier = std::sync::Barrier::new(threads);
+                let t = Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        let barrier = &barrier;
+                        s.spawn(move || {
+                            barrier.wait();
+                            for i in 0..calls {
+                                match k {
+                                    0 => {
+                                        SHARED_A.fetch_add(i as u64, Ordering::Relaxed);
+                                    }
+                                    1 => {
+                                        SHARED_A.fetch_add(i as u64, Ordering::Relaxed);
+                                        SHARED_B[i % SOURCES]
+                                            .fetch_add(i as u64, Ordering::Relaxed);
+                                    }
+                                    _ => count(TALLY_BYTES, TALLY_SOURCE + i % SOURCES, i as u64),
+                                }
+                            }
+                        });
+                    }
+                });
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best / (threads * calls) as f64 * 1e9
+        };
+        let (one, two, mine) = (run(0), run(1), run(2));
+        println!(
+            "UPLOAD TALLY CONTENTION: {threads} threads × {calls} calls · one shared add {one:.2} ns a call · two shared adds {two:.2} ns · per thread {mine:.2} ns"
+        );
+        assert!(
+            mine <= one,
+            "per thread {mine:.2} ns against one shared add {one:.2} ns"
+        );
     }
 
     /// Many threads taking scoped allocations at once (as the executor's
