@@ -1185,16 +1185,25 @@ fn the_levels_tail_knob_is_named_and_off_by_default() {
     }
 }
 
-/// The untrimmed-readings knob's name; it is off by default, and only `1`
-/// turns it on.
+/// The untrimmed-readings knob's name; it is on by default, and only `0`
+/// turns it off.
 #[test]
-fn the_levels_untrimmed_knob_is_named_and_off_by_default() {
-    use super::wlfm_knobs::{TAIL_ENV, UNTRIMMED_ENV, knob_word_on, levels_untrimmed};
+fn the_levels_untrimmed_knob_is_named_and_on_by_default() {
+    use super::wlfm_knobs::{UNTRIMMED_ENV, levels_untrimmed, untrimmed_word};
     assert_eq!(UNTRIMMED_ENV, "LAMBDA_VM_LEVELS_UNTRIMMED");
-    if std::env::var_os(UNTRIMMED_ENV).is_none() && std::env::var_os(TAIL_ENV).is_none() {
-        assert!(!levels_untrimmed());
+    if std::env::var_os(UNTRIMMED_ENV).is_none() {
+        assert!(levels_untrimmed());
     }
-    assert!(knob_word_on(Some("1")) && !knob_word_on(Some("0")) && !knob_word_on(None));
+    for (word, on) in [
+        (None, true),
+        (Some(""), true),
+        (Some("0"), false),
+        (Some(" 0 "), false),
+        (Some("on"), true),
+        (Some("1"), true),
+    ] {
+        assert_eq!(untrimmed_word(word), on, "{word:?}");
+    }
 }
 
 /// ★ The levels' tail taken off the path, in parts and whole

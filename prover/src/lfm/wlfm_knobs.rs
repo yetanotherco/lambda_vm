@@ -109,11 +109,18 @@ pub fn tail() -> bool {
     *ON.get_or_init(|| tail_word(std::env::var(TAIL_ENV).ok().as_deref()))
 }
 
-/// `LAMBDA_VM_LEVELS_UNTRIMMED=1`: [`TAIL_ENV`]'s second half alone, every card
-/// reading inside the levels taken without trimming the pool; the lean fill
-/// as its own knob says. Off by default (and for any word but `1`); the same
-/// bytes. Read once a process.
+/// `LAMBDA_VM_LEVELS_UNTRIMMED`: [`TAIL_ENV`]'s second half alone, every card
+/// reading inside the levels taken without trimming the pool (each level's
+/// allocations reuse the pool's pages; each still trims on a failed
+/// allocation); the lean fill as its own knob says. On by default; `0` turns
+/// it off (any other word leaves it on); the same bytes either way. Read once
+/// a process.
 pub const UNTRIMMED_ENV: &str = "LAMBDA_VM_LEVELS_UNTRIMMED";
+
+/// [`UNTRIMMED_ENV`]'s word: on unless it is `0`.
+pub fn untrimmed_word(word: Option<&str>) -> bool {
+    !knob_word_off(word)
+}
 
 /// A test's [`untrimmed_only`], process wide (0 the knob, 1 off, 2 on).
 static UNTRIMMED_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -138,7 +145,7 @@ fn untrimmed_only() -> bool {
         _ => {}
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| knob_word_on(std::env::var(UNTRIMMED_ENV).ok().as_deref()))
+    *ON.get_or_init(|| untrimmed_word(std::env::var(UNTRIMMED_ENV).ok().as_deref()))
 }
 
 /// Whether the level driver reads the card inside the levels without
