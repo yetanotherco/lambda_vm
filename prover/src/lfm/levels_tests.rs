@@ -1164,22 +1164,22 @@ fn the_blake3_driver_settling_late_proves_the_same_level_bytes() {
     }
 }
 
-/// The levels' tail knob's name; it is off by default, and only `1` turns it
-/// on.
+/// The levels' tail knob's name; it is on by default, and only `0` turns it
+/// off.
 #[test]
-fn the_levels_tail_knob_is_named_and_off_by_default() {
+fn the_levels_tail_knob_is_named_and_on_by_default() {
     use super::wlfm_knobs::{TAIL_ENV, tail, tail_word};
     assert_eq!(TAIL_ENV, "LAMBDA_VM_LEVELS_TAIL");
     if std::env::var_os(TAIL_ENV).is_none() {
-        assert!(!tail());
+        assert!(tail());
     }
     for (word, on) in [
-        (None, false),
-        (Some(""), false),
+        (None, true),
+        (Some(""), true),
         (Some("0"), false),
-        (Some("on"), false),
+        (Some(" 0 "), false),
+        (Some("on"), true),
         (Some("1"), true),
-        (Some(" 1 "), true),
     ] {
         assert_eq!(tail_word(word), on, "{word:?}");
     }
@@ -1192,7 +1192,8 @@ fn the_levels_untrimmed_knob_is_named_and_off_by_default() {
     use super::wlfm_knobs::{TAIL_ENV, UNTRIMMED_ENV, knob_word_on, levels_untrimmed};
     assert_eq!(UNTRIMMED_ENV, "LAMBDA_VM_LEVELS_UNTRIMMED");
     if std::env::var_os(UNTRIMMED_ENV).is_none() && std::env::var_os(TAIL_ENV).is_none() {
-        assert!(!levels_untrimmed());
+        // The tail, on by default, takes its readings untrimmed.
+        assert!(levels_untrimmed());
     }
     assert!(knob_word_on(Some("1")) && !knob_word_on(Some("0")) && !knob_word_on(None));
 }

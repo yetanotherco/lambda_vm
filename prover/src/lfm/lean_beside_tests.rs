@@ -175,12 +175,19 @@ fn assert_tables_equal(what: &str, a: &B3lTraces, b: &B3lTraces) {
 // The knob
 // =============================================================================
 
-/// The lean round tables are filled after the execution by default, and the
-/// knob turns on for `1` alone.
+/// The lean round tables are filled beside the execution by default, as part
+/// of the levels' tail (`LAMBDA_VM_LEVELS_TAIL`, on unless `0`); the knob of
+/// its own turns on for `1` alone.
 #[test]
-fn the_lean_fill_beside_is_off_by_default_and_on_for_one_alone() {
+fn the_lean_fill_beside_follows_the_tail_and_its_own_knob_is_on_for_one_alone() {
     assert_eq!(LEAN_BESIDE_ENV, "LAMBDA_VM_WLFM_LEAN_BESIDE");
-    assert!(!lean_beside(), "off by default");
+    if std::env::var_os(LEAN_BESIDE_ENV).is_none() {
+        assert_eq!(
+            lean_beside(),
+            super::wlfm_knobs::tail(),
+            "the tail's by default"
+        );
+    }
     assert!(knob_word_on(Some("1")));
     for word in [
         None,
@@ -194,8 +201,10 @@ fn the_lean_fill_beside_is_off_by_default_and_on_for_one_alone() {
     }
     let on = test_format::set_lean_beside(true);
     assert!(lean_beside(), "the override");
+    let off = test_format::set_lean_beside(false);
+    assert!(!lean_beside(), "the override off");
+    drop(off);
     drop(on);
-    assert!(!lean_beside(), "the override restored");
 }
 
 /// An execution not tapped reports nothing; a tapped one is the same
