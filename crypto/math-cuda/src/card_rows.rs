@@ -980,15 +980,21 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     let mut registers_up: Vec<Option<RegistersUp>> = Vec::with_capacity(tables.len());
     let mut at = 0usize;
     let mut offsets = Vec::with_capacity(tables.len());
+    let lanes = crate::columns::copy_lanes();
+    let mut deferred: crate::columns::WideCopies<'_> = Vec::new();
     for (table, plan) in tables.iter().zip(&plans) {
         offsets.push(at);
         let (mut s, mut l, mut r) = (None, None, None);
         match (table, plan) {
             (TableUpload::Wide(columns), _) => {
                 for column in columns.iter() {
-                    let mut slab = buffer.slice_mut(at..at + column.len());
-                    crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
-                    stream.memcpy_htod(*column, &mut slab).ok()?;
+                    if lanes > 1 {
+                        deferred.push((at, *column));
+                    } else {
+                        let mut slab = buffer.slice_mut(at..at + column.len());
+                        crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
+                        stream.memcpy_htod(*column, &mut slab).ok()?;
+                    }
                     spans.push((at, column.len()));
                     at += column.len();
                 }
@@ -1212,6 +1218,10 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     let registers_dev = (!register_descs.is_empty())
         .then(|| stream.clone_htod(&register_descs).ok())
         .flatten();
+
+    // The wide columns' copies deferred to more than one lane go up now, and
+    // pass 2 waits for them on `stream`.
+    crate::columns::copy_wide_lanes(&stream, &mut buffer, deferred, lanes)?;
 
     // ---- pass 2: every kernel ----
     // `LAMBDA_VM_CARD_UPLOAD_TIMES=1` times each kernel here (its copy was

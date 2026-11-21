@@ -1781,6 +1781,100 @@ fn phase_b_many_first_proves_the_same_bytes() {
     }
 }
 
+/// ★ Phase B's uploads copying their wide columns on two streams at once
+/// (`LAMBDA_VM_PHASE_B_COPY_STREAMS`) and the argument's read-backs through
+/// pinned staging (`LAMBDA_VM_PHASE_B_ARGUE_PINNED`), each alone and both,
+/// prove the bytes of today's phase B under the deterministic grind (run this
+/// test alone: both overrides are process wide), and verify. The stamps name
+/// the upload's tables by kind, and on a card the argument read back pinned.
+#[test]
+fn phase_b_copy_streams_and_pinned_argue_read_backs_prove_the_same_bytes() {
+    use stark::multilinear_block::{PhaseBOverlap::Pinned, set_phase_b_copy_streams_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_phase_b_copy_streams_for_test(None);
+            multilinear::gpu::set_argue_pinned_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.phase_b_overlap = Pinned;
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let card = multilinear::gpu::reserve_budget() > 0;
+    let proved = |lanes: usize, pinned: bool| {
+        set_phase_b_copy_streams_for_test(Some(lanes));
+        multilinear::gpu::set_argue_pinned_for_test(Some(pinned));
+        let before = multilinear::gpu::argue_pinned_copies();
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        let pinned_copies = multilinear::gpu::argue_pinned_copies() - before;
+        assert!(
+            verify(&proof, &elf, &format),
+            "lanes {lanes} pinned {pinned}"
+        );
+        let tables: usize = stamps
+            .groups
+            .iter()
+            .map(|g| {
+                g.upload_b_mix.wide_tables
+                    + g.upload_b_mix.narrow_tables
+                    + g.upload_b_mix.records_tables
+            })
+            .sum();
+        (proof, tables, pinned_copies)
+    };
+    let (today, tables, none) = proved(1, false);
+    assert!(tables > 0, "phase B's uploads are named by kind");
+    assert_eq!(none, 0, "no pinned argue read-back off");
+    for (lanes, pinned) in [(2, false), (1, true), (2, true)] {
+        let (got, _, copies) = proved(lanes, pinned);
+        if card && pinned {
+            assert!(copies > 0, "lanes {lanes}: the argument read back pinned");
+        }
+        if crypto::grinding::deterministic() {
+            assert_eq!(
+                bytes(&got),
+                bytes(&today),
+                "lanes {lanes} pinned {pinned}: the proof's bytes"
+            );
+        }
+    }
+}
+
+/// The phase-B copy-streams knob reads 2 to 4, and anything else as one.
+#[test]
+fn the_phase_b_copy_streams_knob_reads_two_to_four() {
+    use stark::multilinear_block::{PHASE_B_COPY_STREAMS_ENV, phase_b_copy_streams_word};
+    assert_eq!(PHASE_B_COPY_STREAMS_ENV, "LAMBDA_VM_PHASE_B_COPY_STREAMS");
+    for (word, lanes) in [
+        (None, 1),
+        (Some(""), 1),
+        (Some("0"), 1),
+        (Some("1"), 1),
+        (Some("2"), 2),
+        (Some(" 3 "), 3),
+        (Some("4"), 4),
+        (Some("5"), 1),
+        (Some("two"), 1),
+    ] {
+        assert_eq!(phase_b_copy_streams_word(word), lanes, "{word:?}");
+    }
+}
+
 /// ★ Phase B led by a leaf (the early leaf first, [`block_whir::PhaseBLead`]) on a
 /// streamed block: with a leaf offered before phase B starts, phase B moves
 /// that leaf's groups ahead at its first turn and takes that order (the

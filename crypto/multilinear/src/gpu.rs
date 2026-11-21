@@ -1355,6 +1355,43 @@ pub struct PinnedReadbacks(#[allow(dead_code)] math_cuda::readback::PinnedReadba
 #[cfg(not(feature = "cuda"))]
 pub struct PinnedReadbacks;
 
+/// Runs `f` with this thread's table uploads copying their wide columns on
+/// `lanes` streams at once (`math_cuda::columns::with_copy_lanes`); `f` alone
+/// without a device.
+#[cfg(feature = "cuda")]
+pub fn with_copy_lanes<R>(lanes: usize, f: impl FnOnce() -> R) -> R {
+    math_cuda::columns::with_copy_lanes(lanes, f)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn with_copy_lanes<R>(_lanes: usize, f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// Read-backs outside the background class that went through pinned staging
+/// (`LAMBDA_VM_PHASE_B_ARGUE_PINNED`), process wide; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn argue_pinned_copies() -> u64 {
+    math_cuda::readback::argue_pinned_copies()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn argue_pinned_copies() -> u64 {
+    0
+}
+
+/// Tests only: `LAMBDA_VM_PHASE_B_ARGUE_PINNED` forced for the whole process
+/// (`None` restores the knob); nothing without a device.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn set_argue_pinned_for_test(on: Option<bool>) {
+    math_cuda::readback::set_argue_pinned_for_test(on)
+}
+
+#[doc(hidden)]
+#[cfg(not(feature = "cuda"))]
+pub fn set_argue_pinned_for_test(_on: Option<bool>) {}
+
 /// Turns pinned read-backs on until the guard drops.
 #[cfg(feature = "cuda")]
 pub fn pinned_readbacks() -> PinnedReadbacks {
