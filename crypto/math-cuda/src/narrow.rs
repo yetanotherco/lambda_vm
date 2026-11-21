@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, LaunchConfig, PushKernelArg,
+};
 
 use crate::Result;
 use crate::device::{Backend, backend};
@@ -121,6 +123,56 @@ pub(crate) fn widen_col_major_into(
     }
     crate::pinned::note_upload(t.data.as_ptr(), t.data.len());
     let data_dev = stream.clone_htod(t.data)?;
+    widen_col_major_from(stream, be, &data_dev, t, rows, cols, dst)
+}
+
+/// `t`'s packed bytes on the card for a copy deferred to the copy lanes
+/// ([`crate::columns::copy_raw_lanes`]): the range allocated on `stream` now
+/// and the copy pushed into `copies`, to be written before `stream` runs
+/// [`widen_col_major_from`]. `None` for a table with no cells.
+pub(crate) fn stage_packed<'a>(
+    stream: &Arc<CudaStream>,
+    t: NarrowInput<'a>,
+    copies: &mut crate::columns::RawCopies<'a>,
+) -> Result<Option<CudaSlice<u8>>> {
+    if t.rows * t.widths.len() == 0
+        || t.data.is_empty()
+        || t.data.len() < crate::columns::lane_copy_min_bytes()
+    {
+        return Ok(None);
+    }
+    // SAFETY: the deferred copy writes every byte before the widen reads it,
+    // in `stream`'s order (it waits for the lanes).
+    let mut data_dev = unsafe { crate::device::alloc_or_trim::<u8>(stream, t.data.len()) }?;
+    let at = data_dev.device_ptr_mut(stream).0;
+    copies.push((at, t.data, crate::columns::CopyKind::Narrow));
+    Ok(Some(data_dev))
+}
+
+/// [`widen_col_major_into`] from packed bytes already on the card
+/// (`data_dev`, `t`'s bytes): its offsets and widths copied up, the widen
+/// launched, all on `stream`.
+pub(crate) fn widen_col_major_from(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    data_dev: &CudaSlice<u8>,
+    t: NarrowInput,
+    rows: usize,
+    cols: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
+    assert_eq!(t.rows, rows, "packed trace: rows");
+    assert_eq!(t.widths.len(), cols, "packed trace: columns");
+    let cells = rows * cols;
+    assert_eq!(dst.len(), cells, "packed trace: destination size");
+    assert_eq!(
+        data_dev.len(),
+        t.data.len(),
+        "packed trace: bytes on the card"
+    );
+    if cells == 0 {
+        return Ok(());
+    }
     let offsets_dev = stream.clone_htod(t.offsets)?;
     let widths_dev = stream.clone_htod(t.widths)?;
     let cfg =
@@ -129,7 +181,7 @@ pub(crate) fn widen_col_major_into(
     unsafe {
         stream
             .launch_builder(&be.widen_narrow_col_major)
-            .arg(&data_dev)
+            .arg(data_dev)
             .arg(&offsets_dev)
             .arg(&widths_dev)
             .arg(dst)

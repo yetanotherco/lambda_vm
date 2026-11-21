@@ -1355,8 +1355,8 @@ pub struct PinnedReadbacks(#[allow(dead_code)] math_cuda::readback::PinnedReadba
 #[cfg(not(feature = "cuda"))]
 pub struct PinnedReadbacks;
 
-/// Runs `f` with this thread's table uploads copying their wide columns on
-/// `lanes` streams at once (`math_cuda::columns::with_copy_lanes`); `f` alone
+/// Runs `f` with this thread's table uploads copying on `lanes` streams at
+/// once: wide columns, packed bytes and records (`math_cuda::columns::with_copy_lanes`); `f` alone
 /// without a device.
 #[cfg(feature = "cuda")]
 pub fn with_copy_lanes<R>(lanes: usize, f: impl FnOnce() -> R) -> R {
@@ -1366,6 +1366,62 @@ pub fn with_copy_lanes<R>(lanes: usize, f: impl FnOnce() -> R) -> R {
 #[cfg(not(feature = "cuda"))]
 pub fn with_copy_lanes<R>(_lanes: usize, f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// What uploads sent on the copy lanes ([`with_copy_lanes_tallied`]).
+#[cfg(feature = "cuda")]
+pub use math_cuda::columns::LanedCopies;
+
+/// What uploads sent on the copy lanes; always zero without a device.
+#[cfg(not(feature = "cuda"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LanedCopies {
+    pub copies: u64,
+    pub wide_bytes: u64,
+    pub narrow_bytes: u64,
+    pub records_bytes: u64,
+    pub wall_secs: f64,
+    pub most_lanes: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl LanedCopies {
+    /// The two tallies together.
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            copies: self.copies + other.copies,
+            wide_bytes: self.wide_bytes + other.wide_bytes,
+            narrow_bytes: self.narrow_bytes + other.narrow_bytes,
+            records_bytes: self.records_bytes + other.records_bytes,
+            wall_secs: self.wall_secs + other.wall_secs,
+            most_lanes: self.most_lanes.max(other.most_lanes),
+        }
+    }
+}
+
+/// [`with_copy_lanes`], with what `f`'s uploads sent on the lanes
+/// (`math_cuda::columns::with_copy_lanes_tallied`); `f` alone and a zero
+/// tally without a device.
+#[cfg(feature = "cuda")]
+pub fn with_copy_lanes_tallied<R>(lanes: usize, f: impl FnOnce() -> R) -> (R, LanedCopies) {
+    math_cuda::columns::with_copy_lanes_tallied(lanes, f)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn with_copy_lanes_tallied<R>(_lanes: usize, f: impl FnOnce() -> R) -> (R, LanedCopies) {
+    (f(), LanedCopies::default())
+}
+
+/// What the copy lanes carried since the last call, process wide, the tally
+/// zeroed (`math_cuda::columns::take_laned_copies`); zero without a device.
+#[cfg(feature = "cuda")]
+pub fn take_laned_copies() -> LanedCopies {
+    math_cuda::columns::take_laned_copies()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn take_laned_copies() -> LanedCopies {
+    LanedCopies::default()
 }
 
 /// Read-backs outside the background class that went through pinned staging

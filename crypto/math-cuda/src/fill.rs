@@ -24,8 +24,8 @@ use std::mem::{offset_of, size_of};
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
-    CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, DeviceRepr,
-    LaunchConfig, PushKernelArg,
+    CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, DevicePtrMut,
+    DeviceRepr, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -1069,6 +1069,52 @@ pub(crate) fn upload_pieces<T: DeviceRepr + Default>(
     Ok(records)
 }
 
+/// Copies deferred to the copy lanes ([`crate::columns::copy_raw_lanes`]),
+/// or `None`: every copy made where it is met.
+pub(crate) type Sink<'s, 'a> = Option<&'s mut crate::columns::RawCopies<'a>>;
+
+/// [`upload`] with its copy deferred into `sink` when there is one and the
+/// copy is large enough ([`crate::columns::LANE_COPY_MIN_BYTES`]): the
+/// range is allocated on `stream` now and written once the lanes run.
+fn upload_to<'a, T: DeviceRepr + Default>(
+    stream: &Arc<CudaStream>,
+    records: &'a [T],
+    sink: &mut Sink<'_, 'a>,
+) -> Result<CudaSlice<T>> {
+    upload_pieces_to(stream, std::slice::from_ref(&records), sink)
+}
+
+/// [`upload_pieces`] with each large piece's copy deferred into `sink`, as
+/// [`upload_to`].
+fn upload_pieces_to<'a, T: DeviceRepr + Default>(
+    stream: &Arc<CudaStream>,
+    pieces: &[&'a [T]],
+    sink: &mut Sink<'_, 'a>,
+) -> Result<CudaSlice<T>> {
+    let Some(copies) = sink.as_deref_mut() else {
+        return upload_pieces(stream, pieces);
+    };
+    let n: usize = pieces.iter().map(|piece| piece.len()).sum();
+    if n == 0 || std::mem::size_of::<T>() * n < crate::columns::lane_copy_min_bytes() {
+        return upload_pieces(stream, pieces);
+    }
+    // SAFETY: every element is written by the copies below (now, or on the
+    // lanes before `stream` reads it), which cover `0..n` piece by piece.
+    let mut records = unsafe { crate::device::alloc_or_trim::<T>(stream, n) }?;
+    let base = records.device_ptr_mut(stream).0;
+    let mut at = 0usize;
+    for piece in pieces.iter().filter(|piece| !piece.is_empty()) {
+        let bytes = crate::columns::as_bytes(piece);
+        copies.push((
+            base + (at * std::mem::size_of::<T>()) as u64,
+            bytes,
+            crate::columns::CopyKind::Records,
+        ));
+        at += piece.len();
+    }
+    Ok(records)
+}
+
 /// Test-only fault: with the `test-faults` feature, a table filled from its
 /// records is filled this many rows late (plus
 /// `LAMBDA_VM_TEST_FAULT_CARD_FILL_SKIP`, read at the first fill): other words
@@ -1392,11 +1438,22 @@ pub(crate) enum Staged<'a> {
 /// `records` copied up on `stream`, as [`fill_col_major_into`] copies them;
 /// no kernel launched.
 pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> Result<Staged<'a>> {
+    stage_with(stream, records, None)
+}
+
+/// [`stage`] with its large copies deferred into `sink` when there is one
+/// ([`upload_pieces_to`]); what it stages is the same.
+pub(crate) fn stage_with<'a>(
+    stream: &Arc<CudaStream>,
+    records: RecordsInput<'a>,
+    mut sink: Sink<'_, 'a>,
+) -> Result<Staged<'a>> {
+    let sink = &mut sink;
     let n = records.len();
     Ok(match records {
         RecordsInput::KeccakRnd { ops, skip, .. } => Staged::KeccakRnd {
             nops: u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?,
-            ops: upload(stream, ops)?,
+            ops: upload_to(stream, ops, sink)?,
             skip,
         },
         RecordsInput::Cpu {
@@ -1405,12 +1462,14 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             decode,
             ..
         } => Staged::Cpu {
-            logs: CpuLogsOnCard::Owned(upload_pieces(stream, logs)?),
+            logs: CpuLogsOnCard::Owned(upload_pieces_to(stream, logs, sink)?),
             n,
             decode: decode.as_ref(),
             sides: upload_sides(stream, sides, n)?,
         },
-        RecordsInput::MemwR { records, .. } => Staged::MemwR(upload_pieces(stream, records)?, n),
+        RecordsInput::MemwR { records, .. } => {
+            Staged::MemwR(upload_pieces_to(stream, records, sink)?, n)
+        }
         RecordsInput::MemwRWords { decode, .. } => {
             let decoded = decode(0, n);
             if decoded.len() != n {
@@ -1418,20 +1477,30 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             }
             Staged::MemwR(upload_pieces(stream, &[&decoded[..]])?, n)
         }
-        RecordsInput::MemwA { records, .. } => Staged::MemwA(upload_pieces(stream, records)?, n),
-        RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
+        RecordsInput::MemwA { records, .. } => {
+            Staged::MemwA(upload_pieces_to(stream, records, sink)?, n)
+        }
+        RecordsInput::Load { records, .. } => {
+            Staged::Load(upload_pieces_to(stream, records, sink)?, n)
+        }
         RecordsInput::MemLoad { records, .. } => {
-            Staged::MemLoad(upload_pieces(stream, records)?, n)
+            Staged::MemLoad(upload_pieces_to(stream, records, sink)?, n)
         }
         RecordsInput::MemStore { records, .. } => {
-            Staged::MemStore(upload_pieces(stream, records)?, n)
+            Staged::MemStore(upload_pieces_to(stream, records, sink)?, n)
         }
-        RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
-        RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),
-        RecordsInput::Memw { records, .. } => Staged::Memw(upload_pieces(stream, records)?, n),
+        RecordsInput::Store { records, .. } => {
+            Staged::Store(upload_pieces_to(stream, records, sink)?, n)
+        }
+        RecordsInput::Shift { records, .. } => {
+            Staged::Shift(upload_pieces_to(stream, records, sink)?, n)
+        }
+        RecordsInput::Memw { records, .. } => {
+            Staged::Memw(upload_pieces_to(stream, records, sink)?, n)
+        }
         RecordsInput::B3lRound { ops, skip, .. } => Staged::B3lRound {
             nops: u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?,
-            ops: upload(stream, ops)?,
+            ops: upload_to(stream, ops, sink)?,
             skip,
         },
         RecordsInput::LfmChip {
@@ -1444,11 +1513,11 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             check_lfm_chip(&prefix, values, kind, real, rows)?;
             let (data, offsets, widths) = prefix.parts();
             Staged::LfmChip {
-                data: upload(stream, data)?,
-                offsets: upload(stream, offsets)?,
-                widths: upload(stream, widths)?,
+                data: upload_to(stream, data, sink)?,
+                offsets: upload_to(stream, offsets, sink)?,
+                widths: upload_to(stream, widths, sink)?,
                 prefix_cols: prefix.cols(),
-                values: upload(stream, values)?,
+                values: upload_to(stream, values, sink)?,
                 kind,
                 real,
             }

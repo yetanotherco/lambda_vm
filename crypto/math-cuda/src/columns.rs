@@ -153,20 +153,40 @@ pub struct DeviceColumns {
 }
 
 std::thread_local! {
-    /// The copy lanes this thread's wide uploads take ([`with_copy_lanes`]).
+    /// The copy lanes this thread's uploads take ([`with_copy_lanes`]).
     static COPY_LANES: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+    /// What this thread's uploads sent on the lanes ([`with_copy_lanes_tallied`]).
+    static LANED_HERE: std::cell::Cell<LanedCopies> = const {
+        std::cell::Cell::new(LanedCopies {
+            copies: 0,
+            wide_bytes: 0,
+            narrow_bytes: 0,
+            records_bytes: 0,
+            wall_secs: 0.0,
+            most_lanes: 0,
+        })
+    };
 }
 
-/// Runs `f` with this thread's table uploads copying their wide columns on
-/// `lanes` streams at once (`1`, the default: one stream, one copy after
-/// another). Each lane is a thread of its own, since a copy from pageable
-/// memory returns only once the driver has staged it. The same words at the
-/// same places.
+/// Runs `f` with this thread's table uploads copying on `lanes` streams at
+/// once (`1`, the default: one stream, one copy after another): the wide
+/// columns, and under the card-rows upload ([`crate::card_rows`]) the narrow
+/// tables' packed bytes and the records' large copies too. Each lane is a
+/// thread of its own, since a copy from pageable memory returns only once
+/// the driver has staged it. The same words at the same places.
 pub fn with_copy_lanes<R>(lanes: usize, f: impl FnOnce() -> R) -> R {
     let before = COPY_LANES.with(|c| c.replace(lanes.max(1)));
     let out = f();
     COPY_LANES.with(|c| c.set(before));
     out
+}
+
+/// [`with_copy_lanes`], with what `f`'s uploads sent on the lanes.
+pub fn with_copy_lanes_tallied<R>(lanes: usize, f: impl FnOnce() -> R) -> (R, LanedCopies) {
+    let before = LANED_HERE.with(|c| c.replace(LanedCopies::default()));
+    let out = with_copy_lanes(lanes, f);
+    let here = LANED_HERE.with(|c| c.replace(before.plus(&c.get())));
+    (out, here)
 }
 
 /// This thread's copy lanes ([`with_copy_lanes`]).
@@ -178,49 +198,183 @@ pub(crate) fn copy_lanes() -> usize {
 /// by an upload under more than one copy lane.
 pub(crate) type WideCopies<'a> = Vec<(usize, &'a [u64])>;
 
-/// Queues `copies` into `buffer` on `lanes` streams at once: the first lane on
-/// `stream` from this thread, every other on a stream and a thread of its
-/// own that waits for what `stream` had queued before (the buffer's
-/// allocation), and `stream` then waits for every lane, so what it runs next
-/// sees every word. The columns split by their words, the largest first.
-/// `None` when a copy fails.
+/// What a deferred copy carries, for the lanes' tally ([`laned_copies`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyKind {
+    Wide,
+    Narrow,
+    Records,
+}
+
+/// Host-to-card copies deferred by an upload under more than one copy lane:
+/// `(the card address, the host bytes, what they are)`. Each address is the
+/// start of a range allocated on the upload's stream before the lanes run,
+/// written by that copy alone.
+pub(crate) type RawCopies<'a> = Vec<(u64, &'a [u8], CopyKind)>;
+
+/// A copy smaller than this goes up where it is met, not on a lane.
+pub const LANE_COPY_MIN_BYTES: usize = 1 << 20;
+
+static LANE_COPY_MIN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(LANE_COPY_MIN_BYTES);
+
+/// The smallest copy a lane takes ([`LANE_COPY_MIN_BYTES`], or a test's).
+pub(crate) fn lane_copy_min_bytes() -> usize {
+    LANE_COPY_MIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests only: the smallest copy a lane takes, process wide (`None` restores
+/// [`LANE_COPY_MIN_BYTES`]), so small tables' copies take the lanes too. A
+/// test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_lane_copy_min_bytes_for_test(bytes: Option<usize>) {
+    LANE_COPY_MIN.store(
+        bytes.unwrap_or(LANE_COPY_MIN_BYTES),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `src`'s bytes, for a deferred copy.
+pub(crate) fn as_bytes<T>(src: &[T]) -> &[u8] {
+    // SAFETY: the card's element types are plain old data (`DeviceRepr`), so
+    // their bytes are initialized; the view borrows `src` for its lifetime.
+    unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src)) }
+}
+
+static LANED_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LANED_WIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LANED_NARROW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LANED_RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LANED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LANED_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the copy lanes carried since the last take: copies, their bytes by
+/// kind, the host's wall seconds from the first lane's start to the last
+/// lane's end summed over the uploads, and the most lanes one upload used.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LanedCopies {
+    pub copies: u64,
+    pub wide_bytes: u64,
+    pub narrow_bytes: u64,
+    pub records_bytes: u64,
+    pub wall_secs: f64,
+    pub most_lanes: u64,
+}
+
+impl LanedCopies {
+    /// The two tallies together.
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            copies: self.copies + other.copies,
+            wide_bytes: self.wide_bytes + other.wide_bytes,
+            narrow_bytes: self.narrow_bytes + other.narrow_bytes,
+            records_bytes: self.records_bytes + other.records_bytes,
+            wall_secs: self.wall_secs + other.wall_secs,
+            most_lanes: self.most_lanes.max(other.most_lanes),
+        }
+    }
+}
+
+/// [`LanedCopies`] since the last call, process wide, the tally zeroed.
+pub fn take_laned_copies() -> LanedCopies {
+    use std::sync::atomic::Ordering::Relaxed;
+    LanedCopies {
+        copies: LANED_COPIES.swap(0, Relaxed),
+        wide_bytes: LANED_WIDE.swap(0, Relaxed),
+        narrow_bytes: LANED_NARROW.swap(0, Relaxed),
+        records_bytes: LANED_RECORDS.swap(0, Relaxed),
+        wall_secs: LANED_NS.swap(0, Relaxed) as f64 * 1e-9,
+        most_lanes: LANED_MAX.swap(0, Relaxed),
+    }
+}
+
+/// Queues `copies` into `buffer` on `lanes` streams at once ([`copy_raw_lanes`]).
 pub(crate) fn copy_wide_lanes(
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<u64>,
     copies: WideCopies<'_>,
     lanes: usize,
 ) -> Option<()> {
+    let raw = wide_as_raw(stream, buffer, copies);
+    copy_raw_lanes(stream, raw, lanes)
+}
+
+/// `copies` into `buffer`, as card addresses and bytes.
+pub(crate) fn wide_as_raw<'a>(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<u64>,
+    copies: WideCopies<'a>,
+) -> RawCopies<'a> {
+    if copies.is_empty() {
+        return Vec::new();
+    }
+    let (base, _record) = buffer.device_ptr_mut(stream);
+    copies
+        .into_iter()
+        .map(|(at, column)| (base + (at * 8) as u64, as_bytes(column), CopyKind::Wide))
+        .collect()
+}
+
+/// Queues `copies` on `lanes` streams at once: the first lane on `stream` from
+/// this thread, every other on a stream and a thread of its own that waits
+/// for what `stream` had queued before (the ranges' allocations), and
+/// `stream` then waits for every lane, so what it runs next sees every byte.
+/// The copies split by their bytes, the largest first. Each lane's copies
+/// are from pageable memory, so each returns once the driver has staged it:
+/// the host bytes may go once this returns. `None` when a copy fails.
+pub(crate) fn copy_raw_lanes(
+    stream: &Arc<CudaStream>,
+    copies: RawCopies<'_>,
+    lanes: usize,
+) -> Option<()> {
+    use std::sync::atomic::Ordering::Relaxed;
     if copies.is_empty() {
         return Some(());
     }
+    let clock = std::time::Instant::now();
     let lanes = lanes.clamp(1, copies.len());
     let mut copies = copies;
-    copies.sort_by_key(|&(_, column)| std::cmp::Reverse(column.len()));
-    let mut parts: Vec<WideCopies<'_>> = (0..lanes).map(|_| Vec::new()).collect();
+    copies.sort_by_key(|&(_, bytes, _)| std::cmp::Reverse(bytes.len()));
+    let mut parts: Vec<RawCopies<'_>> = (0..lanes).map(|_| Vec::new()).collect();
     let mut load = vec![0usize; lanes];
     for copy in copies {
         let k = (0..lanes).min_by_key(|&k| load[k]).unwrap_or(0);
         load[k] += copy.1.len();
+        let tally = match copy.2 {
+            CopyKind::Wide => &LANED_WIDE,
+            CopyKind::Narrow => &LANED_NARROW,
+            CopyKind::Records => &LANED_RECORDS,
+        };
+        tally.fetch_add(copy.1.len() as u64, Relaxed);
+        LANED_COPIES.fetch_add(1, Relaxed);
         parts[k].push(copy);
+    }
+    let used = load.iter().filter(|&&l| l > 0).count() as u64;
+    LANED_MAX.fetch_max(used, Relaxed);
+    let mut here = LanedCopies {
+        most_lanes: used,
+        ..LanedCopies::default()
+    };
+    for part in &parts {
+        for &(_, bytes, kind) in part {
+            here.copies += 1;
+            let b = bytes.len() as u64;
+            match kind {
+                CopyKind::Wide => here.wide_bytes += b,
+                CopyKind::Narrow => here.narrow_bytes += b,
+                CopyKind::Records => here.records_bytes += b,
+            }
+        }
     }
     let be = backend().ok()?;
     let ready = stream.record_event(None).ok()?;
-    let (base, _record) = buffer.device_ptr_mut(stream);
-    let copy = |on: &Arc<CudaStream>, part: &WideCopies<'_>| -> Option<()> {
-        for &(at, column) in part {
-            crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
-            // SAFETY: `at .. at + column.len()` lies inside the buffer (the
-            // caller's spans), and the buffer outlives the copy: the caller
-            // synchronizes `stream`, which waits for this lane, before it
-            // returns or drops the buffer.
-            unsafe {
-                cudarc::driver::result::memcpy_htod_async(
-                    base + (at * 8) as u64,
-                    column,
-                    on.cu_stream(),
-                )
-            }
-            .ok()?;
+    let copy = |on: &Arc<CudaStream>, part: &RawCopies<'_>| -> Option<()> {
+        for &(at, bytes, _) in part {
+            crate::pinned::note_upload(bytes.as_ptr(), bytes.len());
+            // SAFETY: `at .. at + bytes.len()` is a range the caller allocated
+            // on `stream` (queued before `ready`), written by this copy alone,
+            // and alive until `stream`, which waits for this lane, has run.
+            unsafe { cudarc::driver::result::memcpy_htod_async(at, bytes, on.cu_stream()) }.ok()?;
         }
         Some(())
     };
@@ -249,6 +403,10 @@ pub(crate) fn copy_wide_lanes(
     for event in done? {
         stream.wait(&event).ok()?;
     }
+    let wall = clock.elapsed();
+    LANED_NS.fetch_add(wall.as_nanos() as u64, Relaxed);
+    here.wall_secs = wall.as_secs_f64();
+    LANED_HERE.with(|c| c.set(c.get().plus(&here)));
     Some(())
 }
 

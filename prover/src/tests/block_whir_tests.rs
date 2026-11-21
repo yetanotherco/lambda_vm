@@ -1781,12 +1781,15 @@ fn phase_b_many_first_proves_the_same_bytes() {
     }
 }
 
-/// ★ Phase B's uploads copying their wide columns on two streams at once
-/// (`LAMBDA_VM_PHASE_B_COPY_STREAMS`) and the argument's read-backs through
-/// pinned staging (`LAMBDA_VM_PHASE_B_ARGUE_PINNED`), each alone and both,
-/// prove the bytes of today's phase B under the deterministic grind (run this
-/// test alone: both overrides are process wide), and verify. The stamps name
-/// the upload's tables by kind, and on a card the argument read back pinned.
+/// ★ Phase B's uploads copying on two streams at once
+/// (`LAMBDA_VM_PHASE_B_COPY_STREAMS`: wide columns, narrow tables' packed
+/// bytes, records; every copy takes a lane here, the smallest laned copy set
+/// to 0) and the argument's read-backs through pinned staging
+/// (`LAMBDA_VM_PHASE_B_ARGUE_PINNED`), each alone and both, prove the bytes of
+/// today's phase B under the deterministic grind (run this test alone: the
+/// overrides are process wide), and verify. The stamps name the upload's
+/// tables by kind; on a card the argument read back pinned, and the lanes
+/// carried the records and every narrow table's bytes.
 #[test]
 fn phase_b_copy_streams_and_pinned_argue_read_backs_prove_the_same_bytes() {
     use stark::multilinear_block::{PhaseBOverlap::Pinned, set_phase_b_copy_streams_for_test};
@@ -1795,9 +1798,13 @@ fn phase_b_copy_streams_and_pinned_argue_read_backs_prove_the_same_bytes() {
         fn drop(&mut self) {
             set_phase_b_copy_streams_for_test(None);
             multilinear::gpu::set_argue_pinned_for_test(None);
+            #[cfg(feature = "cuda")]
+            math_cuda::columns::set_lane_copy_min_bytes_for_test(None);
         }
     }
     let _restore = Restore;
+    #[cfg(feature = "cuda")]
+    math_cuda::columns::set_lane_copy_min_bytes_for_test(Some(0));
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let mut o = streamed(MaxRowsConfig::small(), 5, 3);
@@ -1835,15 +1842,33 @@ fn phase_b_copy_streams_and_pinned_argue_read_backs_prove_the_same_bytes() {
                     + g.upload_b_mix.records_tables
             })
             .sum();
-        (proof, tables, pinned_copies)
+        let narrow: u64 = stamps
+            .groups
+            .iter()
+            .map(|g| g.upload_b_mix.narrow_bytes)
+            .sum();
+        let laned = stamps
+            .groups
+            .iter()
+            .fold(multilinear::gpu::LanedCopies::default(), |a, g| {
+                a.plus(&g.upload_b_laned)
+            });
+        (proof, tables, pinned_copies, narrow, laned)
     };
-    let (today, tables, none) = proved(1, false);
+    let (today, tables, none, _, one_lane) = proved(1, false);
     assert!(tables > 0, "phase B's uploads are named by kind");
     assert_eq!(none, 0, "no pinned argue read-back off");
+    assert_eq!(one_lane.copies, 0, "one lane takes no lane");
     for (lanes, pinned) in [(2, false), (1, true), (2, true)] {
-        let (got, _, copies) = proved(lanes, pinned);
+        let (got, _, copies, narrow, laned) = proved(lanes, pinned);
         if card && pinned {
             assert!(copies > 0, "lanes {lanes}: the argument read back pinned");
+        }
+        if card && lanes > 1 {
+            assert!(
+                laned.records_bytes > 0 && laned.narrow_bytes == narrow && laned.most_lanes >= 2,
+                "lanes {lanes}: the lanes carried {laned:?} (narrow bytes {narrow})"
+            );
         }
         if crypto::grinding::deterministic() {
             assert_eq!(

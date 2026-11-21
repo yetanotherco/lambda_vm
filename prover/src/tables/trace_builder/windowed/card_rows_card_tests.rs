@@ -166,6 +166,76 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
     );
 }
 
+/// A group's upload on 2, 3 and 4 copy lanes (`LAMBDA_VM_PHASE_B_COPY_STREAMS`)
+/// writes one lane's words, in `words` and `order`: records tables beside a
+/// narrow one, every copy taking a lane (the smallest laned copy set to 0
+/// here). Each pass says the lanes carried both narrow bytes and records, on
+/// more than one lane, so lanes that took nothing cannot pass.
+#[test]
+fn card_rows_uploads_on_copy_lanes_write_one_lanes_words() {
+    use multilinear::gpu::with_copy_lanes_tallied;
+    struct Min;
+    impl Drop for Min {
+        fn drop(&mut self) {
+            math_cuda::columns::set_lane_copy_min_bytes_for_test(None);
+        }
+    }
+    let _reset = Reset::new();
+    let _min = Min;
+    math_cuda::columns::set_lane_copy_min_bytes_for_test(Some(0));
+    let max_rows = MaxRowsConfig {
+        load: 1 << 2,
+        store: 1 << 2,
+        ..MaxRowsConfig::small()
+    };
+    let small: Vec<Vec<u64>> = (0..5u64)
+        .map(|k| (0..1u64 << 12).map(|i| (i * 13 + k) & 0x3ff).collect())
+        .collect();
+    let small_refs: Vec<&[u64]> = small.iter().map(Vec::as_slice).collect();
+    let packed = multilinear::narrow::NarrowColumns::pack_par(&small_refs).expect("packs");
+    let mut checked = 0usize;
+    for name in ["all_loadstore_32", "test_keccak_multi"] {
+        let (program, _) = run(name);
+        let chunks = records_chunks(&program, &[], &max_rows, 33, (0, None), true);
+        for group in grouped(&chunks, 6) {
+            let mut tables: Vec<TableColumns<'_, F>> =
+                group.iter().map(|r| TableColumns::Records(r)).collect();
+            tables.insert(tables.len() / 2, TableColumns::Narrow(&packed));
+            for mode in [Mode::Words, Mode::Order] {
+                card_rows::set_mode_override(Some(mode));
+                card_rows::clear();
+                let (one, none) = with_copy_lanes_tallied(1, || {
+                    upload_tables(&tables).and_then(|store| store.download())
+                });
+                let one = one.unwrap_or_else(|| panic!("{name} {mode:?}: one lane declined"));
+                assert_eq!(none.copies, 0, "{name} {mode:?}: one lane took the lanes");
+                for lanes in [2usize, 3, 4] {
+                    card_rows::clear();
+                    let (many, laned) = with_copy_lanes_tallied(lanes, || {
+                        upload_tables(&tables).and_then(|store| store.download())
+                    });
+                    let many =
+                        many.unwrap_or_else(|| panic!("{name} {mode:?}: {lanes} lanes declined"));
+                    let (count, first) = mismatches(&many, &one);
+                    assert_eq!(
+                        count, 0,
+                        "{name} {mode:?} on {lanes} lanes: {count} words differ, the first at {first:?}"
+                    );
+                    assert!(
+                        laned.narrow_bytes == packed.data().len() as u64
+                            && laned.records_bytes > 0
+                            && laned.most_lanes >= 2,
+                        "{name} {mode:?} on {lanes} lanes: the lanes carried {laned:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    println!("CARD ROWS COPY LANES: {checked} uploads on 2, 3 and 4 lanes hold one lane's words");
+    assert!(checked > 0, "no group checked");
+}
+
 /// The real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) at the production
 /// heights: the hand-out's chunks up to its first LOAD and STORE chunks and
 /// `CARD_ROWS_EXTRA_CHUNKS` (default 24) more, in groups of ten in hand-out

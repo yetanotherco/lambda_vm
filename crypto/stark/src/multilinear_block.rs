@@ -187,6 +187,10 @@ pub struct GroupStamps {
     /// wide (eight bytes a cell), narrow (packed, widened on the card) or as
     /// records (filled on the card) — its tables and bytes.
     pub upload_b_mix: UploadMix,
+    /// What of that upload went up on the copy lanes
+    /// (`LAMBDA_VM_PHASE_B_COPY_STREAMS` above 1): copies, bytes by kind,
+    /// the lanes' wall seconds and the most lanes used; zero on one lane.
+    pub upload_b_laned: multilinear::gpu::LanedCopies,
     pub argue: f64,
     pub encode: f64,
     pub open: f64,
@@ -3842,15 +3846,18 @@ pub fn phase_b_copy_streams() -> usize {
     })
 }
 
-/// [`upload_group`] as phase B makes it: on [`phase_b_copy_streams`] lanes.
-fn upload_group_phase_b<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
+/// [`upload_group`] as phase B makes it: on [`phase_b_copy_streams`] lanes,
+/// with what went up on them.
+fn upload_group_phase_b<F, E>(
+    group: &[CommittedTable<'_, F, E>],
+) -> (Store, multilinear::gpu::LanedCopies)
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    multilinear::gpu::with_copy_lanes(phase_b_copy_streams(), || upload_group(group))
+    multilinear::gpu::with_copy_lanes_tallied(phase_b_copy_streams(), || upload_group(group))
 }
 
 /// Uploads a group's columns, in table order — a narrow table's packed, and
@@ -5130,7 +5137,7 @@ where
     // The next group's columns, uploaded during this group's argument — the
     // card idles through the argument's host glue, and a group's store is a
     // few GiB beside the argument's working set, not beside its codewords.
-    let mut pre_uploaded: Option<Store> = None;
+    let mut pre_uploaded: Option<(Store, multilinear::gpu::LanedCopies)> = None;
     // The finished groups' records go to a thread of their own (under a spill,
     // the only time phase B lets them go).
     let returner = spill.is_some().then(RecordsReturner::start);
@@ -5209,11 +5216,12 @@ where
         })?;
 
         let t = Instant::now();
-        let store = match pre_uploaded.take() {
-            Some(store) => store,
+        let (store, laned) = match pre_uploaded.take() {
+            Some(up) => up,
             None => upload_group_phase_b(&tables[at..at + size]),
         };
         stamps[g].upload_b_mix = upload_mix(&tables[at..at + size]);
+        stamps[g].upload_b_laned = laned;
         if let Some(store) = &store {
             let mut first = 0usize;
             for table in tables[at..at + size].iter_mut() {

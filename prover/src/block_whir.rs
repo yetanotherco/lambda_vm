@@ -3394,6 +3394,23 @@ impl BlockStamps {
                 stark::multilinear_block::phase_b_copy_streams(),
                 multilinear::gpu::argue_pinned_copies(),
             ));
+            // What of those uploads went up on more than one copy lane.
+            let laned = self
+                .groups
+                .iter()
+                .fold(multilinear::gpu::LanedCopies::default(), |a, g| {
+                    a.plus(&g.upload_b_laned)
+                });
+            out.push_str(&format!(
+                "BLOCK PHASE-B LANES: copies {} · wide {:.3} GB · narrow {:.3} GB · records {:.3} GB · lanes wall {:.3}s · most lanes {} · groups laned {}\n",
+                laned.copies,
+                gb(laned.wide_bytes),
+                gb(laned.narrow_bytes),
+                gb(laned.records_bytes),
+                laned.wall_secs,
+                laned.most_lanes,
+                self.groups.iter().filter(|g| g.upload_b_laned.copies > 0).count(),
+            ));
         }
         if !self.build_marks.is_empty() {
             let marks: Vec<String> = self

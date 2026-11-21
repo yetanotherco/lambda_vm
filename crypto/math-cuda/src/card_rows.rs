@@ -982,9 +982,14 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     let mut offsets = Vec::with_capacity(tables.len());
     let lanes = crate::columns::copy_lanes();
     let mut deferred: crate::columns::WideCopies<'_> = Vec::new();
+    // Under more than one lane, the narrow tables' packed bytes and the
+    // records' large copies too: their ranges allocated here, their copies
+    // made on the lanes before pass 2.
+    let mut raw: crate::columns::RawCopies<'_> = Vec::new();
+    let mut packed_up: Vec<Option<CudaSlice<u8>>> = Vec::with_capacity(tables.len());
     for (table, plan) in tables.iter().zip(&plans) {
         offsets.push(at);
-        let (mut s, mut l, mut r) = (None, None, None);
+        let (mut s, mut l, mut r, mut p) = (None, None, None, None);
         match (table, plan) {
             (TableUpload::Wide(columns), _) => {
                 for column in columns.iter() {
@@ -1001,9 +1006,14 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 staged.push(None);
                 lists.push(None);
                 registers_up.push(None);
+                packed_up.push(None);
                 continue;
             }
-            (TableUpload::Narrow(_), _) => {}
+            (TableUpload::Narrow(packed), _) => {
+                if lanes > 1 {
+                    p = crate::narrow::stage_packed(&stream, *packed, &mut raw).ok()?;
+                }
+            }
             (
                 TableUpload::Records(RecordsInput::Cpu {
                     decode,
@@ -1099,7 +1109,8 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 if matches!(records, RecordsInput::Cpu { .. }) && derive {
                     add(&counters().cpu_copies, 1);
                 }
-                s = Some(crate::fill::stage(&stream, *records).ok()?);
+                let sink = (lanes > 1).then_some(&mut raw);
+                s = Some(crate::fill::stage_with(&stream, *records, sink).ok()?);
             }
         }
         let (rows, cols) = match table {
@@ -1112,6 +1123,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         staged.push(s);
         lists.push(l);
         registers_up.push(r);
+        packed_up.push(p);
     }
 
     // The derived launches' descriptors: the cache's entries and this group's
@@ -1219,23 +1231,32 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         .then(|| stream.clone_htod(&register_descs).ok())
         .flatten();
 
-    // The wide columns' copies deferred to more than one lane go up now, and
-    // pass 2 waits for them on `stream`.
-    crate::columns::copy_wide_lanes(&stream, &mut buffer, deferred, lanes)?;
+    // The copies deferred to more than one lane (wide columns, packed bytes,
+    // records) go up now, and pass 2 waits for them on `stream`.
+    let mut copies = crate::columns::wide_as_raw(&stream, &mut buffer, deferred);
+    copies.append(&mut raw);
+    crate::columns::copy_raw_lanes(&stream, copies, lanes)?;
 
     // ---- pass 2: every kernel ----
     // `LAMBDA_VM_CARD_UPLOAD_TIMES=1` times each kernel here (its copy was
     // made in pass 1), and a derived family's launch as one table.
     let mut clocks = Vec::new();
-    for ((table, s), &offset) in tables.iter().zip(&staged).zip(&offsets) {
+    for (((table, s), &offset), up) in tables.iter().zip(&staged).zip(&offsets).zip(&packed_up) {
         match table {
             TableUpload::Wide(_) => {}
             TableUpload::Narrow(packed) => {
                 let (rows, cols) = (packed.rows(), packed.cols());
                 let mut slab = buffer.slice_mut(offset..offset + rows * cols);
                 let clock = TableClock::start(&stream, false);
-                crate::narrow::widen_col_major_into(&stream, be, *packed, rows, cols, &mut slab)
-                    .ok()?;
+                match up {
+                    Some(data) => crate::narrow::widen_col_major_from(
+                        &stream, be, data, *packed, rows, cols, &mut slab,
+                    ),
+                    None => crate::narrow::widen_col_major_into(
+                        &stream, be, *packed, rows, cols, &mut slab,
+                    ),
+                }
+                .ok()?;
                 clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
             }
             TableUpload::Records(records) => {
