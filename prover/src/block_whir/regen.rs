@@ -656,7 +656,7 @@ impl Recorder {
 
     /// Phase A commits the streamed chunks in another order than the
     /// hand-out's: each group's places are noted as it closes
-    /// ([`Self::committed`]) and [`Self::handout_place`] reads them.
+    /// ([`Self::committed`]) and [`Self::handout_place_of`] reads them.
     pub(crate) fn commits_out_of_order(&self) {
         self.lock().block_ranks.get_or_insert_with(Vec::new);
     }
@@ -670,13 +670,15 @@ impl Recorder {
         }
     }
 
-    /// The hand-out place of the table at block index `t`: `t` itself when
-    /// phase A commits the streamed chunks in hand-out order, else what its
-    /// group noted (`None`: not a streamed chunk, or not closed yet).
-    pub(crate) fn handout_place(&self, t: usize) -> Option<usize> {
+    /// The hand-out place of the table phase A holds at `place` in its order
+    /// of tables, whose block index is `t`: `t` itself when phase A commits
+    /// the streamed chunks in hand-out order, else what its group noted at
+    /// `place` (the groups' places are noted in phase A's order; `None`: not a
+    /// streamed chunk, or not closed yet).
+    pub(crate) fn handout_place_of(&self, place: usize, t: usize) -> Option<usize> {
         match &self.lock().block_ranks {
             None => Some(t),
-            Some(ranks) => ranks.get(t).copied().flatten(),
+            Some(ranks) => ranks.get(place).copied().flatten(),
         }
     }
 
