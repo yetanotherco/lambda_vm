@@ -119,6 +119,52 @@ pub enum PoolClass {
     ExecLogs,
 }
 
+/// `LAMBDA_VM_POOL_ARENA`: how a scope picks its shared arena. Unset, empty or
+/// `slot` (the default): the thread's turn ([`thread_slot`]), as before. `class`:
+/// the allocation's jemalloc size class, whatever thread asks, so a request of
+/// a size goes to the arena where that size was last freed, and a prove's new
+/// threads take the last prove's freed buffers again instead of carving more
+/// of the pool. Any other word reads as the default. Read once a process.
+pub const POOL_ARENA_ENV: &str = "LAMBDA_VM_POOL_ARENA";
+
+/// [`POOL_ARENA_ENV`]'s word: whether it picks by size class.
+pub fn pool_arena_by_class_word(word: Option<&str>) -> bool {
+    word.is_some_and(|w| w.trim() == "class")
+}
+
+/// A test's [`pool_arena_by_class`], process wide (0 the knob, 1 slot, 2 class).
+static ARENA_BY_CLASS_FOR_TEST: AtomicU32 = AtomicU32::new(0);
+
+/// Tests only: [`pool_arena_by_class`] forced for the whole process (`None`
+/// gives the knob back).
+#[doc(hidden)]
+pub fn set_pool_arena_by_class_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    ARENA_BY_CLASS_FOR_TEST.store(v, Ordering::Relaxed);
+}
+
+/// Whether scopes pick their shared arena by size class ([`POOL_ARENA_ENV`]).
+pub fn pool_arena_by_class() -> bool {
+    match ARENA_BY_CLASS_FOR_TEST.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pool_arena_by_class_word(std::env::var(POOL_ARENA_ENV).ok().as_deref()))
+}
+
+/// The shared arena for an allocation of `bytes` under the size-class choice:
+/// its jemalloc size class ([`usable`]), spread over the [`ARENAS`].
+fn class_slot(bytes: usize) -> usize {
+    let class = usable(bytes);
+    (class.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % ARENAS
+}
+
 /// Binds this thread to one of the shared arenas for an allocation of
 /// `bytes` ([`PoolClass::Shared`]).
 pub fn scope(bytes: usize) -> Scope {
@@ -137,6 +183,7 @@ pub fn scope_in(class: PoolClass, bytes: usize) -> Scope {
         return Scope(None);
     }
     let mine = match class {
+        PoolClass::Shared if pool_arena_by_class() => arenas.ids[class_slot(bytes)],
         PoolClass::Shared => arenas.ids[thread_slot() % ARENAS],
         PoolClass::ExecLogs => arenas.logs,
     };
@@ -1510,6 +1557,214 @@ mod tests {
         assert!(
             mine <= one,
             "per thread {mine:.2} ns against one shared add {one:.2} ns"
+        );
+    }
+
+    /// One round of `sizes.len()` new threads, each taking one scoped
+    /// allocation of its size from a shared arena; freed after every thread
+    /// took its own. The addresses, sorted.
+    fn round_of_new_threads(sizes: &[usize]) -> Vec<usize> {
+        let ptrs: Vec<(usize, usize)> = sizes
+            .iter()
+            .map(|&bytes| {
+                std::thread::spawn(move || {
+                    let ptr = {
+                        let _scope = scope(bytes);
+                        take(bytes)
+                    };
+                    assert!(is_pinned(ptr.cast(), bytes), "in the pool");
+                    (ptr as usize, bytes)
+                })
+                .join()
+                .expect("a thread")
+            })
+            .collect();
+        for &(at, bytes) in &ptrs {
+            give(at as *mut c_void, bytes);
+        }
+        let mut at: Vec<usize> = ptrs.iter().map(|&(a, _)| a).collect();
+        at.sort_unstable();
+        at
+    }
+
+    /// The tests that move the process-wide arena choice, one at a time.
+    static ARENA_CHOICE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the knob's choice however a test ends.
+    struct ArenaChoice;
+    impl Drop for ArenaChoice {
+        fn drop(&mut self) {
+            set_pool_arena_by_class_for_test(None);
+        }
+    }
+
+    /// The knob's words: `class` alone picks by size class.
+    #[test]
+    fn the_pool_arena_knob_is_named_and_by_thread_by_default() {
+        assert_eq!(POOL_ARENA_ENV, "LAMBDA_VM_POOL_ARENA");
+        for (word, class) in [
+            (None, false),
+            (Some(""), false),
+            (Some("slot"), false),
+            (Some("1"), false),
+            (Some("class"), true),
+            (Some(" class "), true),
+        ] {
+            assert_eq!(pool_arena_by_class_word(word), class, "{word:?}");
+        }
+    }
+
+    /// By size class, a second round of new threads (as a prove's next run
+    /// is) takes the first round's freed buffers, address for address; by
+    /// thread slot (today's choice, the mutant here) the new threads bind to
+    /// other arenas and some carve more of the pool.
+    #[test]
+    fn by_size_class_new_threads_take_the_last_rounds_freed_buffers_and_by_slot_they_do_not() {
+        let _ = on();
+        let _one = ARENA_CHOICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ArenaChoice;
+        // Sizes no other test here asks for, five (not a multiple of the
+        // arenas, so a round of new threads shifts every slot).
+        let sizes: Vec<usize> = [21usize, 23, 27, 29, 31]
+            .iter()
+            .map(|m| (m << 20) + 4096)
+            .collect();
+        set_pool_arena_by_class_for_test(Some(true));
+        let first = round_of_new_threads(&sizes);
+        let second = round_of_new_threads(&sizes);
+        assert_eq!(
+            second, first,
+            "by size class: the freed buffers taken again"
+        );
+        set_pool_arena_by_class_for_test(Some(false));
+        let third = round_of_new_threads(&sizes);
+        let fourth = round_of_new_threads(&sizes);
+        let fresh = fourth.iter().filter(|a| !third.contains(a)).count();
+        assert!(
+            fresh > 0,
+            "by thread slot: new threads took none from other arenas: {third:?} {fourth:?}"
+        );
+    }
+
+    /// By size class, many threads asking for one size at once (one arena)
+    /// still get disjoint extents of the pool, each holding its own bytes.
+    #[test]
+    fn by_size_class_same_size_requests_at_once_never_share_the_pools_bytes() {
+        let _ = on();
+        let _one = ARENA_CHOICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ArenaChoice;
+        set_pool_arena_by_class_for_test(Some(true));
+        let bytes = (5 << 20) + 8192;
+        let threads = 2 * ARENAS;
+        let per = 4usize;
+        let barrier = std::sync::Barrier::new(threads);
+        let got: Vec<Vec<(usize, usize)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        barrier.wait();
+                        let mut mine = Vec::new();
+                        for k in 0..per {
+                            let ptr = {
+                                let _scope = scope(bytes);
+                                take(bytes)
+                            };
+                            assert!(is_pinned(ptr.cast(), bytes), "thread {t} allocation {k}");
+                            // SAFETY: `bytes` bytes of a live allocation.
+                            unsafe {
+                                std::ptr::write_bytes(ptr.cast::<u8>(), (t * per + k) as u8, bytes)
+                            };
+                            mine.push((ptr as usize, t * per + k));
+                        }
+                        barrier.wait();
+                        for &(at, tag) in &mine {
+                            // SAFETY: as written above, freed below.
+                            let all = unsafe { std::slice::from_raw_parts(at as *const u8, bytes) };
+                            assert!(all.iter().all(|&b| b == tag as u8), "thread {t}'s bytes");
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a thread"))
+                .collect()
+        });
+        let mut spans: Vec<usize> = got.iter().flatten().map(|&(at, _)| at).collect();
+        spans.sort_unstable();
+        for w in spans.windows(2) {
+            assert!(w[0] + bytes <= w[1], "two allocations overlap");
+        }
+        assert_eq!(spans.len(), threads * per);
+        for &(at, _) in got.iter().flatten() {
+            give(at as *mut c_void, bytes);
+        }
+    }
+
+    /// The size-class choice's cost under contention: `threads` threads each
+    /// taking and freeing `rounds` scoped allocations of one size at once, by
+    /// size class (one arena for all) and by thread slot (spread over the
+    /// arenas). Prints both walls (best of five) and each choice's cost a
+    /// take-and-free; fails when the class choice's costs more than 20 µs (an
+    /// absolute bound: one arena's lock under 16 threads is slower than eight
+    /// arenas', and what matters is that it stays negligible against the
+    /// fills these allocations are for). Timing: run alone.
+    #[test]
+    #[ignore = "timing: run alone"]
+    fn by_size_class_same_size_contention_costs_no_more_than_by_slot() {
+        let _ = on();
+        let _one = ARENA_CHOICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ArenaChoice;
+        let threads = 16usize;
+        let rounds = 200usize;
+        let mut report = Vec::new();
+        for bytes in [1usize << 20, 8 << 20, 64 << 20] {
+            let wall = |class: bool| {
+                set_pool_arena_by_class_for_test(Some(class));
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let barrier = std::sync::Barrier::new(threads);
+                    let t = Instant::now();
+                    std::thread::scope(|s| {
+                        for _ in 0..threads {
+                            let barrier = &barrier;
+                            s.spawn(move || {
+                                barrier.wait();
+                                for _ in 0..rounds {
+                                    let ptr = {
+                                        let _scope = scope(bytes);
+                                        take(bytes)
+                                    };
+                                    // SAFETY: a byte of a live allocation.
+                                    unsafe { ptr.cast::<u8>().write_volatile(1) };
+                                    give(ptr, bytes);
+                                }
+                            });
+                        }
+                    });
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                best
+            };
+            let (slot, class) = (wall(false), wall(true));
+            let ops = (threads * rounds) as f64;
+            let (slot_us, class_us) = (slot / ops * 1e6, class / ops * 1e6);
+            report.push(format!(
+                "{} MiB: slot {slot:.4} s ({slot_us:.2} µs a take-and-free), class {class:.4} s ({class_us:.2} µs, ×{:.1})",
+                bytes >> 20,
+                class / slot
+            ));
+            assert!(
+                class_us <= 20.0,
+                "{} MiB: {class_us:.2} µs a take-and-free by size class",
+                bytes >> 20
+            );
+        }
+        println!(
+            "POOL ARENA CONTENTION: {threads} threads × {rounds} take-and-free each · {}",
+            report.join(" · ")
         );
     }
 

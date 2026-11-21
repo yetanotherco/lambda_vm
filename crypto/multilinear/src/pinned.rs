@@ -17,6 +17,16 @@ pub fn with_pinned<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Whether the pool's scopes pick their arena by size class
+/// (`LAMBDA_VM_POOL_ARENA=class`, `math_cuda::pinned::pool_arena_by_class`);
+/// `false` without the card.
+pub fn arena_by_class() -> bool {
+    #[cfg(feature = "cuda")]
+    return math_cuda::pinned::pool_arena_by_class();
+    #[cfg(not(feature = "cuda"))]
+    false
+}
+
 /// [`with_pinned`] for the executor's window buffers: their allocation comes
 /// from the pool's arena of their own (`math_cuda::pinned::PoolClass::ExecLogs`),
 /// whatever thread makes it, so a buffer freed after one run is the next run's
