@@ -715,8 +715,10 @@ mod scan {
                     "pub fn checked_base(",
                     "pub fn block_statement_tag(",
                     "pub fn prove_block_whir(",
-                    "pub fn verify_block_whir(",
-                    "fn verify_block_whir_with(",
+                    // Generic over the proof's kind (today's, or one that
+                    // carries every group's local argue).
+                    "pub fn verify_block_whir<L: LocalPart>(",
+                    "pub(crate) fn verify_block_whir_with<L: LocalPart>(",
                 ],
                 sites: &[],
                 forbidden: &[],
@@ -843,6 +845,14 @@ fn the_block_path_scan_refuses_planted_regressions() {
         "#[cfg(test)]\npub fn verify_whir_block_tree_proof(",
     )
     .expect_err("a gated entry point");
+    assert!(e.contains("does not reach"), "{e}");
+    // A test gate that would hide the block's verifier, of either kind.
+    let e = planted(
+        "block_whir.rs",
+        "pub fn verify_block_whir<L: LocalPart>(",
+        "#[cfg(test)]\npub fn verify_block_whir<L: LocalPart>(",
+    )
+    .expect_err("a gated block verifier");
     assert!(e.contains("does not reach"), "{e}");
     // A test gate that would hide the check of the top against the derived
     // top program.
