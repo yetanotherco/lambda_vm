@@ -117,42 +117,45 @@ pub fn dword_hl(x: u64) -> [FE; 4] {
 /// `DWordHL`, and `DWordBL`, the final `L` means "little-endian limbs". Mixed
 /// encodings like `DWordWHH` and `DWordHHW` keep the spec's packing name, while
 /// still storing the low chunk first in the trace.
+// The per-cell writers below are always inlined: a generator writes every
+// cell through them, and whether a call a cell survived followed the crate's
+// code-unit split (the ECDAS rows: 15–24 % apart between two builds).
 pub trait VmTable {
     /// Write an already-constructed field element into one trace cell.
     fn set_fe(&mut self, row: usize, col: usize, value: FE);
 
     /// Convert `value` with `FE::from` and write it into one trace cell.
-    #[inline]
+    #[inline(always)]
     fn set_u64(&mut self, row: usize, col: usize, value: u64) {
         self.set_fe(row, col, FE::from(value));
     }
 
     /// Write a bit column as `0` or `1`.
-    #[inline]
+    #[inline(always)]
     fn set_bool(&mut self, row: usize, col: usize, value: bool) {
         self.set_u64(row, col, u64::from(value));
     }
 
     /// Write an 8-bit VM `Byte` column.
-    #[inline]
+    #[inline(always)]
     fn set_byte(&mut self, row: usize, col: usize, value: u8) {
         self.set_u64(row, col, u64::from(value));
     }
 
     /// Write a 16-bit VM `Half` column.
-    #[inline]
+    #[inline(always)]
     fn set_half(&mut self, row: usize, col: usize, value: u16) {
         self.set_u64(row, col, u64::from(value));
     }
 
     /// Write a 32-bit VM `Word` column.
-    #[inline]
+    #[inline(always)]
     fn set_word(&mut self, row: usize, col: usize, value: u32) {
         self.set_u64(row, col, u64::from(value));
     }
 
     /// Write contiguous `Byte` columns starting at `start_col`.
-    #[inline]
+    #[inline(always)]
     fn set_bytes(&mut self, row: usize, start_col: usize, values: &[u8]) {
         for (offset, &value) in values.iter().enumerate() {
             self.set_byte(row, start_col + offset, value);

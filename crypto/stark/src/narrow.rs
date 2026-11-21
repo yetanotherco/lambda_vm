@@ -395,7 +395,10 @@ impl NarrowRows<'_> {
 
     /// Write `word` into `row` (a row of this part, by the writer's index) of
     /// column `col`, as [`NarrowWriter::set`] does.
-    #[inline]
+    // Always inlined: a generator writes every cell through it, and a call a
+    // cell (or not) followed the crate's code-unit split (the ECDAS rows: 330
+    // calls a row in one build, a loop in another, 15–24 % apart).
+    #[inline(always)]
     pub fn set(&mut self, row: usize, col: usize, word: u64) {
         debug_assert!(
             self.range().contains(&row),
@@ -473,7 +476,8 @@ impl NarrowWriter {
 
     /// Write `word` into row `row` of column `col`: its low bytes, at the
     /// column's width (see [`NarrowWriter`] for a word that does not fit).
-    #[inline]
+    // Always inlined, as [`NarrowRows::set`].
+    #[inline(always)]
     pub fn set(&mut self, row: usize, col: usize, word: u64) {
         debug_assert!(row < self.rows, "NarrowWriter: row {row} of {}", self.rows);
         let column = &mut self.columns[col];

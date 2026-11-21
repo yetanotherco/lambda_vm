@@ -85,7 +85,9 @@ impl Default for WidthHint {
 
 /// The packed cells: the raw word of each element, as `NarrowMain` holds it.
 impl VmTable for NarrowWriter {
-    #[inline]
+    // Always inlined: a generator's every cell goes through it (see
+    // `stark::narrow::NarrowWriter::set`).
+    #[inline(always)]
     fn set_fe(&mut self, row: usize, col: usize, value: FE) {
         self.set(row, col, *value.value());
     }
@@ -93,7 +95,9 @@ impl VmTable for NarrowWriter {
 
 /// A part of a 64-bit table split by rows ([`generate_main_rows!`]).
 impl VmTable for TableRowsMut<'_, GoldilocksField> {
-    #[inline]
+    // Always inlined: a generator's every cell goes through it (see
+    // `stark::narrow::NarrowWriter::set`).
+    #[inline(always)]
     fn set_fe(&mut self, row: usize, col: usize, value: FE) {
         self.set(row, col, value);
     }
@@ -101,7 +105,9 @@ impl VmTable for TableRowsMut<'_, GoldilocksField> {
 
 /// A part of a packed writer split by rows ([`generate_main_rows!`]).
 impl VmTable for NarrowRows<'_> {
-    #[inline]
+    // Always inlined: a generator's every cell goes through it (see
+    // `stark::narrow::NarrowWriter::set`).
+    #[inline(always)]
     fn set_fe(&mut self, row: usize, col: usize, value: FE) {
         self.set(row, col, *value.value());
     }
