@@ -274,6 +274,9 @@ pub struct GroupStamps {
     /// peak through the commit (the next group's columns, uploaded beside it,
     /// included). Bytes; 0 without a device.
     pub commit_base: u64,
+    /// Under phase A's lane: the commit's growth of the ledger the lane
+    /// predicted as it began ([`zc_lane::LaneGrowth`]); 0 without a lane.
+    pub lane_predicted_growth: u64,
     pub commit_reserved: u64,
     /// The real card beside that ledger: what the memory pool held just before
     /// the group's commit and just after it
@@ -575,8 +578,9 @@ pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
 mod zc_lane;
 #[doc(hidden)]
 pub use zc_lane::{
-    LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, local_lane_lines, merge_probe_lines,
-    zc_lane_lines,
+    LANE_GROWTH_ENV, LANE_RESERVE_DEFAULT, LANE_RESERVE_ENV, LaneDefer, LaneGrowth, LaneLimits,
+    LaneState, MergeStamp, ZcLaneStamp, lane_growth_line, lane_limits_from_env,
+    lane_limits_setting, local_lane_lines, merge_probe_lines, shape_slack, zc_lane_lines,
 };
 
 /// The label that opens a group's probe transcript ([`CsProbe`]): no proof's
@@ -2946,16 +2950,18 @@ where
             let committed = if upload_ahead {
                 // Whether the next group (or the producer's end) has come.
                 let next_came = std::sync::atomic::AtomicBool::new(false);
+                let predicted_growth = std::sync::atomic::AtomicU64::new(0);
                 let (committed, next) = std::thread::scope(|scope| {
                     let (room_tx, room_rx) = std::sync::mpsc::channel::<()>();
                     let columns = &columns;
+                    let (shape, predicted_growth) = (shapes.as_slice(), &predicted_growth);
                     let (group_ref, next_came) = (&group, &next_came);
                     let committer = scope.spawn(move || {
                         let signal = move || {
                             let _ = room_tx.send(());
                         };
                         if let Some(lane) = lane {
-                            lane.commit_begins(group_index);
+                            predicted_growth.store(lane.commit_begins(group_index, shape), Relaxed);
                         }
                         let committed = commit_and_retire::<F, E, H, T, _>(
                             group_index,
@@ -2981,6 +2987,7 @@ where
                             if let Ok(done) = &committed {
                                 lane.submit(
                                     group_index,
+                                    shape,
                                     group_ref,
                                     &done.roots,
                                     probe_on_card,
@@ -3091,6 +3098,7 @@ where
                     });
                     (committed, next)
                 });
+                stamp.lane_predicted_growth = predicted_growth.load(Relaxed);
                 exhausted = next.is_none();
                 ahead = next;
                 committed
@@ -3141,7 +3149,10 @@ where
             stamp.commit_host_fallbacks =
                 multilinear::gpu::host_fallbacks().saturating_sub(fallbacks_before);
             if let Some(lane) = lane {
-                lane.note_growth(stamp.commit_reserved.saturating_sub(stamp.commit_base));
+                lane.note_growth(
+                    &shapes,
+                    stamp.commit_reserved.saturating_sub(stamp.commit_base),
+                );
             }
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
