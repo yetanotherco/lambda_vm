@@ -3360,6 +3360,41 @@ impl BlockStamps {
             sum(|g| g.ood),
             ood_max,
         ));
+        {
+            // Phase B's uploads by how each table goes up, and the heaviest
+            // groups' wide bytes; the argue's read-backs through pinned
+            // staging (`LAMBDA_VM_PHASE_B_ARGUE_PINNED`).
+            let mix = |f: &dyn Fn(&stark::multilinear_block::UploadMix) -> u64| -> u64 {
+                self.groups.iter().map(|g| f(&g.upload_b_mix)).sum()
+            };
+            let gb = |b: u64| b as f64 / 1e9;
+            let mut heavy: Vec<(usize, u64)> = self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(g, s)| (g, s.upload_b_mix.wide_bytes))
+                .collect();
+            heavy.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
+            let top: Vec<String> = heavy
+                .iter()
+                .take(4)
+                .filter(|&&(_, b)| b > 0)
+                .map(|&(g, b)| format!("{g}:{:.2}", gb(b)))
+                .collect();
+            out.push_str(&format!(
+                "BLOCK PHASE-B UPLOADS: wide {} tables {:.3} GB · narrow {} tables {:.3} GB packed of {:.3} GB words · records {} tables {:.3} GB · heaviest wide groups (GB) {} · copy streams {} · argue read-backs pinned {}\n",
+                mix(&|m| m.wide_tables as u64),
+                gb(mix(&|m| m.wide_bytes)),
+                mix(&|m| m.narrow_tables as u64),
+                gb(mix(&|m| m.narrow_bytes)),
+                gb(mix(&|m| m.narrow_words)),
+                mix(&|m| m.records_tables as u64),
+                gb(mix(&|m| m.records_bytes)),
+                if top.is_empty() { "none".to_string() } else { top.join(" ") },
+                stark::multilinear_block::phase_b_copy_streams(),
+                multilinear::gpu::argue_pinned_copies(),
+            ));
+        }
         if !self.build_marks.is_empty() {
             let marks: Vec<String> = self
                 .build_marks

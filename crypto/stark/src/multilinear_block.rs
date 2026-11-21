@@ -183,6 +183,10 @@ pub struct GroupStamps {
     /// Phase B: the columns up again, the tables' arguments, the codewords
     /// recomputed, the opening.
     pub upload_b: f64,
+    /// Phase B's upload of the group's columns, by how each table goes up:
+    /// wide (eight bytes a cell), narrow (packed, widened on the card) or as
+    /// records (filled on the card) — its tables and bytes.
+    pub upload_b_mix: UploadMix,
     pub argue: f64,
     pub encode: f64,
     pub open: f64,
@@ -3757,6 +3761,98 @@ where
 /// A group's columns on the card, shared by its tables.
 type Store = Option<Arc<multilinear::gpu::ResidentColumns>>;
 
+/// How a group's tables go up to the card ([`GroupStamps::upload_b_mix`]):
+/// tables and host bytes by kind; a narrow table's packed bytes and the words
+/// they widen to.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UploadMix {
+    pub wide_tables: usize,
+    pub wide_bytes: u64,
+    pub narrow_tables: usize,
+    pub narrow_bytes: u64,
+    pub narrow_words: u64,
+    pub records_tables: usize,
+    pub records_bytes: u64,
+}
+
+/// [`UploadMix`] of `group`, from the views its upload takes; nothing moves.
+fn upload_mix<F, E>(group: &[CommittedTable<'_, F, E>]) -> UploadMix
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let mut mix = UploadMix::default();
+    for table in group {
+        match table.upload_view() {
+            multilinear::gpu::TableColumns::Wide(columns) => {
+                mix.wide_tables += 1;
+                mix.wide_bytes += columns.iter().map(|c| c.len() as u64 * 8).sum::<u64>();
+            }
+            multilinear::gpu::TableColumns::Narrow(packed) => {
+                mix.narrow_tables += 1;
+                mix.narrow_bytes += packed.data().len() as u64;
+                mix.narrow_words += (packed.rows() * packed.cols()) as u64 * 8;
+            }
+            multilinear::gpu::TableColumns::Records(records) => {
+                mix.records_tables += 1;
+                mix.records_bytes += records.bytes() as u64;
+            }
+        }
+    }
+    mix
+}
+
+/// `LAMBDA_VM_PHASE_B_COPY_STREAMS=<2..4>`: phase B's per-group uploads copy
+/// their wide columns on that many streams at once, each from a thread of
+/// its own (`multilinear::gpu::with_copy_lanes`). Unset, `1` or any other word
+/// is one stream, today's. The same words at the same places. Read once a
+/// process.
+pub const PHASE_B_COPY_STREAMS_ENV: &str = "LAMBDA_VM_PHASE_B_COPY_STREAMS";
+
+/// [`PHASE_B_COPY_STREAMS_ENV`]'s word: `2` to `4` lanes, else one.
+pub fn phase_b_copy_streams_word(word: Option<&str>) -> usize {
+    word.map(str::trim)
+        .and_then(|w| w.parse::<usize>().ok())
+        .filter(|n| (2..=4).contains(n))
+        .unwrap_or(1)
+}
+
+/// A test's [`phase_b_copy_streams`], process wide (`0`: the knob).
+static PHASE_B_COPY_STREAMS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Tests only: [`phase_b_copy_streams`] forced for the whole process (`None`
+/// restores the knob). A test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_phase_b_copy_streams_for_test(lanes: Option<usize>) {
+    PHASE_B_COPY_STREAMS_FOR_TEST.store(lanes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`PHASE_B_COPY_STREAMS_ENV`]'s lanes.
+pub fn phase_b_copy_streams() -> usize {
+    match PHASE_B_COPY_STREAMS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        lanes => return lanes,
+    }
+    static LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LANES.get_or_init(|| {
+        phase_b_copy_streams_word(std::env::var(PHASE_B_COPY_STREAMS_ENV).ok().as_deref())
+    })
+}
+
+/// [`upload_group`] as phase B makes it: on [`phase_b_copy_streams`] lanes.
+fn upload_group_phase_b<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    multilinear::gpu::with_copy_lanes(phase_b_copy_streams(), || upload_group(group))
+}
+
 /// Uploads a group's columns, in table order — a narrow table's packed, and
 /// widened on the card; `None` when the card declines (every reader then takes
 /// the host copy, widening a narrow table's there).
@@ -5115,8 +5211,9 @@ where
         let t = Instant::now();
         let store = match pre_uploaded.take() {
             Some(store) => store,
-            None => upload_group(&tables[at..at + size]),
+            None => upload_group_phase_b(&tables[at..at + size]),
         };
+        stamps[g].upload_b_mix = upload_mix(&tables[at..at + size]);
         if let Some(store) = &store {
             let mut first = 0usize;
             for table in tables[at..at + size].iter_mut() {
@@ -5165,7 +5262,7 @@ where
         let answers_ref = &answers;
         let (argue_result, argue_end, next_store, joined, opened, open_paid) =
             std::thread::scope(|scope| {
-                let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
+                let uploader = next.map(|next| scope.spawn(move || upload_group_phase_b(next)));
                 let opener = prev.as_mut().map(|earlier| {
                     let its_tables = &all[earlier.at..earlier.at + earlier.size];
                     scope.spawn(move || -> Result<Opened<F, E>, MlError> {

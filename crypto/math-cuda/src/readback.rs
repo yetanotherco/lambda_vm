@@ -28,6 +28,52 @@ static PINNED: AtomicBool = AtomicBool::new(false);
 static PINNED_COPIES: AtomicU64 = AtomicU64::new(0);
 static PAGEABLE_COPIES: AtomicU64 = AtomicU64::new(0);
 static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+static ARGUE_PINNED_COPIES: AtomicU64 = AtomicU64::new(0);
+
+/// `LAMBDA_VM_PHASE_B_ARGUE_PINNED=1`: while [`pinned`] is on (phase B under
+/// its default overlap), every thread reads back through pinned staging, the
+/// argument's own thread too, not only the background class. The argument's
+/// round trips then leave the driver's pageable path as the openings' did.
+/// Off by default (and for any word but `1`). The bytes are the same either
+/// way. Read once a process.
+pub const ARGUE_PINNED_ENV: &str = "LAMBDA_VM_PHASE_B_ARGUE_PINNED";
+
+/// [`ARGUE_PINNED_ENV`]'s word: on only for `1`.
+pub fn argue_pinned_word(word: Option<&str>) -> bool {
+    word.is_some_and(|w| w.trim() == "1")
+}
+
+/// A test's [`argue_pinned`], process wide (0 the knob, 1 off, 2 on).
+static ARGUE_PINNED_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`argue_pinned`] forced for the whole process (`None` restores
+/// the knob). A test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_argue_pinned_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    ARGUE_PINNED_FOR_TEST.store(v, Ordering::Relaxed);
+}
+
+/// Whether [`ARGUE_PINNED_ENV`] is on.
+pub fn argue_pinned() -> bool {
+    match ARGUE_PINNED_FOR_TEST.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| argue_pinned_word(std::env::var(ARGUE_PINNED_ENV).ok().as_deref()))
+}
+
+/// Read-backs of threads outside the background class that went through
+/// pinned staging under [`ARGUE_PINNED_ENV`], process wide.
+pub fn argue_pinned_copies() -> u64 {
+    ARGUE_PINNED_COPIES.load(Ordering::Relaxed)
+}
 
 /// Buffers threads gave back, for the next thread to take.
 static POOL: Mutex<Vec<Staging>> = Mutex::new(Vec::new());
@@ -77,6 +123,10 @@ pub fn pinned_bytes() -> u64 {
 /// background-class read-back either way.
 fn through_staging() -> bool {
     if stream_class::current() != StreamClass::Background {
+        if argue_pinned() && PINNED.load(Ordering::Acquire) {
+            ARGUE_PINNED_COPIES.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         return false;
     }
     let pinned = PINNED.load(Ordering::Acquire);
@@ -296,5 +346,26 @@ mod tests {
         assert!(!background());
         let after = background_copies();
         assert_eq!((after.0 - before.0, after.1 - before.1), (1, 2));
+    }
+}
+
+#[cfg(test)]
+mod argue_pinned_tests {
+    use super::{ARGUE_PINNED_ENV, argue_pinned_word};
+
+    /// The argue-pinned knob's name; only `1` turns it on.
+    #[test]
+    fn the_argue_pinned_knob_is_named_and_on_for_one_alone() {
+        assert_eq!(ARGUE_PINNED_ENV, "LAMBDA_VM_PHASE_B_ARGUE_PINNED");
+        for (word, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("on"), false),
+            (Some("1"), true),
+            (Some(" 1 "), true),
+        ] {
+            assert_eq!(argue_pinned_word(word), on, "{word:?}");
+        }
     }
 }

@@ -152,6 +152,106 @@ pub struct DeviceColumns {
     _room: DeviceReservation,
 }
 
+std::thread_local! {
+    /// The copy lanes this thread's wide uploads take ([`with_copy_lanes`]).
+    static COPY_LANES: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+/// Runs `f` with this thread's table uploads copying their wide columns on
+/// `lanes` streams at once (`1`, the default: one stream, one copy after
+/// another). Each lane is a thread of its own, since a copy from pageable
+/// memory returns only once the driver has staged it. The same words at the
+/// same places.
+pub fn with_copy_lanes<R>(lanes: usize, f: impl FnOnce() -> R) -> R {
+    let before = COPY_LANES.with(|c| c.replace(lanes.max(1)));
+    let out = f();
+    COPY_LANES.with(|c| c.set(before));
+    out
+}
+
+/// This thread's copy lanes ([`with_copy_lanes`]).
+pub(crate) fn copy_lanes() -> usize {
+    COPY_LANES.with(std::cell::Cell::get)
+}
+
+/// Wide columns' copies, `(word offset in the buffer, the column)`, deferred
+/// by an upload under more than one copy lane.
+pub(crate) type WideCopies<'a> = Vec<(usize, &'a [u64])>;
+
+/// Queues `copies` into `buffer` on `lanes` streams at once: the first lane on
+/// `stream` from this thread, every other on a stream and a thread of its
+/// own that waits for what `stream` had queued before (the buffer's
+/// allocation), and `stream` then waits for every lane, so what it runs next
+/// sees every word. The columns split by their words, the largest first.
+/// `None` when a copy fails.
+pub(crate) fn copy_wide_lanes(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<u64>,
+    copies: WideCopies<'_>,
+    lanes: usize,
+) -> Option<()> {
+    if copies.is_empty() {
+        return Some(());
+    }
+    let lanes = lanes.clamp(1, copies.len());
+    let mut copies = copies;
+    copies.sort_by_key(|&(_, column)| std::cmp::Reverse(column.len()));
+    let mut parts: Vec<WideCopies<'_>> = (0..lanes).map(|_| Vec::new()).collect();
+    let mut load = vec![0usize; lanes];
+    for copy in copies {
+        let k = (0..lanes).min_by_key(|&k| load[k]).unwrap_or(0);
+        load[k] += copy.1.len();
+        parts[k].push(copy);
+    }
+    let be = backend().ok()?;
+    let ready = stream.record_event(None).ok()?;
+    let (base, _record) = buffer.device_ptr_mut(stream);
+    let copy = |on: &Arc<CudaStream>, part: &WideCopies<'_>| -> Option<()> {
+        for &(at, column) in part {
+            crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
+            // SAFETY: `at .. at + column.len()` lies inside the buffer (the
+            // caller's spans), and the buffer outlives the copy: the caller
+            // synchronizes `stream`, which waits for this lane, before it
+            // returns or drops the buffer.
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    base + (at * 8) as u64,
+                    column,
+                    on.cu_stream(),
+                )
+            }
+            .ok()?;
+        }
+        Some(())
+    };
+    let done: Option<Vec<cudarc::driver::CudaEvent>> = std::thread::scope(|scope| {
+        let others: Vec<_> = parts[1..]
+            .iter()
+            .map(|part| {
+                let ready = &ready;
+                let copy = &copy;
+                scope.spawn(move || -> Option<cudarc::driver::CudaEvent> {
+                    be.ctx.bind_to_thread().ok()?;
+                    let lane = be.next_stream();
+                    lane.wait(ready).ok()?;
+                    copy(&lane, part)?;
+                    lane.record_event(None).ok()
+                })
+            })
+            .collect();
+        let first = copy(stream, &parts[0]);
+        let events: Option<Vec<_>> = others
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect();
+        first.and(events)
+    });
+    for event in done? {
+        stream.wait(&event).ok()?;
+    }
+    Some(())
+}
+
 impl DeviceColumns {
     /// `None` when the card will not promise the room, in which case every
     /// caller uploads its own copy as before.
@@ -423,13 +523,19 @@ impl DeviceColumns {
         let mut at = 0usize;
         let mut checks = crate::fill::FillChecks::default();
         let mut clocks = Vec::new();
+        let lanes = copy_lanes();
+        let mut deferred: WideCopies<'_> = Vec::new();
         for table in tables {
             match table {
                 TableUpload::Wide(columns) => {
                     for column in columns.iter() {
-                        let mut slab = buffer.slice_mut(at..at + column.len());
-                        crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
-                        stream.memcpy_htod(*column, &mut slab).ok()?;
+                        if lanes > 1 {
+                            deferred.push((at, *column));
+                        } else {
+                            let mut slab = buffer.slice_mut(at..at + column.len());
+                            crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
+                            stream.memcpy_htod(*column, &mut slab).ok()?;
+                        }
                         spans.push((at, column.len()));
                         at += column.len();
                     }
@@ -465,6 +571,7 @@ impl DeviceColumns {
                 }
             }
         }
+        copy_wide_lanes(&stream, &mut buffer, deferred, lanes)?;
         stream.synchronize().ok()?;
         if prepaid {
             room.shrink(room.bytes() - words);
