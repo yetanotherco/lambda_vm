@@ -7340,6 +7340,36 @@ struct LocalPack<'a> {
     own: Option<LocalCounts>,
     /// LOCAL_BYTES tables made: the next one's `j`.
     made: usize,
+    /// Where each LOCAL_BYTES table sits in phase A's order of tables (the
+    /// groups' tables one after another, as they are sent), for live
+    /// regeneration ([`LocalPlaces`]).
+    places: LocalPlaces,
+}
+
+/// Where the LOCAL_BYTES tables sit in phase A's order of tables: the groups'
+/// tables one after another, as the packer sends them. A LOCAL_BYTES table's
+/// block index is `N + j`, after every other table, while in phase A it is the
+/// last table of its group; so a table's place in phase A is its block index
+/// plus the LOCAL_BYTES tables sent before it. Live regeneration names a table
+/// it drops by its block index ([`block_index_of`]).
+#[derive(Clone, Default)]
+pub(crate) struct LocalPlaces(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+
+impl LocalPlaces {
+    /// A LOCAL_BYTES table sent at `place` in phase A's order.
+    pub(crate) fn push(&self, place: usize) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(place);
+    }
+
+    /// The block index of the table at `place` in phase A's order, or `None`
+    /// for a LOCAL_BYTES table (no regenerator builds one again).
+    pub(crate) fn block_index_of(&self, place: usize) -> Option<usize> {
+        let places = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if places.contains(&place) {
+            return None;
+        }
+        Some(place - places.iter().filter(|&&q| q < place).count())
+    }
 }
 
 impl LocalPack<'_> {
@@ -7618,6 +7648,14 @@ impl<'a> Packer<'a> {
             (places, self.own.as_ref().and_then(|own| own.recorder))
         {
             recorder.committed(&places);
+        }
+        if let Some(local) = &self.local {
+            let first: usize = self.group_keys.iter().map(Vec::len).sum();
+            for (k, key) in keys.iter().enumerate() {
+                if matches!(key, Key::Local(_)) {
+                    local.places.push(first + k);
+                }
+            }
         }
         self.group_keys.push(keys);
         self.closed_at.push(self.start.elapsed().as_secs_f64());
@@ -8873,6 +8911,9 @@ fn prove_streamed(
     // Live regeneration's recorder: the rest's tables it can build again are
     // tagged as they are laid out (N3).
     let live_recorder = recorder.filter(|_| regen_mode.live());
+    // Under local lookups: where phase A's LOCAL_BYTES tables sit, for live
+    // regeneration to name each table it drops by its block index.
+    let local_places = LocalPlaces::default();
     // Live regeneration: phase A drops the streamed chunks the policy moves off
     // the host (`always`: every one). The streamed chunks are placed first, in
     // hand-out order, so the table at block index `t` is the `t`-th chunk
@@ -8884,15 +8925,22 @@ fn prove_streamed(
         .filter(|_| regen_mode.live())
         .map(|recorder| {
             let recorder = std::sync::Arc::clone(recorder);
+            let local_places = local_places.clone();
             // Class 0: the streamed chunks (the replay); class 1: KECCAK_RND's
             // and LT's tables of the rest (the kept lists, N3).
             multilinear_block::BlockRegen::new(
-                // A streamed chunk's rank is its hand-out place, which is its
-                // block index unless phase A commits out of hand-out order
-                // (KECCAK_RND's own groups: [`Recorder::handout_place`]).
-                std::sync::Arc::new(move |t| {
+                // Phase A names a table by its place in its own order of
+                // tables (`p`); under local lookups each LOCAL_BYTES table sent
+                // before it moves that place one past the table's block index
+                // `t`, and a LOCAL_BYTES table itself is never dropped
+                // ([`LocalPlaces`]). A streamed chunk's rank is its hand-out
+                // place, which is its block index unless phase A commits out of
+                // hand-out order (KECCAK_RND's own groups:
+                // [`Recorder::handout_place_of`], which reads phase A's places).
+                std::sync::Arc::new(move |p| {
+                    let t = local_places.block_index_of(p)?;
                     recorder
-                        .handout_place(t)
+                        .handout_place_of(p, t)
                         .and_then(|r| recorder.chunk_at(r).map(|_| (0, r as u64)))
                         .or_else(|| recorder.rest_at(t).map(|_| (1, t as u64)))
                 }),
@@ -9910,6 +9958,7 @@ fn prove_streamed(
                         open: None,
                         own: None,
                         made: 0,
+                        places: local_places.clone(),
                     }),
                 };
                 // Off the inline path, the prepared columns wait until the
