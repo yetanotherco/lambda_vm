@@ -3170,10 +3170,14 @@ pub fn pool_exec_logs() -> bool {
 }
 
 /// An empty log buffer of `capacity` logs, from the page-locked pool when it
-/// is locked and has the room ([`multilinear::pinned::with_pinned`]), pageable
-/// otherwise: a buffer the executor writes a window into.
+/// is locked and has the room, pageable otherwise: a buffer the executor
+/// writes a window into. From the pool's arena for the executor's buffers
+/// ([`multilinear::pinned::with_pinned_logs`]): each run's executor is a new
+/// thread, which a shared arena would bind elsewhere than the last run's, so
+/// the windows freed by one run would sit in an arena the next never asks and
+/// the pool would run out by the second run.
 pub(crate) fn pooled_log_buffer(capacity: usize) -> Vec<executor::vm::logs::Log> {
-    multilinear::pinned::with_pinned(
+    multilinear::pinned::with_pinned_logs(
         capacity * std::mem::size_of::<executor::vm::logs::Log>(),
         || Vec::with_capacity(capacity),
     )

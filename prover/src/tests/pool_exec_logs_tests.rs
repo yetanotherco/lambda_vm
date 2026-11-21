@@ -117,6 +117,17 @@ fn spend_the_pool(window_bytes: usize) -> Vec<Vec<u8>> {
         .expect("a spending thread");
         held.extend(taken);
     }
+    // And the executor's buffers' own arena.
+    for _ in 0..4096 {
+        let chunk: Vec<u8> = multilinear::pinned::with_pinned_logs(window_bytes, || {
+            Vec::with_capacity(window_bytes)
+        });
+        let inside = multilinear::pinned::is_pinned(chunk.as_ptr(), chunk.capacity());
+        held.push(chunk);
+        if !inside {
+            break;
+        }
+    }
     let spent = math_cuda::pinned::stats();
     assert!(
         spent.carved_bytes + (4 << 20) >= spent.pool_bytes,
@@ -227,6 +238,27 @@ fn pooled_executor_log_buffers_hold_the_same_logs_survive_a_purge_and_spill_when
         "every window but the first (and the last, shrunk) in the pool: {pooled_in:?}"
     );
 
+    // 1b. A second run on a new thread (as each prove's executor is) takes
+    // the first run's freed buffers again: the logs' own arena, the pool
+    // carved no further than a window or two.
+    let carved = math_cuda::pinned::stats().carved_bytes;
+    let (elf2, input2) = (elf.clone(), input.clone());
+    let (again, again_in, _) =
+        std::thread::spawn(move || run_windows(&elf2, &input2, window, true))
+            .join()
+            .expect("a second run's thread");
+    assert!(again == plain, "the second run: the logs, byte for byte");
+    assert!(
+        again_in[1..again_in.len() - 1].iter().all(|&p| p),
+        "the second run's windows in the pool: {again_in:?}"
+    );
+    let grew = math_cuda::pinned::stats().carved_bytes - carved;
+    // One window's buffer at most: the last window's spare, never taken.
+    assert!(
+        grew <= window_bytes as u64,
+        "the second run carved {grew} bytes more of the pool"
+    );
+
     // 2. A purge returns none of the pool's pages.
     // The windows' buffers are freed (back to the pool's arenas) as
     // `run_windows` returned; their pages were written, so resident.
@@ -277,7 +309,7 @@ fn pooled_executor_log_buffers_hold_the_same_logs_survive_a_purge_and_spill_when
     );
     drop(held);
     println!(
-        "POOL EXEC LOGS HOST: {} windows · {in_pool} in the pool · after a purge still the pool's · spent: {} pageable · the same logs",
+        "POOL EXEC LOGS HOST: {} windows · {in_pool} in the pool · a second run carved {grew} B more · after a purge still the pool's · spent: {} pageable · the same logs",
         pooled_in.len(),
         short_in.len()
     );
