@@ -24,14 +24,24 @@ use super::card_records_card_tests::{mismatches, records_chunks};
 use crate::tables::MaxRowsConfig;
 use crate::tests::windowed_builder_tests::run;
 
+/// The tests here one at a time: each moves the card-rows mode override and
+/// the logs' cache, both the process's, so two of them at once in a whole-lib
+/// run read each other's mode and cache (one's "today's" pass ran under the
+/// other's override, and declined: l18g).
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Logs kept across groups (as inside a block's prove) while it lives; the
-/// knob back and the cache empty however the test ends.
-struct Reset;
+/// knob back and the cache empty however the test ends; the tests here one at
+/// a time ([`ONE_AT_A_TIME`]).
+struct Reset(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
 impl Reset {
     fn new() -> Self {
+        let one = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         card_rows::begin();
-        Self
+        Self(one)
     }
 }
 
