@@ -108,8 +108,25 @@ impl Drop for Scope {
     }
 }
 
-/// Binds this thread to one of the arenas for an allocation of `bytes`.
+/// Which of the pool's arenas a scope binds to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolClass {
+    /// One of [`ARENAS`] shared arenas, a thread to each in turn.
+    Shared,
+    /// The executor's window buffers' own arena, whatever thread asks: a
+    /// window's buffer freed after one run is the next run's, where a new
+    /// thread bound to another shared arena would carve more of the pool.
+    ExecLogs,
+}
+
+/// Binds this thread to one of the shared arenas for an allocation of
+/// `bytes` ([`PoolClass::Shared`]).
 pub fn scope(bytes: usize) -> Scope {
+    scope_in(PoolClass::Shared, bytes)
+}
+
+/// Binds this thread to `class`'s arena for an allocation of `bytes`.
+pub fn scope_in(class: PoolClass, bytes: usize) -> Scope {
     if !binds(bytes, POOL_READY.load(Ordering::Acquire)) {
         return Scope(None);
     }
@@ -119,7 +136,10 @@ pub fn scope(bytes: usize) -> Scope {
     if bytes <= arenas.tcache_max {
         return Scope(None);
     }
-    let mine = arenas.ids[thread_slot() % ARENAS];
+    let mine = match class {
+        PoolClass::Shared => arenas.ids[thread_slot() % ARENAS],
+        PoolClass::ExecLogs => arenas.logs,
+    };
     match thread_arena() {
         Some(previous) if set_thread_arena(mine) => {
             let now = PENDING.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
@@ -463,7 +483,7 @@ pub fn arena_free_bytes() -> u64 {
         return 0;
     };
     let mut resident = 0u64;
-    for id in arenas.ids {
+    for id in arenas.all() {
         let Ok(name) = std::ffi::CString::new(format!("stats.arenas.{id}.resident")) else {
             return 0;
         };
@@ -521,7 +541,7 @@ fn live_bytes() -> Option<u64> {
             return None;
         }
         let mut held = 0u64;
-        for id in arenas.ids {
+        for id in arenas.all() {
             for kind in ["small", "large"] {
                 let name =
                     std::ffi::CString::new(format!("stats.arenas.{id}.{kind}.allocated")).ok()?;
@@ -648,9 +668,18 @@ fn carve(size: usize, alignment: usize) -> Option<usize> {
 
 struct Arenas {
     ids: [u32; ARENAS],
+    /// [`PoolClass::ExecLogs`]'s arena.
+    logs: u32,
     /// jemalloc's thread-cache ceiling: an allocation at or under it can come
     /// from a cache of any arena, and never binds.
     tcache_max: usize,
+}
+
+impl Arenas {
+    /// Every arena of the pool's: the shared ones and the logs'.
+    fn all(&self) -> impl Iterator<Item = u32> + '_ {
+        self.ids.iter().copied().chain(std::iter::once(self.logs))
+    }
 }
 
 /// The arenas, made at the first scope with the pool locked; `None` when
@@ -695,8 +724,8 @@ fn make_arenas() -> Option<Arenas> {
         if rc != 0 {
             return None;
         }
-        let mut ids = [0u32; ARENAS];
-        for id in &mut ids {
+        let mut made = [0u32; ARENAS + 1];
+        for id in &mut made {
             let mut hooks = HOOKS.0.get();
             let mut len = std::mem::size_of::<u32>();
             let rc = jem::mallctl(
@@ -733,7 +762,13 @@ fn make_arenas() -> Option<Arenas> {
                 );
             }
         }
-        Some(Arenas { ids, tcache_max })
+        let mut ids = [0u32; ARENAS];
+        ids.copy_from_slice(&made[..ARENAS]);
+        Some(Arenas {
+            ids,
+            logs: made[ARENAS],
+            tcache_max,
+        })
     }
 }
 
@@ -1307,6 +1342,42 @@ mod tests {
         assert_eq!(SOURCE.with(Cell::get), UploadSource::Other as u8);
         give(locked, bytes);
         give(plain, bytes);
+    }
+
+    /// The executor's buffers' arena is one, whatever thread asks: a buffer
+    /// freed on one thread is the next thread's (its very address).
+    #[test]
+    fn the_exec_logs_arena_is_one_for_every_thread_and_reuses_a_freed_buffer() {
+        let arenas = on();
+        let bytes = 40 << 20;
+        let first = std::thread::spawn(move || {
+            let ptr = {
+                let _scope = scope_in(PoolClass::ExecLogs, bytes);
+                take(bytes)
+            };
+            let at = ptr as usize;
+            give(ptr, bytes);
+            at
+        })
+        .join()
+        .expect("a thread");
+        let (again, arena) = std::thread::spawn(move || {
+            let ptr = {
+                let _scope = scope_in(PoolClass::ExecLogs, bytes);
+                take(bytes)
+            };
+            let arena = arena_of(ptr);
+            let at = ptr as usize;
+            give(ptr, bytes);
+            (at, arena)
+        })
+        .join()
+        .expect("another thread");
+        assert_eq!(arena, arenas.logs, "the logs' own arena");
+        assert!(!arenas.ids.contains(&arena), "not a shared one");
+        // The same address: the freed extent taken again, not more of the
+        // pool (the cursor itself moves under the module's other tests).
+        assert_eq!(again, first, "the freed buffer, taken again");
     }
 
     /// Many threads taking scoped allocations at once (as the executor's
