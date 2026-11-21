@@ -957,9 +957,26 @@ pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
     card_settle_on(at, true)
 }
 
+/// A card reading inside the levels: trimmed as today, or under
+/// [`super::wlfm_knobs::tail`] untrimmed ([`card_settle_on`]).
+fn card_settle_levels(at: &str) -> Option<CardReading> {
+    card_settle_on(at, !super::wlfm_knobs::tail())
+}
+
+/// Card readings this process took without a trim ([`card_settle_on`]).
+static UNTRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`UNTRIMMED`] so far.
+pub fn untrimmed_readings() -> u64 {
+    UNTRIMMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// [`card_settle`], trimming the pool only when `trim`: untrimmed, the pool
 /// keeps the pages it holds for the next allocations.
 fn card_settle_on(at: &str, trim: bool) -> Option<CardReading> {
+    if !trim {
+        UNTRIMMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let reading = if trim {
         multilinear::gpu::settle_card()
     } else {
@@ -1974,7 +1991,7 @@ pub fn prove_block_levels(
     );
     // Read on the driver's thread (a test's override is that thread's).
     let fill_beside_on = fill_beside();
-    let late = settle_late();
+    let late = settle_late() || super::wlfm_knobs::tail();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
     let lean_beside = super::wlfm::lean_beside()
@@ -2303,7 +2320,7 @@ pub fn prove_block_levels(
                     take_levels_budget(settled.map(|c| c.total))?;
                     take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
-                    let committed = card_settle("level 1 committed");
+                    let committed = card_settle_levels("level 1 committed");
                     Ok((
                         build,
                         prepare,
@@ -2402,11 +2419,12 @@ pub fn prove_block_levels(
         None => {
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
-            let (settled, settle_secs, trimmed) = settle_base_end(settle_late());
+            let (settled, settle_secs, trimmed) =
+                settle_base_end(settle_late() || super::wlfm_knobs::tail());
             take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
             let build = commit_level(pre, 1)?;
-            let committed = card_settle("level 1 committed");
+            let committed = card_settle_levels("level 1 committed");
             (
                 build,
                 prepare,
@@ -2574,7 +2592,7 @@ pub fn prove_block_levels(
             .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
         levels[0].build.release_prover_half();
         times.purges[2] = purge_filled.join().ok().flatten();
-        if let Some(card) = card_settle("level 1 proved") {
+        if let Some(card) = card_settle_levels("level 1 proved") {
             times.card.push(("level 1 proved".to_string(), card));
         }
         if let Some(r) = resident_now() {
@@ -2601,7 +2619,7 @@ pub fn prove_block_levels(
                     (
                         build,
                         now(),
-                        card_settle(&format!("level {} committed", k + 1)),
+                        card_settle_levels(&format!("level {} committed", k + 1)),
                     )
                 })
             });
@@ -2661,7 +2679,7 @@ pub fn prove_block_levels(
                 .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
             levels.push(Level { program, build });
             levels[k].build.release_prover_half();
-            if let Some(card) = card_settle(&format!("level {} proved", k + 1)) {
+            if let Some(card) = card_settle_levels(&format!("level {} proved", k + 1)) {
                 times.card.push((format!("level {} proved", k + 1), card));
             }
             k += 1;

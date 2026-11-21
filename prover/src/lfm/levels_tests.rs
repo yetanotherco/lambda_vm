@@ -1164,6 +1164,102 @@ fn the_blake3_driver_settling_late_proves_the_same_level_bytes() {
     }
 }
 
+/// The levels' tail knob's name; it is off by default, and only `1` turns it
+/// on.
+#[test]
+fn the_levels_tail_knob_is_named_and_off_by_default() {
+    use super::wlfm_knobs::{TAIL_ENV, tail, tail_word};
+    assert_eq!(TAIL_ENV, "LAMBDA_VM_LEVELS_TAIL");
+    if std::env::var_os(TAIL_ENV).is_none() {
+        assert!(!tail());
+    }
+    for (word, on) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("on"), false),
+        (Some("1"), true),
+        (Some(" 1 "), true),
+    ] {
+        assert_eq!(tail_word(word), on, "{word:?}");
+    }
+}
+
+/// ★ The levels' tail taken off the path (`LAMBDA_VM_LEVELS_TAIL`: level 1's
+/// lean tables filled beside its execution, every card reading inside the
+/// levels untrimmed) proves the same level bytes: a small BLAKE3 block driven
+/// with the knob on proves each level's bytes as [`prove_levels`] does over
+/// the same base; level 1's fill took the lean prefill, the base-end reading
+/// skipped its trim, and every reading inside the levels did. With the knob
+/// off, no reading skipped one. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; run
+/// alone (the override is process wide).
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_the_tail_off_the_path_proves_the_same_level_bytes() {
+    use super::b3l_tables::{B3lHold, test_hold};
+    use super::levels::{prove_block_levels, untrimmed_readings};
+    use super::wlfm_knobs::set_tail_for_test;
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_tail_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let _records = test_hold::set(B3lHold::Records);
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let drive = |on: bool| {
+        set_tail_for_test(Some(on));
+        let before = untrimmed_readings();
+        let run = prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level");
+        (run, untrimmed_readings() - before)
+    };
+    let _restore = Restore;
+    let (off, none) = drive(false);
+    assert_eq!(none, 0, "the knob off skips no trim");
+    let (run, skipped) = drive(true);
+    let (_, trimmed) = run.times.settle_base_end.expect("the base-end reading");
+    assert!(!trimmed, "the base-end reading skipped its trim");
+    assert!(
+        skipped >= 3,
+        "the readings inside the levels skipped theirs ({skipped})"
+    );
+    assert!(
+        run.times.lean_prefilled,
+        "level 1's fill took the lean prefill"
+    );
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, ((a, b), c)) in run.proofs.iter().zip(&proofs).zip(&off.proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        let c = rkyv::to_bytes::<rkyv::rancor::Error>(c).expect("serializes");
+        assert!(
+            a[..] == b[..] && a[..] == c[..],
+            "level {}: the same proof bytes",
+            k + 1
+        );
+        println!("LEVELS TAIL IDENTITY level {}: {} B equal", k + 1, a.len());
+    }
+}
+
 /// The BLAKE3 driver with level 1's lean round tables filled beside its
 /// execution (`LAMBDA_VM_WLFM_LEAN_BESIDE`, the round chunks held as their
 /// records): level 1's fill took the prefill, which was fed every one of its
@@ -1491,7 +1587,11 @@ fn rta_one_run(
         l1_prove_from
     );
     if let Some((secs, trimmed)) = t.settle_base_end {
-        println!("RTA LEVEL1 SETTLE: at the base end {secs:.3}s · trimmed {trimmed}");
+        println!(
+            "RTA LEVEL1 SETTLE: at the base end {secs:.3}s · trimmed {trimmed} · tail {} · readings untrimmed {}",
+            super::wlfm_knobs::tail(),
+            super::levels::untrimmed_readings()
+        );
     }
     // Level 2 streamed beside level 1's prove (`LAMBDA_VM_LEVELS_STREAM_NEXT`):
     // its pieces' landing against level 1's proved time, and level 1's own
