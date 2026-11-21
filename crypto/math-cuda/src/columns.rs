@@ -428,7 +428,11 @@ impl DeviceColumns {
                 TableUpload::Wide(columns) => {
                     for column in columns.iter() {
                         let mut slab = buffer.slice_mut(at..at + column.len());
-                        crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
+                        crate::pinned::note_upload_from(
+                            crate::pinned::UploadSource::Wide,
+                            column.as_ptr().cast(),
+                            column.len() * 8,
+                        );
                         stream.memcpy_htod(*column, &mut slab).ok()?;
                         spans.push((at, column.len()));
                         at += column.len();

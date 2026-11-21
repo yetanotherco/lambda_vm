@@ -62,6 +62,29 @@ pub fn arena_free_bytes() -> u64 {
     0
 }
 
+/// Whether the page-locked pool is locked and handing out its memory: an
+/// allocation in [`with_pinned`] comes from it only then. `false` without the
+/// card.
+pub fn ready() -> bool {
+    #[cfg(feature = "cuda")]
+    return math_cuda::pinned::ready();
+    #[cfg(not(feature = "cuda"))]
+    false
+}
+
+/// The upload bytes by source so far in this process, and how many of them
+/// came from the pool: `(source's name, bytes, from the pool)`
+/// (`math_cuda::pinned::upload_sources`); empty without the card.
+pub fn upload_sources() -> Vec<(&'static str, u64, u64)> {
+    #[cfg(feature = "cuda")]
+    return math_cuda::pinned::upload_sources()
+        .into_iter()
+        .map(|(s, bytes, pinned)| (s.name(), bytes, pinned))
+        .collect();
+    #[cfg(not(feature = "cuda"))]
+    Vec::new()
+}
+
 /// The block's prove is over: from now on the host's readings count the
 /// pool's free bytes as the memory they are.
 pub fn retire_netting() {

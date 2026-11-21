@@ -1143,6 +1143,30 @@ pub(crate) fn fill_col_major_into(
     dst: &mut CudaViewMut<u64>,
     checks: &mut FillChecks,
 ) -> Result<()> {
+    crate::pinned::with_source(source_of(&records), || {
+        fill_col_major_into_counted(stream, records, dst, checks)
+    })
+}
+
+/// The upload tally's source of a records table's copies
+/// ([`crate::pinned::upload_sources`]).
+fn source_of(records: &RecordsInput<'_>) -> crate::pinned::UploadSource {
+    use crate::pinned::UploadSource as S;
+    match records {
+        RecordsInput::Cpu { .. } => S::CpuLogs,
+        RecordsInput::KeccakRnd { .. } | RecordsInput::B3lRound { .. } => S::RoundOps,
+        RecordsInput::LfmChip { .. } => S::LfmChip,
+        _ => S::MemoryRows,
+    }
+}
+
+/// [`fill_col_major_into`] under its source.
+fn fill_col_major_into_counted(
+    stream: &Arc<CudaStream>,
+    records: RecordsInput<'_>,
+    dst: &mut CudaViewMut<u64>,
+    checks: &mut FillChecks,
+) -> Result<()> {
     ensure_eq!(
         dst.len(),
         records.rows() * records.cols(),
@@ -1303,7 +1327,9 @@ pub(crate) fn upload_sides(
         return Ok(None);
     }
     ensure_eq!(held, n, "one side record a log");
-    upload_pieces(stream, sides).map(Some)
+    crate::pinned::with_source(crate::pinned::UploadSource::CpuSides, || {
+        upload_pieces(stream, sides).map(Some)
+    })
 }
 
 /// The lean BLAKE3 round kernel's launch over ops already on the card: one
@@ -1392,6 +1418,11 @@ pub(crate) enum Staged<'a> {
 /// `records` copied up on `stream`, as [`fill_col_major_into`] copies them;
 /// no kernel launched.
 pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> Result<Staged<'a>> {
+    crate::pinned::with_source(source_of(&records), || stage_counted(stream, records))
+}
+
+/// [`stage`] under its source.
+fn stage_counted<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> Result<Staged<'a>> {
     let n = records.len();
     Ok(match records {
         RecordsInput::KeccakRnd { ops, skip, .. } => Staged::KeccakRnd {

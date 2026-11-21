@@ -987,7 +987,11 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             (TableUpload::Wide(columns), _) => {
                 for column in columns.iter() {
                     let mut slab = buffer.slice_mut(at..at + column.len());
-                    crate::pinned::note_upload(column.as_ptr().cast(), column.len() * 8);
+                    crate::pinned::note_upload_from(
+                        crate::pinned::UploadSource::Wide,
+                        column.as_ptr().cast(),
+                        column.len() * 8,
+                    );
                     stream.memcpy_htod(*column, &mut slab).ok()?;
                     spans.push((at, column.len()));
                     at += column.len();
@@ -1025,7 +1029,11 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 });
             }
             (TableUpload::Records(records), Plan::Derived { store, cycles }) => {
-                crate::pinned::note_upload(cycles.as_ptr().cast(), cycles.len() * 4);
+                crate::pinned::note_upload_from(
+                    crate::pinned::UploadSource::CycleLists,
+                    cycles.as_ptr().cast(),
+                    cycles.len() * 4,
+                );
                 l = Some(stream.clone_htod(cycles).ok()?);
                 add(&counters().list_bytes, (cycles.len() * 4) as u64);
                 add(&counters().records_bytes_spared, records.bytes() as u64);
@@ -1049,7 +1057,11 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 ),
                 Plan::Words(plan),
             ) => {
-                let mut words = crate::fill::upload_pieces(&stream, pieces).ok()?;
+                let mut words =
+                    crate::pinned::with_source(crate::pinned::UploadSource::MemoryRows, || {
+                        crate::fill::upload_pieces(&stream, pieces)
+                    })
+                    .ok()?;
                 let mut k = plan.whole_base + plan.n_whole as u64;
                 for &(s, e) in &plan.ranges {
                     let patch: Vec<u64> = (0..(e - s) as u64).map(|j| (k + j) << 32).collect();
@@ -1066,7 +1078,12 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 let whole_dev = if total_whole == 0 {
                     None
                 } else {
-                    Some(crate::fill::upload_pieces(&stream, &wp).ok()?)
+                    Some(
+                        crate::pinned::with_source(crate::pinned::UploadSource::MemoryRows, || {
+                            crate::fill::upload_pieces(&stream, &wp)
+                        })
+                        .ok()?,
+                    )
                 };
                 r = Some((words, whole_dev, plan.whole_base, plan.n as u64));
                 let c = counters();

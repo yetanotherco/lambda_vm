@@ -43,6 +43,15 @@ use crate::elf::Elf;
 /// as [`Executor::resume_owned`](super::execution::Executor::resume_owned).
 const MAX_RESERVED_LOGS: usize = 1 << 22;
 
+/// The capacity of the log buffer a window of `limit` cycles is written into
+/// ([`FastExecutor::resume_owned`], [`FastExecutor::resume_history`],
+/// [`FastExecutor::resume_word_history`]): a buffer given back through
+/// [`FastExecutor::recycle`] is taken for the next window only when it has
+/// exactly this capacity.
+pub fn log_window_capacity(limit: usize) -> usize {
+    limit.min(MAX_RESERVED_LOGS)
+}
+
 /// The most ops the decoded table spans (64 MiB of ops); a program whose
 /// executable segments span more is decoded over its largest segment only,
 /// the rest running through the reference cycle.
@@ -442,7 +451,7 @@ impl FastExecutor {
         &mut self,
         limit: usize,
     ) -> Result<Option<(Vec<Log>, WindowHistory)>, ExecutorError> {
-        let window = limit.min(MAX_RESERVED_LOGS);
+        let window = log_window_capacity(limit);
         if self.pc == 0 {
             return Ok(None);
         }
@@ -473,7 +482,7 @@ impl FastExecutor {
         &mut self,
         limit: usize,
     ) -> Result<Option<(Vec<Log>, WindowHistory)>, ExecutorError> {
-        let window = limit.min(MAX_RESERVED_LOGS);
+        let window = log_window_capacity(limit);
         if self.pc == 0 {
             return Ok(None);
         }
@@ -652,7 +661,7 @@ impl FastExecutor {
     /// the window's logs handed out as they lie, a new buffer reserved for
     /// the next call.
     pub fn resume_owned(&mut self, limit: usize) -> Result<Option<Vec<Log>>, ExecutorError> {
-        let window = limit.min(MAX_RESERVED_LOGS);
+        let window = log_window_capacity(limit);
         if self.logs.capacity() < window {
             self.logs.clear();
             self.logs.reserve_exact(window);

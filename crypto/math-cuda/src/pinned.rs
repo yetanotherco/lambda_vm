@@ -75,6 +75,12 @@ pub fn enabled() -> bool {
     pool_gib() > 0
 }
 
+/// Whether the pool is locked and hands out its memory: a scope binds only
+/// then ([`scope`]).
+pub fn ready() -> bool {
+    POOL_READY.load(Ordering::Acquire)
+}
+
 /// Sets the pool's size in a test process that has not read the knob yet;
 /// the size it has.
 #[doc(hidden)]
@@ -126,12 +132,114 @@ pub fn scope(bytes: usize) -> Scope {
     }
 }
 
+/// Where an upload's host bytes come from, for the tally by source
+/// ([`upload_sources`]): what each upload site sends, or the thread's
+/// [`with_source`] around a records table's copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UploadSource {
+    /// Anything no site names.
+    Other = 0,
+    /// A wide table's columns, eight bytes a cell.
+    Wide,
+    /// A narrow table's packed bytes.
+    Narrow,
+    /// The CPU table's logs (the executor's window buffers).
+    CpuLogs,
+    /// The CPU table's side records (the in-row register format).
+    CpuSides,
+    /// KECCAK_RND's and the lean BLAKE3 round's operations.
+    RoundOps,
+    /// The memory and shift families' rows and operations.
+    MemoryRows,
+    /// An LFM chip table's prefix and values.
+    LfmChip,
+    /// A derived table's cycle list.
+    CycleLists,
+}
+
+impl UploadSource {
+    /// Every source, in tally order.
+    pub const ALL: [UploadSource; 9] = [
+        Self::Other,
+        Self::Wide,
+        Self::Narrow,
+        Self::CpuLogs,
+        Self::CpuSides,
+        Self::RoundOps,
+        Self::MemoryRows,
+        Self::LfmChip,
+        Self::CycleLists,
+    ];
+
+    /// Its name in the report.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::Wide => "wide",
+            Self::Narrow => "narrow",
+            Self::CpuLogs => "cpu logs",
+            Self::CpuSides => "cpu sides",
+            Self::RoundOps => "round ops",
+            Self::MemoryRows => "memory rows",
+            Self::LfmChip => "lfm chips",
+            Self::CycleLists => "cycle lists",
+        }
+    }
+}
+
+std::thread_local! {
+    /// The source this thread's untagged uploads count under ([`with_source`]).
+    static SOURCE: Cell<u8> = const { Cell::new(0) };
+}
+
+/// `f` with this thread's untagged uploads ([`note_upload`]) counted under
+/// `source`; the thread's source before it again after.
+pub fn with_source<R>(source: UploadSource, f: impl FnOnce() -> R) -> R {
+    let before = SOURCE.with(|s| s.replace(source as u8));
+    struct Back(u8);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            SOURCE.with(|s| s.set(self.0));
+        }
+    }
+    let _back = Back(before);
+    f()
+}
+
+const SOURCES: usize = UploadSource::ALL.len();
+static SOURCE_BYTES: [AtomicU64; SOURCES] = [const { AtomicU64::new(0) }; SOURCES];
+static SOURCE_PINNED: [AtomicU64; SOURCES] = [const { AtomicU64::new(0) }; SOURCES];
+
+/// The bytes [`note_upload`] saw by source so far in this process, and how
+/// many of them came from the pool: `(source, bytes, from the pool)`.
+pub fn upload_sources() -> Vec<(UploadSource, u64, u64)> {
+    UploadSource::ALL
+        .iter()
+        .map(|&s| {
+            (
+                s,
+                SOURCE_BYTES[s as usize].load(Ordering::Relaxed),
+                SOURCE_PINNED[s as usize].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
 /// `bytes` from `ptr` going to the card: counted, and counted as page-locked
-/// when they lie in the pool.
+/// when they lie in the pool, under the thread's source ([`with_source`]).
 pub fn note_upload(ptr: *const u8, bytes: usize) {
+    let source = SOURCE.with(Cell::get) as usize;
+    note_upload_from(UploadSource::ALL[source.min(SOURCES - 1)], ptr, bytes);
+}
+
+/// [`note_upload`] under `source`.
+pub fn note_upload_from(source: UploadSource, ptr: *const u8, bytes: usize) {
     UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    SOURCE_BYTES[source as usize].fetch_add(bytes as u64, Ordering::Relaxed);
     if POOL_READY.load(Ordering::Acquire) && is_pinned(ptr, bytes) {
         UPLOAD_PINNED.fetch_add(bytes as u64, Ordering::Relaxed);
+        SOURCE_PINNED[source as usize].fetch_add(bytes as u64, Ordering::Relaxed);
         let _ = PENDING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
             Some(p.saturating_sub(bytes as u64))
         });
@@ -1164,5 +1272,97 @@ mod tests {
         assert!(after.pending_most >= bytes as u64);
         give(locked, bytes);
         give(plain, bytes);
+    }
+
+    /// The tally by source: an upload under a source counts there, and as the
+    /// pool's when its bytes lie in it; an untagged one counts under the
+    /// thread's [`with_source`], else under `other`.
+    #[test]
+    fn uploads_are_counted_by_source_and_the_pools_apart() {
+        let _ = on();
+        let bytes = 2 << 20;
+        let locked = {
+            let _scope = scope(bytes);
+            take(bytes)
+        };
+        let plain = take(bytes);
+        let at = |s: UploadSource| {
+            let all = upload_sources();
+            let (_, b, p) = all[s as usize];
+            assert_eq!(all[s as usize].0, s);
+            (b, p)
+        };
+        let (logs_b, logs_p) = at(UploadSource::CpuLogs);
+        let (narrow_b, narrow_p) = at(UploadSource::Narrow);
+        with_source(UploadSource::CpuLogs, || note_upload(locked.cast(), bytes));
+        note_upload_from(UploadSource::Narrow, plain.cast(), bytes);
+        let (logs_b2, logs_p2) = at(UploadSource::CpuLogs);
+        let (narrow_b2, narrow_p2) = at(UploadSource::Narrow);
+        assert!(logs_b2 >= logs_b + bytes as u64 && logs_p2 >= logs_p + bytes as u64);
+        assert!(narrow_b2 >= narrow_b + bytes as u64);
+        // Other tests run beside this one; none uploads pool bytes as narrow
+        // from this thread, so the pool's narrow tally moved by none of ours.
+        let _ = (narrow_p, narrow_p2);
+        // The thread's source is back to `other` after the scope.
+        assert_eq!(SOURCE.with(Cell::get), UploadSource::Other as u8);
+        give(locked, bytes);
+        give(plain, bytes);
+    }
+
+    /// Many threads taking scoped allocations at once (as the executor's
+    /// thread takes its window buffers while the producers take theirs): each
+    /// gets extents of the pool of its own, none overlapping another's, each
+    /// holding what its thread wrote; the pool's cursor is a compare-and-swap,
+    /// each arena jemalloc's own locks.
+    #[test]
+    fn scoped_allocations_from_many_threads_at_once_never_share_the_pools_bytes() {
+        let _ = on();
+        let bytes = 3 << 20;
+        let per = 6usize;
+        let threads = 2 * ARENAS;
+        let barrier = std::sync::Barrier::new(threads);
+        let got: Vec<Vec<(usize, usize)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        barrier.wait();
+                        let mut mine = Vec::new();
+                        for k in 0..per {
+                            let ptr = {
+                                let _scope = scope(bytes);
+                                take(bytes)
+                            };
+                            assert!(is_pinned(ptr.cast(), bytes), "thread {t} allocation {k}");
+                            // SAFETY: `bytes` bytes of a live allocation.
+                            unsafe {
+                                std::ptr::write_bytes(ptr.cast::<u8>(), (t * per + k) as u8, bytes)
+                            };
+                            mine.push((ptr as usize, t * per + k));
+                        }
+                        barrier.wait();
+                        for &(at, tag) in &mine {
+                            // SAFETY: as written above, freed below.
+                            let all = unsafe { std::slice::from_raw_parts(at as *const u8, bytes) };
+                            assert!(all.iter().all(|&b| b == tag as u8), "thread {t}'s bytes");
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a thread"))
+                .collect()
+        });
+        let mut spans: Vec<usize> = got.iter().flatten().map(|&(at, _)| at).collect();
+        spans.sort_unstable();
+        for w in spans.windows(2) {
+            assert!(w[0] + bytes <= w[1], "two allocations overlap");
+        }
+        assert_eq!(spans.len(), threads * per);
+        for &(at, _) in got.iter().flatten() {
+            give(at as *mut c_void, bytes);
+        }
     }
 }

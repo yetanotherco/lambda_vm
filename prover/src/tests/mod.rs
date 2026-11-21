@@ -150,6 +150,8 @@ pub mod pc_double_read_poc;
 #[cfg(all(test, feature = "cuda"))]
 pub mod pinned_producer_tests;
 #[cfg(test)]
+pub mod pool_exec_logs_tests;
+#[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod recursion_smoke_test;
