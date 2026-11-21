@@ -68,12 +68,56 @@ pub fn chip_records() -> bool {
 /// the tables are the records path's, column for column. Read once a process.
 pub const LEAN_BESIDE_ENV: &str = "LAMBDA_VM_WLFM_LEAN_BESIDE";
 
+/// `LAMBDA_VM_LEVELS_TAIL=1`: the levels' tail after the base taken off the
+/// path in one switch: level 1's lean round tables filled beside its
+/// execution ([`LEAN_BESIDE_ENV`]'s fill), and every card reading the level
+/// driver makes inside the levels (the base's end, each level committed and
+/// proved) taken without trimming the pool, which keeps its pages for the
+/// levels' own allocations (each still trims on a failed allocation). The
+/// reading at the clock's start is today's. Off by default (and for any word
+/// but `1`); the same bytes. Read once a process.
+pub const TAIL_ENV: &str = "LAMBDA_VM_LEVELS_TAIL";
+
+/// [`TAIL_ENV`]'s word: on only for `1`.
+pub fn tail_word(word: Option<&str>) -> bool {
+    knob_word_on(word)
+}
+
+/// A test's [`tail`], process wide (0 the knob, 1 off, 2 on).
+static TAIL_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`tail`] forced for the whole process (`None` restores the
+/// knob). A test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_tail_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    TAIL_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`TAIL_ENV`] is on (or a test's override).
+pub fn tail() -> bool {
+    match TAIL_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| tail_word(std::env::var(TAIL_ENV).ok().as_deref()))
+}
+
 /// Whether the level driver fills level 1's lean round tables beside its
-/// execution: [`LEAN_BESIDE_ENV`], or a test's override.
+/// execution: [`LEAN_BESIDE_ENV`], [`TAIL_ENV`], or a test's override.
 pub fn lean_beside() -> bool {
     #[cfg(test)]
     if let Some(on) = super::wlfm::test_format::lean_beside() {
         return on;
+    }
+    if tail() {
+        return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| knob_word_on(std::env::var(LEAN_BESIDE_ENV).ok().as_deref()))
