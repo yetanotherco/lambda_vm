@@ -5752,6 +5752,69 @@ fn streamed_keccak_rnd_chunks_keep_the_regenerators_ranks() {
     }
 }
 
+/// ★ Under the word memory format with its families streamed as chunks
+/// ([`Deviations::word_stream`]), live regeneration dropping every streamed
+/// chunk it can keeps every dropped chunk the one its rank names: a word
+/// family's chunk is kept (never recorded, never dropped) but holds its place
+/// in the hand-out, so the chunks after it keep their ranks. The proof
+/// verifies and is the one without regeneration. (The ranks shifted past the
+/// first word chunk once: "dropped table N is not the chunk its rank names".)
+#[test]
+fn word_family_chunks_keep_the_regenerators_ranks() {
+    let _fills = records_fill_lock();
+    use crate::block_whir::regen::RegenMode;
+    use crate::tables::fused_memory::MemoryFormat;
+    let elf = asm_elf_bytes("fused_mem_cases");
+    // The production format (its in-row registers, which the word format
+    // needs) with word memory, pages one table a page.
+    let format = BlockFormat::production()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
+    let tiny = MaxRowsConfig {
+        mem_load: 4,
+        mem_store: 4,
+        ..MaxRowsConfig::small()
+    };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let arm = |mode| {
+        regenerated_at(
+            &elf,
+            &format,
+            mode,
+            Deviations {
+                word_stream: Some(true),
+                ..Deviations::default()
+            },
+            tiny.clone(),
+        )
+        .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
+    };
+    let (plain, plain_stamps) = arm(RegenMode::Off);
+    let (dropped, stamps) = arm(RegenMode::Always);
+    assert!(
+        plain.word_memory.iter().any(|&n| n > 1),
+        "a word family cut into several chunks"
+    );
+    let r = stamps.regen.as_ref().expect("live regeneration's readout");
+    assert_eq!((r.mismatches, r.failed), (0, 0), "{:?}", r.lines);
+    assert!(r.error.is_none(), "{:?}", r.lines);
+    assert!(
+        r.dropped > r.rest_dropped && r.regenerated >= r.dropped,
+        "no streamed chunk dropped and rebuilt: {:?}",
+        r.lines
+    );
+    assert_eq!(stamps.streamed.1, plain_stamps.streamed.1, "the hand-out");
+    assert!(verify(&plain, &elf, &format), "without regeneration");
+    assert!(verify(&dropped, &elf, &format), "regenerated");
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&dropped), bytes(&plain), "the proof");
+    }
+}
+
 /// ★ KECCAK_RND's streamed tables in groups of their own
 /// ([`Deviations::keccak_rnd_own_groups`], the `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`
 /// knob, on by default): every group holding a streamed KECCAK_RND table

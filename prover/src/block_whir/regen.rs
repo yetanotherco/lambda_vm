@@ -712,8 +712,11 @@ impl Recorder {
                 r.by_order.push(None);
                 continue;
             }
+            // A word family's chunk (no regenerator cuts one; kept, never
+            // dropped) holds its place in the hand-out too, or every chunk
+            // after it would take the rank of the one before.
             let Some(t) = slot(job.table) else {
-                r.stray += 1;
+                r.by_order.push(None);
                 continue;
             };
             let ops = job.op_count();
