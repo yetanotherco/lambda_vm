@@ -1203,6 +1203,64 @@ fn a_forged_local_output_is_refused_by_its_ladder() {
     ));
 }
 
+/// ★ The two forgeries above under the two-layer GKR ladder, the BLAKE3
+/// base's default (its levels verifier pins it): a false local lookup is
+/// refused by the local balance alone, and accepted with the balance off, so
+/// the balance is the check that holds it under this ladder too; a local
+/// output forged to balance is refused by its ladder.
+#[test]
+fn local_forgeries_are_refused_under_the_two_layer_ladder() {
+    let airs = Airs::new(None);
+    let block = false_tuple();
+    let config = config_for(
+        ArgueFormat::BATCHED.with_ladder(GkrLadder::Double),
+        GroupFold::PerPoly,
+    );
+    let proved = prove(&airs, &block, &config, Some(local(&airs, &block)), honest()).unwrap();
+    assert_eq!(
+        verify_local(&airs, &block, &config, &proved),
+        Err(MlError::LocalImbalance { group: 1 })
+    );
+    let inert = VerifierChecks {
+        local_balance: false,
+        ..VerifierChecks::ALL
+    };
+    verify(
+        &airs,
+        &block,
+        &config,
+        &proved,
+        inert,
+        Some(&digests(&airs, &block, true)),
+    )
+    .expect("the mutant without the local balance accepts the false tuple");
+    let forged = prove(
+        &airs,
+        &block,
+        &config,
+        Some(local(&airs, &block)),
+        faulted(
+            1,
+            ProverFaults {
+                local_balance_with: Some(0),
+                ..ProverFaults::default()
+            },
+        ),
+    )
+    .unwrap();
+    let sum = forged.5[1]
+        .bus_outputs
+        .iter()
+        .fold(EE::zero(), |acc, (p, q)| acc + p * q.inv().unwrap());
+    assert_eq!(sum, EE::zero(), "the outputs balance");
+    let refused = verify_local(&airs, &block, &config, &forged);
+    println!("TWO-LAYER FORGED LOCAL OUTPUT: {refused:?}");
+    assert!(
+        matches!(refused, Err(MlError::LayerRelationMismatch { .. })),
+        "the ladder refuses the forged output: {refused:?}"
+    );
+}
+
 /// The C phase's local pairs: a local claim absorbed off by one, two tables'
 /// local claims swapped, and a table weighted `λ^{5t+1}` are each refused.
 #[test]
