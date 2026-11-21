@@ -9263,9 +9263,8 @@ fn prove_streamed(
                 // The window's buffer capacity, and whether each next one
                 // comes from the page-locked pool (`LAMBDA_VM_POOL_EXEC_LOGS`).
                 let log_capacity = executor::vm::fast::log_window_capacity(window);
-                own.logs_pooled = pool_exec_logs()
-                    && kind == EngineKind::Fast
-                    && multilinear::pinned::ready();
+                let pool_ready = multilinear::pinned::ready();
+                own.logs_pooled = pool_exec_logs() && kind == EngineKind::Fast && pool_ready;
                 loop {
                     let t = Instant::now();
                     if own.logs_pooled {
@@ -9311,7 +9310,9 @@ fn prove_streamed(
                         break;
                     };
                     cycles += logs.len() as u64;
-                    own.note_logs(&logs, logs.capacity());
+                    if pool_ready {
+                        own.note_logs(&logs, logs.capacity());
+                    }
                     if let Some(check) = &mut shadow {
                         if let Some(start) = sampled {
                             check.submit(start, &logs, executor.pc(), executor.registers());

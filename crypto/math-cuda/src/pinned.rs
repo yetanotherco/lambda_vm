@@ -216,6 +216,10 @@ std::thread_local! {
 /// `f` with this thread's untagged uploads ([`note_upload`]) counted under
 /// `source`; the thread's source before it again after.
 pub fn with_source<R>(source: UploadSource, f: impl FnOnce() -> R) -> R {
+    // Without a locked pool nothing is tallied by source: the call is `f`.
+    if !POOL_READY.load(Ordering::Acquire) {
+        return f();
+    }
     let before = SOURCE.with(|s| s.replace(source as u8));
     struct Back(u8);
     impl Drop for Back {
@@ -249,12 +253,20 @@ pub fn upload_sources() -> Vec<(UploadSource, u64, u64)> {
 /// `bytes` from `ptr` going to the card: counted, and counted as page-locked
 /// when they lie in the pool, under the thread's source ([`with_source`]).
 pub fn note_upload(ptr: *const u8, bytes: usize) {
+    if !POOL_READY.load(Ordering::Acquire) {
+        UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        return;
+    }
     let source = SOURCE.with(Cell::get) as usize;
     note_upload_from(UploadSource::ALL[source.min(SOURCES - 1)], ptr, bytes);
 }
 
 /// [`note_upload`] under `source`.
 pub fn note_upload_from(source: UploadSource, ptr: *const u8, bytes: usize) {
+    if !POOL_READY.load(Ordering::Acquire) {
+        UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        return;
+    }
     UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     SOURCE_BYTES[source as usize].fetch_add(bytes as u64, Ordering::Relaxed);
     if POOL_READY.load(Ordering::Acquire) && is_pinned(ptr, bytes) {
