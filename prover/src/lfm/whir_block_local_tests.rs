@@ -393,17 +393,12 @@ fn every_local_mutant_of_the_leaf_refuses_the_honest_base() {
     }
 }
 
-/// ★ A FALSE LOCAL LOOKUP: a prover whose LOCAL_BYTES receives one lookup no
-/// table sent (its `MU_ARE_BYTES` one more at a byte pair), every tree,
-/// ladder and opening honest over it. The host verifier refuses it for the
-/// group's local balance alone (`LocalImbalance`); the leaf that holds the
-/// group has no execution over it; and the leaf with its local-balance
-/// assert dropped executes it — the assert in the leaf is the check that
-/// refuses a false local lookup.
-#[test]
-#[ignore = "proves a small block under local lookups; box tier"]
-fn a_false_local_lookup_is_refused_by_the_leafs_local_balance() {
-    let format = b3_local();
+/// [`a_false_local_lookup_is_refused_by_the_leafs_local_balance`]'s case
+/// under `format`: the forgery proves, the host refuses it for the local
+/// balance, the leaf that holds its group refuses it, and that leaf without
+/// its local-balance assert executes it.
+fn false_local_lookup_case(format: &BlockFormat) {
+    let format = *format;
     let forged = prove_local(
         &format,
         &Deviations {
@@ -433,6 +428,37 @@ fn a_false_local_lookup_is_refused_by_the_leafs_local_balance() {
         k,
     )
     .unwrap_or_else(|e| panic!("with no local balance the forgery executes: {e}"));
+}
+
+/// ★ A FALSE LOCAL LOOKUP: a prover whose LOCAL_BYTES receives one lookup no
+/// table sent (its `MU_ARE_BYTES` one more at a byte pair), every tree,
+/// ladder and opening honest over it. The host verifier refuses it for the
+/// group's local balance alone (`LocalImbalance`); the leaf that holds the
+/// group has no execution over it; and the leaf with its local-balance
+/// assert dropped executes it — the assert in the leaf is the check that
+/// refuses a false local lookup.
+#[test]
+#[ignore = "proves a small block under local lookups; box tier"]
+fn a_false_local_lookup_is_refused_by_the_leafs_local_balance() {
+    false_local_lookup_case(&b3_local());
+}
+
+/// ★ The same false local lookup under the two-layer GKR ladder, the BLAKE3
+/// base's default (the levels verifier pins it): the host refuses it for the
+/// local balance, the leaf refuses it, and the leaf without its local-balance
+/// assert executes it.
+#[test]
+#[ignore = "proves a small block under local lookups; box tier"]
+fn a_false_local_lookup_is_refused_by_the_leafs_local_balance_under_the_two_layer_ladder() {
+    let format = BlockFormat {
+        argue: ArgueFormat::BATCHED.with_ladder(multilinear::whir_chain::GkrLadder::Double),
+        ..b3_local()
+    };
+    assert_eq!(
+        format.argue.ladder(),
+        multilinear::whir_chain::GkrLadder::Double
+    );
+    false_local_lookup_case(&format);
 }
 
 /// ★ A LOCAL_BYTES TABLE THAT IS NOT THE VERIFIER'S: a prover whose
