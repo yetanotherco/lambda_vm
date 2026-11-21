@@ -779,6 +779,58 @@ fn a_recycled_buffer_takes_the_next_window() {
     }
 }
 
+// A fresh buffer of the window's capacity given before each window (as the
+// prover hands the executor buffers from its page-locked pool) is written
+// into from the second window on, and the word history's logs and histories
+// are byte for byte those of a run that is given nothing.
+#[test]
+fn a_fresh_buffer_given_before_each_window_holds_the_same_word_history() {
+    use crate::vm::fast::log_window_capacity;
+    let elf = looping_program();
+    let window = 300;
+    let cap = log_window_capacity(window);
+    assert_eq!(cap, window);
+    assert_eq!(log_window_capacity(1 << 30), 1 << 22, "capped");
+    let mut plain = FastExecutor::new(&elf, vec![]).unwrap();
+    let mut given = FastExecutor::new(&elf, vec![]).unwrap();
+    plain.enable_word_history().unwrap();
+    given.enable_word_history().unwrap();
+    let (mut windows, mut taken) = (0, 0);
+    let mut last_given: Option<*const Log> = None;
+    loop {
+        let buffer: Vec<Log> = Vec::with_capacity(cap);
+        let at = buffer.as_ptr();
+        given.recycle(buffer);
+        let want = plain.resume_word_history(window).unwrap();
+        let got = given.resume_word_history(window).unwrap();
+        let (Some((want, want_h)), Some((got, got_h))) = (want, got) else {
+            break;
+        };
+        windows += 1;
+        assert_eq!(
+            want.iter().map(record).collect::<Vec<_>>(),
+            got.iter().map(record).collect::<Vec<_>>(),
+            "window {windows}: the logs"
+        );
+        assert_eq!(
+            format!("{want_h:?}"),
+            format!("{got_h:?}"),
+            "window {windows}: the history"
+        );
+        // The buffer given before window k is the one window k + 1 is written
+        // into (window k's own was set aside when k - 1 was handed out).
+        if last_given == Some(got.as_ptr()) {
+            taken += 1;
+        }
+        last_given = Some(at);
+    }
+    assert!(windows >= 8, "{windows} windows");
+    assert!(
+        taken >= windows - 2,
+        "{taken} of {windows} windows in a given buffer"
+    );
+}
+
 // History mode writes a window's extras into a buffer given back (or
 // prepared pre-faulted) when it holds exactly one window.
 #[test]
