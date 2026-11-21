@@ -958,9 +958,9 @@ pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
 }
 
 /// A card reading inside the levels: trimmed as today, or under
-/// [`super::wlfm_knobs::tail`] untrimmed ([`card_settle_on`]).
+/// [`super::wlfm_knobs::levels_untrimmed`] untrimmed ([`card_settle_on`]).
 fn card_settle_levels(at: &str) -> Option<CardReading> {
-    card_settle_on(at, !super::wlfm_knobs::tail())
+    card_settle_on(at, !super::wlfm_knobs::levels_untrimmed())
 }
 
 /// Card readings this process took without a trim ([`card_settle_on`]).
@@ -1991,7 +1991,7 @@ pub fn prove_block_levels(
     );
     // Read on the driver's thread (a test's override is that thread's).
     let fill_beside_on = fill_beside();
-    let late = settle_late() || super::wlfm_knobs::tail();
+    let late = settle_late() || super::wlfm_knobs::levels_untrimmed();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
     let lean_beside = super::wlfm::lean_beside()
@@ -2420,7 +2420,7 @@ pub fn prove_block_levels(
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
             let (settled, settle_secs, trimmed) =
-                settle_base_end(settle_late() || super::wlfm_knobs::tail());
+                settle_base_end(settle_late() || super::wlfm_knobs::levels_untrimmed());
             take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
             let build = commit_level(pre, 1)?;
