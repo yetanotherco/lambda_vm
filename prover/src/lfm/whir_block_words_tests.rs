@@ -3334,6 +3334,82 @@ fn a_blake3_local_leaf_is_pinned_without_a_proof() {
     }
 }
 
+/// ★ The local leaf at the levels verifier's own format, pinned: the
+/// pinned format moved onto the BLAKE3 base (`pin_family(pinned_with(Indexed),
+/// B3, Fri)`: local lookups, the two-layer GKR ladder, the base's group
+/// size), over the same hand-built local statement, one leaf. The two pins
+/// above derive from the test process's production format (the one-layer
+/// ladder); this one is the leaf a public entry derives, and every local
+/// fault moves it.
+#[test]
+fn the_pinned_blake3_local_leaf_is_pinned_without_a_proof() {
+    use super::local_faults::{self, Fault as LocalFault};
+    use multilinear::whir_chain::{GkrLadder, GroupFold};
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = super::super::levels::pin_family(
+        BlockFormat::pinned_with(GroupFold::Indexed),
+        super::super::wlfm::WlfmFamily::B3,
+        crate::block_whir::B3Rounds::Fri,
+    )
+    .expect("the BLAKE3 pin");
+    assert!(
+        format.local_lookups(),
+        "the pinned BLAKE3 format argues local lookups"
+    );
+    assert_eq!(
+        format.argue.ladder(),
+        GkrLadder::Double,
+        "the two-layer ladder"
+    );
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+    let rnd: &[(usize, usize)] = &[(1 << 8, 1)];
+    let mut mix: Vec<(&str, &[(usize, usize)])> = SMALL_SPLIT.to_vec();
+    mix.push(("KECCAK", keccak));
+    mix.push(("KECCAK_RND", rnd));
+    let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+    let plan = WhirBlockPlan::derive_blake3(elf, &opts, &format, owned.view(), 1, None)
+        .expect("the pinned BLAKE3 local plan derives from a hand-built statement");
+    assert!(
+        (0..plan.num_groups()).any(|g| plan.local_classes(g).is_some()),
+        "the plan argues a local group"
+    );
+    let digest = |fault: LocalFault| -> String {
+        local_faults::with(fault, || {
+            super::super::whir_chain_tests::program_digest(
+                &plan.leaf_program(0).expect("the leaf emits"),
+            )
+        })
+    };
+    let honest = digest(LocalFault::None);
+    println!(
+        "PINNED B3 LOCAL LEAF PIN: {} groups, id {:02x?}, digest {honest}",
+        owned.groups.len(),
+        &plan.id()[..8]
+    );
+    // Re-bless with two builds when the leaf changes on purpose.
+    const PIN: &str = "3bb66c7e1358bb65b208628bf1393e96015539e6af15123c416b568eb91cd0fe";
+    assert_eq!(honest, PIN, "the pinned BLAKE3 local leaf's digest");
+    for fault in [
+        LocalFault::NoLocalBalance,
+        LocalFault::NoLocalBytesRoute,
+        LocalFault::NoLocalRoots,
+        LocalFault::NoLocalAnswers,
+        LocalFault::NoLocalDigests,
+        LocalFault::LocalDrawsFirst,
+        LocalFault::NoLocalState,
+        LocalFault::LocalStateLast,
+        LocalFault::TodaysWeights,
+        LocalFault::LocalBytesXorAsOr,
+    ] {
+        assert_ne!(
+            digest(fault),
+            honest,
+            "{fault:?}: the pinned local leaf's digest moves"
+        );
+    }
+}
+
 /// ★ THE STAGE-2 GATE: local lookups' precondition on senders over the WHOLE
 /// local-format AIR set the frame builds, not one chip's list. The static
 /// check holds receivers only, and a local sender of multiplicity −1 is a
