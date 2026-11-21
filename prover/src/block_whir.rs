@@ -3127,6 +3127,58 @@ pub(crate) fn exec_mode(walkers: usize) -> Result<(EngineKind, bool), Error> {
     )
 }
 
+/// `LAMBDA_VM_POOL_EXEC_LOGS=1`: the executor writes each window's logs into a
+/// buffer from the page-locked pool (`LAMBDA_VM_PINNED_POOL_GIB`), handed to it
+/// before the window ([`executor::vm::engine::Engine::recycle`]), so the CPU
+/// table's logs go up to the card at both of their uploads (phase A's commit,
+/// phase B's argue) from page-locked memory, with no staging copy. A buffer
+/// the pool cannot give is pageable, as today's, and counted so
+/// ([`ExecutorStamps`]). Off by default and for any word but `1`; a no-op
+/// without a locked pool or on the reference engine; the same logs, so the
+/// same bytes. Read once a process.
+pub const POOL_EXEC_LOGS_ENV: &str = "LAMBDA_VM_POOL_EXEC_LOGS";
+
+/// [`POOL_EXEC_LOGS_ENV`]'s word: on only for `1`.
+pub fn pool_exec_logs_word(word: Option<&str>) -> bool {
+    crate::lfm::wlfm_knobs::knob_word_on(word)
+}
+
+/// A test's [`pool_exec_logs`], process wide (0 the knob, 1 off, 2 on).
+static POOL_EXEC_LOGS_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`pool_exec_logs`] forced for the whole process (`None`
+/// restores the knob). A test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_pool_exec_logs_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    POOL_EXEC_LOGS_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`POOL_EXEC_LOGS_ENV`] is on (or a test's override).
+pub fn pool_exec_logs() -> bool {
+    match POOL_EXEC_LOGS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pool_exec_logs_word(std::env::var(POOL_EXEC_LOGS_ENV).ok().as_deref()))
+}
+
+/// An empty log buffer of `capacity` logs, from the page-locked pool when it
+/// is locked and has the room ([`multilinear::pinned::with_pinned`]), pageable
+/// otherwise: a buffer the executor writes a window into.
+pub(crate) fn pooled_log_buffer(capacity: usize) -> Vec<executor::vm::logs::Log> {
+    multilinear::pinned::with_pinned(
+        capacity * std::mem::size_of::<executor::vm::logs::Log>(),
+        || Vec::with_capacity(capacity),
+    )
+}
+
 /// [`exec_mode`] of the two variables' values.
 fn exec_mode_from(
     engine: Option<&str>,
@@ -3255,9 +3307,44 @@ pub struct ExecutorStamps {
     pub handoff: f64,
     /// The windows handed out.
     pub windows: usize,
+    /// Whether the executor wrote into buffers from the page-locked pool
+    /// ([`POOL_EXEC_LOGS_ENV`] on, the pool locked, the fast engine).
+    pub logs_pooled: bool,
+    /// The windows whose logs lay in the pool, and their buffers' bytes; and
+    /// those that lay in pageable memory.
+    pub pooled_windows: usize,
+    pub pooled_bytes: u64,
+    pub pageable_windows: usize,
+    pub pageable_bytes: u64,
 }
 
 impl ExecutorStamps {
+    /// Counts a handed-out window's buffer as pooled or pageable.
+    fn note_logs(&mut self, logs: &[executor::vm::logs::Log], capacity: usize) {
+        let bytes =
+            (capacity.max(logs.len()) * std::mem::size_of::<executor::vm::logs::Log>()) as u64;
+        if multilinear::pinned::is_pinned(logs.as_ptr().cast(), bytes as usize) {
+            self.pooled_windows += 1;
+            self.pooled_bytes += bytes;
+        } else {
+            self.pageable_windows += 1;
+            self.pageable_bytes += bytes;
+        }
+    }
+
+    /// The `BLOCK EXECUTOR LOG BUFFERS:` line.
+    fn log_buffers_line(&self) -> String {
+        format!(
+            "BLOCK EXECUTOR LOG BUFFERS: from the pool {} ({}) · {} windows in the pool, {:.3} GB · {} pageable, {:.3} GB\n",
+            if self.logs_pooled { "on" } else { "off" },
+            POOL_EXEC_LOGS_ENV,
+            self.pooled_windows,
+            self.pooled_bytes as f64 / 1e9,
+            self.pageable_windows,
+            self.pageable_bytes as f64 / 1e9,
+        )
+    }
+
     /// The `BLOCK EXECUTOR:` line, `send` the thread's blocked sends.
     fn line(&self, send: f64) -> String {
         format!(
@@ -3395,6 +3482,7 @@ impl BlockStamps {
             ));
             if self.executor.windows > 0 {
                 out.push_str(&self.executor.line(p.executor_send));
+                out.push_str(&self.executor.log_buffers_line());
             }
             let h = &self.windows.handout;
             let tables: Vec<String> = StreamTable::ALL
@@ -6107,6 +6195,19 @@ fn prove_block_whir_inner(
             p.spilled_bytes,
             p.held_bytes
                 .map_or("unread".to_string(), |b| format!("{b} bytes"))
+        );
+    }
+    // The same tally by where the bytes come from (process wide so far).
+    let sources = multilinear::pinned::upload_sources();
+    if sources.iter().any(|&(_, bytes, _)| bytes > 0) {
+        let parts: Vec<String> = sources
+            .iter()
+            .filter(|&&(_, bytes, _)| bytes > 0)
+            .map(|&(name, bytes, pinned)| format!("{name} {pinned} of {bytes}"))
+            .collect();
+        eprintln!(
+            "BLOCK UPLOAD SOURCES: bytes from the pool of the bytes uploaded, by source · {}",
+            parts.join(" · ")
         );
     }
     proved
@@ -9203,8 +9304,20 @@ fn prove_streamed(
                 let snapshots = walkers > 0 && !history;
                 let mut at_start = snapshots.then(|| executor.snapshot());
                 let mut cycles = 0u64;
+                // The window's buffer capacity, and whether each next one
+                // comes from the page-locked pool (`LAMBDA_VM_POOL_EXEC_LOGS`).
+                let log_capacity = executor::vm::fast::log_window_capacity(window);
+                own.logs_pooled = pool_exec_logs()
+                    && kind == EngineKind::Fast
+                    && multilinear::pinned::ready();
                 loop {
                     let t = Instant::now();
+                    if own.logs_pooled {
+                        // Taken when this window is handed out, as the next
+                        // window's buffer; a buffer of another capacity is
+                        // never taken (and freed).
+                        executor.recycle(pooled_log_buffer(log_capacity));
+                    }
                     // A sampled window's start, for the shadow check.
                     let sampled = match &shadow {
                         Some(check) if check.samples(own.windows) => Some(WindowStart {
@@ -9242,6 +9355,7 @@ fn prove_streamed(
                         break;
                     };
                     cycles += logs.len() as u64;
+                    own.note_logs(&logs, logs.capacity());
                     if let Some(check) = &mut shadow {
                         if let Some(start) = sampled {
                             check.submit(start, &logs, executor.pc(), executor.registers());
@@ -13196,6 +13310,7 @@ mod producer_report_tests {
                 run: 2.5,
                 handoff: 0.04,
                 windows: 134,
+                ..ExecutorStamps::default()
             },
             ..BlockStamps::default()
         };
