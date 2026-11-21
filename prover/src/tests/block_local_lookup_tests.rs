@@ -746,6 +746,97 @@ fn the_lane_room_knobs_move_no_byte_and_a_misprediction_falls_back() {
     }
 }
 
+/// ★ The lane's room knobs under pressure: with the next commit's growth by
+/// group shape and 1 GiB reserves (the lane admits the most), and live
+/// regeneration dropping every table it can (the spill path a short host
+/// arms), the block proves the bytes of the prove with neither, with no
+/// mismatch: split memory, and words with pages in runs of 16, KECCAK_RND at
+/// the finish.
+#[test]
+#[ignore = "box tier: proves a block four times, run with --ignored --test-threads=1 and \
+            LAMBDA_VM_DETERMINISTIC_GRIND=1"]
+fn the_lane_knobs_under_live_regeneration_prove_the_same_bytes() {
+    use crate::block_whir::regen::RegenMode;
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tests::block_whir_tests::{records_fill_lock, streamed};
+    use stark::multilinear_block::{LaneGrowth, LaneLimits};
+    let _fills = records_fill_lock();
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    let bytes = |proof: &BlockWhirProof<LocalArgues>| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+            .expect("serialize")
+            .to_vec()
+    };
+    for (memory, page_run) in [
+        (MemoryFormat::Split, 0),
+        (MemoryFormat::Words, block_whir::BLOCK_PAGE_RUN_LOG2),
+    ] {
+        let format = BlockFormat {
+            registers: crate::tables::register::RegisterFormat::InRow,
+            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+            ecdas: crate::tables::ecdas::EcdasForm::Halves,
+            ..local()
+        }
+        .with_memory(memory)
+        .with_page_run(page_run);
+        let elf = asm_elf_bytes(match memory {
+            MemoryFormat::Words => "test_keccak256",
+            _ => "test_keccak_multi",
+        });
+        let what = format!("{memory:?}, page runs 2^{page_run}");
+        let prove = |mode, limits: Option<LaneLimits>| {
+            let mut o = streamed(crate::tables::MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = 3;
+            o.drop_streamed_ops = true;
+            o.regen = Some(mode);
+            prove_block_whir_local_with(
+                &elf,
+                &[],
+                &opts(),
+                &format,
+                &o,
+                &Deviations {
+                    card_fill: Some(false),
+                    card_fill_streamed: Some([false, false]),
+                    stream_keccak_rnd: Some(false),
+                    word_stream: Some(memory == MemoryFormat::Words),
+                    local_lane: Some(true),
+                    lane_limits: limits,
+                    ..Deviations::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{what}, {mode:?}: {e:?}"))
+        };
+        let (plain, _) = prove(RegenMode::Off, None);
+        let (pressed, stamps) = prove(
+            RegenMode::Always,
+            Some(LaneLimits {
+                growth: LaneGrowth::Shape,
+                margin: 1 << 30,
+                unledgered: 1 << 30,
+                ..LaneLimits::default()
+            }),
+        );
+        let r = stamps.regen.as_ref().expect("live regeneration's readout");
+        eprintln!(
+            "{what}: {} | {}",
+            r.lines.join(" | "),
+            stark::multilinear_block::local_lane_lines(&stamps.groups)
+        );
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{what}: {:?}", r.lines);
+        assert!(r.error.is_none(), "{what}: {:?}", r.lines);
+        assert!(r.dropped > 0, "{what}: nothing dropped: {:?}", r.lines);
+        assert!(bytes(&pressed) == bytes(&plain), "{what}: the bytes moved");
+        assert!(
+            verify(&pressed, &elf, &format),
+            "{what}: the proof verifies"
+        );
+    }
+}
+
 /// ★ Where the LOCAL_BYTES tables sit ([`block_whir::check_local_groups`]),
 /// on hand-written groups (no proof): tables 0–3 the run's (0 and 2 send a
 /// local lookup), 4 and 5 LOCAL_BYTES. The honest packing passes; each
