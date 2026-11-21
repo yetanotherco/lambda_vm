@@ -683,10 +683,23 @@ fn trim_default_mempool() {
 /// taken needs the pool empty first, or it is measuring the pool's retention
 /// instead of the caller's — see `a_group_holds_only_its_codewords_before_any_open`.
 pub fn drain_and_trim() -> Result<()> {
+    drain()?;
+    trim_default_mempool();
+    Ok(())
+}
+
+/// [`drain_and_trim`] without the trim: every stream of the context waited
+/// for, so the pool's counts are settled, while the pool keeps the pages it
+/// holds for the next allocations. Counted with the trims ([`trims`]) as a
+/// context-wide wait.
+pub fn drain_untrimmed() -> Result<()> {
+    drain()
+}
+
+fn drain() -> Result<()> {
     TRIMS.fetch_add(1, Ordering::Relaxed);
     let be = backend()?;
     be.ctx.synchronize()?;
-    trim_default_mempool();
     Ok(())
 }
 

@@ -954,7 +954,18 @@ pub struct CardReading {
 /// [`CardReading`] now, the card drained and trimmed first, its pool's peak
 /// started again.
 pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
-    let (pool_used, pool_peak, free, total) = multilinear::gpu::settle_card()?;
+    card_settle_on(at, true)
+}
+
+/// [`card_settle`], trimming the pool only when `trim`: untrimmed, the pool
+/// keeps the pages it holds for the next allocations.
+fn card_settle_on(at: &str, trim: bool) -> Option<CardReading> {
+    let reading = if trim {
+        multilinear::gpu::settle_card()
+    } else {
+        multilinear::gpu::settle_card_untrimmed()
+    };
+    let (pool_used, pool_peak, free, total) = reading?;
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     // Said as it happens, so a run that fails later still shows it.
     eprintln!(
@@ -973,6 +984,52 @@ pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
         free,
         total,
     })
+}
+
+/// `LAMBDA_VM_LEVELS_SETTLE_LATE=1`: at the base's end the driver reads the
+/// card after draining it but WITHOUT trimming its pool, and commits level 1's
+/// stacks at once on the pages the pool still holds; the trim comes at the
+/// next reading, once level 1 is committed. Today's reading trims the base's
+/// pool first (≈ 0.08–0.14 s on a real block, in level 1's tail). Every
+/// allocation is the pool's and retries after a trim when it fails
+/// (`math_cuda::device::alloc_or_trim`); the levels' budget reads only the
+/// card's total. Off by default (and for any word but `1`). The order of the
+/// work changes, never its bytes. Read once a process.
+pub const SETTLE_LATE_ENV: &str = "LAMBDA_VM_LEVELS_SETTLE_LATE";
+
+thread_local! {
+    /// A test's [`settle_late`] on this thread.
+    static SETTLE_LATE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`settle_late`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_settle_late_for_test(on: Option<bool>) {
+    SETTLE_LATE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// [`SETTLE_LATE_ENV`]'s word: on only for `1`.
+pub fn settle_late_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
+}
+
+/// Whether [`SETTLE_LATE_ENV`] is on (or this thread's test override).
+pub fn settle_late() -> bool {
+    if let Some(on) = SETTLE_LATE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| settle_late_word(super::wlfm_knobs::env_word(SETTLE_LATE_ENV).as_deref()))
+}
+
+/// The card read at the base's end, before level 1's stacks are committed:
+/// trimmed as today, or under [`settle_late`] untrimmed. Its seconds and
+/// whether it trimmed, for the times.
+fn settle_base_end(late: bool) -> (Option<CardReading>, f64, bool) {
+    let t = std::time::Instant::now();
+    let reading = card_settle_on("base end", !late);
+    (reading, t.elapsed().as_secs_f64(), !late)
 }
 
 /// This process's resident set, in bytes (Linux; `None` elsewhere).
@@ -1671,6 +1728,9 @@ pub struct LevelsTimes {
     /// stacks' commit: its seconds and when it ended (the driver's clock).
     /// `None` when the driver filled after the commit.
     pub fill_beside: Option<(f64, f64)>,
+    /// The card's reading at the base's end ([`settle_base_end`]): its
+    /// seconds, and whether it trimmed the pool.
+    pub settle_base_end: Option<(f64, bool)>,
     pub levels: Vec<LevelClock>,
     /// Each level's prove stamps ([`super::wlfm::take_wlfm_stamps`]): its
     /// host preparation, phases and groups.
@@ -1914,6 +1974,7 @@ pub fn prove_block_levels(
     );
     // Read on the driver's thread (a test's override is that thread's).
     let fill_beside_on = fill_beside();
+    let late = settle_late();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
     let lean_beside = super::wlfm::lean_beside()
@@ -2238,12 +2299,19 @@ pub fn prove_block_levels(
                     if proved.is_err() {
                         return Err("the base did not prove".to_string());
                     }
-                    let settled = card_settle("base end");
+                    let (settled, settle_secs, trimmed) = settle_base_end(late);
                     take_levels_budget(settled.map(|c| c.total))?;
                     take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
                     let committed = card_settle("level 1 committed");
-                    Ok((build, prepare, cells, now(), [settled, committed]))
+                    Ok((
+                        build,
+                        prepare,
+                        cells,
+                        now(),
+                        [settled, committed],
+                        (settle_secs, trimmed),
+                    ))
                 }))
             }
             None => None,
@@ -2329,19 +2397,27 @@ pub fn prove_block_levels(
     // Level 1's build: its stacks committed on the card at the base's end
     // (prepared beside phase B under `build_beside`), or prepared and
     // committed now.
-    let (first, prepare, cells, committed, cards) = match built_beside {
+    let (first, prepare, cells, committed, cards, settle) = match built_beside {
         Some(built) => built?,
         None => {
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
-            let settled = card_settle("base end");
+            let (settled, settle_secs, trimmed) = settle_base_end(settle_late());
             take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
             let build = commit_level(pre, 1)?;
             let committed = card_settle("level 1 committed");
-            (build, prepare, cells, now(), [settled, committed])
+            (
+                build,
+                prepare,
+                cells,
+                now(),
+                [settled, committed],
+                (settle_secs, trimmed),
+            )
         }
     };
+    times.settle_base_end = Some(settle);
     times.card_pad = levels_pad_held();
     for (at, card) in ["base end", "level 1 committed"].into_iter().zip(cards) {
         if let Some(card) = card {

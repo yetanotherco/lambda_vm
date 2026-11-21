@@ -1166,8 +1166,25 @@ pub fn set_up_device() {}
 /// a device.
 #[cfg(feature = "cuda")]
 pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
+    settle_card_on(true)
+}
+
+/// [`settle_card`] with the pool left holding its pages (no trim): the
+/// context drained, the same readings. A caller that allocates again at once
+/// reuses those pages instead of mapping them anew.
+#[cfg(feature = "cuda")]
+pub fn settle_card_untrimmed() -> Option<(u64, u64, u64, u64)> {
+    settle_card_on(false)
+}
+
+#[cfg(feature = "cuda")]
+fn settle_card_on(trim: bool) -> Option<(u64, u64, u64, u64)> {
     let be = math_cuda::device::backend().ok()?;
-    let _ = math_cuda::device::drain_and_trim();
+    let _ = if trim {
+        math_cuda::device::drain_and_trim()
+    } else {
+        math_cuda::device::drain_untrimmed()
+    };
     let (used, peak) = math_cuda::device::pool_used_bytes().ok()?;
     // A card window ([`card_window_start`]) restarts the high-water mark; what
     // it had seen since this reading's last one is kept and counted here.
@@ -1293,6 +1310,11 @@ pub fn card_window_end() -> Option<CardWindow> {
 
 #[cfg(not(feature = "cuda"))]
 pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn settle_card_untrimmed() -> Option<(u64, u64, u64, u64)> {
     None
 }
 
