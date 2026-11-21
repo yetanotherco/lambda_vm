@@ -498,6 +498,114 @@ fn the_local_lane_moves_no_byte_on_a_real_block() {
     }
 }
 
+/// Phase A's place of a table and its block index under local lookups: each
+/// LOCAL_BYTES table sent before a table moves its place one past its block
+/// index, and a LOCAL_BYTES table has none (it is never dropped).
+#[test]
+fn a_tables_block_index_skips_the_local_bytes_tables_before_it() {
+    let places = block_whir::LocalPlaces::default();
+    assert_eq!(places.block_index_of(5), Some(5), "no LOCAL_BYTES yet");
+    places.push(3);
+    places.push(7);
+    for (place, want) in [
+        (0, Some(0)),
+        (2, Some(2)),
+        (3, None),
+        (4, Some(3)),
+        (6, Some(5)),
+        (7, None),
+        (8, Some(6)),
+        (20, Some(18)),
+    ] {
+        assert_eq!(places.block_index_of(place), want, "place {place}");
+    }
+}
+
+/// ★ Live regeneration under local lookups: phase A dropping every table it
+/// can (streamed chunks, and the rest's KECCAK_RND and LT tables built at the
+/// finish) and phase B rebuilding them proves the bytes of the prove without
+/// regeneration, with no mismatch, under the split memory format and the word
+/// one, KECCAK_RND at the finish or streamed, the lane on. A rebuilt table that
+/// is not the one dropped refuses the prove ("the regenerated columns are not
+/// the ones dropped"), so this pins that each kind of dropped table comes back
+/// as it was.
+#[test]
+#[ignore = "box tier: proves a block twelve times, run with --ignored --test-threads=1 and \
+            LAMBDA_VM_DETERMINISTIC_GRIND=1"]
+fn local_lookups_survive_live_regeneration() {
+    use crate::block_whir::regen::RegenMode;
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tests::block_whir_tests::{records_fill_lock, streamed};
+    let _fills = records_fill_lock();
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    let bytes = |proof: &BlockWhirProof<LocalArgues>| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+            .expect("serialize")
+            .to_vec()
+    };
+    // The production's row forms (in-row registers, which the word format
+    // needs; MEMW_A's limbs; ECDAS' halves), memory split or in words, pages
+    // one a table or in runs of 16 (the production's).
+    for (memory, page_run, stream_keccak_rnd) in [
+        (MemoryFormat::Split, 0, false),
+        (MemoryFormat::Split, 0, true),
+        (MemoryFormat::Words, 0, false),
+        (MemoryFormat::Words, 0, true),
+        (MemoryFormat::Words, block_whir::BLOCK_PAGE_RUN_LOG2, false),
+        (MemoryFormat::Words, block_whir::BLOCK_PAGE_RUN_LOG2, true),
+    ] {
+        let format = BlockFormat {
+            registers: crate::tables::register::RegisterFormat::InRow,
+            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+            ecdas: crate::tables::ecdas::EcdasForm::Halves,
+            ..local()
+        }
+        .with_memory(memory)
+        .with_page_run(page_run);
+        // The word format proves keccak256's syscall, not the bare permutation.
+        let elf = asm_elf_bytes(match memory {
+            MemoryFormat::Words => "test_keccak256",
+            _ => "test_keccak_multi",
+        });
+        let what =
+            format!("{memory:?}, page runs 2^{page_run}, KECCAK_RND streamed {stream_keccak_rnd}");
+        let prove = |mode| {
+            let mut o = streamed(crate::tables::MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = 3;
+            o.drop_streamed_ops = true;
+            o.regen = Some(mode);
+            prove_block_whir_local_with(
+                &elf,
+                &[],
+                &opts(),
+                &format,
+                &o,
+                &Deviations {
+                    card_fill: Some(false),
+                    card_fill_streamed: Some([false, false]),
+                    stream_keccak_rnd: Some(stream_keccak_rnd),
+                    word_stream: Some(memory == MemoryFormat::Words),
+                    local_lane: Some(true),
+                    ..Deviations::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{what}, {mode:?}: {e:?}"))
+        };
+        let (plain, _) = prove(RegenMode::Off);
+        let (dropped, stamps) = prove(RegenMode::Always);
+        let r = stamps.regen.as_ref().expect("live regeneration's readout");
+        eprintln!("{what}: {}", r.lines.join(" | "));
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{what}: {:?}", r.lines);
+        assert!(r.error.is_none(), "{what}: {:?}", r.lines);
+        assert!(r.dropped > 0, "{what}: nothing dropped: {:?}", r.lines);
+        assert!(bytes(&dropped) == bytes(&plain), "{what}: the bytes moved");
+        assert!(verify(&dropped, &elf, &format), "{what}: regenerated");
+    }
+}
+
 /// ★ Where the LOCAL_BYTES tables sit ([`block_whir::check_local_groups`]),
 /// on hand-written groups (no proof): tables 0–3 the run's (0 and 2 send a
 /// local lookup), 4 and 5 LOCAL_BYTES. The honest packing passes; each
