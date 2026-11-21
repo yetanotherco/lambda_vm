@@ -29,8 +29,8 @@ use super::local_lookup_tests::{
 };
 use crate::multilinear_air::Uniforms;
 use crate::multilinear_block::{
-    self, ArgueDeviation, BlockCommitted, BlockProved, CsProbe, GroupStamps, LaneDefer, LaneLimits,
-    LaneState, LocalPhaseA, Narrowing, ZcLaneStamp, local_lane_lines,
+    self, ArgueDeviation, BlockCommitted, BlockProved, CsProbe, GroupStamps, LaneDefer, LaneGrowth,
+    LaneLimits, LaneState, LocalPhaseA, Narrowing, ZcLaneStamp, local_lane_lines,
 };
 use crate::multilinear_table::{
     CommittedTable, TableLayout,
@@ -285,6 +285,41 @@ fn the_local_lane_moves_no_byte() {
             )),
             "{lines}"
         );
+
+        // The lane's room knobs (the next commit's growth by group shape,
+        // 1 GiB reserves, both) and a test's forced zero prediction: the
+        // same bytes, every bin on the lane (without a card the budget is 0
+        // and the room rule is off).
+        for limits in [
+            LaneLimits {
+                growth: LaneGrowth::Shape,
+                ..LaneLimits::default()
+            },
+            LaneLimits {
+                margin: 1 << 30,
+                unledgered: 1 << 30,
+                ..LaneLimits::default()
+            },
+            LaneLimits {
+                growth: LaneGrowth::Shape,
+                margin: 1 << 30,
+                unledgered: 1 << 30,
+                ..LaneLimits::default()
+            },
+            LaneLimits {
+                growth: LaneGrowth::Shape,
+                predict: Some(0),
+                margin: 0,
+                unledgered: 0,
+                ..LaneLimits::default()
+            },
+        ] {
+            let proved = check(lane(limits));
+            for (g, (job, left)) in lane_stamps(&proved).iter().enumerate().skip(1) {
+                assert_eq!(job.state, LaneState::Ran, "{limits:?}, group {g}: {job:?}");
+                assert!(left.is_empty(), "{limits:?}, group {g}");
+            }
+        }
 
         // No lane: phase B runs every bin.
         for placement in [Placement::PhaseB, Placement::NoUpload] {

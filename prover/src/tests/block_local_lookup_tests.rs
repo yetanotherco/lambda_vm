@@ -606,6 +606,146 @@ fn local_lookups_survive_live_regeneration() {
     }
 }
 
+/// ★ The lane's room knobs move no byte, and a misprediction never fails a
+/// prove. The block proved with the lane under each of its knobs — the next
+/// commit's growth by group shape (`LAMBDA_VM_LANE_GROWTH=shape`), reserves of
+/// 1 GiB (`LAMBDA_VM_LANE_RESERVE_MIB=1024`), and both — is the lane-off proof
+/// byte for byte, and verifies. Then every prediction forced to 0 with no
+/// reserves, under a budget below the lane-off run's ledger peak: the lane
+/// holds what it would not, a commit's reservations are refused where they
+/// ask and take the host path, and the prove still ends with the same bytes.
+/// On a card the refusals are counted; on the host the budget is 0 and the
+/// lane's room rule is off. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`.
+#[test]
+#[ignore = "box tier: proves a real block five times, run with --ignored --test-threads=1 and \
+            LAMBDA_VM_DETERMINISTIC_GRIND=1 (it moves the process's card budget)"]
+fn the_lane_room_knobs_move_no_byte_and_a_misprediction_falls_back() {
+    use stark::multilinear_block::{LaneGrowth, LaneLimits};
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    let elf = elf();
+    let prove_with = |lane: bool, limits: Option<LaneLimits>, what: &str| {
+        let t = std::time::Instant::now();
+        let proved = prove_block_whir_local_with(
+            &elf,
+            &[],
+            &opts(),
+            &local(),
+            &block_options(),
+            &Deviations {
+                local_lane: Some(lane),
+                lane_limits: limits,
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{what}: the prove failed: {e:?}"));
+        eprintln!(
+            "lane room {what}: {:.1}s\n{}",
+            t.elapsed().as_secs_f64(),
+            stark::multilinear_block::local_lane_lines(&proved.1.groups)
+        );
+        proved
+    };
+    let bytes = |proof: &BlockWhirProof<LocalArgues>| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (reference, off_stamps) = prove_with(false, None, "lane off");
+    let reference = bytes(&reference);
+    let gib = 1u64 << 30;
+    for (what, limits) in [
+        (
+            "growth by shape",
+            LaneLimits {
+                growth: LaneGrowth::Shape,
+                ..LaneLimits::default()
+            },
+        ),
+        (
+            "reserves 1 GiB",
+            LaneLimits {
+                margin: gib,
+                unledgered: gib,
+                ..LaneLimits::default()
+            },
+        ),
+        (
+            "both",
+            LaneLimits {
+                growth: LaneGrowth::Shape,
+                margin: gib,
+                unledgered: gib,
+                ..LaneLimits::default()
+            },
+        ),
+    ] {
+        let (proof, stamps) = prove_with(true, Some(limits), what);
+        assert!(bytes(&proof) == reference, "{what}: the bytes moved");
+        assert!(verify(&proof, &elf, &local()), "{what}: the proof verifies");
+        if limits.growth == LaneGrowth::Shape && multilinear::gpu::reserve_budget() > 0 {
+            assert!(
+                stamps
+                    .groups
+                    .iter()
+                    .skip(1)
+                    .any(|g| g.lane_predicted_growth > 0),
+                "{what}: the lane predicted the commits' growth"
+            );
+        }
+    }
+    // Every prediction 0, no reserves, under a budget below the lane-off
+    // run's peak: commits are refused where they ask, and the prove ends.
+    let peak = off_stamps
+        .groups
+        .iter()
+        .map(|g| g.commit_reserved)
+        .max()
+        .unwrap_or(0);
+    let tight = peak / 4 * 3;
+    let before = multilinear::gpu::set_reserve_budget(tight);
+    let fallbacks_before = multilinear::gpu::host_fallbacks();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prove_with(
+            true,
+            Some(LaneLimits {
+                growth: LaneGrowth::Shape,
+                predict: Some(0),
+                margin: 0,
+                unledgered: 0,
+                ..LaneLimits::default()
+            }),
+            "every prediction 0 under a tight budget",
+        )
+    }));
+    let fallbacks = multilinear::gpu::host_fallbacks().saturating_sub(fallbacks_before);
+    multilinear::gpu::set_reserve_budget(before);
+    let (proof, stamps) = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let refused: u64 = stamps.groups.iter().map(|g| g.commit_host_fallbacks).sum();
+    eprintln!(
+        "lane room misprediction: budget {} MiB (the lane-off peak {} MiB) · commits with a host \
+         fallback {refused} · host fallbacks {fallbacks}",
+        tight >> 20,
+        peak >> 20
+    );
+    assert!(
+        bytes(&proof) == reference,
+        "a misprediction moved the bytes"
+    );
+    assert!(
+        verify(&proof, &elf, &local()),
+        "the mispredicted proof verifies"
+    );
+    if before > 0 {
+        assert!(
+            refused > 0 || fallbacks > 0,
+            "on a card the tight budget refused a commit's reservation"
+        );
+    }
+}
+
 /// ★ Where the LOCAL_BYTES tables sit ([`block_whir::check_local_groups`]),
 /// on hand-written groups (no proof): tables 0–3 the run's (0 and 2 send a
 /// local lookup), 4 and 5 LOCAL_BYTES. The honest packing passes; each

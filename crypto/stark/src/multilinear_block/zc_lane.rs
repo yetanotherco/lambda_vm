@@ -74,6 +74,12 @@ pub struct LaneLimits {
     /// ran, its transcript moved past what the bin sent — a failure that
     /// leaves the job partway. `None` in production.
     pub fail_bin: Option<usize>,
+    /// How the next commit's growth is predicted ([`LaneGrowth`]).
+    pub growth: LaneGrowth,
+    /// ⛔ A test's fault: every prediction of a commit's growth is this many
+    /// bytes, whatever the commits grew (a misprediction on purpose). `None`
+    /// in production.
+    pub predict: Option<u64>,
 }
 
 impl Default for LaneLimits {
@@ -81,11 +87,155 @@ impl Default for LaneLimits {
         Self {
             hold: 3,
             hold_bytes: None,
-            margin: 5 << 29,
-            unledgered: 5 << 29,
+            margin: LANE_RESERVE_DEFAULT,
+            unledgered: LANE_RESERVE_DEFAULT,
             bins: None,
             fail_bin: None,
+            growth: LaneGrowth::Max,
+            predict: None,
         }
+    }
+}
+
+/// How the lane predicts a commit's growth of the card's ledger, the room it
+/// keeps for the commit beside the stores it holds ([`LaneLimits::growth`]).
+/// A prediction moves only which groups' local bins run in phase A and which
+/// at their turn in phase B: the proof is the same byte for byte. A commit
+/// that grows past its prediction is refused by the ledger where it asks
+/// ([`multilinear::gpu::reserve_budget`]) and takes its host path.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaneGrowth {
+    /// The most any commit of the run has grown the ledger so far.
+    #[default]
+    Max,
+    /// The growth of the last commit of the same group shape (its tables'
+    /// widths and heights), with a slack ([`shape_slack`]), capped by
+    /// [`LaneGrowth::Max`]; a shape not committed yet takes the maximum. At a
+    /// group's own commit the prediction is its shape's; for the commit after
+    /// a group's, the group's shape when it repeats the shape before it, else
+    /// the maximum.
+    Shape,
+}
+
+/// The knob that picks [`LaneGrowth`] (`max`, the default, or `shape`).
+pub const LANE_GROWTH_ENV: &str = "LAMBDA_VM_LANE_GROWTH";
+
+/// The knob that sets [`LaneLimits::margin`] and [`LaneLimits::unledgered`],
+/// each, in MiB ([`LANE_RESERVE_DEFAULT`] unset).
+pub const LANE_RESERVE_ENV: &str = "LAMBDA_VM_LANE_RESERVE_MIB";
+
+/// Each of the lane's two reserves by default: 2.5 GiB.
+pub const LANE_RESERVE_DEFAULT: u64 = 5 << 29;
+
+/// The fewest and the most MiB [`LANE_RESERVE_ENV`] takes.
+const LANE_RESERVE_MIB: std::ops::RangeInclusive<u64> = 256..=8192;
+
+/// The slack a [`LaneGrowth::Shape`] prediction adds to the shape's last
+/// growth: a quarter of it, and at least 256 MiB.
+pub fn shape_slack(growth: u64) -> u64 {
+    (growth / 4).max(1 << 28)
+}
+
+/// [`LaneLimits`] as [`LANE_GROWTH_ENV`] and [`LANE_RESERVE_ENV`] read
+/// (`growth`, `reserve`): unset or empty, today's limits
+/// ([`LaneLimits::default`]); `max` or `shape`; a reserve of 256 to 8192 MiB.
+/// Anything else is refused.
+pub fn lane_limits_setting(
+    growth: Option<&str>,
+    reserve: Option<&str>,
+) -> Result<LaneLimits, String> {
+    let growth = match growth.map(str::trim) {
+        None | Some("" | "max") => LaneGrowth::Max,
+        Some("shape") => LaneGrowth::Shape,
+        Some(v) => {
+            return Err(format!(
+                "{LANE_GROWTH_ENV}={v}: max (the run's largest commit growth, the default) or \
+                 shape (the last commit of the same group shape)"
+            ));
+        }
+    };
+    let reserve = match reserve.map(str::trim) {
+        None | Some("") => LANE_RESERVE_DEFAULT,
+        Some(v) => {
+            let mib = v
+                .parse::<u64>()
+                .ok()
+                .filter(|mib| LANE_RESERVE_MIB.contains(mib))
+                .ok_or_else(|| {
+                    format!(
+                        "{LANE_RESERVE_ENV}={v}: each of the lane's two reserves in MiB, {} to {} \
+                         (unset: {})",
+                        LANE_RESERVE_MIB.start(),
+                        LANE_RESERVE_MIB.end(),
+                        LANE_RESERVE_DEFAULT >> 20
+                    )
+                })?;
+            mib << 20
+        }
+    };
+    Ok(LaneLimits {
+        growth,
+        margin: reserve,
+        unledgered: reserve,
+        ..LaneLimits::default()
+    })
+}
+
+/// [`lane_limits_setting`] of this process's environment.
+pub fn lane_limits_from_env() -> Result<LaneLimits, String> {
+    lane_limits_setting(
+        std::env::var(LANE_GROWTH_ENV).ok().as_deref(),
+        std::env::var(LANE_RESERVE_ENV).ok().as_deref(),
+    )
+}
+
+/// A group's shape for [`LaneGrowth::Shape`]: its tables' committed widths
+/// and heights, in order.
+pub type GroupShape = [(usize, usize)];
+
+/// The growths the lane has seen, by group shape, and the last commit's
+/// shape ([`LaneGrowth::Shape`]).
+#[derive(Default)]
+pub(crate) struct GrowthBook {
+    by_shape: Vec<(Vec<(usize, usize)>, u64)>,
+    last_shape: Option<Vec<(usize, usize)>>,
+}
+
+impl GrowthBook {
+    /// A commit of `shape` grew the ledger by `bytes`.
+    pub(crate) fn note(&mut self, shape: &GroupShape, bytes: u64) {
+        match self
+            .by_shape
+            .iter_mut()
+            .find(|(s, _)| s.as_slice() == shape)
+        {
+            Some((_, last)) => *last = bytes,
+            None => self.by_shape.push((shape.to_vec(), bytes)),
+        }
+        self.last_shape = Some(shape.to_vec());
+    }
+
+    /// The predicted growth of a commit of `shape` (`None`: not known), with
+    /// `max` the run's largest growth so far.
+    pub(crate) fn predict(&self, mode: LaneGrowth, max: u64, shape: Option<&GroupShape>) -> u64 {
+        match (mode, shape) {
+            (LaneGrowth::Max, _) | (LaneGrowth::Shape, None) => max,
+            (LaneGrowth::Shape, Some(shape)) => self
+                .by_shape
+                .iter()
+                .find(|(s, _)| s.as_slice() == shape)
+                .map_or(max, |&(_, last)| {
+                    last.saturating_add(shape_slack(last)).min(max)
+                }),
+        }
+    }
+
+    /// The predicted growth of the commit after one of `shape`: `shape`'s,
+    /// when the commit before was of the same shape (a run), else `max`.
+    pub(crate) fn predict_next(&self, mode: LaneGrowth, max: u64, shape: &GroupShape) -> u64 {
+        let repeats = self.last_shape.as_deref().is_some_and(|last| last == shape);
+        self.predict(mode, max, repeats.then_some(shape))
     }
 }
 
@@ -263,6 +413,8 @@ where
     committing: AtomicBool,
     /// The most a commit has grown the ledger so far (bytes).
     max_growth: AtomicU64,
+    /// The growths seen by group shape ([`LaneGrowth::Shape`]).
+    book: Mutex<GrowthBook>,
     queue: Mutex<LaneQueue<'a, F, E>>,
     wake: Condvar,
 }
@@ -309,6 +461,7 @@ where
             local_buses,
             committing: AtomicBool::new(false),
             max_growth: AtomicU64::new(0),
+            book: Mutex::new(GrowthBook::default()),
             queue: Mutex::new(LaneQueue {
                 jobs: VecDeque::new(),
                 running: None,
@@ -337,21 +490,53 @@ where
         }
     }
 
-    /// Whether a commit starting now, with the ledger at `reserved`, would
-    /// pass `budget − unledgered` at its predicted peak.
-    fn over(&self, reserved: u64) -> bool {
+    /// Whether a commit starting now that grows the ledger by `growth`, with
+    /// the ledger at `reserved`, would pass `budget − unledgered` at its
+    /// peak.
+    fn over(&self, reserved: u64, growth: u64) -> bool {
         let budget = multilinear::gpu::reserve_budget();
-        budget > 0
-            && reserved + self.max_growth.load(std::sync::atomic::Ordering::Relaxed)
-                > budget.saturating_sub(self.limits.unledgered)
+        budget > 0 && reserved + growth > budget.saturating_sub(self.limits.unledgered)
     }
 
-    /// Group `group`'s commit begins: no unit starts until it ends. It waits
-    /// for the unit under way, and before it lets queued stores go, oldest
-    /// first, while its predicted peak would pass `budget − unledgered`; if
-    /// that is not enough, the job under way lets its store go at its unit
-    /// boundary, and the commit waits for that too.
-    pub(super) fn commit_begins(&self, group: usize) {
+    fn book(&self) -> std::sync::MutexGuard<'_, GrowthBook> {
+        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn max_growth(&self) -> u64 {
+        self.max_growth.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The predicted growth of a commit of `shape` ([`LaneLimits::growth`];
+    /// a test's [`LaneLimits::predict`] first).
+    fn predicted(&self, shape: &GroupShape) -> u64 {
+        self.limits.predict.unwrap_or_else(|| {
+            self.book()
+                .predict(self.limits.growth, self.max_growth(), Some(shape))
+        })
+    }
+
+    /// The predicted growth of the commit after one of `shape`.
+    fn predicted_next(&self, shape: &GroupShape) -> u64 {
+        self.limits.predict.unwrap_or_else(|| {
+            self.book()
+                .predict_next(self.limits.growth, self.max_growth(), shape)
+        })
+    }
+
+    /// Group `group`'s commit begins, its tables of `shape`: no unit starts
+    /// until it ends. It waits for the unit under way, and before it lets
+    /// queued stores go, oldest first, while its predicted peak would pass
+    /// `budget − unledgered`; if that is not enough, the job under way lets
+    /// its store go at its unit boundary, and the commit waits for that too.
+    /// Returns the commit's predicted growth.
+    ///
+    /// It never waits for room: the ledger refuses a reservation at once
+    /// rather than block (`math_cuda::device::reserve`), so a commit that
+    /// grows past its prediction takes its host path where it is refused,
+    /// and the only waits here are for the unit under way and the job's next
+    /// unit boundary, which the lane reaches without the commit.
+    pub(super) fn commit_begins(&self, group: usize, shape: &GroupShape) -> u64 {
+        let growth = self.predicted(shape);
         let waited = Instant::now();
         let mut queue = self.lock();
         self.committing
@@ -363,7 +548,7 @@ where
                 .map(|(guard, _)| guard)
                 .unwrap_or_else(|e| e.into_inner().0);
         }
-        while self.over(multilinear::gpu::ledger_reserved()) {
+        while self.over(multilinear::gpu::ledger_reserved(), growth) {
             let Some(job) = queue.jobs.pop_front() else {
                 break;
             };
@@ -377,7 +562,7 @@ where
             drop(job.tables);
             self.decide();
         }
-        if queue.running.is_some() && self.over(multilinear::gpu::ledger_reserved()) {
+        if queue.running.is_some() && self.over(multilinear::gpu::ledger_reserved(), growth) {
             queue.shed = true;
             self.wake.notify_all();
             while queue.running.is_some() {
@@ -392,6 +577,7 @@ where
         queue
             .commit_waits
             .push((group, waited.elapsed().as_secs_f64()));
+        growth
     }
 
     /// Whether the lane runs local jobs.
@@ -406,10 +592,11 @@ where
         self.wake.notify_all();
     }
 
-    /// A commit grew the ledger by `bytes` at its peak.
-    pub(super) fn note_growth(&self, bytes: u64) {
+    /// A commit of `shape` grew the ledger by `bytes` at its peak.
+    pub(super) fn note_growth(&self, shape: &GroupShape, bytes: u64) {
         self.max_growth
             .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.book().note(shape, bytes);
     }
 
     /// Group `group`, just committed: its job, held while the lane may hold it
@@ -417,9 +604,11 @@ where
     /// the group's store on the card. `local`: its local argue begun at
     /// commit time — a local job; a group with none runs the lane's probe, if
     /// one is on, and nothing otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn submit(
         &self,
         group: usize,
+        shape: &GroupShape,
         tables: &[CommittedTable<'a, F, E>],
         roots: &[Commitment],
         on_card: bool,
@@ -455,7 +644,7 @@ where
             .is_some_and(|cap| held_bytes + store_bytes > cap)
             || (budget > 0
                 && multilinear::gpu::ledger_reserved()
-                    + self.max_growth.load(std::sync::atomic::Ordering::Relaxed)
+                    + self.predicted_next(shape)
                     + self.limits.margin
                     > budget.saturating_sub(self.limits.unledgered))
         {
@@ -1104,7 +1293,48 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
             .fold(0.0, f64::max),
         stamps.iter().map(|s| s.zc_lane.close_wait).fold(0.0, f64::max),
     ));
+    out.push_str(&lane_growth_line(stamps));
     out
+}
+
+/// The lane's predictions of each commit's growth against what the commit
+/// grew ([`LaneGrowth`]): per group `predicted/actual` MiB, the largest
+/// under-prediction, and the commits that fell back to the host.
+#[doc(hidden)]
+pub fn lane_growth_line(stamps: &[GroupStamps]) -> String {
+    if stamps.iter().all(|s| s.lane_predicted_growth == 0) {
+        return String::new();
+    }
+    let actual = |s: &GroupStamps| s.commit_reserved.saturating_sub(s.commit_base);
+    // The first commit is predicted with nothing seen (0 in every mode).
+    let under = stamps
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(g, s)| (actual(s).saturating_sub(s.lane_predicted_growth), g))
+        .max()
+        .unwrap_or((0, 0));
+    format!(
+        "BLOCK LOCAL LANE GROWTH: per group predicted/actual [{}] MiB · largest under-prediction \
+         after the first commit {} MiB (group {}) · commits under-predicted {} · commits with a \
+         host fallback {}\n",
+        stamps
+            .iter()
+            .map(|s| format!("{}/{}", s.lane_predicted_growth >> 20, actual(s) >> 20))
+            .collect::<Vec<_>>()
+            .join(", "),
+        under.0 >> 20,
+        under.1,
+        stamps
+            .iter()
+            .skip(1)
+            .filter(|s| actual(s) > s.lane_predicted_growth)
+            .count(),
+        stamps
+            .iter()
+            .filter(|s| s.commit_host_fallbacks > 0)
+            .count(),
+    )
 }
 
 /// A local group's bins: those run on the lane and those run in phase B (a
@@ -1162,4 +1392,94 @@ pub fn merge_probe_lines(stamps: &[GroupStamps]) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::*;
+
+    /// The knobs: unset is today's limits; `max` / `shape`; a reserve of
+    /// 256 to 8192 MiB sets both reserves; anything else is refused.
+    #[test]
+    fn the_lane_room_knobs_read_their_words() {
+        let today = LaneLimits::default();
+        let unset = lane_limits_setting(None, None).expect("unset");
+        assert_eq!(
+            (unset.growth, unset.margin, unset.unledgered, unset.hold),
+            (today.growth, today.margin, today.unledgered, today.hold)
+        );
+        assert_eq!(today.growth, LaneGrowth::Max);
+        assert_eq!(today.margin, 5 << 29);
+        assert_eq!(today.unledgered, 5 << 29);
+        assert_eq!(today.predict, None);
+        let words = lane_limits_setting(Some(" shape "), Some("1024")).expect("words");
+        assert_eq!(words.growth, LaneGrowth::Shape);
+        assert_eq!((words.margin, words.unledgered), (1 << 30, 1 << 30));
+        assert_eq!(
+            lane_limits_setting(Some("max"), Some("")).map(|l| l.growth),
+            Ok(LaneGrowth::Max)
+        );
+        for bad in ["shapes", "1", "min"] {
+            assert!(lane_limits_setting(Some(bad), None).is_err(), "{bad:?}");
+        }
+        for bad in ["255", "8193", "-1", "1g", "lots"] {
+            assert!(lane_limits_setting(None, Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!(lane_limits_setting(None, Some("256")).is_ok());
+        assert!(lane_limits_setting(None, Some("8192")).is_ok());
+    }
+
+    /// The predictions: `max` is the run's largest growth whatever the shape;
+    /// `shape` is the shape's last growth with its slack, capped by the
+    /// largest, and the largest for a shape not seen; for the commit after
+    /// one, the shape's only when the commit before repeated it.
+    #[test]
+    fn the_growth_book_predicts_by_shape_and_falls_back_to_the_largest() {
+        let mib = 1u64 << 20;
+        let cpu: &GroupShape = &[(57, 21), (57, 21)];
+        let keccak: &GroupShape = &[(400, 16), (7, 16)];
+        let mut book = GrowthBook::default();
+        assert_eq!(
+            book.predict(LaneGrowth::Shape, 0, Some(keccak)),
+            0,
+            "nothing seen"
+        );
+        book.note(cpu, 10_000 * mib);
+        let max = 10_000 * mib;
+        assert_eq!(book.predict(LaneGrowth::Max, max, Some(cpu)), max);
+        assert_eq!(
+            book.predict(LaneGrowth::Shape, max, Some(keccak)),
+            max,
+            "unseen shape"
+        );
+        assert_eq!(book.predict(LaneGrowth::Shape, max, None), max, "no shape");
+        book.note(keccak, 50 * mib);
+        assert_eq!(
+            book.predict(LaneGrowth::Shape, max, Some(keccak)),
+            50 * mib + shape_slack(50 * mib),
+            "the shape's last growth and its slack"
+        );
+        assert_eq!(shape_slack(50 * mib), 256 * mib, "the slack's floor");
+        assert_eq!(shape_slack(4_000 * mib), 1_000 * mib, "a quarter");
+        assert_eq!(
+            book.predict(LaneGrowth::Shape, max, Some(cpu)),
+            max,
+            "capped by the largest"
+        );
+        assert_eq!(book.predict(LaneGrowth::Max, max, Some(keccak)), max);
+        // The commit after a KECCAK_RND group: the last commit was one too.
+        assert_eq!(
+            book.predict_next(LaneGrowth::Shape, max, keccak),
+            50 * mib + shape_slack(50 * mib)
+        );
+        // After a CPU group, or under `max`: the largest.
+        assert_eq!(book.predict_next(LaneGrowth::Shape, max, cpu), max);
+        assert_eq!(book.predict_next(LaneGrowth::Max, max, keccak), max);
+        // A shape that grows later is predicted from its last growth.
+        book.note(keccak, 3_000 * mib);
+        assert_eq!(
+            book.predict(LaneGrowth::Shape, max, Some(keccak)),
+            3_000 * mib + 750 * mib
+        );
+    }
 }

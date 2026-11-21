@@ -5304,6 +5304,9 @@ pub(crate) struct Deviations {
     /// (`Some(true)`) or leaves them to phase B (`Some(false)`), instead of
     /// the knob ([`LOCAL_LANE_ENV`]). The proof is the same.
     pub local_lane: Option<bool>,
+    /// What phase A's lane may hold, instead of its knobs
+    /// (`multilinear_block::lane_limits_from_env`). The proof is the same.
+    pub lane_limits: Option<multilinear_block::LaneLimits>,
     /// Under local lookups: every LOCAL_BYTES table made wrong
     /// ([`LocalBytesFault`]) and proved honestly over.
     pub local_bytes: LocalBytesFault,
@@ -8725,7 +8728,14 @@ fn prove_streamed(
     refuse_retired_words(|name| std::env::var(name).ok())?;
     // The constraint-sumcheck probes: measurements, off unless asked (the
     // proof is the same); a word they do not take refuses the prove.
-    let cs_probe = multilinear_block::CsProbe::from_env().map_err(Error::Prover)?;
+    let mut cs_probe = multilinear_block::CsProbe::from_env().map_err(Error::Prover)?;
+    // What phase A's lane may hold beside the commits: how it predicts the
+    // next commit's growth and the room it keeps. The proof is the same; a
+    // word the knobs do not take refuses the prove.
+    cs_probe.limits = match deviations.lane_limits {
+        Some(limits) => limits,
+        None => multilinear_block::lane_limits_from_env().map_err(Error::Prover)?,
+    };
     // Under local lookups, whether phase A's lane runs the local argues: the
     // proof is the same either way; a word it does not take refuses the prove.
     let local_lane = match deviations.local_lane {
@@ -8733,6 +8743,20 @@ fn prove_streamed(
         None => local_lane_setting(std::env::var(LOCAL_LANE_ENV).ok().as_deref())
             .map_err(Error::Prover)?,
     };
+    if format.local_lookups() && local_lane {
+        let limits = &cs_probe.limits;
+        eprintln!(
+            "★ BLOCK LOCAL LANE ROOM: next commit's growth {} · reserves {} + {} MiB ({}, {})",
+            match limits.growth {
+                multilinear_block::LaneGrowth::Max => "the run's largest so far (the default)",
+                multilinear_block::LaneGrowth::Shape => "the last commit of its group shape",
+            },
+            limits.margin >> 20,
+            limits.unledgered >> 20,
+            multilinear_block::LANE_GROWTH_ENV,
+            multilinear_block::LANE_RESERVE_ENV,
+        );
+    }
     // Where the in-row side records are walked into: a word it does not take
     // refuses the prove.
     let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(
