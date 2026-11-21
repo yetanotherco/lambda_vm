@@ -68,19 +68,20 @@ pub fn chip_records() -> bool {
 /// the tables are the records path's, column for column. Read once a process.
 pub const LEAN_BESIDE_ENV: &str = "LAMBDA_VM_WLFM_LEAN_BESIDE";
 
-/// `LAMBDA_VM_LEVELS_TAIL=1`: the levels' tail after the base taken off the
+/// `LAMBDA_VM_LEVELS_TAIL`: the levels' tail after the base taken off the
 /// path in one switch: level 1's lean round tables filled beside its
 /// execution ([`LEAN_BESIDE_ENV`]'s fill), and every card reading the level
 /// driver makes inside the levels (the base's end, each level committed and
 /// proved) taken without trimming the pool, which keeps its pages for the
 /// levels' own allocations (each still trims on a failed allocation). The
-/// reading at the clock's start is today's. Off by default (and for any word
-/// but `1`); the same bytes. Read once a process.
+/// reading at the clock's start is unchanged. On by default; `0` turns it off
+/// (any other word leaves it on); the same bytes either way. Read once a
+/// process.
 pub const TAIL_ENV: &str = "LAMBDA_VM_LEVELS_TAIL";
 
-/// [`TAIL_ENV`]'s word: on only for `1`.
+/// [`TAIL_ENV`]'s word: on unless it is `0`.
 pub fn tail_word(word: Option<&str>) -> bool {
-    knob_word_on(word)
+    !knob_word_off(word)
 }
 
 /// A test's [`tail`], process wide (0 the knob, 1 off, 2 on).
