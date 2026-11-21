@@ -387,3 +387,69 @@ fn pooled_executor_logs_prove_the_same_bytes_on_the_card() {
         off_x.windows, on_x.pooled_windows, on_x.windows, short_x.pageable_windows, short_x.windows
     );
 }
+
+/// ★ Card, one process (the pool locked by the driver for its life): run
+/// alone, deterministic grind. With the executor's logs in a 1 GiB pool, the
+/// block proved twice with the shared arenas picked by thread (today's) and
+/// twice by size class (`LAMBDA_VM_POOL_ARENA=class`) proves the same bytes
+/// each time, and verifies. Prints how much more of the pool each choice's
+/// second prove carved (by size class: the first's freed buffers taken again).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: locks a page-locked pool for the whole process; run alone, deterministic grind"]
+fn the_pool_arena_by_size_class_proves_the_same_bytes_on_the_card() {
+    use crate::block_whir::{BlockWhirProof, Deviations, prove_block_whir_with, verify_block_whir};
+    use stark::proof::options::ProofOptions;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_pool_exec_logs_for_test(None);
+            math_cuda::pinned::set_pool_arena_by_class_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    assert!(multilinear::gpu::reserve_budget() > 0, "needs a card");
+    assert_eq!(
+        math_cuda::pinned::set_pool_gib_for_tests(1),
+        1,
+        "the pool's knob was read already in this process"
+    );
+    let pool = math_cuda::pinned::lock_pool().expect("the pool locked");
+    assert_eq!((pool.pieces, pool.refused), (1, 0), "{pool:?}");
+    set_pool_exec_logs_for_test(Some(true));
+    let (elf, input, format, o) = pooled_logs_fixture();
+    let opts = ProofOptions::default_test_options();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let proved = |class: bool| {
+        math_cuda::pinned::set_pool_arena_by_class_for_test(Some(class));
+        let (proof, _) =
+            prove_block_whir_with(&elf, &input, &opts, &format, &o, &Deviations::default())
+                .expect("the block proves");
+        assert!(
+            verify_block_whir(&proof, &elf, &opts, &format).unwrap_or(false),
+            "by size class {class}: the proof verifies"
+        );
+        (bytes(&proof), math_cuda::pinned::stats().carved_bytes)
+    };
+    let (slot1, c1) = proved(false);
+    let (slot2, c2) = proved(false);
+    let (class1, c3) = proved(true);
+    let (class2, c4) = proved(true);
+    assert_eq!(slot2, slot1, "by thread, twice: the proof's bytes");
+    assert_eq!(class1, slot1, "by size class: the proof's bytes");
+    assert_eq!(class2, slot1, "by size class, twice: the proof's bytes");
+    println!(
+        "POOL ARENA CARD: the same bytes by thread and by size class · the second prove carved {} B more by thread, {} B by size class",
+        c2 - c1,
+        c4 - c3
+    );
+}
