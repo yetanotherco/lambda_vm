@@ -1081,6 +1081,89 @@ fn the_fill_beside_knob_is_named_and_on_by_default() {
     assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }
 
+/// The settle-late knob's name; it is off by default, and only `1` turns it
+/// on.
+#[test]
+fn the_settle_late_knob_is_named_and_off_by_default() {
+    use super::levels::{SETTLE_LATE_ENV, settle_late, settle_late_word};
+    assert_eq!(SETTLE_LATE_ENV, "LAMBDA_VM_LEVELS_SETTLE_LATE");
+    if std::env::var_os(SETTLE_LATE_ENV).is_none() {
+        assert!(!settle_late());
+    }
+    for (word, on) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("on"), false),
+        (Some("1"), true),
+        (Some(" 1 "), true),
+    ] {
+        assert_eq!(settle_late_word(word), on, "{word:?}");
+    }
+}
+
+/// ★ Level 1's stacks committed at the base's end on the pool's pages, the
+/// pool trimmed only after (`LAMBDA_VM_LEVELS_SETTLE_LATE`), are the same
+/// proofs: a small BLAKE3 block driven with the knob on proves each level's
+/// bytes as [`prove_levels`] does over the same base, and the driver read the
+/// card at the base's end without a trim (no card: no reading). Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_settling_late_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_settle_late_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_settle_late_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        set_settle_late_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let (secs, trimmed) = run
+        .times
+        .settle_base_end
+        .expect("the driver read the card at the base's end");
+    assert!(
+        secs >= 0.0 && !trimmed,
+        "the base-end reading skipped the trim"
+    );
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS SETTLE LATE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The BLAKE3 driver with level 1's lean round tables filled beside its
 /// execution (`LAMBDA_VM_WLFM_LEAN_BESIDE`, the round chunks held as their
 /// records): level 1's fill took the prefill, which was fed every one of its
@@ -1407,6 +1490,9 @@ fn rta_one_run(
         t.built,
         l1_prove_from
     );
+    if let Some((secs, trimmed)) = t.settle_base_end {
+        println!("RTA LEVEL1 SETTLE: at the base end {secs:.3}s · trimmed {trimmed}");
+    }
     // Level 2 streamed beside level 1's prove (`LAMBDA_VM_LEVELS_STREAM_NEXT`):
     // its pieces' landing against level 1's proved time, and level 1's own
     // prove seconds (the stream must not slow it).
