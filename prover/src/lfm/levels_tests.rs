@@ -2717,7 +2717,9 @@ fn a_levels_verifier_pins_its_familys_base() {
     }
 }
 
-/// ★ A public entry accepts: a small block proved at the format
+/// ★ A public entry accepts: a small block with a keccak call (`test_keccak`,
+/// so its statement holds a KECCAK_RND group closed by its LOCAL_BYTES table
+/// and the pinned format argues that group's lookups locally) proved at the format
 /// `verify_block_levels` pins (the tree's pinned format on the BLAKE3 base),
 /// under the options it derives, through its two levels, and the last level
 /// verified by `verify_block_levels` itself — so the entry's own constants
@@ -2737,7 +2739,11 @@ fn the_public_levels_verifier_accepts_at_the_pinned_format() {
     )
     .expect("the pin");
     let opts = super::proof::block_base_options_under(&format.zf);
-    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    assert!(
+        format.local_lookups(),
+        "the pinned BLAKE3 format argues local lookups"
+    );
+    let elf = crate::test_utils::asm_elf_bytes("test_keccak");
     // The pinned format's KECCAK_RND lean byte checks need the windowed build.
     let run = super::levels::prove_block_levels(
         &elf,
@@ -2751,6 +2757,22 @@ fn the_public_levels_verifier_accepts_at_the_pinned_format() {
         true,
     )
     .expect("the block proves to its last level at the pinned format");
+    let local_groups = run
+        .base_proof
+        .local
+        .as_ref()
+        .expect("a base of the local kind")
+        .iter()
+        .filter(|argue| !argue.is_empty())
+        .count();
+    println!(
+        "PUBLIC LEVELS: {} groups, {local_groups} local",
+        run.base_proof.groups.len()
+    );
+    assert!(
+        local_groups >= 1,
+        "the base argues at least one local group"
+    );
     let last = run.proofs.last().expect("a last level");
     super::levels::verify_block_levels(&elf, run.base_proof.statement(), WlfmFamily::B3, last)
         .expect("the public entry accepts the honest last level");
