@@ -1188,6 +1188,7 @@ mod tests {
 
     #[test]
     fn the_pool_is_locked_once_and_only_when_asked() {
+        let _choice = arena_choice_held();
         let _ = on();
         assert_eq!(LOCKED.load(Ordering::Relaxed), 2 << 30);
         assert!(lock_pool().is_none(), "a second lock");
@@ -1198,6 +1199,7 @@ mod tests {
 
     #[test]
     fn a_large_allocation_in_a_scope_comes_from_the_pool_and_one_outside_does_not() {
+        let _choice = arena_choice_held();
         let arenas = on();
         let bytes = 8 << 20;
         let inside = {
@@ -1215,6 +1217,7 @@ mod tests {
 
     #[test]
     fn a_small_allocation_never_binds() {
+        let _choice = arena_choice_held();
         let arenas = on();
         let before = thread_arena().expect("the thread's arena");
         let small = {
@@ -1229,6 +1232,7 @@ mod tests {
 
     #[test]
     fn a_scope_gives_the_thread_its_arena_back_even_nested() {
+        let _choice = arena_choice_held();
         let arenas = on();
         let before = thread_arena().expect("the thread's arena");
         {
@@ -1246,6 +1250,7 @@ mod tests {
 
     #[test]
     fn a_freed_block_stays_in_the_pool_through_a_purge_and_serves_the_next() {
+        let _choice = arena_choice_held();
         let arenas = on();
         let bytes = 16 << 20;
         let first = {
@@ -1278,6 +1283,7 @@ mod tests {
 
     #[test]
     fn an_extent_never_spans_two_pieces() {
+        let _choice = arena_choice_held();
         let _ = on();
         let base = POOL_BASE.load(Ordering::Relaxed);
         for size in [PAGE, 3 << 20, 64 << 20, 200 << 20] {
@@ -1294,6 +1300,7 @@ mod tests {
 
     #[test]
     fn the_unused_pool_leaves_out_what_an_allocation_holds() {
+        let _choice = arena_choice_held();
         let _ = on();
         let len = POOL_LEN.load(Ordering::Relaxed) as u64;
         let bytes = 32 << 20;
@@ -1313,6 +1320,7 @@ mod tests {
 
     #[test]
     fn the_netting_retires_with_the_prove() {
+        let _choice = arena_choice_held();
         let _ = on();
         let len = POOL_LEN.load(Ordering::Relaxed) as u64;
         assert!(arena_free_bytes() <= len);
@@ -1325,6 +1333,7 @@ mod tests {
 
     #[test]
     fn a_tail_goes_back_to_the_pool_in_place() {
+        let _choice = arena_choice_held();
         let arenas = on();
         let bytes = 32 << 20;
         let taken = {
@@ -1356,6 +1365,7 @@ mod tests {
     /// 40), and the rounding is no memory a pageable allocation faults in.
     #[test]
     fn the_held_pool_counts_what_was_asked_not_its_size_classes() {
+        let _choice = arena_choice_held();
         let _ = on();
         assert_eq!(usable(32 << 20), 32 << 20);
         assert_eq!(usable((33 << 20) + 1), 40 << 20);
@@ -1380,6 +1390,7 @@ mod tests {
 
     #[test]
     fn merges_stay_inside_one_piece() {
+        let _choice = arena_choice_held();
         let _ = on();
         let base = POOL_BASE.load(Ordering::Relaxed);
         assert!(may_merge(base, base + PIECE));
@@ -1389,6 +1400,7 @@ mod tests {
 
     #[test]
     fn uploads_are_counted_and_the_pools_apart() {
+        let _choice = arena_choice_held();
         let _ = on();
         let bytes = 2 << 20;
         let locked = {
@@ -1412,6 +1424,7 @@ mod tests {
     /// thread's [`with_source`], else under `other`.
     #[test]
     fn uploads_are_counted_by_source_and_the_pools_apart() {
+        let _choice = arena_choice_held();
         let _ = on();
         let bytes = 2 << 20;
         let locked = {
@@ -1443,9 +1456,15 @@ mod tests {
     }
 
     /// The executor's buffers' arena is one, whatever thread asks: a buffer
-    /// freed on one thread is the next thread's (its very address).
+    /// freed on one thread serves the next thread's, carving none of the pool
+    /// (jemalloc may serve it a few hundred bytes off, where the freed buffer
+    /// merged with a free neighbour).
     #[test]
     fn the_exec_logs_arena_is_one_for_every_thread_and_reuses_a_freed_buffer() {
+        // Alone: no other test carves while the cursor is read.
+        let _alone = ARENA_CHOICE_TESTS
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let arenas = on();
         let bytes = 40 << 20;
         let first = std::thread::spawn(move || {
@@ -1459,6 +1478,7 @@ mod tests {
         })
         .join()
         .expect("a thread");
+        let before = CURSOR.load(Ordering::Acquire);
         let (again, arena) = std::thread::spawn(move || {
             let ptr = {
                 let _scope = scope_in(PoolClass::ExecLogs, bytes);
@@ -1473,9 +1493,11 @@ mod tests {
         .expect("another thread");
         assert_eq!(arena, arenas.logs, "the logs' own arena");
         assert!(!arenas.ids.contains(&arena), "not a shared one");
-        // The same address: the freed extent taken again, not more of the
-        // pool (the cursor itself moves under the module's other tests).
-        assert_eq!(again, first, "the freed buffer, taken again");
+        let carved = CURSOR.load(Ordering::Acquire) - before;
+        assert_eq!(
+            carved, 0,
+            "the freed buffer taken again, not {carved} B more of the pool ({first:#x} then {again:#x})"
+        );
     }
 
     /// The upload tallies under many threads: per thread, every upload of
@@ -1587,8 +1609,18 @@ mod tests {
         at
     }
 
-    /// The tests that move the process-wide arena choice, one at a time.
-    static ARENA_CHOICE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The tests that move the process-wide arena choice take it to write, one
+    /// at a time; every other test that allocates in a scope or carves the
+    /// pool takes it to read, so none does while the choice is moved (a
+    /// class-chosen arena is shared with other tests' threads, and the
+    /// choice's tests read the pool's cursor).
+    static ARENA_CHOICE_TESTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// A test that allocates in a scope under today's choice: no test moves
+    /// the choice meanwhile.
+    fn arena_choice_held() -> std::sync::RwLockReadGuard<'static, ()> {
+        ARENA_CHOICE_TESTS.read().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Restores the knob's choice however a test ends.
     struct ArenaChoice;
@@ -1615,13 +1647,17 @@ mod tests {
     }
 
     /// By size class, a second round of new threads (as a prove's next run
-    /// is) takes the first round's freed buffers, address for address; by
+    /// is) takes the first round's freed buffers: it carves none of the pool
+    /// (jemalloc may serve it a few hundred bytes off, where a freed buffer
+    /// merged with a free neighbour); by
     /// thread slot (today's choice, the mutant here) the new threads bind to
     /// other arenas and some carve more of the pool.
     #[test]
     fn by_size_class_new_threads_take_the_last_rounds_freed_buffers_and_by_slot_they_do_not() {
         let _ = on();
-        let _one = ARENA_CHOICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = ARENA_CHOICE_TESTS
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let _restore = ArenaChoice;
         // Sizes no other test here asks for, five (not a multiple of the
         // arenas, so a round of new threads shifts every slot).
@@ -1631,18 +1667,23 @@ mod tests {
             .collect();
         set_pool_arena_by_class_for_test(Some(true));
         let first = round_of_new_threads(&sizes);
+        // No other test carves meanwhile (they hold the choice to read).
+        let before = CURSOR.load(Ordering::Acquire);
         let second = round_of_new_threads(&sizes);
+        let carved = CURSOR.load(Ordering::Acquire) - before;
         assert_eq!(
-            second, first,
-            "by size class: the freed buffers taken again"
+            carved, 0,
+            "by size class: the second round carved {carved} B more of the pool \
+             instead of taking the first round's freed buffers ({first:?} then {second:?})"
         );
         set_pool_arena_by_class_for_test(Some(false));
         let third = round_of_new_threads(&sizes);
+        let before = CURSOR.load(Ordering::Acquire);
         let fourth = round_of_new_threads(&sizes);
-        let fresh = fourth.iter().filter(|a| !third.contains(a)).count();
+        let carved = CURSOR.load(Ordering::Acquire) - before;
         assert!(
-            fresh > 0,
-            "by thread slot: new threads took none from other arenas: {third:?} {fourth:?}"
+            carved > 0,
+            "by thread slot: the new threads carved none of the pool: {third:?} then {fourth:?}"
         );
     }
 
@@ -1651,7 +1692,9 @@ mod tests {
     #[test]
     fn by_size_class_same_size_requests_at_once_never_share_the_pools_bytes() {
         let _ = on();
-        let _one = ARENA_CHOICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = ARENA_CHOICE_TESTS
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let _restore = ArenaChoice;
         set_pool_arena_by_class_for_test(Some(true));
         let bytes = (5 << 20) + 8192;
@@ -1715,7 +1758,9 @@ mod tests {
     #[ignore = "timing: run alone"]
     fn by_size_class_same_size_contention_costs_no_more_than_by_slot() {
         let _ = on();
-        let _one = ARENA_CHOICE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = ARENA_CHOICE_TESTS
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let _restore = ArenaChoice;
         let threads = 16usize;
         let rounds = 200usize;
@@ -1775,6 +1820,7 @@ mod tests {
     /// each arena jemalloc's own locks.
     #[test]
     fn scoped_allocations_from_many_threads_at_once_never_share_the_pools_bytes() {
+        let _choice = arena_choice_held();
         let _ = on();
         let bytes = 3 << 20;
         let per = 6usize;
