@@ -374,6 +374,135 @@ pub struct NarrowWriter {
     rows: usize,
     columns: Vec<WriterColumn>,
     data: Vec<u8>,
+    /// Under [`NARROW_TILE_ENV`], the rows being written, staged row-major.
+    tile: Option<Box<Tile>>,
+}
+
+/// `LAMBDA_VM_NARROW_TILE=<rows>`: a [`NarrowWriter`] stages that many rows
+/// at a time row-major ([`Tile`]) and writes them into the columns a column
+/// at a time. The trace is the same, byte for byte. Written straight into the
+/// columns, a row's writes (one a column) all fall in the same cache sets at a
+/// power-of-two row count, since every column starts at a multiple of the rows
+/// times its width; staged, each column takes a tile's rows in one run. Unset
+/// or 0 is off (the default).
+pub const NARROW_TILE_ENV: &str = "LAMBDA_VM_NARROW_TILE";
+
+static NARROW_TILE_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Force [`narrow_tile_rows`] to `Some(rows)` (0 is off) or back to the
+/// environment's word (`None`), process wide: tests only.
+#[doc(hidden)]
+pub fn set_narrow_tile_for_test(rows: Option<usize>) {
+    NARROW_TILE_FOR_TEST.store(
+        rows.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The rows a new [`NarrowWriter`] stages at a time ([`NARROW_TILE_ENV`],
+/// read once); 0 is off.
+pub fn narrow_tile_rows() -> usize {
+    let forced = NARROW_TILE_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
+    if forced != usize::MAX {
+        return forced;
+    }
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var(NARROW_TILE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// A [`NarrowWriter`]'s staged rows: rows `[start, start + rows)` row-major,
+/// each column's cell at its width, `at[c]` bytes into a staged row. A window
+/// written back before ([`Tile::written`]) is read back in when it is taken
+/// again; one never written back starts zero, as the columns do.
+struct Tile {
+    rows: usize,
+    start: usize,
+    held: bool,
+    row_bytes: usize,
+    at: Vec<usize>,
+    buf: Vec<u8>,
+    written: Vec<bool>,
+}
+
+/// `word`'s low `width` bytes at `at`.
+#[inline(always)]
+fn put(data: &mut [u8], at: usize, width: usize, word: u64) {
+    match width {
+        1 => data[at] = word as u8,
+        2 => data[at..at + 2].copy_from_slice(&(word as u16).to_le_bytes()),
+        4 => data[at..at + 4].copy_from_slice(&(word as u32).to_le_bytes()),
+        _ => data[at..at + 8].copy_from_slice(&word.to_le_bytes()),
+    }
+}
+
+impl Tile {
+    fn new(tile_rows: usize, trace_rows: usize, columns: &[WriterColumn]) -> Self {
+        let mut at = Vec::with_capacity(columns.len());
+        let mut row_bytes = 0usize;
+        for c in columns {
+            at.push(row_bytes);
+            row_bytes += c.width;
+        }
+        Tile {
+            rows: tile_rows,
+            start: 0,
+            held: false,
+            row_bytes,
+            at,
+            buf: vec![0u8; tile_rows * row_bytes],
+            written: vec![false; trace_rows.div_ceil(tile_rows)],
+        }
+    }
+
+    /// The window's rows that are rows of the trace.
+    fn held_rows(&self, trace_rows: usize) -> usize {
+        self.rows.min(trace_rows - self.start)
+    }
+
+    /// The held window's rows into the columns, each column's in one run.
+    fn write_back(&mut self, columns: &[WriterColumn], data: &mut [u8], trace_rows: usize) {
+        if !self.held {
+            return;
+        }
+        let n = self.held_rows(trace_rows);
+        for (c, column) in columns.iter().enumerate() {
+            let (w, src) = (column.width, self.at[c]);
+            let dst =
+                &mut data[column.offset + self.start * w..column.offset + (self.start + n) * w];
+            for (r, cell) in dst.chunks_exact_mut(w).enumerate() {
+                let from = r * self.row_bytes + src;
+                cell.copy_from_slice(&self.buf[from..from + w]);
+            }
+        }
+        self.written[self.start / self.rows] = true;
+        self.held = false;
+    }
+
+    /// Hold the window of `row`: written back before, its rows are read
+    /// back in; never, it starts zero.
+    fn take(&mut self, row: usize, columns: &[WriterColumn], data: &[u8], trace_rows: usize) {
+        self.start = row - row % self.rows;
+        self.held = true;
+        if !self.written[self.start / self.rows] {
+            self.buf.fill(0);
+            return;
+        }
+        let n = self.held_rows(trace_rows);
+        for (c, column) in columns.iter().enumerate() {
+            let (w, dst) = (column.width, self.at[c]);
+            let src = &data[column.offset + self.start * w..column.offset + (self.start + n) * w];
+            for (r, cell) in src.chunks_exact(w).enumerate() {
+                let to = r * self.row_bytes + dst;
+                self.buf[to..to + w].copy_from_slice(cell);
+            }
+        }
+    }
 }
 
 /// Rows `[first_row, first_row + rows)` of a [`NarrowWriter`], writable on their
@@ -453,11 +582,22 @@ impl NarrowWriter {
             });
             total += rows * width;
         }
+        let tile_rows = narrow_tile_rows();
+        let tile = (tile_rows > 0 && rows > 0 && !columns.is_empty())
+            .then(|| Box::new(Tile::new(tile_rows, rows, &columns)));
         Self {
             rows,
             columns,
             // The bytes a group's upload reads: page-locked when that is on.
             data: multilinear::pinned::with_pinned(total, || vec![0u8; total]),
+            tile,
+        }
+    }
+
+    /// The staged rows into the columns ([`NARROW_TILE_ENV`]).
+    fn write_back_tile(&mut self) {
+        if let Some(tile) = self.tile.as_deref_mut() {
+            tile.write_back(&self.columns, &mut self.data, self.rows);
         }
     }
 
@@ -478,13 +618,17 @@ impl NarrowWriter {
         debug_assert!(row < self.rows, "NarrowWriter: row {row} of {}", self.rows);
         let column = &mut self.columns[col];
         column.seen |= word;
-        let (width, at) = (column.width, column.offset + row * column.width);
-        match width {
-            1 => self.data[at] = word as u8,
-            2 => self.data[at..at + 2].copy_from_slice(&(word as u16).to_le_bytes()),
-            4 => self.data[at..at + 4].copy_from_slice(&(word as u32).to_le_bytes()),
-            _ => self.data[at..at + 8].copy_from_slice(&word.to_le_bytes()),
+        let (width, offset) = (column.width, column.offset);
+        if let Some(tile) = self.tile.as_deref_mut() {
+            if !(tile.held && row >= tile.start && row < tile.start + tile.rows) {
+                tile.write_back(&self.columns, &mut self.data, self.rows);
+                tile.take(row, &self.columns, &self.data, self.rows);
+            }
+            let at = (row - tile.start) * tile.row_bytes + tile.at[col];
+            put(&mut tile.buf, at, width, word);
+            return;
         }
+        put(&mut self.data, offset + row * width, width, word);
     }
 
     /// The writer cut into the row ranges `[bounds[i], bounds[i + 1])`, each
@@ -493,6 +637,10 @@ impl NarrowWriter {
     /// [`Self::absorb`] takes back once the parts are done. `bounds` rises from
     /// 0 to the rows; a bound past the rows is taken as the rows.
     pub fn split_rows(&mut self, bounds: &[usize]) -> Vec<NarrowRows<'_>> {
+        // The parts write the columns themselves: the staged rows go back
+        // first, and the writer stages no more.
+        self.write_back_tile();
+        self.tile = None;
         let rows = self.rows;
         let starts: Vec<usize> = {
             let mut at = bounds.first().copied().unwrap_or(0).min(rows);
@@ -552,7 +700,8 @@ impl NarrowWriter {
     /// The packed trace, every column narrowed to the bytes its words need; or,
     /// when a word did not fit its column, `Err` with the widths the trace
     /// needs (each at least the width given, for a column that missed).
-    pub fn finish(self) -> Result<NarrowMain, Vec<u8>> {
+    pub fn finish(mut self) -> Result<NarrowMain, Vec<u8>> {
+        self.write_back_tile();
         let need = self.needed_widths();
         if need
             .iter()
@@ -565,6 +714,7 @@ impl NarrowWriter {
             rows,
             columns,
             mut data,
+            tile: _,
         } = self;
         // Columns move only toward the front and only narrow, so moving them
         // in order never overwrites a byte not yet moved.
@@ -970,6 +1120,106 @@ mod tests {
         let dropped = write_split(&words, cols, &exact, &bounds, Some(1));
         assert_ne!(dropped.needed_widths(), exact);
         assert_ne!(dropped.finish().ok(), Some(whole));
+    }
+
+    /// The tests that move the tile knob, one at a time.
+    static TILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Puts the tile knob back however a test ends.
+    struct TileKnob;
+    impl Drop for TileKnob {
+        fn drop(&mut self) {
+            set_narrow_tile_for_test(None);
+        }
+    }
+
+    /// ★ Staged a tile of rows at a time ([`NARROW_TILE_ENV`]), the writer
+    /// finishes to the bytes it gives unstaged: tiles of 1, 3, 64 and 100 rows,
+    /// over traces of 1, 5, 63, 64, 65, 1000 and 4096 rows (a last tile cut
+    /// short, a trace shorter than a tile), written in row order, column by
+    /// column from the last row (every cell takes another window, each read
+    /// back in), by row ranges after a first stretch staged, narrowed,
+    /// refused and written again.
+    #[test]
+    fn the_tile_writes_the_same_bytes() {
+        let _one = TILE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _knob = TileKnob;
+        for rows in [1usize, 5, 63, 64, 65, 1000, 4096] {
+            let (words, cols) = words_for_the_writer(rows, rows - rows / 7);
+            let whole = NarrowMain::pack(&words, cols);
+            let exact = whole.widths().to_vec();
+            for tile in [1usize, 3, 64, 100] {
+                set_narrow_tile_for_test(Some(tile));
+                assert!(NarrowWriter::new(rows, &exact).tile.is_some(), "staged");
+                for widths in [exact.clone(), vec![8u8; cols]] {
+                    for scrambled in [false, true] {
+                        let w = write(&words, cols, &widths, scrambled);
+                        assert_eq!(
+                            w.finish().ok(),
+                            Some(whole.clone()),
+                            "rows {rows} tile {tile} widths {widths:?} scrambled {scrambled}"
+                        );
+                    }
+                }
+                let missed = write(&words, cols, &[1; 9], true).finish();
+                assert_eq!(
+                    missed.as_ref().err(),
+                    Some(&exact),
+                    "rows {rows} tile {tile}"
+                );
+                // A first stretch staged, then the rest by row ranges.
+                let mut w = NarrowWriter::new(rows, &exact);
+                let cut = rows / 3;
+                for r in 0..cut {
+                    for c in 0..cols {
+                        if words[r * cols + c] != 0 {
+                            w.set(r, c, words[r * cols + c]);
+                        }
+                    }
+                }
+                let seen: Vec<Vec<u64>> = {
+                    let mut parts = w.split_rows(&[cut, (cut + rows) / 2, rows]);
+                    for part in &mut parts {
+                        for r in part.range() {
+                            for c in 0..cols {
+                                if words[r * cols + c] != 0 {
+                                    part.set(r, c, words[r * cols + c]);
+                                }
+                            }
+                        }
+                    }
+                    parts.into_iter().map(NarrowRows::into_seen).collect()
+                };
+                for s in &seen {
+                    w.absorb(s);
+                }
+                assert_eq!(
+                    w.finish().ok(),
+                    Some(whole.clone()),
+                    "rows {rows} tile {tile}: staged then split"
+                );
+            }
+        }
+        // The writer's own tests, staged.
+        set_narrow_tile_for_test(Some(64));
+        a_trace_written_cell_by_cell_packs_as_a_whole();
+        a_trace_written_by_row_ranges_is_the_trace_written_in_one_pass();
+        the_writer_rounds_widths_up_and_finishes_empty_traces();
+        narrow_round_trips_at_every_width_boundary();
+        set_narrow_tile_for_test(Some(0));
+        assert!(NarrowWriter::new(64, &[1, 2]).tile.is_none(), "0 is off");
+    }
+
+    /// The tile's word: a row count, unset or 0 off.
+    #[test]
+    fn the_tile_knob_is_named_and_off_by_default() {
+        assert_eq!(NARROW_TILE_ENV, "LAMBDA_VM_NARROW_TILE");
+        if std::env::var(NARROW_TILE_ENV).is_err() {
+            let _one = TILE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            let _knob = TileKnob;
+            set_narrow_tile_for_test(None);
+            assert_eq!(narrow_tile_rows(), 0, "off by default");
+        }
     }
 
     /// A widths list that is not 1, 2, 4 or 8 is rounded up; a trace never
