@@ -63,14 +63,42 @@ fn ecdas_halves_generator_timing() {
     // faults fresh pages), keep (every table held: fresh extents).
     let memory = std::env::var("ECDAS_BENCH_MEMORY").unwrap_or_else(|_| "reuse".to_string());
     assert!(["reuse", "purge", "keep"].contains(&memory.as_str()), "ECDAS_BENCH_MEMORY {memory}");
+    // ECDAS_BENCH_WARM: untimed fills before rep 1 · ECDAS_BENCH_SLEEP_MS: a
+    // pause before each rep · ECDAS_BENCH_NEW_POOL=1: each rep on a new
+    // pool's new thread.
+    let env_n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let (warm, sleep_ms, new_pool) = (env_n("ECDAS_BENCH_WARM"), env_n("ECDAS_BENCH_SLEEP_MS"), env_n("ECDAS_BENCH_NEW_POOL") == 1);
+    for _ in 0..warm {
+        let table = pool.install(|| ecdas::try_generate_ecdas_rows_in(&rows, num_rows, TraceForm::Narrow, EcdasForm::Halves));
+        std::hint::black_box(&table);
+    }
+    // ECDAS_BENCH_PLAN=widepack: each rep the 64-bit table, then packed.
+    let plan = std::env::var("ECDAS_BENCH_PLAN").unwrap_or_else(|_| "narrow".to_string());
+    assert!(["narrow", "narrowu", "widepack"].contains(&plan.as_str()), "ECDAS_BENCH_PLAN {plan}");
     let mut kept = Vec::new();
     let mut ms = Vec::new();
     for _ in 0..reps {
         if memory == "purge" {
             purge_all();
         }
+        if sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        }
+        let fresh_pool = new_pool.then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("a pool"));
+        let pool = fresh_pool.as_ref().unwrap_or(&pool);
         let t = std::time::Instant::now();
-        let table = pool.install(|| ecdas::try_generate_ecdas_rows_in(&rows, num_rows, TraceForm::Narrow, EcdasForm::Halves));
+        // The synthetic steps break the relations, so the checked fill notes a
+        // problem a row; the unchecked plans (narrowu, widepack) do not.
+        let table = pool.install(|| match plan.as_str() {
+            // The fill's first-time plan (no width hint yet): the 64-bit
+            // table, then packed.
+            "widepack" => Ok(super::gpack::packed(
+                ecdas::generate_ecdas_rows_in(&rows, num_rows, TraceForm::Wide, EcdasForm::Halves),
+                &ecdas::WIDTHS_HALVES,
+            )),
+            "narrowu" => Ok(ecdas::generate_ecdas_rows_in(&rows, num_rows, TraceForm::Narrow, EcdasForm::Halves)),
+            _ => ecdas::try_generate_ecdas_rows_in(&rows, num_rows, TraceForm::Narrow, EcdasForm::Halves),
+        });
         ms.push(t.elapsed().as_secs_f64() * 1e3);
         std::hint::black_box(&table);
         if memory == "keep" {
@@ -81,7 +109,7 @@ fn ecdas_halves_generator_timing() {
     let mut sorted = ms.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     println!(
-        "ECDAS HALVES BENCH: {n} steps · {threads} threads · memory {memory} · {reps} reps · median {:.1} ms · min {:.1} ms · all {:?}",
+        "ECDAS HALVES BENCH: {n} steps · {threads} threads · memory {memory} · warm {warm} · sleep {sleep_ms} ms · new pool {new_pool} · plan {plan} · {reps} reps · median {:.1} ms · min {:.1} ms · all {:?}",
         sorted[reps / 2],
         sorted[0],
         ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
