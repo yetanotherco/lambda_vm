@@ -684,11 +684,29 @@ fn count_bitwise(
             units.push((name, unit));
         }
 
+        // Under `LAMBDA_VM_P4_PULL` the `cap` workers take the units from one
+        // queue, the heaviest sources first, a unit at a time as each finishes
+        // its last: the work balances itself (a worker ends within a unit of
+        // the others). Otherwise the units are dealt round-robin into `cap`
+        // buckets, a worker each (today's: a bucket of heavy units runs long
+        // while another sits done). Either way, a histogram a worker.
+        let pull = p4_pull();
+        if pull {
+            units.sort_by_key(|(name, _)| p4_pull_rank(name));
+        }
         let mut buckets: Vec<Vec<(&'static str, Collector)>> =
             (0..cap).map(|_| Vec::new()).collect();
-        for (i, unit) in units.into_iter().enumerate() {
-            buckets[i % cap].push(unit);
-        }
+        let queue: Vec<(&'static str, Collector)> = if pull {
+            units
+        } else {
+            for (i, unit) in units.into_iter().enumerate() {
+                buckets[i % cap].push(unit);
+            }
+            Vec::new()
+        };
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let queue = &queue;
+        let next = &next;
         // The row counts on the pool beside the buckets; the line says how
         // long the buckets took beside them, and what each source cost.
         type Run = (
@@ -702,6 +720,16 @@ fn count_bitwise(
             let mut h = bitwise::BitwiseHistogram::new();
             let mut by: Vec<(&'static str, f64)> = Vec::new();
             for (name, f) in bucket {
+                let t = std::time::Instant::now();
+                f(&mut h);
+                add_source_seconds(&mut by, name, t.elapsed().as_secs_f64());
+            }
+            // Pulling, the worker's own bucket is empty: it takes from the queue.
+            loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((name, f)) = queue.get(k) else {
+                    break;
+                };
                 let t = std::time::Instant::now();
                 f(&mut h);
                 add_source_seconds(&mut by, name, t.elapsed().as_secs_f64());
@@ -755,8 +783,9 @@ fn count_bitwise(
             if rows.is_some() || from_tables {
                 add_to_row_scan_line(&format!(
                     " · beside it, phase 4's other collectors in {collectors:.2} s on {cap} \
-                     buckets (the longest {most:.2} s, the shortest {least:.2} s) · by source, \
+                     buckets{} (the longest {most:.2} s, the shortest {least:.2} s) · by source, \
                      summed over the buckets: {}",
+                    if pull { " pulling" } else { "" },
                     by.iter()
                         .map(|(name, secs)| format!("{name} {secs:.2} s"))
                         .collect::<Vec<_>>()
@@ -2434,6 +2463,66 @@ fn finish_direct() -> FinishDirect {
         page: page_direct_from(word("LAMBDA_VM_FINISH_PAGE_DIRECT").as_deref()),
         bitwise: word("LAMBDA_VM_FINISH_BITWISE_DIRECT").is_some_and(|v| v.trim() == "1"),
     })
+}
+
+/// `LAMBDA_VM_P4_PULL`: with `1`, phase 4's side count ([`count_bitwise`]'s
+/// parallel path) runs its workers off one queue of units, the heaviest
+/// sources first, rather than round-robin buckets. The histogram is a sum of
+/// every unit's lookups whatever worker counts it, so BITWISE's multiplicities
+/// are the same. Off by default.
+pub(crate) const P4_PULL_ENV: &str = "LAMBDA_VM_P4_PULL";
+
+#[cfg(test)]
+pub(crate) mod p4_pull_test {
+    static FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    /// Force [`super::p4_pull`] on (`Some(true)`), off, or back to the word.
+    pub(crate) fn set(on: Option<bool>) {
+        FORCED.store(
+            match on {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    pub(super) fn on() -> Option<bool> {
+        match FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// Whether phase 4's side count pulls its units from one queue
+/// ([`P4_PULL_ENV`], read once).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+fn p4_pull() -> bool {
+    #[cfg(test)]
+    if let Some(on) = p4_pull_test::on() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(P4_PULL_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The queue's order under [`p4_pull`]: the sources whose units cost the most
+/// (rfw22nw3's `BLOCK P4 ROWS` lines: ECDAS, EQ, MUL, the in-walk lookups) go
+/// first, so the last units taken are short ones; the sort is stable, so a
+/// source's units keep their order.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+fn p4_pull_rank(name: &str) -> u8 {
+    match name {
+        "ECDAS" => 0,
+        "EQ" => 1,
+        "MUL" => 2,
+        "DVRM" => 3,
+        "IN_WALK" => 4,
+        "KECCAK" => 5,
+        "SHIFT" => 6,
+        _ => 7,
+    }
 }
 
 /// [`finish_direct`]'s reading of `LAMBDA_VM_FINISH_PAGE_DIRECT`: unset or any

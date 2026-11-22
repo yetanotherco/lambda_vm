@@ -214,6 +214,54 @@ fn the_plan_builds_the_oracles_whole_run_tables() {
     }
 }
 
+/// Puts phase 4's pull word back however a test ends.
+struct P4PullKnob;
+impl Drop for P4PullKnob {
+    fn drop(&mut self) {
+        super::finish::p4_pull_test::set(None);
+    }
+}
+
+/// ★ Phase 4's side count pulling its units from one queue
+/// (`LAMBDA_VM_P4_PULL`) builds every table the round-robin buckets build,
+/// BITWISE's multiplicities included: whole runs of every program here
+/// (ECDAS's, KECCAK's, ECSM's, BLAKE3's lookups among them), at small chunks
+/// (many units, every source sliced) and at the production sizes.
+#[test]
+fn the_side_count_pulled_builds_the_tables_the_buckets_build() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let _knob = P4PullKnob;
+    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::default()] {
+        for name in PROGRAMS {
+            let (program, logs) = run(name);
+            let build =
+                || Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build");
+            super::finish::p4_pull_test::set(Some(false));
+            let buckets = build();
+            super::finish::p4_pull_test::set(Some(true));
+            let pulled = build();
+            same(&format!("{name} pulled"), &buckets, &pulled);
+        }
+    }
+    // The streamed finish's side count, beside the rest's builds on threads of
+    // its own (`rest_bitwise_last`), as a block prove runs it.
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_ecsm_multi",
+        "test_blake3",
+    ] {
+        let (program, logs) = run(name);
+        let build = || windowed(&program, &logs, &max_rows, 64, &|b| b.rest_bitwise_last());
+        super::finish::p4_pull_test::set(Some(false));
+        let buckets = build();
+        super::finish::p4_pull_test::set(Some(true));
+        let pulled = build();
+        same(&format!("{name} windowed pulled"), &buckets, &pulled);
+    }
+}
+
 /// A run cut into two epochs, the first non-final, with and without the L2G
 /// bookend (no PAGE, touched cells): the plan's tables are the oracle's, and
 /// so is the final epoch's.
