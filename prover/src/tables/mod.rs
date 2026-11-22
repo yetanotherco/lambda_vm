@@ -41,6 +41,8 @@ pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
 pub mod ecdas;
+#[cfg(test)]
+mod ecdas_bench_tests;
 pub mod ecrec;
 pub mod ecrec_w;
 #[cfg(test)]
