@@ -1234,6 +1234,18 @@ pub(crate) fn try_generate_ecdas_rows_in<R: EcdasRow + Sync>(
     }
 }
 
+/// The halves rows' writer with each cell's write out of line: the row loop
+/// keeps one call a cell whatever the crate's code-unit split decides about
+/// inlining the writer under it (the shape the fill runs fastest in).
+struct OutOfLineCells<'a, T: VmTable + ?Sized>(&'a mut T);
+
+impl<T: VmTable + ?Sized> VmTable for OutOfLineCells<'_, T> {
+    #[inline(never)]
+    fn set_fe(&mut self, row: usize, col: usize, value: FE) {
+        self.0.set_fe(row, col, value);
+    }
+}
+
 /// An ECDAS table of `num_rows` rows under [`EcdasForm::Halves`]: `rows` (a
 /// step a row), then the padding rows, whose carries are zero (`LO = 0`,
 /// `HI = 2^23 / 2^16`). With `check`, the first step the limb form cannot lay
@@ -1262,6 +1274,7 @@ fn generate_halves_rows_of<R: EcdasRow + Sync>(
         }
     };
     let table = generate_main!(form, &WIDTHS_HALVES, num_rows, h::NUM_COLUMNS, |table| {
+        let table = &mut OutOfLineCells(table);
         for (row_idx, row) in rows.iter().enumerate() {
             let s = row.step_bytes();
             if check && s.op == DEFERRED_ECREC_OP {
