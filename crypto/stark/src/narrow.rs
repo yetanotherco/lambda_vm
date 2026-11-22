@@ -447,8 +447,15 @@ fn valid_width(w: u8) -> usize {
 /// costs once a row writes more columns than the cache has ways; under huge
 /// pages nothing spreads them. A narrower table keeps the columns back to
 /// back: closing the gaps is a pass over the table it has no aliasing to win
-/// back. Unset or 0 is off (the default).
+/// back. Unset, it is [`STAGGER_DEFAULT_COLUMNS`] (the default); `0` turns it
+/// off.
 pub const NARROW_STAGGER_ENV: &str = "LAMBDA_VM_NARROW_STAGGER";
+
+/// The fewest columns a staggered table has by default: the wide tables
+/// (ECDAS 515, KECCAK 907, KECCAK_W 1031, KECCAK_RND 1480, ECREC 1543, ECSM
+/// 667) and none of the narrow ones, whose rows write fewer columns than the
+/// caches have ways (COPY's 41 is the widest of those).
+pub const STAGGER_DEFAULT_COLUMNS: usize = 256;
 
 /// The bytes left before each column after the first under
 /// [`NARROW_STAGGER_ENV`]: a cache line, so the columns' starts step through
@@ -469,7 +476,8 @@ pub fn set_narrow_stagger_for_test(columns: Option<usize>) {
 }
 
 /// The fewest columns a new [`NarrowWriter`] needs to leave a gap before each
-/// column ([`NARROW_STAGGER_ENV`], read once); 0 is off.
+/// column ([`NARROW_STAGGER_ENV`], read once; [`STAGGER_DEFAULT_COLUMNS`]
+/// unless the word is another number); 0 is off.
 pub fn narrow_stagger_columns() -> usize {
     let forced = NARROW_STAGGER_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
     if forced != usize::MAX {
@@ -480,7 +488,7 @@ pub fn narrow_stagger_columns() -> usize {
         std::env::var(NARROW_STAGGER_ENV)
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(STAGGER_DEFAULT_COLUMNS)
     })
 }
 
@@ -1141,18 +1149,32 @@ mod tests {
         narrow_round_trips_at_every_width_boundary();
     }
 
-    /// The stagger's word: the fewest columns a staggered table has; unset or
-    /// 0 is off.
+    /// The stagger's word: the fewest columns a staggered table has; unset,
+    /// 256 (on for the wide tables alone); 0 is off.
     #[test]
-    fn the_stagger_knob_is_named_and_off_by_default() {
+    fn the_stagger_knob_is_named_and_on_for_wide_tables_by_default() {
         assert_eq!(NARROW_STAGGER_ENV, "LAMBDA_VM_NARROW_STAGGER");
         assert_eq!(STAGGER_GAP, 64);
+        assert_eq!(STAGGER_DEFAULT_COLUMNS, 256);
         if std::env::var(NARROW_STAGGER_ENV).is_err() {
             let _one = STAGGER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
             let _knob = StaggerKnob;
             set_narrow_stagger_for_test(None);
-            assert_eq!(narrow_stagger_columns(), 0, "off by default");
-            assert!(!narrow_stagger(10_000));
+            assert_eq!(
+                narrow_stagger_columns(),
+                256,
+                "on for the wide tables by default"
+            );
+            assert!(
+                narrow_stagger(515) && !narrow_stagger(41),
+                "ECDAS staggered, COPY not"
+            );
+        }
+        {
+            let _one = STAGGER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            let _knob = StaggerKnob;
+            set_narrow_stagger_for_test(Some(0));
+            assert!(!narrow_stagger(10_000), "0 is off");
         }
         let _one = STAGGER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let _knob = StaggerKnob;
