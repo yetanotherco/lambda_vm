@@ -475,9 +475,12 @@ impl Tile {
             let (w, src) = (column.width, self.at[c]);
             let dst =
                 &mut data[column.offset + self.start * w..column.offset + (self.start + n) * w];
-            for (r, cell) in dst.chunks_exact_mut(w).enumerate() {
-                let from = r * self.row_bytes + src;
-                cell.copy_from_slice(&self.buf[from..from + w]);
+            let (rb, buf) = (self.row_bytes, &self.buf);
+            match w {
+                1 => cells_out::<1>(dst, buf, rb, src, n),
+                2 => cells_out::<2>(dst, buf, rb, src, n),
+                4 => cells_out::<4>(dst, buf, rb, src, n),
+                _ => cells_out::<8>(dst, buf, rb, src, n),
             }
         }
         self.written[self.start / self.rows] = true;
@@ -497,11 +500,33 @@ impl Tile {
         for (c, column) in columns.iter().enumerate() {
             let (w, dst) = (column.width, self.at[c]);
             let src = &data[column.offset + self.start * w..column.offset + (self.start + n) * w];
-            for (r, cell) in src.chunks_exact(w).enumerate() {
-                let to = r * self.row_bytes + dst;
-                self.buf[to..to + w].copy_from_slice(cell);
+            let rb = self.row_bytes;
+            match w {
+                1 => cells_in::<1>(&mut self.buf, src, rb, dst, n),
+                2 => cells_in::<2>(&mut self.buf, src, rb, dst, n),
+                4 => cells_in::<4>(&mut self.buf, src, rb, dst, n),
+                _ => cells_in::<8>(&mut self.buf, src, rb, dst, n),
             }
         }
+    }
+}
+
+/// A column's `n` staged cells (`W` bytes each, `at` into rows of `rb` bytes)
+/// into its run of the trace.
+#[inline(always)]
+fn cells_out<const W: usize>(dst: &mut [u8], buf: &[u8], rb: usize, at: usize, n: usize) {
+    for (r, cell) in dst[..n * W].chunks_exact_mut(W).enumerate() {
+        let from = r * rb + at;
+        cell.copy_from_slice(&buf[from..from + W]);
+    }
+}
+
+/// A column's run of `n` cells back into the staged rows.
+#[inline(always)]
+fn cells_in<const W: usize>(buf: &mut [u8], src: &[u8], rb: usize, at: usize, n: usize) {
+    for (r, cell) in src[..n * W].chunks_exact(W).enumerate() {
+        let to = r * rb + at;
+        buf[to..to + W].copy_from_slice(cell);
     }
 }
 
