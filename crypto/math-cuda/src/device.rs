@@ -1078,8 +1078,11 @@ fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
 }
 
 impl Backend {
-    fn init() -> Result<Self> {
-        let ctx = CudaContext::new(0)?;
+    /// The backend of the card at `ordinal`: its own context (the device's
+    /// primary one), stream pools, staging, event pool, twiddle cache and
+    /// ledger.
+    fn init_on(ordinal: usize) -> Result<Self> {
+        let ctx = CudaContext::new(ordinal)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
         // per alloc and serialises under the context lock. Cross-stream
         // read-after-write on shared handles is ordered explicitly instead:
@@ -1690,7 +1693,11 @@ impl Backend {
     }
 }
 
-/// Returns the process-wide CUDA backend, initialising it on first call.
+/// Returns the CUDA backend of this thread's device role, initialising it on
+/// first call: card 0's ([`DeviceRole::Main`], every thread unless it says
+/// otherwise), or under [`DeviceRole::Openings`] the openings' backend
+/// ([`openings_placement`]), which is card 0's own unless the two-card
+/// openings are on.
 ///
 /// Returns `Err` when CUDA initialisation fails (no driver, no GPU, PTX load
 /// failure). Initialisation is retried on the next call until one succeeds —
@@ -1698,7 +1705,271 @@ impl Backend {
 /// a caller that finds another initialising waits for it rather than
 /// building a second context.
 pub fn backend() -> Result<&'static Backend> {
-    backend_once()
+    match DEVICE_ROLE.with(std::cell::Cell::get) {
+        DeviceRole::Main => backend_once(),
+        DeviceRole::Openings => openings_backend(),
+    }
+}
+
+// ── Device roles: the openings on a second card ─────────────────────────────
+
+/// What a thread's device work is for, which picks the card [`backend`]
+/// returns. Every thread is [`DeviceRole::Main`] unless it entered another
+/// role ([`enter_role`], [`set_thread_role`]); a rayon worker of the global
+/// pool is never marked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRole {
+    /// Everything but phase B's openings: card 0.
+    Main,
+    /// Phase B's openings: card 1 under the two-card openings
+    /// ([`openings_placement`]), card 0 otherwise.
+    Openings,
+}
+
+thread_local! {
+    static DEVICE_ROLE: std::cell::Cell<DeviceRole> = const { std::cell::Cell::new(DeviceRole::Main) };
+}
+
+/// This thread's device role.
+pub fn current_role() -> DeviceRole {
+    DEVICE_ROLE.with(std::cell::Cell::get)
+}
+
+/// Restores the thread's previous role when dropped ([`enter_role`]).
+#[must_use = "the role lasts while the guard lives"]
+pub struct RoleGuard(DeviceRole);
+
+impl Drop for RoleGuard {
+    fn drop(&mut self) {
+        DEVICE_ROLE.with(|c| c.set(self.0));
+    }
+}
+
+/// This thread works in `role` until the guard drops.
+pub fn enter_role(role: DeviceRole) -> RoleGuard {
+    RoleGuard(DEVICE_ROLE.with(|c| c.replace(role)))
+}
+
+/// This thread works in `role` for the rest of its life: for a pool's worker
+/// threads, set once as each starts.
+pub fn set_thread_role(role: DeviceRole) {
+    DEVICE_ROLE.with(|c| c.set(role));
+}
+
+/// `LAMBDA_VM_TWO_CARD_OPENINGS`: phase B's openings on a second card.
+pub const TWO_CARD_OPENINGS_ENV: &str = "LAMBDA_VM_TWO_CARD_OPENINGS";
+
+/// The two-card openings' setting ([`TWO_CARD_OPENINGS_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoCardOpenings {
+    /// Unset or `auto`: on when the process sees two cards or more.
+    Auto,
+    /// `0`: off, every role on card 0 (today's).
+    Off,
+    /// `1`: on. With one card, the openings get a backend of their own on
+    /// card 0 (its own streams, staging and ledger, the same context): the
+    /// two-card bookkeeping on a one-card box, for tests.
+    Forced,
+}
+
+impl TwoCardOpenings {
+    /// The knob's reading: unset or `auto` [`Self::Auto`], `0` off, `1`
+    /// forced; anything else is refused.
+    pub fn parse(word: Option<&str>) -> std::result::Result<Self, String> {
+        match word.map(str::trim) {
+            None | Some("auto") => Ok(Self::Auto),
+            Some("0") => Ok(Self::Off),
+            Some("1") => Ok(Self::Forced),
+            Some(other) => Err(format!("{TWO_CARD_OPENINGS_ENV}={other}: auto, 0 or 1")),
+        }
+    }
+}
+
+/// Where a role's device work runs: the backend slot (0 card 0's, 1 the
+/// openings' own) and the card's ordinal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RolePlacement {
+    pub slot: usize,
+    pub ordinal: usize,
+}
+
+/// Card 0's backend, every role's without the two-card openings.
+pub const MAIN_PLACEMENT: RolePlacement = RolePlacement {
+    slot: 0,
+    ordinal: 0,
+};
+
+/// The placement of `role` under `setting` with `cards` cards visible. Only
+/// the openings ever leave slot 0: on card 1 when there are two cards or more
+/// (auto or forced), on a second backend of card 0 when forced with one card.
+pub fn placement_for(role: DeviceRole, setting: TwoCardOpenings, cards: usize) -> RolePlacement {
+    match (role, setting, cards) {
+        (DeviceRole::Main, _, _) | (_, TwoCardOpenings::Off, _) | (_, _, 0) => MAIN_PLACEMENT,
+        (DeviceRole::Openings, TwoCardOpenings::Auto, 1) => MAIN_PLACEMENT,
+        (DeviceRole::Openings, TwoCardOpenings::Forced, 1) => RolePlacement {
+            slot: 1,
+            ordinal: 0,
+        },
+        (DeviceRole::Openings, _, _) => RolePlacement {
+            slot: 1,
+            ordinal: 1,
+        },
+    }
+}
+
+/// Test only: the setting in place of the environment's, process-wide
+/// (0 none, 1 auto, 2 off, 3 forced). Set before the openings' backend is made.
+static TWO_CARD_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test only, not for production callers: the two-card setting in place of
+/// [`TWO_CARD_OPENINGS_ENV`] (`None`: the environment's). Process-wide, read
+/// by [`openings_placement`] on every call; a backend already made for the
+/// openings stays made.
+#[doc(hidden)]
+pub fn set_two_card_openings_for_test(setting: Option<TwoCardOpenings>) {
+    let v = match setting {
+        None => 0,
+        Some(TwoCardOpenings::Auto) => 1,
+        Some(TwoCardOpenings::Off) => 2,
+        Some(TwoCardOpenings::Forced) => 3,
+    };
+    TWO_CARD_FORCED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process's two-card setting: a test's, else the environment's, read
+/// once (an unrecognised word is said once and read as off).
+pub fn two_card_openings_setting() -> TwoCardOpenings {
+    match TWO_CARD_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return TwoCardOpenings::Auto,
+        2 => return TwoCardOpenings::Off,
+        3 => return TwoCardOpenings::Forced,
+        _ => {}
+    }
+    static SETTING: OnceLock<TwoCardOpenings> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        TwoCardOpenings::parse(std::env::var(TWO_CARD_OPENINGS_ENV).ok().as_deref()).unwrap_or_else(
+            |e| {
+                eprintln!("{e} — read as off");
+                TwoCardOpenings::Off
+            },
+        )
+    })
+}
+
+/// The cards the driver sees, counted once; 0 without a driver (cudarc panics
+/// when it cannot load the driver library: caught here and read as none).
+pub fn card_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::panic::catch_unwind(CudaContext::device_count)
+            .ok()
+            .and_then(|n| n.ok())
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Where the openings' device work runs in this process. Off, the driver is
+/// not asked for its cards.
+pub fn openings_placement() -> RolePlacement {
+    match two_card_openings_setting() {
+        TwoCardOpenings::Off => MAIN_PLACEMENT,
+        setting => placement_for(DeviceRole::Openings, setting, card_count()),
+    }
+}
+
+/// Whether the openings run on a backend of their own (card 1, or forced).
+pub fn two_card_openings() -> bool {
+    openings_placement().slot != 0
+}
+
+static OPENINGS_BACKEND: OnceLock<Backend> = OnceLock::new();
+
+/// The openings' backend: card 0's under [`MAIN_PLACEMENT`], else the second
+/// slot's, made on first use. A second backend that fails to start is said
+/// once and the openings fall back to card 0's for the call (bytes are the
+/// same on either card).
+fn openings_backend() -> Result<&'static Backend> {
+    let placement = openings_placement();
+    if placement.slot == 0 {
+        return backend_once();
+    }
+    // Card 0's first: the pinned pool and the process's first context are
+    // card 0's, as without the openings' backend.
+    let main = backend_once()?;
+    if let Some(b) = OPENINGS_BACKEND.get() {
+        return Ok(b);
+    }
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(main);
+    }
+    static INIT: Mutex<()> = Mutex::new(());
+    let _init = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = OPENINGS_BACKEND.get() {
+        return Ok(b);
+    }
+    match Backend::init_on(placement.ordinal) {
+        Ok(b) => {
+            eprintln!(
+                "[gpu] two-card openings: phase B's openings on card {} ({TWO_CARD_OPENINGS_ENV}={:?}, {} card(s) seen)",
+                placement.ordinal,
+                two_card_openings_setting(),
+                card_count()
+            );
+            let _ = OPENINGS_BACKEND.set(b);
+            Ok(OPENINGS_BACKEND
+                .get()
+                .expect("the openings' backend just initialised"))
+        }
+        Err(e) => {
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[gpu] two-card openings: card {}'s backend did not start ({e}); the openings stay on card 0",
+                placement.ordinal
+            );
+            Ok(main)
+        }
+    }
+}
+
+/// Runs `f` as the openings' device work. Without the two-card openings (or
+/// without a pool for them) it is `f()` on this thread, as before. With them, `f` runs under
+/// [`DeviceRole::Openings`] inside a rayon pool of its own whose workers are
+/// all openings threads, so a parallel iterator inside `f` draws the openings'
+/// card too (a worker of the global pool is [`DeviceRole::Main`]: card 0).
+pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if !two_card_openings() {
+        return f();
+    }
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads().max(1))
+            .thread_name(|i| format!("openings-card-{i}"))
+            .start_handler(|_| set_thread_role(DeviceRole::Openings))
+            .build()
+            .map_err(|e| {
+                eprintln!("[gpu] two-card openings: no pool of their own ({e}); on this thread")
+            })
+            .ok()
+    });
+    match pool {
+        Some(pool) => {
+            let _role = enter_role(DeviceRole::Openings);
+            pool.install(f)
+        }
+        // Without a pool of their own the openings stay on card 0 whole: a
+        // role on this thread alone would split them over two cards.
+        None => f(),
+    }
+}
+
+/// The ordinal of the card a backend's context is on.
+impl Backend {
+    pub fn ordinal(&self) -> usize {
+        self.ctx.ordinal()
+    }
 }
 
 /// Sets the backend up ahead of its first use ([`backend`]), without counting
@@ -1730,7 +2001,7 @@ fn backend_once() -> Result<&'static Backend> {
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }
-    let b = match Backend::init() {
+    let b = match Backend::init_on(0) {
         Ok(b) => b,
         Err(e) => {
             // Backend init failing means every GPU entry point silently falls
@@ -2955,5 +3226,122 @@ mod grid_cap_tests {
         std::thread::spawn(|| assert_eq!(grid_cap(), None, "a new thread starts uncapped"))
             .join()
             .expect("thread");
+    }
+}
+
+#[cfg(test)]
+mod two_card_openings_tests {
+    use super::{
+        DeviceRole, MAIN_PLACEMENT, RolePlacement, TwoCardOpenings, current_role, enter_role,
+        on_openings_card, placement_for, set_two_card_openings_for_test, two_card_openings,
+    };
+
+    const SETTINGS: [TwoCardOpenings; 3] = [
+        TwoCardOpenings::Auto,
+        TwoCardOpenings::Off,
+        TwoCardOpenings::Forced,
+    ];
+
+    /// Every role but the openings is card 0's under every setting and card
+    /// count, and without a card nothing moves.
+    #[test]
+    fn the_main_role_and_a_cardless_process_are_card_0_always() {
+        for setting in SETTINGS {
+            for cards in 0..4 {
+                assert_eq!(
+                    placement_for(DeviceRole::Main, setting, cards),
+                    MAIN_PLACEMENT
+                );
+            }
+            assert_eq!(
+                placement_for(DeviceRole::Openings, setting, 0),
+                MAIN_PLACEMENT
+            );
+        }
+    }
+
+    /// The openings' table: one card leaves them on card 0's backend unless
+    /// forced (a second backend on card 0); two cards or more put them on card
+    /// 1 unless off.
+    #[test]
+    fn the_openings_go_to_card_1_with_two_cards_unless_off() {
+        let card1 = RolePlacement {
+            slot: 1,
+            ordinal: 1,
+        };
+        let second_on_card0 = RolePlacement {
+            slot: 1,
+            ordinal: 0,
+        };
+        let o = DeviceRole::Openings;
+        assert_eq!(placement_for(o, TwoCardOpenings::Auto, 1), MAIN_PLACEMENT);
+        assert_eq!(placement_for(o, TwoCardOpenings::Off, 1), MAIN_PLACEMENT);
+        assert_eq!(
+            placement_for(o, TwoCardOpenings::Forced, 1),
+            second_on_card0
+        );
+        for cards in 2..5 {
+            assert_eq!(placement_for(o, TwoCardOpenings::Auto, cards), card1);
+            assert_eq!(placement_for(o, TwoCardOpenings::Forced, cards), card1);
+            assert_eq!(
+                placement_for(o, TwoCardOpenings::Off, cards),
+                MAIN_PLACEMENT
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_card_knob_reads_its_words_and_refuses_the_rest() {
+        assert_eq!(TwoCardOpenings::parse(None), Ok(TwoCardOpenings::Auto));
+        assert_eq!(
+            TwoCardOpenings::parse(Some("auto")),
+            Ok(TwoCardOpenings::Auto)
+        );
+        assert_eq!(
+            TwoCardOpenings::parse(Some(" 0 ")),
+            Ok(TwoCardOpenings::Off)
+        );
+        assert_eq!(
+            TwoCardOpenings::parse(Some("1")),
+            Ok(TwoCardOpenings::Forced)
+        );
+        for bad in ["", "on", "2", "yes"] {
+            let err = TwoCardOpenings::parse(Some(bad)).expect_err(bad);
+            assert!(err.contains("LAMBDA_VM_TWO_CARD_OPENINGS"), "{err}");
+        }
+    }
+
+    /// A role lasts while its guard lives, nests, and is the thread's alone.
+    #[test]
+    fn a_role_is_the_threads_and_its_guard_restores_it() {
+        assert_eq!(current_role(), DeviceRole::Main);
+        {
+            let _outer = enter_role(DeviceRole::Openings);
+            assert_eq!(current_role(), DeviceRole::Openings);
+            std::thread::spawn(|| {
+                assert_eq!(current_role(), DeviceRole::Main, "a new thread is Main")
+            })
+            .join()
+            .expect("thread");
+            {
+                let _inner = enter_role(DeviceRole::Main);
+                assert_eq!(current_role(), DeviceRole::Main);
+            }
+            assert_eq!(current_role(), DeviceRole::Openings);
+        }
+        assert_eq!(current_role(), DeviceRole::Main);
+    }
+
+    /// Off, the openings' work runs as before: on the caller's thread, in its
+    /// role, and no rayon pool of their own is made.
+    #[test]
+    fn off_the_openings_run_on_the_callers_thread_unchanged() {
+        set_two_card_openings_for_test(Some(TwoCardOpenings::Off));
+        assert!(!two_card_openings());
+        let caller = std::thread::current().id();
+        let (thread, role) = on_openings_card(|| (std::thread::current().id(), current_role()));
+        set_two_card_openings_for_test(None);
+        assert_eq!(thread, caller);
+        assert_eq!(role, DeviceRole::Main);
     }
 }
