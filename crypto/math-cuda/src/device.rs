@@ -588,6 +588,10 @@ fn retain_default_mempool(ctx: &CudaContext) {
 #[derive(Debug)]
 pub struct DeviceReservation {
     bytes: AtomicU64,
+    /// The backend whose ledger holds the bytes ([`BackendSlot`]): a
+    /// reservation grows, shrinks and is released there, whichever thread
+    /// (in whichever role) does it.
+    slot: BackendSlot,
 }
 
 impl DeviceReservation {
@@ -602,7 +606,9 @@ impl DeviceReservation {
     /// caller then does without whatever it wanted the bytes for, rather than
     /// holding memory the accounting cannot see.
     pub fn grow(&self, extra: u64) -> bool {
-        let Ok(be) = backend() else { return false };
+        let Ok(be) = self.slot.backend() else {
+            return false;
+        };
         let mut held = be.reserved.load(Ordering::Relaxed);
         loop {
             if held.saturating_add(extra) > be.vram_budget_bytes() {
@@ -616,7 +622,9 @@ impl DeviceReservation {
             ) {
                 Ok(_) => {
                     self.bytes.fetch_add(extra, Ordering::Relaxed);
-                    note_reserved(held + extra);
+                    if self.slot == BackendSlot::Main {
+                        note_reserved(held + extra);
+                    }
                     return true;
                 }
                 Err(seen) => held = seen,
@@ -632,7 +640,7 @@ impl DeviceReservation {
             return;
         }
         self.bytes.fetch_sub(given, Ordering::Relaxed);
-        if let Ok(be) = backend() {
+        if let Ok(be) = self.slot.backend() {
             be.reserved.fetch_sub(given, Ordering::Relaxed);
         }
     }
@@ -640,7 +648,7 @@ impl DeviceReservation {
 
 impl Drop for DeviceReservation {
     fn drop(&mut self) {
-        if let Ok(be) = backend() {
+        if let Ok(be) = self.slot.backend() {
             be.reserved
                 .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         }
@@ -1588,9 +1596,15 @@ impl Backend {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    note_reserved(held + bytes);
+                    // The peaks are card 0's: the openings' own backend keeps
+                    // its ledger apart and moves neither.
+                    let slot = BackendSlot::of(self);
+                    if slot == BackendSlot::Main {
+                        note_reserved(held + bytes);
+                    }
                     return Some(DeviceReservation {
                         bytes: AtomicU64::new(bytes),
+                        slot,
                     });
                 }
                 Err(seen) => held = seen,
@@ -1762,9 +1776,10 @@ pub const TWO_CARD_OPENINGS_ENV: &str = "LAMBDA_VM_TWO_CARD_OPENINGS";
 /// The two-card openings' setting ([`TWO_CARD_OPENINGS_ENV`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TwoCardOpenings {
-    /// Unset or `auto`: on when the process sees two cards or more.
+    /// `auto`: on when the process sees two cards or more. Not the default
+    /// until a two-card box has measured it (bytes and time).
     Auto,
-    /// `0`: off, every role on card 0 (today's).
+    /// Unset or `0`: off, every role on card 0 (today's). The default.
     Off,
     /// `1`: on. With one card, the openings get a backend of their own on
     /// card 0 (its own streams, staging and ledger, the same context): the
@@ -1773,12 +1788,12 @@ pub enum TwoCardOpenings {
 }
 
 impl TwoCardOpenings {
-    /// The knob's reading: unset or `auto` [`Self::Auto`], `0` off, `1`
-    /// forced; anything else is refused.
+    /// The knob's reading: unset or `0` off (the default), `auto`
+    /// [`Self::Auto`], `1` forced; anything else is refused.
     pub fn parse(word: Option<&str>) -> std::result::Result<Self, String> {
         match word.map(str::trim) {
-            None | Some("auto") => Ok(Self::Auto),
-            Some("0") => Ok(Self::Off),
+            None | Some("0") => Ok(Self::Off),
+            Some("auto") => Ok(Self::Auto),
             Some("1") => Ok(Self::Forced),
             Some(other) => Err(format!("{TWO_CARD_OPENINGS_ENV}={other}: auto, 0 or 1")),
         }
@@ -1884,6 +1899,34 @@ pub fn two_card_openings() -> bool {
 }
 
 static OPENINGS_BACKEND: OnceLock<Backend> = OnceLock::new();
+
+/// Which of the process's backends an object belongs to: card 0's
+/// ([`backend_once`]) or the openings' own ([`OPENINGS_BACKEND`]). What holds
+/// a backend's ledger bytes or pooled events keeps its slot, so it gives them
+/// back to that backend even when a thread in another role drops it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackendSlot {
+    Main,
+    Openings,
+}
+
+impl BackendSlot {
+    /// The slot of `be`.
+    pub(crate) fn of(be: &Backend) -> Self {
+        match OPENINGS_BACKEND.get() {
+            Some(o) if std::ptr::eq(o, be) => Self::Openings,
+            _ => Self::Main,
+        }
+    }
+
+    /// The backend of this slot.
+    pub(crate) fn backend(self) -> Result<&'static Backend> {
+        match self {
+            Self::Main => backend_once(),
+            Self::Openings => OPENINGS_BACKEND.get().map_or_else(backend_once, Ok),
+        }
+    }
+}
 
 /// The openings' backend: card 0's under [`MAIN_PLACEMENT`], else the second
 /// slot's, made on first use. A second backend that fails to start is said
@@ -3040,6 +3083,8 @@ impl PendingD2H<'_> {
 /// driver lock (see `PinnedStaging::record_event`).
 pub struct PooledEvent {
     event: Option<cudarc::driver::CudaEvent>,
+    /// The backend whose pool (and context) the event belongs to.
+    slot: BackendSlot,
 }
 
 impl PooledEvent {
@@ -3050,7 +3095,7 @@ impl PooledEvent {
 
 impl Drop for PooledEvent {
     fn drop(&mut self) {
-        if let (Some(ev), Ok(be)) = (self.event.take(), backend()) {
+        if let (Some(ev), Ok(be)) = (self.event.take(), self.slot.backend()) {
             be.event_pool.lock().unwrap().push(ev);
         }
     }
@@ -3064,7 +3109,10 @@ impl Backend {
             Some(ev) => ev,
             None => self.ctx.new_event(None)?,
         };
-        Ok(PooledEvent { event: Some(ev) })
+        Ok(PooledEvent {
+            event: Some(ev),
+            slot: BackendSlot::of(self),
+        })
     }
 }
 
@@ -3300,7 +3348,11 @@ mod two_card_openings_tests {
 
     #[test]
     fn the_two_card_knob_reads_its_words_and_refuses_the_rest() {
-        assert_eq!(TwoCardOpenings::parse(None), Ok(TwoCardOpenings::Auto));
+        assert_eq!(
+            TwoCardOpenings::parse(None),
+            Ok(TwoCardOpenings::Off),
+            "off by default"
+        );
         assert_eq!(
             TwoCardOpenings::parse(Some("auto")),
             Ok(TwoCardOpenings::Auto)

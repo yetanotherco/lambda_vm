@@ -103,7 +103,7 @@ fn forced_two_card_openings_prove_the_same_bytes_on_one_card() {
 }
 
 /// ★ Two-card box, one process: run alone, deterministic grind. With two cards
-/// seen and the knob at its default (auto), the openings run on card 1, and
+/// seen and the knob at `auto`, the openings run on card 1, and
 /// the block proves the same bytes as with the knob off.
 #[cfg(feature = "cuda")]
 #[test]
