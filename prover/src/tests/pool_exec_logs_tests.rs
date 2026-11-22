@@ -78,13 +78,13 @@ fn the_pooled_logs_fixture_proves_on_the_host_under_the_group_cap() {
 }
 
 /// A stand-in for the driver's page-locking, for the host test.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 fn stand_in_lock(_ptr: *mut u8, _len: usize) -> bool {
     true
 }
 
 /// The spin guest's private input: `spins` spins (13 cycles, and 2 a spin).
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 fn spin_input(spins: u32) -> Vec<u8> {
     let mut input = spins.to_le_bytes().to_vec();
     input.extend_from_slice(b"pooled!!");
@@ -140,7 +140,7 @@ fn spend_the_pool(window_bytes: usize) -> Vec<Vec<u8>> {
 /// time, each window's buffer from [`pooled_log_buffer`] when `pooled`: each
 /// window's logs as records, and per window whether its buffer lay in the
 /// pool.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 fn run_windows(
     elf: &[u8],
     input: &[u8],
@@ -174,7 +174,7 @@ fn run_windows(
 }
 
 /// Whether every whole page of `[at, at + len)` is resident (`mincore`).
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 fn resident(at: usize, len: usize) -> bool {
     // SAFETY: sysconf has no preconditions.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
@@ -201,7 +201,7 @@ fn resident(at: usize, len: usize) -> bool {
 ///    carved or locked, and a buffer taken again lies in the pool.
 /// 3. The pool spent: the windows' buffers are pageable, the spill is counted,
 ///    and the logs are the same again.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 #[ignore = "locks a stand-in page-locked pool for the whole process: run alone"]
 fn pooled_executor_log_buffers_hold_the_same_logs_survive_a_purge_and_spill_when_short() {
