@@ -67,7 +67,7 @@ fn digest(words: &[u64]) -> u64 {
 }
 
 /// 300 steps padded to 512 rows, packed and wide: the same words, whose digest
-/// is the one batch 5's build (2f4941f37) wrote.
+/// is the one the build with the writer out of line by the code-unit split (2f4941f37) wrote.
 #[test]
 fn the_ecdas_halves_rows_words_are_pinned() {
     let rows: Vec<CompactEcdasOp> = (0..300)

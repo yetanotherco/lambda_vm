@@ -27,7 +27,7 @@ use crate::tests::windowed_builder_tests::run;
 /// The tests here one at a time: each moves the card-rows mode override and
 /// the logs' cache, both the process's, so two of them at once in a whole-lib
 /// run read each other's mode and cache (one's "today's" pass ran under the
-/// other's override, and declined: l18g).
+/// other's override, and declined, in a gate run where the two collided).
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Logs kept across groups (as inside a block's prove) while it lives; the
