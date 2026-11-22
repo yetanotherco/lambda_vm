@@ -453,3 +453,24 @@ fn the_pool_arena_by_size_class_proves_the_same_bytes_on_the_card() {
         c4 - c3
     );
 }
+
+/// The near-full warning: a pool handed out to within 1 GiB of its end (or
+/// past it, spilled) warns with what is left; a pool with room, or none, does
+/// not. The bound is strict: exactly 1 GiB left is room.
+#[test]
+fn the_pinned_pool_warns_near_full_within_a_gib_of_its_end() {
+    use crate::block_whir::{PINNED_POOL_NEAR_FULL_BYTES as GIB, pinned_pool_near_full as near};
+    assert_eq!(GIB, 1 << 30);
+    let pool = 32 * GIB;
+    assert_eq!(near(pool, 0), None);
+    assert_eq!(near(pool, pool - GIB), None, "exactly a GiB left is room");
+    assert_eq!(near(pool, pool - GIB + 1), Some(GIB - 1));
+    assert_eq!(
+        near(pool, 31 * GIB + GIB / 2),
+        Some(GIB / 2),
+        "the large block's 31.5 GiB"
+    );
+    assert_eq!(near(pool, pool), Some(0));
+    assert_eq!(near(pool, pool + 4096), Some(0), "spilled past its end");
+    assert_eq!(near(0, 0), None, "no pool");
+}
