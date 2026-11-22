@@ -32,6 +32,8 @@ pub mod bitwise;
 pub mod blake3;
 pub mod branch;
 pub mod bytewise;
+#[cfg(test)]
+mod concurrent_fill_bench_tests;
 pub mod copy;
 pub mod copy_w;
 #[cfg(test)]
