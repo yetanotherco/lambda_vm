@@ -438,13 +438,16 @@ fn valid_width(w: u8) -> usize {
     }
 }
 
-/// `LAMBDA_VM_NARROW_STAGGER`: with `1`, a [`NarrowWriter`] leaves
-/// [`STAGGER_GAP`] bytes before each column after the first while it is
-/// written, and [`NarrowWriter::finish`] closes the gaps. The trace is the
-/// same, byte for byte. Without the gaps, at a power-of-two row count every
-/// column starts at a multiple of the rows (times its width), so a row's
-/// writes, one a column, all fall in the same cache sets; under huge pages
-/// nothing spreads them. Off by default.
+/// `LAMBDA_VM_NARROW_STAGGER=<columns>`: a [`NarrowWriter`] of at least that
+/// many columns leaves [`STAGGER_GAP`] bytes before each column after the
+/// first while it is written, and [`NarrowWriter::finish`] closes the gaps.
+/// The trace is the same, byte for byte. Without the gaps, at a power-of-two
+/// row count every column starts at a multiple of the rows (times its width),
+/// so a row's writes, one a column, all fall in the same cache sets, which
+/// costs once a row writes more columns than the cache has ways; under huge
+/// pages nothing spreads them. A narrower table keeps the columns back to
+/// back: closing the gaps is a pass over the table it has no aliasing to win
+/// back. Unset or 0 is off (the default).
 pub const NARROW_STAGGER_ENV: &str = "LAMBDA_VM_NARROW_STAGGER";
 
 /// The bytes left before each column after the first under
@@ -452,39 +455,52 @@ pub const NARROW_STAGGER_ENV: &str = "LAMBDA_VM_NARROW_STAGGER";
 /// the cache sets (1024 columns before two share a set of a 64 KiB period).
 pub const STAGGER_GAP: usize = 64;
 
-static NARROW_STAGGER_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static NARROW_STAGGER_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
-/// Force [`narrow_stagger`] on (`Some(true)`), off (`Some(false)`) or back to
+/// Force [`narrow_stagger_columns`] to `Some(columns)` (0 is off) or back to
 /// the environment's word (`None`), process wide: tests only.
 #[doc(hidden)]
-pub fn set_narrow_stagger_for_test(on: Option<bool>) {
-    let v = match on {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    };
-    NARROW_STAGGER_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+pub fn set_narrow_stagger_for_test(columns: Option<usize>) {
+    NARROW_STAGGER_FOR_TEST.store(
+        columns.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
-/// Whether new [`NarrowWriter`]s leave a gap before each column
-/// ([`NARROW_STAGGER_ENV`], read once).
-pub fn narrow_stagger() -> bool {
-    match NARROW_STAGGER_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
+/// The fewest columns a new [`NarrowWriter`] needs to leave a gap before each
+/// column ([`NARROW_STAGGER_ENV`], read once); 0 is off.
+pub fn narrow_stagger_columns() -> usize {
+    let forced = NARROW_STAGGER_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
+    if forced != usize::MAX {
+        return forced;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var(NARROW_STAGGER_ENV).is_ok_and(|v| v.trim() == "1"))
+    static COLUMNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COLUMNS.get_or_init(|| {
+        std::env::var(NARROW_STAGGER_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Whether a new [`NarrowWriter`] of `columns` columns leaves the gaps.
+pub fn narrow_stagger(columns: usize) -> bool {
+    let at_least = narrow_stagger_columns();
+    at_least > 0 && columns >= at_least
 }
 
 impl NarrowWriter {
     /// A writer for a trace of `rows` rows and `widths.len()` columns, column
-    /// `c` at `widths[c]` bytes (rounded up to 1, 2, 4 or 8); under
-    /// [`NARROW_STAGGER_ENV`], with [`STAGGER_GAP`] bytes before each column
-    /// after the first.
+    /// `c` at `widths[c]` bytes (rounded up to 1, 2, 4 or 8); with
+    /// [`STAGGER_GAP`] bytes before each column after the first when it has at
+    /// least [`NARROW_STAGGER_ENV`]'s columns.
     pub fn new(rows: usize, widths: &[u8]) -> Self {
-        let gap = if narrow_stagger() { STAGGER_GAP } else { 0 };
+        let gap = if narrow_stagger(widths.len()) {
+            STAGGER_GAP
+        } else {
+            0
+        };
         let mut columns = Vec::with_capacity(widths.len());
         let mut total = 0usize;
         for (c, &w) in widths.iter().enumerate() {
@@ -1038,8 +1054,8 @@ mod tests {
     /// after the first while written) the writer finishes to the same bytes:
     /// cell by cell in any order, by row ranges, narrowed, refused and written
     /// again, empty; at a power-of-two row count too. The gaps are there while
-    /// it is written, and gone once it finishes. Off, the columns lie back to
-    /// back.
+    /// it is written, and gone once it finishes. Off, or for a table of fewer
+    /// columns than the word, the columns lie back to back.
     #[test]
     fn the_stagger_writes_the_same_bytes() {
         let _one = STAGGER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1048,37 +1064,51 @@ mod tests {
         let (words, cols) = words_for_the_writer(rows, rows - 3);
         let whole = NarrowMain::pack(&words, cols);
         let exact = whole.widths().to_vec();
-        set_narrow_stagger_for_test(Some(false));
+        set_narrow_stagger_for_test(Some(0));
         let plain = NarrowWriter::new(rows, &exact);
         assert_eq!(plain.columns[1].offset, rows * exact[0] as usize);
-        set_narrow_stagger_for_test(Some(true));
-        let staggered = NarrowWriter::new(rows, &exact);
-        for c in 1..cols {
-            assert_eq!(
-                staggered.columns[c].offset,
-                plain.columns[c].offset + c * STAGGER_GAP,
-                "column {c}"
-            );
+        // The gate: a table of fewer columns than the word keeps them back to
+        // back; one of as many or more leaves the gaps.
+        for (at_least, gapped) in [(cols + 1, false), (cols, true), (1, true)] {
+            set_narrow_stagger_for_test(Some(at_least));
+            let w = NarrowWriter::new(rows, &exact);
+            for c in 1..cols {
+                let gap = if gapped { c * STAGGER_GAP } else { 0 };
+                assert_eq!(
+                    w.columns[c].offset,
+                    plain.columns[c].offset + gap,
+                    "at least {at_least}: column {c}"
+                );
+            }
         }
-        for scrambled in [false, true] {
-            let written = write(&words, cols, &exact, scrambled);
+        for at_least in [1, cols, cols + 1] {
+            set_narrow_stagger_for_test(Some(at_least));
+            for scrambled in [false, true] {
+                let written = write(&words, cols, &exact, scrambled);
+                assert_eq!(
+                    written.finish().ok(),
+                    Some(whole.clone()),
+                    "at least {at_least}, scrambled {scrambled}"
+                );
+            }
+            let bounds = [0, 17, rows / 2, rows / 2, rows - 1, rows];
+            let split = write_split(&words, cols, &[8; 9], &bounds, None);
             assert_eq!(
-                written.finish().ok(),
+                split.finish().ok(),
                 Some(whole.clone()),
-                "scrambled {scrambled}"
+                "at least {at_least}: by row ranges"
             );
         }
-        let bounds = [0, 17, rows / 2, rows / 2, rows - 1, rows];
-        let split = write_split(&words, cols, &[8; 9], &bounds, None);
-        assert_eq!(split.finish().ok(), Some(whole.clone()), "by row ranges");
-        // The writer's own tests, under the stagger.
+        // The writer's own tests, every table staggered.
+        set_narrow_stagger_for_test(Some(1));
         a_trace_written_cell_by_cell_packs_as_a_whole();
         a_trace_written_by_row_ranges_is_the_trace_written_in_one_pass();
         the_writer_rounds_widths_up_and_finishes_empty_traces();
         narrow_round_trips_at_every_width_boundary();
     }
 
-    /// The stagger's word: `1` alone turns it on.
+    /// The stagger's word: the fewest columns a staggered table has; unset or
+    /// 0 is off.
     #[test]
     fn the_stagger_knob_is_named_and_off_by_default() {
         assert_eq!(NARROW_STAGGER_ENV, "LAMBDA_VM_NARROW_STAGGER");
@@ -1087,8 +1117,13 @@ mod tests {
             let _one = STAGGER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
             let _knob = StaggerKnob;
             set_narrow_stagger_for_test(None);
-            assert!(!narrow_stagger(), "off by default");
+            assert_eq!(narrow_stagger_columns(), 0, "off by default");
+            assert!(!narrow_stagger(10_000));
         }
+        let _one = STAGGER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _knob = StaggerKnob;
+        set_narrow_stagger_for_test(Some(256));
+        assert!(!narrow_stagger(255) && narrow_stagger(256) && narrow_stagger(515));
     }
 
     /// A widths list that is not 1, 2, 4 or 8 is rounded up; a trace never
