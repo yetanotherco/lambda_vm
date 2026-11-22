@@ -639,10 +639,14 @@ impl NarrowWriter {
         // yet moved.
         let mut offsets = Vec::with_capacity(columns.len());
         let mut at = 0usize;
+        #[cfg(any(test, feature = "test-utils"))]
+        let skip_close = bench::skip_close() && gaps > 0;
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let skip_close = false;
         for (&n, c) in need.iter().zip(&columns) {
             let n = n as usize;
             offsets.push(at);
-            if at != c.offset || n != c.width {
+            if (at != c.offset || n != c.width) && !skip_close {
                 move_column(&mut data, rows, c.offset, c.width, at, n);
             }
             at += rows * n;
@@ -673,6 +677,22 @@ impl NarrowWriter {
         #[cfg(any(test, feature = "test-utils"))]
         let narrow = mutation::apply(narrow);
         Ok(narrow)
+    }
+}
+
+/// A bench's switch, test builds only: `LAMBDA_VM_NARROW_STAGGER_BENCH_SKIP_CLOSE=1`
+/// has a staggered writer's finish skip moving its columns to the front, so a
+/// timing can price the move alone. The trace it gives is then NOT the trace
+/// (its columns lie where the gaps left them, the tail cut off): a timing only.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod bench {
+    /// The switch's word.
+    pub const SKIP_CLOSE_ENV: &str = "LAMBDA_VM_NARROW_STAGGER_BENCH_SKIP_CLOSE";
+
+    /// Whether a staggered writer's finish skips the move (read once).
+    pub fn skip_close() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var(SKIP_CLOSE_ENV).is_ok_and(|v| v.trim() == "1"))
     }
 }
 
