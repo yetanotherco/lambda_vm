@@ -200,7 +200,7 @@ fn copy_and_eq_packed_fills_timing() {
             eq::EqOperation::new(a, if i % 3 == 0 { a } else { a ^ (i as u64) }, i % 5 == 0)
         })
         .collect();
-    let time = |name: &str, f: &dyn Fn()| {
+    let time = |name: &str, f: &(dyn Fn() + Sync)| {
         let mut ms = Vec::new();
         for _ in 0..reps {
             let t = std::time::Instant::now();
