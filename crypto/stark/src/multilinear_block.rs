@@ -4606,6 +4606,12 @@ where
         multilinear::gpu::reset_reserved_window();
     }
     let before_revive = own_window.then(multilinear::gpu::ledger_reserved);
+    // ★ THE TWO-CARD OPENINGS' SECOND UPLOAD (r4). Under the two-card openings
+    // `store` is `None` here (dropped with the group's card-0 state before its
+    // openings started), so this revive uploads the group's columns from the
+    // host a second time, to the openings' card: the host link's extra bytes
+    // a measurement prices (`stamps.encode` below holds its time with the
+    // re-encode).
     let stacked = retired.revive::<H, _>(
         &columns,
         store.map(|store| (&**store, ColumnsAt::From(0))),
@@ -4744,6 +4750,9 @@ where
             };
             let revived = match &p.commitment {
                 PreparedCommitment::Held(_) => None,
+                // Under the two-card openings (no upload-once store) this
+                // revive uploads the prepared columns to the openings' card:
+                // the second upload's prepared share (r4).
                 PreparedCommitment::Retired(r) => Some((*r).clone().revive::<H, _>(
                     p.columns,
                     store.as_ref().map(|s| (s, ColumnsAt::From(0))),
