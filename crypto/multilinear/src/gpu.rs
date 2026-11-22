@@ -1355,6 +1355,32 @@ pub struct BackgroundStreams(#[allow(dead_code)] math_cuda::stream_class::ClassG
 #[cfg(not(feature = "cuda"))]
 pub struct BackgroundStreams;
 
+/// Whether phase B's openings run on a backend of their own, card 1's when
+/// the process sees two cards ([`math_cuda::device::two_card_openings`],
+/// `LAMBDA_VM_TWO_CARD_OPENINGS`); `false` without a device build.
+#[cfg(feature = "cuda")]
+pub fn two_card_openings() -> bool {
+    math_cuda::device::two_card_openings()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn two_card_openings() -> bool {
+    false
+}
+
+/// Runs `f` as phase B's openings' device work: on the openings' card, its
+/// parallel iterators too, under the two-card openings; `f()` here otherwise
+/// ([`math_cuda::device::on_openings_card`]).
+#[cfg(feature = "cuda")]
+pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    math_cuda::device::on_openings_card(f)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    f()
+}
+
 /// Marks this thread's stream draws as background work until the guard drops.
 #[cfg(feature = "cuda")]
 pub fn background_streams() -> BackgroundStreams {
