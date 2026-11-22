@@ -1947,7 +1947,15 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         rayon::ThreadPoolBuilder::new()
             .num_threads(rayon::current_num_threads().max(1))
             .thread_name(|i| format!("openings-card-{i}"))
-            .start_handler(|_| set_thread_role(DeviceRole::Openings))
+            .start_handler(|_| {
+                set_thread_role(DeviceRole::Openings);
+                // Background-class draws, as on the opener's own thread
+                // (phase B's openings take the pinned read-backs there), for
+                // the worker's life.
+                std::mem::forget(crate::stream_class::enter(
+                    crate::stream_class::StreamClass::Background,
+                ));
+            })
             .build()
             .map_err(|e| {
                 eprintln!("[gpu] two-card openings: no pool of their own ({e}); on this thread")
