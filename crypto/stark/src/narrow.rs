@@ -632,6 +632,8 @@ impl NarrowWriter {
             columns,
             mut data,
         } = self;
+        // The stagger's gaps (0 for a table it leaves back to back).
+        let gaps = data.len() - columns.iter().map(|c| rows * c.width).sum::<usize>();
         // Columns move only toward the front (closing the stagger's gaps) and
         // only narrow, so moving them in order never overwrites a byte not
         // yet moved.
@@ -645,9 +647,14 @@ impl NarrowWriter {
             }
             at += rows * n;
         }
-        if at != data.len() {
+        // A tail freed by columns that narrowed goes back; the stagger's gaps
+        // alone (64 bytes a column) are not worth a reallocation.
+        let freed = data.len() - at;
+        if freed > 0 {
             data.truncate(at);
-            data.shrink_to_fit();
+            if freed > gaps {
+                data.shrink_to_fit();
+            }
         }
         let narrow = NarrowMain {
             rows,
@@ -1098,6 +1105,33 @@ mod tests {
                 Some(whole.clone()),
                 "at least {at_least}: by row ranges"
             );
+        }
+        // The finish of a staggered table that narrows no column keeps its
+        // buffer, gaps' bytes as spare capacity (not worth a reallocation);
+        // one that narrows gives the freed tail back. Unstaggered and exact,
+        // the buffer is never touched (today's path).
+        for (at_least, widths, spare) in [
+            (1usize, exact.clone(), (cols - 1) * STAGGER_GAP),
+            (1, vec![8u8; cols], 0),
+            (0, exact.clone(), 0),
+        ] {
+            set_narrow_stagger_for_test(Some(at_least));
+            let w = write(&words, cols, &widths, false);
+            let before = w.data.as_ptr();
+            let done = w.finish().expect("fits");
+            assert_eq!(done, whole, "at least {at_least}, widths {widths:?}");
+            assert_eq!(
+                done.data.capacity() - done.data.len(),
+                spare,
+                "at least {at_least}, widths {widths:?}: spare capacity"
+            );
+            if spare > 0 || at_least == 0 {
+                assert_eq!(
+                    done.data.as_ptr(),
+                    before,
+                    "at least {at_least}: the buffer kept"
+                );
+            }
         }
         // The writer's own tests, every table staggered.
         set_narrow_stagger_for_test(Some(1));
