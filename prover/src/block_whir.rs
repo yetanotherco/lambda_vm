@@ -1668,6 +1668,19 @@ pub(crate) fn host_real_bytes_now() -> u64 {
     HostReading::now().real_bytes()
 }
 
+/// How close to the page-locked pool's end a run may hand out before its
+/// stamps warn: the pool is handed out front to back once, so what was handed
+/// out is the most this process ever held of it at once.
+pub(crate) const PINNED_POOL_NEAR_FULL_BYTES: u64 = 1 << 30;
+
+/// The pool's bytes left, where a run handed out all but less than
+/// [`PINNED_POOL_NEAR_FULL_BYTES`] of it (or all of it); `None` for a pool
+/// with room, or none at all.
+pub(crate) fn pinned_pool_near_full(pool_bytes: u64, handed_out: u64) -> Option<u64> {
+    let left = pool_bytes.saturating_sub(handed_out);
+    (pool_bytes > 0 && left < PINNED_POOL_NEAR_FULL_BYTES).then_some(left)
+}
+
 /// The host's bytes a drop decision weighs: its peak ([`HostReading::bytes`]),
 /// or, under partial drops once they have armed (`now`), what it holds now
 /// ([`HostReading::now_bytes`]): a dropped table's pages, once purged, leave
@@ -3790,6 +3803,15 @@ impl BlockStamps {
                 gib(p.usable_bytes),
                 if p.usable_bytes > 0 { 100.0 * p.requested_bytes as f64 / p.usable_bytes as f64 } else { 0.0 },
             ));
+            if let Some(left) = pinned_pool_near_full(p.pool_bytes, p.carved_bytes) {
+                out.push_str(&format!(
+                    "BLOCK PINNED POOL NEAR FULL: warning · handed out {:.2} of {:.2} GiB, {:.2} GiB left (under {} GiB) · a larger run spills to pageable memory; raise LAMBDA_VM_PINNED_POOL_GIB\n",
+                    gib(p.carved_bytes),
+                    gib(p.pool_bytes),
+                    gib(left),
+                    PINNED_POOL_NEAR_FULL_BYTES >> 30,
+                ));
+            }
         } else {
             out.push_str("BLOCK PINNED POOL: off\n");
         }
