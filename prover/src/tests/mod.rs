@@ -79,6 +79,8 @@ pub mod dvrm_tests;
 #[cfg(test)]
 pub mod ecdas_halves_tests;
 #[cfg(test)]
+pub mod ecdas_rows_kat_tests;
+#[cfg(test)]
 pub mod ecdas_tests;
 pub mod ecrec_tests;
 #[cfg(test)]
