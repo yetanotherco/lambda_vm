@@ -1,0 +1,20 @@
+name = "lambda-vm-formal"
+defaultTargets = ["LambdaVM", "LambdaVMExport"]
+
+[leanOptions]
+autoImplicit = false
+relaxedAutoImplicit = false
+
+# Clean pinned to a revision; Mathlib and CompPoly come in through Clean's manifest.
+[[require]]
+name = "Clean"
+git = "https://github.com/Verified-zkEVM/clean"
+rev = "f3abad7c099e49f847836c1883dd9e7c539f06f9"
+
+[[lean_lib]]
+name = "LambdaVM"
+
+# The export script, so that `lake build` also compiles its dependency `Clean.Circuit.Json`.
+[[lean_lib]]
+name = "LambdaVMExport"
+roots = ["LambdaVM.Export"]

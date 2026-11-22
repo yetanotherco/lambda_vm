@@ -24,6 +24,7 @@ use stark::frame::Frame;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
+use super::test_rng::SplitMix64;
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 type Gl = GoldilocksField;
@@ -31,18 +32,6 @@ type Gl3 = GoldilocksExtension;
 type Fp3 = FieldElement<Gl3>;
 
 const TRIALS: usize = 1000;
-
-/// Deterministic SplitMix64.
-struct SplitMix64(u64);
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
 
 /// Run the folder-vs-capture-interpret differential + meta invariants for one
 /// table's [`ConstraintSet`]. All three interpretations derive from the ONE
