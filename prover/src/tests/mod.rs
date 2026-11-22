@@ -170,6 +170,8 @@ pub mod regs_inrow_tests;
 #[cfg(test)]
 pub mod rpx_two_implementations;
 pub mod transcript_counts;
+#[cfg(test)]
+pub mod two_card_openings_tests;
 pub mod windowed_builder_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]

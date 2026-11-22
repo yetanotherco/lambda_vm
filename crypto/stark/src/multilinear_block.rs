@@ -4534,6 +4534,29 @@ where
 
 /// Whether `group`'s prepared stack was committed and let go: it is revived
 /// at the group's opening ([`open_prepared`]).
+/// Groups whose openings ran on the openings' own card, process-wide: what a
+/// test reads to know the two-card openings ran ([`two_card_opened`]).
+static TWO_CARD_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`TWO_CARD_OPENED`].
+#[doc(hidden)]
+pub fn two_card_opened() -> u64 {
+    TWO_CARD_OPENED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `group` has a prepared stack held as phase A left it (on the card
+/// or the host): the two-card openings leave such a group on card 0.
+fn prepared_is_held<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
+where
+    F: IsFFTField + IsPrimeField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    prepared
+        .iter()
+        .any(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Held(_)))
+}
+
 fn prepared_is_retired<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
 where
     F: IsFFTField + IsPrimeField,
@@ -5050,6 +5073,9 @@ where
     // through pinned staging; this thread, the argument's, does not.
     let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let mut prev: Option<Argued<F, E, T>> = None;
+    // Under the two-card openings: the groups opened on the openings' card,
+    // and those kept on card 0 (a held prepared stack).
+    let mut two_card = (0usize, 0usize);
     let mut latched = false;
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
@@ -5130,6 +5156,35 @@ where
         }
         stamps[g].upload_b += t.elapsed().as_secs_f64();
 
+        // Under the two-card openings the previous group's openings run on
+        // their own card beside this argue: its columns and stores on card 0
+        // go first, and the openings revive over the host's columns there
+        // (the same codewords, so the same bytes). A group whose prepared
+        // stack is held (its codewords where phase A left them) opens on card
+        // 0 as before.
+        let prev_on_own_card = match prev.as_mut() {
+            Some(earlier)
+                if multilinear::gpu::two_card_openings()
+                    && !prepared_is_held(prepared, earlier.group) =>
+            {
+                for table in tables[earlier.at..earlier.at + earlier.size].iter_mut() {
+                    table.clear_resident();
+                }
+                earlier.store = None;
+                earlier.store_promise = None;
+                earlier.upload_once = false;
+                earlier.overlap_resident = false;
+                two_card.0 += 1;
+                TWO_CARD_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            Some(_) if multilinear::gpu::two_card_openings() => {
+                two_card.1 += 1;
+                false
+            }
+            _ => false,
+        };
+
         // The group's tables, one after another, each leaving its columns
         // claimed at its own point — or, batched, all of them in one argue —
         // with the next group's upload beside them, and under the overlap the
@@ -5184,9 +5239,17 @@ where
                             panic!("a test's opening thread panics");
                         }
                         let fails = overlap_faults.open_fails == Some(earlier.place);
-                        let (opened, stacked) = open_group::<F, E, T, H>(
-                            earlier, its_tables, prepared, deviations, config, false, fails,
-                        )?;
+                        let (opened, stacked) = if prev_on_own_card {
+                            multilinear::gpu::on_openings_card(|| {
+                                open_group::<F, E, T, H>(
+                                    earlier, its_tables, prepared, deviations, config, false, fails,
+                                )
+                            })
+                        } else {
+                            open_group::<F, E, T, H>(
+                                earlier, its_tables, prepared, deviations, config, false, fails,
+                            )
+                        }?;
                         on_group(GroupOpened {
                             group: earlier.group,
                             roots: roots_ref,
@@ -5605,6 +5668,14 @@ where
     }
     if sched && let (Some((then, h)), Some(now)) = (turn_sched, thread_schedstat()) {
         stamps[h].sched_b = Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
+    }
+    if multilinear::gpu::two_card_openings() {
+        eprintln!(
+            "BLOCK TWO-CARD OPENINGS: on (LAMBDA_VM_TWO_CARD_OPENINGS) · {} of {n} groups opened on the \
+             openings' card beside an argue · {} kept on card 0 (a held prepared stack) · the rest \
+             opened alone on card 0",
+            two_card.0, two_card.1
+        );
     }
     // Every finished group's records handed back before phase B returns.
     if let Some(returner) = returner {
