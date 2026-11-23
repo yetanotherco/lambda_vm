@@ -1,0 +1,46 @@
+name = "SUB"
+
+[[variables.condition]]
+name = "cond"
+type = "BaseField"
+desc = "Whether the relation should be enforced ($eq.not 0$) or not ($0$)."
+
+[[variables.input]]
+name = "lhs"
+type = "DWordWL"
+desc = "left-hand operator"
+
+[[variables.input]]
+name = "rhs"
+type = "DWordWL"
+desc = "right-hand operator"
+
+[[variables.output]]
+name = "diff"
+type = "DWordWL"
+desc = "$#`lhs` - #`rhs`$"
+
+[[assumptions]]
+desc = "`IS_WORD[lhs[i]]`"
+iter = ["i", 0, 1]
+ref = "sub:a:lhs"
+
+[[assumptions]]
+desc = "`IS_WORD[rhs[i]]`"
+iter = ["i", 0, 1]
+ref = "sub:a:rhs"
+
+[[assumptions]]
+desc = "`IS_WORD[diff[i]]`"
+iter = ["i", 0, 1]
+ref = "sub:a:diff"
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "ADD"
+input = ["diff", "rhs"]
+output = "lhs"
+cond = "cond"

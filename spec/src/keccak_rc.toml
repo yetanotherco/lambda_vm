@@ -1,4 +1,5 @@
 name = "KECCAK_RC"
+code = "KCC"
 
 [[variables.input]]
 name = "round"

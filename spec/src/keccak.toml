@@ -1,15 +1,10 @@
 name = "KECCAK"
+code = "KCK"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "timestamp at which the permutation is performed"
-pad = 0
-
-[[variables.input]]
-name = "addr"
-type = "DWordBL"
-desc = "memory address storing the first bit of the state"
 pad = 0
 
 [[variables.input]]
@@ -26,7 +21,7 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "state_ptr"
-type = [["DWordHL", 5], 5]
+type = [["DWordWHH", 5], 5]
 desc = "memory addresses storing the entire state"
 pad = ["*", 8, ["arr", 
         ["arr", 0, 1, 2, 3, 4],
@@ -46,6 +41,11 @@ pad = 0
 name = "output"
 
 [[constraints.output]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.output]]
 kind = "interaction"
 tag = "ECALL"
 input = ["timestamp", ["cast", ["-", ["^", 2, 64], 2], "DWordWL"]]
@@ -54,28 +54,30 @@ multiplicity = ["-", "μ"]
 [[constraint_groups]]
 name = "mem"
 
+
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], "addr", "timestamp", 1, 0, 0]
-output = "addr"
-multiplicity = "μ"
-ref = "keccak:c:read_addr"
+kind = "template"
+tag = "REG"
+input = [10, ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], "timestamp"]
+output = ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"]
+cond = "μ"
+ref = "keccak:c:read_state_ptr"
 
 [[constraints.mem]]
 kind = "template"
 tag = "ADD"
-input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"]], "DWordWL"]]
+input = [["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"]], "DWordWL"]]
 output = ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"]
 iters = [["x", 0, 4], ["y", 0, 4]]
 ref = "keccak:c:state_ptr"
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], "z"]]
-iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
-multiplicity = "μ"
+kind = "template"
+tag = "IS_WHH"
+input = [["idx", ["idx", "state_ptr", "x"], "y"]]
+iters = [["x", 0, 4], ["y", 0, 4]]
+cond = "μ"
+ref = "keccak:c:range_state_ptr"
 
 [[constraints.mem]]
 kind = "interaction"

@@ -1,4 +1,5 @@
 name = "SHA256_K"
+code = "SHK"
 
 [[variables.input]]
 name = "index"

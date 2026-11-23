@@ -1,4 +1,5 @@
 name = "SHIFT"
+code = "SHF"
 
 # Input
 
@@ -38,15 +39,15 @@ pad = 0
 [[variables.output]]
 name = "out"
 type = "DWordWL"
-desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
+desc = "$#`in` <<\\/>>\\/>>> (#`shift` mod 32 dot (2 - #`word_instr`))$"
 pad = 0
 
 # Auxiliary
 
 [[variables.auxiliary]]
-name = "is_negative"
+name = "sign"
 type = "Bit"
-desc = "Whether `in` is negative"
+desc = "The sign bit of `in`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -94,7 +95,7 @@ def = {idx = "i", polys = [
 name = "extension"
 type = "Half"
 desc = "sign extension of `in`."
-def = ["*", 65535, "is_negative"]
+def = ["*", 65535, "sign"]
 
 [[variables.virtual]]
 name = "left"
@@ -126,7 +127,7 @@ def = {idx="i", iter=[0, 3], poly=["+", ["idx", "Y", "i"], ["idx", "X", ["+", "i
 [[variables.virtual]]
 name = "shifted"
 type = "DWordHL"
-desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
+desc = "$#`in` <<\\/>>\\/>>> (#`shift` mod 32 dot (2 - #`word_instr`))$"
 def = {idx="i", iter=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 4, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
 
 # Multiplicities
@@ -181,6 +182,16 @@ tag = "IS_BIT"
 input = ["word_instr"]
 ref = "shift:c:word_instr"
 
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["zbs"]
+
 [[constraint_groups]]
 name = "left_flag"
 
@@ -193,15 +204,13 @@ ref = "shift:c:direction_implies_mu"
 
 
 [[constraint_groups]]
-name = "is_negative"
+name = "sign"
 
-[[constraints.is_negative]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "in", 3]]
-output = "is_negative"
-multiplicity = "signed"
-ref = "shift:c:is_negative_if_signed"
+[[constraints.sign]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "in", 3], "signed"]
+output = "sign"
 
 
 [[constraint_groups]]

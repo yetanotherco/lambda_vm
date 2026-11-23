@@ -1,0 +1,49 @@
+.sidenote {
+  /* See also `style.css` */
+  --gap-size-h: 24px;
+  --main-margin-width: calc((100vw - var(--content-max-width)) / 2);
+  /* max width of 280 px, otherwise fill the space except for gap-size-h */
+  --note-width: min(280px, calc(var(--main-margin-width) - 2 * var(--gap-size-h)));
+
+  /* Move into the right margin */
+  float: right;
+  clear: right;
+  /* Center it in the right margin */
+  margin-right: calc(-1 * ((var(--main-margin-width) + var(--note-width) + var(--content-padding-x)) / 2));
+  /* General margins */
+  margin-top: 0.15em;
+  margin-bottom: 0.8em;
+
+  width: var(--note-width);
+
+  font-size: 0.85em;
+  color: var(--endnote-fg);
+  /* Gold-tinted card, works on both light and dark paper */
+  background: color-mix(in srgb, var(--gold) 7%, var(--surface-card));
+  border: 1px solid color-mix(in srgb, var(--gold) 30%, var(--border));
+  border-radius: var(--radius);
+  padding: 0.4em 0.6em;
+}
+
+/* Reset the backlink sup to baseline, because it looks nicer */
+.sidenote sup[role="doc-backlink"] {
+  font-size: 1em;
+  vertical-align: baseline;
+  margin-right: 0.3em;
+}
+
+/*
+  Leave out sidenotes for narrow display width or print, still has endnotes
+  Breakpoint: --main-margin-width ≥ reasonable note width (150px) + 2 * --gap-size-h
+*/
+@media (max-width: 1256px) {
+  .sidenote {
+    display: none;
+  }
+}
+
+@media print {
+  .sidenote {
+    display: none;
+  }
+}

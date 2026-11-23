@@ -1,0 +1,166 @@
+#import "@preview/ctheorems:1.1.3": thmrules, thmbox, thmproof
+#import "equate-lite.typ": equate
+
+#let meta = (
+  title: "Lambda VM specification",
+  authors: ("3MI Labs", "Aligned"),
+  version: "0.2",
+  summary: (
+    ("PROOF SYSTEM", (
+        ("logup", [`LogUp` argument], <logup>),
+        ("memory", [Memory argument], <memory>),
+        ("streaming", [Streaming prover], <streaming>),
+        ("verifier", [Verification], <verification>),
+    )),
+    ("OVERVIEW", (
+        ("variables", [Variables], <vars>),
+        ("signatures", [Signatures], <signatures>),
+    )),
+    ("TEMPLATES", (
+      ("is_bit", [`IS_BIT` template], <isbit>),
+      ("is_byte", [`IS_BYTE` template], <isbyte>),
+      ("is_whh", [`IS_WHH` template], <iswhh>),
+      ("sign", [`SIGN` template], <sign>),
+      ("add", [`ADD`/`SUB` templates], <add>),
+      ("neg", [`NEG` template], <neg>),
+      ("reg", [`REG`/`REGW` template], <reg>),
+    )),
+    ("CPU", (
+      ("decode", [`DECODE` table], <decode>),
+      ("cpu", [`CPU` chip], <cpu>),
+      ("cpu32", [`CPU32` chip], <cpu32>),
+    )),
+    ("ALU", (
+      ("shift", [`SHIFT` chip], <shift>),
+      ("branch", [`BRANCH` chip], <branch>),
+      ("lt", [`LT` chip], <lt>),
+      ("eq", [`EQ` chip], <eq>),
+      ("mul", [`MUL` chip], <mul>),
+      ("dvrm", [`DVRM` chip], <dvrm>),
+      ("bitwise", [`BITWISE` chips], <bitwise>),
+      ("bytewise", [`BYTEWISE` chip], <bytewise>),
+      ("is_wh", [`IS_WH`], <is-wh>),
+    )),
+    ("MEMORY", (
+      ("memw", [`MEMW` chip], <memw>),
+      ("load", [`LOAD` chip], <load>),
+      ("store", [`STORE` chip], <store>),
+    )),
+    ("ECALLS", (
+      ("about_ecalls", [About `ECALL`], <ecall>),
+      ("halt", [`HALT` chip], <halt>),
+      ("sha256", [`SHA256` accelerator], <sha256>),
+      ("keccak", [`KECCAK` accelerator], <keccak>),
+      ("ecsm", [`ECSM` accelerator], <ecsm>),
+      ("fext", [Extension field accelerator], <fext>),
+      ("copy", [`COPY` accelerator], <copy>),
+    )),
+    ("RECURSION", (
+      ("recursion", [Recursive verification], <recursion>),
+      ("field_vm", [Field VM], <field-VM>),
+      ("field_vm_decode", [Field `DECODE` table], <field-decode>),
+    )),
+    ("MATHEMATICS", (
+      ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
+    ))
+  )
+)
+
+#let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.4em, radius: .5em, stroke: black)[
+  #set text(fill: foreground)
+  *TODO #if name != none { [(#name)] }*: #body
+]
+
+#let rj = todo.with(background: teal, name: "Robin")
+#let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
+#let cdsg = todo.with(background: olive, name: "Cyprien")
+
+
+/* Colors from the 3MI brand guidelines */
+#let highlights = (
+  "aside": ("Aside", rgb("ffd700"), rgb("#1a1a1a")),
+  "attention": ("Attention", rgb("b3261e"), white),
+)
+
+#let highlight(title, body, ref: none, kind: "aside") = [
+  #figure(
+    caption: title,
+    supplement: highlights.at(kind).at(0),
+    kind: kind,
+    body
+  )#ref
+]
+
+#let aside = highlight.with(kind: "aside")
+#let attention = highlight.with(kind: "attention")
+
+#let stripe_tables(body) = context if target() == "html" {
+  show table: it => html.div(class: "striped", it)
+  body
+} else if target() == "paged" {
+  set table(fill: (_, y) => if calc.odd(y) { color.rgb(255, 215, 0, 10%) } else { color.rgb(255, 255, 255, 20) })
+  body
+} else {
+  assert(false, message: "Unsupported target: " + target())
+}
+
+#let notelist(prefix, body) = {
+  show list: it => context if target() == "html" {
+    html.div(class: "notelist", it)
+  } else {
+    it
+  }
+  show figure.where(kind: "note"): it => super(it.counter.display(it.numbering)) + it
+  show terms: it => list(marker: none, indent: 0pt, ..it.children.map(c => {
+    let labelname = if c.term.has("text") {
+      c.term.text
+    } else {
+      c.term.children.map(x => x.text).join()
+    }
+    list.item[
+      #box[#figure(numbering: "[1]", kind: "note", supplement: [], none)#label(prefix + ":note:" + labelname)]
+      #c.description
+    ]
+  }))
+  body
+}
+
+#let common-formatting(body) = {
+  set footnote(numbering: "[1]")
+  show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
+  show math.equation.where(block: false): box // Don't line-break inline equations by default
+  show ref: equate.with(sub-numbering: true, breakable: true, number-mode: "label")
+  show ref: it => if it.element != none and it.element.func() == figure and it.element.kind == "note" {
+    super[[#it]]
+  } else {
+    it
+  }
+  show selector.or(..highlights.keys().map(k => figure.where(kind: k))): it => {
+    set figure.caption(position: top)
+    show figure.caption: cap => block(
+      inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
+      outset: (left: 1em),
+      width: 100% + 1em,
+      fill: highlights.at(it.kind).at(1),
+      stroke: rgb("#d7d5cd"),
+      sticky: true,
+      {
+        set text(weight: "bold")
+        align(center, cap)
+      }
+    )
+    block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: rgb("#d7d5cd"), breakable: false, align(left, it))
+  }
+  show: it => context if target() == "paged" {
+    thmrules.with(qed-symbol: $square$)(it)
+  } else {
+    // Don't apply full thmrules, so we can do the html styling ourselves in bundle.typ
+    it
+  }
+  body
+}
+
+// Theorem/lemma formatting
+#let lemma = thmbox("lemma", "Lemma", fill: rgb("#f2f1ed"), base_level: 0)
+#let corollary = thmbox("lemma", "Corollary", fill: rgb("#f2f1ed"), base_level: 0)
+#let proof = thmproof("proof", "Proof")

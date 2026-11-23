@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import sys
 import tomllib
@@ -9,19 +10,32 @@ from typing import Never, Optional, Self
 
 class ErrorReporter:
     reported: bool
-    location: str
+    location: list[str]
 
     def __init__(self, location: str):
         self.reported = False
-        self.location = location
+        self.location = [location]
 
     def update_location(self, loc: str):
         self.reported = False
-        self.location = loc
+        self.location = [loc]
+
+    @contextlib.contextmanager
+    def context(self, ctx: str):
+        self.location.append(ctx)
+        yield
+        self.location.pop()
+
+    def _report(self, level: str, message: str, failure: bool = False):
+        if failure:
+            self.reported = True
+        print(f"{level} {'/'.join(self.location)}: {message}", file=sys.stderr)
+
+    def warn(self, message: str):
+        self._report("WARNING", message)
 
     def error(self, message: str):
-        self.reported = True
-        print(f"ERROR {self.location}: {message}", file=sys.stderr)
+        self._report("ERROR", message, True)
 
     def asserts(self, condition: bool, message: str):
         if not condition:
@@ -32,7 +46,7 @@ reporter = ErrorReporter("unknown")
 
 
 def assert_no_unexpected(data: dict, possible_keys: Iterable[str]):
-    for key in data.keys():
+    for key in data:
         reporter.asserts(key in possible_keys, f"Unexpected key: {key!r}")
 
 
@@ -56,16 +70,23 @@ class Range:
         return self.low
 
 
-type Type = list[Type] | Range
+@dataclass(frozen=True)
+class Opaque:
+    tag: str
+
+
+type Type = list[Type] | Range | Opaque
 
 DEFAULT_TYPE: Type = Range.const(0)
 
 
 def structure_matches(a: Type, b: Type) -> bool:
-    if isinstance(a, Range) and isinstance(b, (Range, type(None))):
+    if isinstance(a, Range) and isinstance(b, Range):
         return True
     elif isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(structure_matches(x, y) for x, y in zip(a, b))
+    elif isinstance(a, Opaque) and isinstance(b, Opaque):
+        return a.tag == b.tag
     else:
         return False
 
@@ -73,9 +94,12 @@ def structure_matches(a: Type, b: Type) -> bool:
 def constant_fits(cst: int, target: Type) -> bool:
     if isinstance(target, Range):
         return target.low <= cst <= target.high
-    else:
+    elif isinstance(target, list):
         return constant_fits(cst, target[0])
-
+    else:
+        assert isinstance(target, Opaque)
+        # Let's assume this fits in an opaque
+        return True
 
 type Expr = (
     LitExpr
@@ -86,9 +110,11 @@ type Expr = (
     | MulExpr
     | AddExpr
     | SubExpr
+    | ModExpr
     | PowExpr
     | SumExpr
     | NotExpr
+    | NextExpr
     | DummyExpr
 )
 
@@ -98,7 +124,7 @@ OPSEL = ["AND", "OR", "XOR", "EQ", "LT", "SHIFT", "SHIFTW", "MUL", "DIVREM"]
 @dataclass
 class Environment:
     config: "Config"
-    valmap: dict[str, Range]
+    valmap: dict[str, Type]
     typemap: dict[str, Type]
 
     def with_val(self, key: str, val: Range) -> Self:
@@ -147,7 +173,7 @@ class IdxExpr:
             reporter.error(f"Invalid index: {idx!r}")
             return Range.const(-1)
         idxconst = idx.get_const()
-        if isinstance(base, Range):
+        if not isinstance(base, list):
             reporter.error(f"Indexing into non-array type: {self!r}")
             return DEFAULT_TYPE
         if not (0 <= idxconst < len(base)):
@@ -175,6 +201,24 @@ class CastExpr:
                 constant_fits(base.get_const(), self.type),
                 f"Casting const to type it doesn't fit: {self!r}",
             )
+            if isinstance(self.type, list):
+                return [
+                    CastExpr(LitExpr(base.get_const() if i == 0 else 0), t).typecheck(env)
+                    for i, t in enumerate(self.type)
+                ]
+            elif isinstance(self.type, Opaque):
+                return self.type
+            return base
+        if isinstance(base, list) and all(b == Range.const(0) for b in base):
+            # Workaround for casts of constant zero, to make padding work nicely
+            # This may become cleaner if we eventually get to the cast rework from #326
+            if isinstance(self.type, Range):
+                return Range.const(0)
+            elif isinstance(self.type, Opaque):
+                # We assume this works for an opaque type, as it's an explicit cast
+                return self.type
+            else:
+                return [CastExpr(LitExpr(0), t).typecheck(env) for t in self.type]
         return self.type
 
 
@@ -182,14 +226,21 @@ class CastExpr:
 class MulExpr:
     factors: list[Expr]
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             reporter.error(f"Multiplication of non-scalar types: {self!r}")
             return DEFAULT_TYPE
-        elif not isinstance(a, Range):
-            return [self.type_match(x, b) for x in a]
+        elif isinstance(a, list):
+            return [self.typecheck_binop(x, b) for x in a]
         elif isinstance(b, list):
-            return self.type_match(b, a)
+            return self.typecheck_binop(b, a)
+        elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Multiplication of two distinct opaque types: {self!r}")
+            # Works to multiply with a constant/Range
+            return a
+        elif isinstance(b, Opaque):
+            return self.typecheck_binop(b, a)
         else:
             extrema = [x * y for x in [a.low, a.high] for y in [b.low, b.high]]
             return Range(min(extrema), max(extrema))
@@ -198,7 +249,7 @@ class MulExpr:
         reporter.asserts(self.factors != [], f"Empty product: {self!r}")
         t: Type = Range.const(1)
         for f in self.factors:
-            t = self.type_match(t, f.typecheck(env))
+            t = self.typecheck_binop(t, f.typecheck(env))
         return t
 
 
@@ -206,15 +257,22 @@ class MulExpr:
 class AddExpr:
     terms: list[Expr]
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             if len(a) != len(b):
                 reporter.error(f"Adding array types of different length {self!r}")
                 return [DEFAULT_TYPE for _ in b]
-            return [self.type_match(x, y) for x, y in zip(a, b)]
+            return [self.typecheck_binop(x, y) for x, y in zip(a, b)]
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Adding of scalar and array types {self!r}")
             return DEFAULT_TYPE
+        elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Addition of two distinct opaque types: {self!r}")
+            # Still works adding Ranges to it
+            return a
+        elif isinstance(b, Opaque):
+            return self.typecheck_binop(b, a)
         else:
             return Range(a.low + b.low, a.high + b.high)
 
@@ -224,7 +282,7 @@ class AddExpr:
             return Range.const(0)
         t: Type = self.terms[0].typecheck(env)
         for term in self.terms[1:]:
-            t = self.type_match(t, term.typecheck(env))
+            t = self.typecheck_binop(t, term.typecheck(env))
         return t
 
 
@@ -233,27 +291,38 @@ class SubExpr:
     head: Expr
     subs: list[Expr]
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             if len(a) != len(b):
                 reporter.error(f"Subtracting array types of different length {self!r}")
                 return [DEFAULT_TYPE for _ in a]
-            return [self.type_match(x, y) for x, y in zip(a, b)]
+            return [self.typecheck_binop(x, y) for x, y in zip(a, b)]
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Subtraction of scalar and array types {self!r}")
             return DEFAULT_TYPE
+        elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Subtraction of two distinct opaque types: {self!r}")
+            # We allow subtracting Ranges
+            return a
+        elif isinstance(b, Opaque):
+            # Flipping the order doesn't matter, as we're returning an Opaque anyway
+            return self.typecheck_binop(b, a)
         else:
             return Range(a.low - b.high, a.high - b.low)
 
     def typecheck(self, env: Environment) -> Type:
         t = self.head.typecheck(env)
         if not self.subs:
-            if not isinstance(t, Range):
+            if isinstance(t, Range):
+                return Range(-t.high, -t.low)
+            elif isinstance(t, Opaque):
+                return t
+            else:
                 reporter.error(f"Negating a non-scalar type: {self!r}")
                 return t
-            return Range(-t.high, -t.low)
         for term in self.subs:
-            t = self.type_match(t, term.typecheck(env))
+            t = self.typecheck_binop(t, term.typecheck(env))
         return t
 
 
@@ -266,19 +335,22 @@ class ModExpr:
         elt = self.elt.typecheck(env)
         modulus = self.modulus.typecheck(env)
 
+        if isinstance(elt, Opaque) or isinstance(modulus, Opaque):
+            reporter.error(f"Cannot take a mod with opaque types: {self!r}")
+            return elt
+
         if isinstance(modulus, list) or not modulus.is_const():
             reporter.error(f"Invalid non-constant modulus: {self.modulus!r}")
             return Range.const(0)
-        modulus = modulus.get_const()
-        if modulus <= 0:
+        modulus_val = modulus.get_const()
+        if modulus_val <= 0:
             reporter.error(f"Invalid non-positive modulus: {self.modulus!r}")
             return Range.const(0)
 
-        if elt.is_const():
-            elt = elt.get_const()
-            return Range.const(elt % modulus)
+        if isinstance(elt, Range) and elt.is_const():
+            return Range.const(elt.get_const() % modulus_val)
         else:
-            return Range(0, modulus-1)
+            return Range(0, modulus_val - 1)
 
 
 @dataclass
@@ -289,16 +361,27 @@ class PowExpr:
     def typecheck(self, env: Environment) -> Type:
         base = self.base.typecheck(env)
         exp = self.exp.typecheck(env)
-        if isinstance(base, list) or not base.is_const():
-            reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
+        if isinstance(base, list):
+            reporter.error(f"Invalid exponentiation of a list: {self.base!r}")
             return DEFAULT_TYPE
-        if isinstance(exp, list) or not exp.is_const():
-            reporter.error(
-                f"Invalid exponentiation with non-const exponent: {self.exp!r}"
-            )
+        if not (isinstance(exp, Range) and exp.is_const()):
+            reporter.error(f"Invalid exponentiation with non-const exponent: {self.exp!r}")
             return DEFAULT_TYPE
-        val = pow(base.get_const(), exp.get_const(), env.config.variables.prime)
-        return Range.const(val)
+
+        if isinstance(base, Opaque):
+            return base
+
+        # If const base, we have a const result
+        if base.is_const():
+            return Range.const(pow(base.get_const(), exp.get_const(), env.config.variables.prime))
+        # If we have no modular wrap, we have a correct range
+        e, p = exp.get_const(), env.config.variables.prime
+        small_pow = e * max(0, base.high.bit_length() - 1) <= p.bit_length()
+        if base.low >= 0 and small_pow and base.high ** e < p:
+            return Range(pow(base.low, e, p), pow(base.high, e, p))
+        # Else, escape hatch to the full base type
+        else:
+            return Range(0, env.config.variables.prime - 1)
 
 
 @dataclass
@@ -306,22 +389,28 @@ class SumExpr:
     iter: "Iter"
     terms: Expr
 
-    def type_match(self, a: Type, b: Type) -> Type:
+    def typecheck_binop(self, a: Type, b: Type) -> Type:
         if isinstance(a, list) and isinstance(b, list):
             if len(a) != len(b):
                 reporter.error(f"Summing array types of different length {self!r}")
                 return [DEFAULT_TYPE for _ in b]
-            return [self.type_match(x, y) for x, y in zip(a, b)]
+            return [self.typecheck_binop(x, y) for x, y in zip(a, b)]
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Summing of scalar and array types {self!r}")
             return DEFAULT_TYPE
+        elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Summation of two distinct opaque types: {self!r}")
+            return a
+        elif isinstance(b, Opaque):
+            return self.typecheck_binop(b, a)
         else:
             return Range(a.low + b.low, a.high + b.high)
 
     def typecheck(self, env: Environment) -> Type:
         t: Type = Range.const(0)
         for tc in self.iter.typecheck(env, lambda e: [self.terms.typecheck(e)]):
-            t = self.type_match(t, tc)
+            t = self.typecheck_binop(t, tc)
         return t
 
 
@@ -331,10 +420,18 @@ class NotExpr:
 
     def typecheck(self, env: Environment) -> Type:
         inner = self.inner.typecheck(env)
-        if isinstance(inner, list) or not inner.is_bool():
+        if not (isinstance(inner, Range) and inner.is_bool()):
             reporter.error(f"Not a bool passed to `not`: {self.inner!r}")
             return Range(0, 1)
         return Range(1 - inner.high, 1 - inner.low)
+
+
+@dataclass
+class NextExpr:
+    inner: VarExpr
+
+    def typecheck(self, env: Environment) -> Type:
+        return self.inner.typecheck(env)
 
 
 @dataclass
@@ -349,9 +446,7 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
         case int(x):
             return LitExpr(x)
         case str(x):
-            reporter.asserts(
-                x.isidentifier(), f"Invalid identifier name for variable {x!r}"
-            )
+            reporter.asserts(x.isidentifier(), f"Invalid identifier name for variable {x!r}")
             return VarExpr(x)
         case ["opsel", str(x)]:
             if x not in OPSEL:
@@ -371,9 +466,7 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
         case ["+", *terms]:
             return AddExpr([build_expr(config, t) for t in terms])
         case ["-", head, *subs]:
-            return SubExpr(
-                build_expr(config, head), [build_expr(config, s) for s in subs]
-            )
+            return SubExpr(build_expr(config, head), [build_expr(config, s) for s in subs])
         case ["mod", elt, modulus]:
             return ModExpr(build_expr(config, elt), build_expr(config, modulus))
         case ["^", base, exp]:
@@ -383,9 +476,24 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             return SumExpr(Iter(config, var, start, stop), build_expr(config, terms))
         case ["not", e]:
             return NotExpr(build_expr(config, e))
+        case ["next", str(var)]:
+            inner = build_expr(config, var)
+            assert isinstance(inner, VarExpr), f"Invalid transition variable: {var!r}"
+            return NextExpr(inner)
         case other:
             reporter.error(f"Unknown expression: {other!r}")
             return DummyExpr()
+
+
+def check_padding_fits(config: "Config", type: Type, pad: Expr):
+    def fits(v, t):
+        if isinstance(v, Range):
+            return v.is_const() and constant_fits(v.get_const(), t)
+        else:
+            return isinstance(v, list) and isinstance(t, list) and len(v) == len(t) and all(map(fits, v, t))
+
+    val = pad.typecheck(Environment(config, {}, {}))
+    reporter.asserts(fits(val, type), f"Invalid padding {pad!r} for type {type!r}")
 
 
 @dataclass
@@ -396,24 +504,18 @@ class Iter:
 
     def __init__(self, config: "Config", name: str, start: object, stop: object):
         self.name = name
-        reporter.asserts(
-            isinstance(self.name, str), f"iter name is not a string: {self.name!r}"
-        )
-        reporter.asserts(
-            self.name.isidentifier(), f"Not a valid identifier: {self.name!r}"
-        )
+        reporter.asserts(isinstance(self.name, str), f"iter name is not a string: {self.name!r}")
+        reporter.asserts(self.name.isidentifier(), f"Not a valid identifier: {self.name!r}")
         self.start = build_expr(config, start)
         self.stop = build_expr(config, stop)
 
-    def typecheck[T](
-        self, env: Environment, callback: Callable[[Environment], Iterable[T]]
-    ) -> Iterable[T]:
+    def typecheck[T](self, env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
         start = self.start.typecheck(env)
-        if isinstance(start, list) or not start.is_const():
+        if not (isinstance(start, Range) and start.is_const()):
             reporter.error(f"Starting value of iterator not a const: {self!r}")
             start = Range.const(0)
         stop = self.stop.typecheck(env)
-        if isinstance(stop, list) or not stop.is_const():
+        if not (isinstance(stop, Range) and stop.is_const()):
             reporter.error(f"Ending value of iterator not a const: {self!r}")
             stop = Range.const(start.get_const())
 
@@ -444,9 +546,7 @@ def iters_of(obj: dict, config, name=None) -> list[Iter]:
         return Iter(config, *arr)
 
     if "iters" in obj:
-        reporter.asserts(
-            "iter" not in obj, f"Object has both `iters` and `iter`: {obj!r}"
-        )
+        reporter.asserts("iter" not in obj, f"Object has both `iters` and `iter`: {obj!r}")
         return [clean_iter(it) for it in obj["iters"]]
     elif "iter" in obj:
         return [clean_iter(obj["iter"])]
@@ -458,12 +558,12 @@ def iters_of(obj: dict, config, name=None) -> list[Iter]:
 class TypeConfig:
     label: str
     subtypes: list[Type]
-    range: Optional[Range]
+    scalar_type: Range | Opaque | None
     desc: str
     preprocessed: bool
 
     def __init__(self, default_name: str, lookup: Callable[[str], Type], data: dict):
-        assert_no_unexpected(data, type(self).__annotations__.keys())
+        assert_no_unexpected(data, type(self).__annotations__.keys() - {"scalar_type"} | {"range"})
         self.label = data["label"]
         if "range" in data:
             reporter.asserts(
@@ -475,27 +575,26 @@ class TypeConfig:
                 f"Invalid range: {data!r}",
             )
             start, stop = data["range"]
-            if not isinstance(start, int) and not (
-                isinstance(start, str) and start.isdigit()
-            ):
+            if not isinstance(start, int) and not (isinstance(start, str) and start.isdigit()):
                 reporter.error(f"Range start not an int: {data!r}")
                 start = 0
-            if not isinstance(stop, int) and not (
-                isinstance(stop, str) and stop.isdigit()
-            ):
+            if not isinstance(stop, int) and not (isinstance(stop, str) and stop.isdigit()):
                 reporter.error(f"Range end not an int: {data!r}")
                 stop = start
             reporter.asserts(int(start) <= int(stop), f"Inverted range: {data!r}")
-            self.range = Range(int(start), int(stop))
+            self.scalar_type = Range(int(start), int(stop))
+            self.subtypes = []
+        elif data["subtypes"] == [data["label"]]:
+            self.scalar_type = Opaque(data["label"])
             self.subtypes = []
         else:
-            self.range = None
+            self.scalar_type = None
             self.subtypes = [lookup(tp) for tp in data["subtypes"]]
         self.desc = data["desc"]
         self.preprocessed = data.get("preprocessed", False)
 
     def as_type(self) -> Type:
-        return self.range or self.subtypes[:]
+        return self.scalar_type or self.subtypes[:]
 
 
 @dataclass
@@ -553,9 +652,7 @@ class ConfigMetadata:
     def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.version = data["version"]
-        reporter.asserts(
-            isinstance(self.version, int), f"version {self.version!r} is not an int"
-        )
+        reporter.asserts(isinstance(self.version, int), f"version {self.version!r} is not an int")
 
 
 @dataclass
@@ -610,6 +707,8 @@ class Variable:
         self.desc = data["desc"]
         reporter.asserts(isinstance(self.desc, str), f"{self.desc!r} is not a string")
         self.pad = build_expr(None, data.get("pad", 0))
+        with reporter.context(self.name):
+            check_padding_fits(config, self.type, self.pad)
         self.precomputed = data.get("precomputed", False)
         reporter.asserts(
             isinstance(self.precomputed, bool),
@@ -617,9 +716,7 @@ class Variable:
         )
 
 
-def all_iters[T](
-    its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]
-) -> Iterable[T]:
+def all_iters[T](its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
     if not its:
         yield from callback(env)
     else:
@@ -637,20 +734,14 @@ class VirtualDef:
     # A list of polynomials with each a set of iters they range over
     defs: list[PolyWithIters]
 
-    def __init__(self, config: Config, name: str, tp: Type, data: dict):
+    def __init__(self, config: Config, data: dict):
         if "poly" in data:
             idx = data.get("idx", None)
-            self.defs = [
-                PolyWithIters(
-                    build_expr(config, data["poly"]), iters_of(data, config, name=idx)
-                )
-            ]
+            self.defs = [PolyWithIters(build_expr(config, data["poly"]), iters_of(data, config, name=idx))]
         elif "polys" in data:
             idx = data.get("idx", None)
             self.defs = [
-                PolyWithIters(
-                    build_expr(config, poly["poly"]), iters_of(poly, config, name=idx)
-                )
+                PolyWithIters(build_expr(config, poly["poly"]), iters_of(poly, config, name=idx))
                 for poly in data["polys"]
             ]
         else:
@@ -667,7 +758,7 @@ class VirtualVariable(Variable):
         data = copy.deepcopy(data)
         def_ = data.pop("def", {})
         super().__init__(config, category, data)
-        self.def_ = VirtualDef(config, self.name, self.type, def_)
+        self.def_ = VirtualDef(config, def_)
 
     def typecheck(self, env: Environment) -> Type:
         def handle_iters(
@@ -683,9 +774,7 @@ class VirtualVariable(Variable):
                 for s in seen:
                     ln = min(len(s), len(indices))
                     if s[:ln] == tuple(indices[:ln]):
-                        reporter.error(
-                            f"Double definition for virtual column: {self!r} at index {indices}"
-                        )
+                        reporter.error(f"Double definition for virtual column: {self!r} at index {indices}")
                         break
 
                 val = poly.typecheck(env)
@@ -702,22 +791,16 @@ class VirtualVariable(Variable):
                 # Some duplicated code/concepts from Iter.typecheck
                 # But threading the extra needed state through overly complicates everything
                 start = it.start.typecheck(env)
-                if isinstance(start, list) or not start.is_const():
-                    reporter.error(
-                        f"Starting value of virtual def iter not a const: {self!r}"
-                    )
+                if not (isinstance(start, Range) and start.is_const()):
+                    reporter.error(f"Starting value of virtual def iter not a const: {self!r}")
                     start = Range.const(0)
                 stop = it.stop.typecheck(env)
-                if isinstance(stop, list) or not stop.is_const():
-                    reporter.error(
-                        f"Ending value of virtual def iter not a const: {self!r}"
-                    )
+                if not (isinstance(stop, Range) and stop.is_const()):
+                    reporter.error(f"Ending value of virtual def iter not a const: {self!r}")
                     stop = Range.const(start.get_const())
 
-                if isinstance(expected, Range):
-                    reporter.error(
-                        f"Virtual definition has an iter for a scalar: {self!r}"
-                    )
+                if not isinstance(expected, list):
+                    reporter.error(f"Virtual definition has an iter for a scalar: {self!r}")
                     return
 
                 if not 0 <= start.get_const() <= stop.get_const() < len(expected):
@@ -743,7 +826,7 @@ class VirtualVariable(Variable):
             return False
 
         def check_covered(t: Type, seen: set[tuple], indices: list[int]):
-            if isinstance(t, Range):
+            if not isinstance(t, list):
                 reporter.asserts(
                     is_covered(seen, indices),
                     f"Virtual column {self.name!r} not completely defined",
@@ -753,17 +836,24 @@ class VirtualVariable(Variable):
                     check_covered(elt, seen, indices + [i])
 
         # Special case for better error messages
-        if isinstance(self.type, Range):
+        if not isinstance(self.type, list):
             reporter.asserts(
                 len(self.def_.defs) == 1 and not self.def_.defs[0].iters,
                 f"Invalid def for scalar column: {self!r}",
             )
             assigned_type = self.def_.defs[0].poly.typecheck(env)
-            if not isinstance(assigned_type, Range):
-                reporter.error(
-                    f"Assigning non-scalar type to scalar virtual column: {self!r}"
-                )
+            if isinstance(assigned_type, list):
+                reporter.error(f"Assigning non-scalar type to scalar virtual column: {self!r}")
                 return self.type
+
+            if isinstance(self.type, Range) and not isinstance(assigned_type, Range):
+                reporter.error(f"Incompatible virtual column type assignment: {self!r}")
+                return self.type
+
+            if isinstance(self.type, Opaque) and (not isinstance(assigned_type, Opaque) or assigned_type.tag != self.type.tag):
+                reporter.error(f"Incompatible virtual column opaque type assignment: {self!r}")
+                return self.type
+
             # Check type fits?
             # Leaving this out because it produces too much noise with one-hot assumptions
             # reporter.asserts(self.type.low <= assigned_type.low <= assigned_type.high <= self.type.high, f"Definition may not fit in virtual column: {self!r}")
@@ -771,12 +861,36 @@ class VirtualVariable(Variable):
             # Check no indices are covered twice
             seen: set[tuple] = set()
             for poly_iters in self.def_.defs:
-                handle_iters(
-                    env, poly_iters.iters, poly_iters.poly, self.type, [], seen
-                )
+                handle_iters(env, poly_iters.iters, poly_iters.poly, self.type, [], seen)
             # Check everything is covered
             check_covered(self.type, seen, [])
         return self.type
+
+    def populate_env(self, env: Environment):
+        # We start off general, and assume that the defs
+        # are ordered in such a way that each one at most
+        # depends on the ones before it
+        env.valmap[self.name] = copy.deepcopy(self.type)
+
+        def assign(env, container, its, v):
+            idx = env.valmap[its[0].name].get_const()
+            if len(its) == 1:
+                container[idx] = v
+            else:
+                assign(env, container[idx], its[1:], v)
+
+        for poly_iters in self.def_.defs:
+            if not poly_iters.iters:
+                env.valmap[self.name] = poly_iters.poly.typecheck(env)
+                continue
+
+            for _ in all_iters(
+                poly_iters.iters,
+                env,
+                lambda e: [assign(e, env.valmap[self.name], poly_iters.iters, poly_iters.poly.typecheck(e))],
+            ):
+                # Consume the iterator
+                pass
 
 
 @dataclass
@@ -785,9 +899,7 @@ class Assumption:
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(
-            data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"}
-        )
+        assert_no_unexpected(data, set(type(self).__annotations__.keys()) | {"iter", "iters", "ref"})
         self.desc = data["desc"]
         self.iters = iters_of(data, config)
 
@@ -800,9 +912,7 @@ class ArithConstraint:
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(
-            data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"}
-        )
+        assert_no_unexpected(data, set(type(self).__annotations__.keys()) | {"kind", "ref", "iter", "iters"})
         assert data["kind"] == "arith"
         self.constraint = data["constraint"]
         reporter.asserts(
@@ -810,9 +920,7 @@ class ArithConstraint:
             f"Constraint not a string: {self.constraint!r}",
         )
         self.desc = data.get("desc", "")
-        reporter.asserts(
-            isinstance(self.desc, str), f"desc is not a string: {self.desc!r}"
-        )
+        reporter.asserts(isinstance(self.desc, str), f"desc is not a string: {self.desc!r}")
         self.poly = build_expr(config, data["poly"])
         self.iters = iters_of(data, config)
 
@@ -826,10 +934,8 @@ class ArithConstraint:
                     t.low <= 0 <= t.high,
                     f"Unsatisfiable constraint, 0 not in range: {self!r} {t}",
                 )
-            else:
-                reporter.error(
-                    f"Non-scalar value for polynomial constraint: {self!r} {t}"
-                )
+            elif not isinstance(t, Opaque):
+                reporter.error(f"Non-scalar value for polynomial constraint: {self!r} {t}")
 
         for t in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
             check_includes_zero(t)
@@ -839,8 +945,9 @@ class ArithConstraint:
 @dataclass
 class Signature:
     tag: str
+    condition: Type | None
     input: list[Type]
-    output: Optional[Type]
+    output: Type | None
 
     def matches(self, other: Self) -> bool:
         if not isinstance(other, type(self)):
@@ -849,11 +956,10 @@ class Signature:
             return False
         if (self.output is None) != (other.output is None):
             return False
-        if (
-            self.output is not None
-            and other.output is not None
-            and not structure_matches(self.output, other.output)
-        ):
+        if self.output is not None and other.output is not None and not structure_matches(self.output, other.output):
+            return False
+        # Used as `sig.matches(expected)`, so `self` is the concrete signature found in the toml
+        if self.condition is not None and other.condition is None:
             return False
         return structure_matches(self.input, other.input)
 
@@ -868,8 +974,8 @@ class InteractionLike:
     tag: str
     desc: str
     input: list[Expr]
-    output: Optional[Expr]
-    conditional: Optional[Expr]
+    output: Expr | None
+    conditional: Expr | None
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
@@ -889,13 +995,9 @@ class InteractionLike:
         )
         assert data["kind"] == self.kind
         self.tag = data["tag"]
-        reporter.asserts(
-            isinstance(self.tag, str), f"tag is not a string: {self.tag!r}"
-        )
+        reporter.asserts(isinstance(self.tag, str), f"tag is not a string: {self.tag!r}")
         self.desc = data.get("desc", "")
-        reporter.asserts(
-            isinstance(self.desc, str), f"Description is not a string: {self.desc!r}"
-        )
+        reporter.asserts(isinstance(self.desc, str), f"Description is not a string: {self.desc!r}")
         self.input = [build_expr(config, inp) for inp in data["input"]]
         if "output" in data:
             self.output = build_expr(config, data["output"])
@@ -914,11 +1016,13 @@ class InteractionLike:
     def typecheck(self, env: Environment) -> Iterable[Signature]:
         def callback(e: Environment) -> Iterable[Signature]:
             # TODO: Should we be able to check cond/multiplicity somehow?
+            condition = None
             if self.conditional is not None:
-                self.conditional.typecheck(e)
+                condition = self.conditional.typecheck(e)
             return [
                 self.signature(
                     self.tag,
+                    condition,
                     [inp.typecheck(e) for inp in self.input],
                     self.output.typecheck(e) if self.output else None,
                 )
@@ -951,13 +1055,11 @@ class InteractionConstraint(InteractionLike):
 
 @dataclass
 class DummyConstraint:
-    def typecheck(self, env: Environment) -> list[Never]:
+    def typecheck(self, _env: Environment) -> list[Never]:
         return []
 
 
-type Constraint = (
-    ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
-)
+type Constraint = ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
 
 
 def build_constraint(config, data: dict) -> Constraint:
@@ -977,22 +1079,24 @@ def build_constraint(config, data: dict) -> Constraint:
 class Chip:
     config: Config
     name: str
+    code: str
     variables: list[Variable]
     assumptions: list[Assumption]
     constraints: list[Constraint]
 
     def __init__(self, config: Config, data: dict):
         """Construct a chip from toml-parsed data"""
-        assert_no_unexpected(
-            data, set(type(self).__annotations__.keys()) | {"constraint_groups"}
-        )
+        assert_no_unexpected(data, set(type(self).__annotations__.keys()) | {"constraint_groups"})
         assert_no_unexpected(data["variables"], config.variables.categories.all)
         self.config = config
         self.name = data["name"]
-        reporter.asserts(
-            isinstance(self.name, str), f"name is not a string: {self.name!r}"
-        )
+        reporter.asserts(isinstance(self.name, str), f"name is not a string: {self.name!r}")
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
+        self.code = data.get("code", self.name)
+        reporter.asserts(
+            isinstance(self.code, str), f"code is not a string: {self.code!r}"
+        )
+        reporter.asserts(self.code.isidentifier(), f"Invalid identifier: {self.code!r}")
         self.variables = [
             (Variable if cat != "virtual" else VirtualVariable)(config, cat, var)
             for cat, vars in data["variables"].items()
@@ -1018,6 +1122,14 @@ class Chip:
         reporter.update_location("<string>")
         return cls(config, tomllib.loads(s))
 
+    @property
+    def virtual_vars(self) -> Iterable[VirtualVariable]:
+        return (v for v in self.variables if isinstance(v, VirtualVariable))
+
+    @property
+    def concrete_vars(self) -> Iterable[Variable]:
+        return (v for v in self.variables if not isinstance(v, VirtualVariable))
+
     def typecheck(self) -> Iterable[Signature]:
         typemap = {}
         for v in self.variables:
@@ -1027,30 +1139,73 @@ class Chip:
                 t = v.type
             typemap[v.name] = t
 
-        env = Environment(self.config, {}, typemap)
+        valmap = {}
         for v in self.variables:
-            if isinstance(v, VirtualVariable):
+            if v.category != "constant":
+                continue
+            valmap[v.name] = CastExpr(LitExpr(0), v.type).typecheck(Environment(self.config, {}, {}))
+
+        env = Environment(self.config, valmap, typemap)
+        for v in self.virtual_vars:
+            with reporter.context(v.name):
                 v.typecheck(env)
         for c in self.constraints:
-            yield from c.typecheck(env)
+            with reporter.context(repr(c)):
+                yield from c.typecheck(env)
+
+    def padding_assignment(self) -> dict[str, Type]:
+        env = Environment(self.config, {}, {})
+        res = {}
+        for v in self.concrete_vars:
+            t = v.type
+            if isinstance(t, list) and len(t) == 1:
+                t = t[0]
+            res[v.name] = CastExpr(v.pad, t).typecheck(env)
+        return res
+
+    def check_assignment(
+        self,
+        chip_for_tag: dict[str, Self],
+        values: dict[str, Type],
+    ):
+        reporter.asserts(
+            set(values.keys()) <= {v.name for v in self.concrete_vars},
+            f"Passing unrecognized variable to `check_assignment` of chip {self.name!r}",
+        )
+        env = Environment(self.config, {}, {})
+        for v in self.concrete_vars:
+            if v.name not in values:
+                reporter.error(f"Unable to find variable name {v.name!r} when checking assignment")
+                return
+            env.valmap[v.name] = values[v.name]
+        for v in self.virtual_vars:
+            v.populate_env(env)
+
+        for c in self.constraints:
+            with reporter.context(repr(c)):
+                for sig in c.typecheck(env):
+                    # Recurse on templates
+                    if not isinstance(sig, TemplateSignature):
+                        continue
+                    if sig.tag not in chip_for_tag:
+                        reporter.warn(f"Template {sig.tag!r} unavailable, skipping check.")
+                        continue
+                    template = chip_for_tag[sig.tag]
+                    template.check_assignment(chip_for_tag, sig_to_assignment(sig, template))
 
 
 def build_signature(config: Config, data: dict) -> Signature:
-    assert_no_unexpected(
-        data, {"tag", "kind", "input", "output", "cond", "multiplicity"}
-    )
+    assert_no_unexpected(data, {"tag", "kind", "input", "output", "cond"})
     Sig: type[Signature]
+    cond: Type | None = None
     match data["kind"]:
         case "template":
-            reporter.asserts(
-                "multiplicity" not in data,
-                f"Template signature with multiplicity: {data!r}",
-            )
+            if "cond" in data:
+                cond = build_type(config, data["cond"])
             Sig = TemplateSignature
         case "interaction":
-            reporter.asserts(
-                "cond" not in data, f"Template signature with cond: {data!r}"
-            )
+            reporter.asserts("cond" not in data, f"Template signature with cond: {data!r}")
+            cond = Range.const(1)
             Sig = InteractionSignature
         case other:
             reporter.error(f"Signature of invalid kind '{other}': {data!r}")
@@ -1062,7 +1217,7 @@ def build_signature(config: Config, data: dict) -> Signature:
         output = build_type(config, data["output"])
     else:
         output = None
-    return Sig(tag, input, output)
+    return Sig(tag, cond, input, output)
 
 
 def read_signatures(config, filename) -> list[Signature]:
@@ -1074,9 +1229,30 @@ def read_signatures(config, filename) -> list[Signature]:
 
 def check_signatures(found: Iterable[Signature], expected: list[Signature]):
     for sig in found:
-        reporter.asserts(
-            any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}"
-        )
+        reporter.asserts(any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}")
+
+
+def sig_to_assignment(sig: Signature, chip: Chip) -> dict[str, Type]:
+    input = sig.input[:]
+    output = sig.output
+    cond = sig.condition
+    values = {}
+    for v in chip.variables:
+        match v.category:
+            case "input":
+                values[v.name] = input.pop(0)
+            case "output":
+                if output is None:
+                    reporter.error(f"No output available for template output variable {v.name!r}")
+                    return {}
+                values[v.name] = output
+            case "condition":
+                values[v.name] = cond if cond else Range.const(1)
+            case "virtual":
+                pass
+            case other:
+                reporter.error(f"Cannot check template with variable of category {other!r}")
+    return values
 
 
 if __name__ == "__main__":
@@ -1086,18 +1262,23 @@ if __name__ == "__main__":
         sys.exit(1)
 
     reported = False
-    chips: list[Chip] = []
+    chips: dict[str, Chip] = {}
     for file in sys.argv[3:]:
         if file in sys.argv[1:3]:
             continue
-        chips.append(Chip.from_file(config, file))
+        chip = Chip.from_file(config, file)
+        chips[chip.name] = chip
         reported |= reporter.reported
     if reported:
         sys.exit(1)
 
-    for chip in chips:
+    for chip in chips.values():
         reporter.update_location(f"Chip {chip.name}")
         check_signatures(chip.typecheck(), signatures)
+        reported |= reporter.reported
+    for chip in chips.values():
+        reporter.update_location(f"Padding {chip.name}")
+        chip.check_assignment(chips, chip.padding_assignment())
         reported |= reporter.reported
     if reported:
         sys.exit(1)

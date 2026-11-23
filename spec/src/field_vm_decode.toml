@@ -1,0 +1,87 @@
+name = "FIELD_VM_DECODE"
+code = "FVD"
+
+[[variables.output]]
+name = "pc"
+type = "BaseField"
+desc = "The program counter"
+
+[[variables.output]]
+name = "argument_registers"
+type = ["BaseField", 4]
+desc = "The register numbers of the arguments `d`, `a`, `b`, `c`, in that order"
+
+[[variables.output]]
+name = "argument_scalars"
+type = ["BaseField", 4]
+desc = "The `imm_0` scalars for the arguments `d`, `a`, `b`, `c`, in that order"
+
+[[variables.output]]
+name = "argument_offsets"
+type = ["BaseField", 4]
+desc = "The `imm_1` offsets for the arguments `d`, `a`, `b`, `c`, in that order"
+
+[[variables.output]]
+name = "mem_flags"
+type = ["Bit", 4]
+desc = "Whether the argument (`d`, `a`, `b`, `c`, in that order) comes from a memory lookup"
+
+[[variables.output]]
+name = "hint_input"
+type = ["Bit", 5] # PARAM: ["Bit", N]
+desc = "Whether each input register is hinted by this instruction"
+
+[[variables.output]]
+name = "hint_output"
+type = "Bit"
+desc = "Whether the output register is hinted by this instruction"
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+
+[[variables.virtual]]
+name = "scalars"
+type = "ExtField"
+def = ["sum", ["=", "i", 0], 2, ["*", ["^", "X", "i"], ["idx", "argument_scalars", "i"]]]
+desc = "The packed column containing most of the `imm_0`s"
+
+[[variables.virtual]]
+name = "offsets"
+type = "ExtField"
+def = ["sum", ["=", "i", 0], 2, ["*", ["^", "X", "i"], ["idx", "argument_offsets", "i"]]]
+desc = "The packed column containing most of the `imm_1`s"
+
+[[variables.virtual]]
+name = "pc_and_leftovers"
+type = "ExtField"
+def = ["+", "pc", ["*", "X", ["idx", "argument_scalars", 3]], ["*", ["^", "X", 2], ["idx", "argument_offsets", 3]]]
+desc = "The packed column containing `pc` and the remaining `imm`s"
+
+[[variables.virtual]]
+name = "flags_and_registers"
+type = "ExtField"
+def = ["+",
+  ["sum", ["=", "i", 0], 3, ["*", ["^", 2, "i"], ["idx", "mem_flags", "i"]]],
+  ["*", ["^", 2, 4], "hint_output"],
+  # PARAM: ["sum", ["=", "i", 0], N-1, ["*", ["^", 2, ["+", "i", 5]], ["idx", "hint_input", "i"]]],
+  ["sum", ["=", "i", 0], 4, ["*", ["^", 2, ["+", "i", 5]], ["idx", "hint_input", "i"]]],
+
+  ["*", "X", ["sum", ["=", "i", 0], 3, ["*", ["^", 2, ["*", 8, "i"]], ["idx", "argument_registers", "i"]]]],
+]
+desc = "The packed column containing bit flags and argument register indices"
+
+[[variables.constant]]
+name = "X"
+type = "ExtField"
+desc = "A primitive element of the extension field, such that $(1, #`X`, #`X`^2)$ is a basis for the extension field over the base field"
+
+[[constraint_groups]]
+name = "decode"
+
+[[constraints.decode]]
+kind = "interaction"
+tag = "FIELD_VM_DECODE"
+input = ["pc_and_leftovers", "scalars", "offsets", "flags_and_registers"]
+multiplicity = ["-", "μ"]

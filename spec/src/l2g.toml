@@ -1,0 +1,90 @@
+name = "L2G"
+
+[[variables.input]]
+name = "domain"
+type = "BaseField"
+desc = "The domain separator for different kinds of memory (RAM, register, commit, ...)"
+pad = 0
+
+[[variables.input]]
+name = "address"
+type = "DWordWL"
+desc = "The address of this value"
+pad = 0
+
+[[variables.input]]
+name = "init_epoch"
+type = "B20"
+desc = "The epoch in which we last saw this (domain, address)"
+pad = 0
+
+[[variables.input]]
+name = "init_value"
+type = "BaseField"
+desc = "The value last written by `init_epoch`"
+pad = 0
+
+[[variables.output]]
+name = "fini_timestamp"
+type = "Word"
+desc = "The last timestamp at which we wrote this value"
+pad = 0
+
+[[variables.output]]
+name = "fini_value"
+type = "BaseField"
+desc = "The final value in this epoch"
+pad = 0
+
+[[variables.constant]]
+name = "fini_epoch"
+type = "B20"
+desc = "This epoch's index"
+
+
+[[constraint_groups]]
+name = "consistency"
+
+[[constraints.consistency]]
+kind = "interaction"
+tag = "IS_B20"
+input = ["init_epoch"]
+multiplicity = 1
+
+[[constraints.consistency]]
+kind = "interaction"
+tag = "IS_B20"
+input = [["-", "fini_epoch", "init_epoch", 1]]
+multiplicity = 1
+ref = "l2g:c:lt_epoch"
+
+
+[[constraint_groups]]
+name = "local"
+
+[[constraints.local]]
+kind = "interaction"
+tag = "memory"
+input = ["domain", "address", 0, "init_value"]
+multiplicity = -1
+
+[[constraints.local]]
+kind = "interaction"
+tag = "memory"
+input = ["domain", "address", "fini_timestamp", "fini_value"]
+multiplicity = 1
+
+[[constraint_groups]]
+name = "global"
+
+[[constraints.global]]
+kind = "interaction"
+tag = "GLOBAL_MEM"
+input = ["domain", "address", "init_epoch", "init_value"]
+multiplicity = 1
+
+[[constraints.global]]
+kind = "interaction"
+tag = "GLOBAL_MEM"
+input = ["domain", "address", "fini_epoch", "fini_value"]
+multiplicity = -1
