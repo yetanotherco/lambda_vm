@@ -1,0 +1,5 @@
+wrap = "keep"
+
+[plugin.slw]
+slw_wrap = 80
+slw_min_line = 0
