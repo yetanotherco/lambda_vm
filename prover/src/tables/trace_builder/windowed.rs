@@ -2026,41 +2026,63 @@ fn walk_times_word(value: Option<&str>) -> bool {
 }
 
 /// MEASUREMENT PROBE: `LAMBDA_VM_EXEC_PAD_PROBE=<executor bytes>,<walker
-/// bytes>` makes the executor, and each walker, write that many dead bytes a
-/// cycle into a buffer of its own reused window after window, to price a
-/// byte a cycle on each thread inside a prove. Unset, empty or `0,0`: none
-/// (today). Each part a multiple of 8 up to [`PAD_MOST`]; anything else
-/// refuses the prove. The bytes are never read: the tables are the same.
+/// bytes>[,w|r]` makes the executor, and each walker, write that many dead
+/// bytes a cycle into a buffer of its own reused window after window, to
+/// price a byte a cycle on each thread inside a prove. A third part `r` makes
+/// each walker read its bytes instead (the buffer written once, then read
+/// window after window); `w`, or none, writes. Unset, empty or `0,0`: none
+/// (today). Each byte part a multiple of 8 up to [`PAD_MOST`]; anything else
+/// refuses the prove. The bytes never reach a table: the tables are the same.
 pub(crate) const EXEC_PAD_PROBE_ENV: &str = "LAMBDA_VM_EXEC_PAD_PROBE";
 
 /// The most dead bytes a cycle the pad probe writes on one thread.
 pub(crate) const PAD_MOST: usize = 256;
 
-/// The pad probe's `(executor, walker)` bytes a cycle ([`EXEC_PAD_PROBE_ENV`]).
-pub fn exec_pad_probe() -> Result<(usize, usize), String> {
+/// The pad probe's setting ([`EXEC_PAD_PROBE_ENV`]): bytes a cycle on the
+/// executor and on each walker, and whether the walkers read theirs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PadProbe {
+    pub executor: usize,
+    pub walker: usize,
+    pub walker_reads: bool,
+}
+
+/// The pad probe's setting of the process's environment.
+pub fn exec_pad_probe() -> Result<PadProbe, String> {
     parse_pad_probe(std::env::var(EXEC_PAD_PROBE_ENV).ok().as_deref())
 }
 
 /// [`exec_pad_probe`] of the knob's value.
-fn parse_pad_probe(value: Option<&str>) -> Result<(usize, usize), String> {
+fn parse_pad_probe(value: Option<&str>) -> Result<PadProbe, String> {
     let refuse = || {
         format!(
-            "{EXEC_PAD_PROBE_ENV}={}: <executor bytes>,<walker bytes>, each a multiple of 8 up to {PAD_MOST}",
+            "{EXEC_PAD_PROBE_ENV}={}: <executor bytes>,<walker bytes>[,w|r], each a multiple of 8 up to {PAD_MOST}",
             value.unwrap_or_default()
         )
     };
     match value.map(str::trim) {
-        None | Some("") => Ok((0, 0)),
+        None | Some("") => Ok(PadProbe::default()),
         Some(v) => {
-            let (a, b) = v.split_once(',').ok_or_else(refuse)?;
+            let parts: Vec<&str> = v.split(',').map(str::trim).collect();
             let part = |x: &str| {
-                x.trim()
-                    .parse::<usize>()
+                x.parse::<usize>()
                     .ok()
                     .filter(|n| *n <= PAD_MOST && n % 8 == 0)
                     .ok_or_else(refuse)
             };
-            Ok((part(a)?, part(b)?))
+            let walker_reads = match parts.get(2).copied() {
+                None | Some("w") => false,
+                Some("r") => true,
+                Some(_) => return Err(refuse()),
+            };
+            match parts.as_slice() {
+                [a, b] | [a, b, _] => Ok(PadProbe {
+                    executor: part(a)?,
+                    walker: part(b)?,
+                    walker_reads,
+                }),
+                _ => Err(refuse()),
+            }
         }
     }
 }
@@ -2086,28 +2108,77 @@ pub fn pad_write(buf: &mut Vec<u8>, from: usize, cycles: usize, bytes: usize, se
     std::hint::black_box(buf.as_ptr());
 }
 
+/// Reads `bytes` a cycle for `cycles` cycles from cycle `from` of `buf`,
+/// eight bytes at a time, and returns their sum (kept, so the loads are real
+/// ones); a range past the buffer's end is first written as [`pad_write`]
+/// writes it (once). `bytes` 0 reads nothing.
+pub fn pad_read(buf: &mut Vec<u8>, from: usize, cycles: usize, bytes: usize, seed: u64) -> u64 {
+    if bytes == 0 || cycles == 0 {
+        return 0;
+    }
+    let end = (from + cycles) * bytes;
+    if buf.len() < end {
+        let have = buf.len() / bytes;
+        buf.truncate(have * bytes);
+        pad_write(buf, have, end / bytes - have, bytes, seed);
+    }
+    let sum = buf[from * bytes..end].chunks_exact(8).fold(0u64, |sum, w| {
+        sum.wrapping_add(u64::from_le_bytes(w.try_into().unwrap_or([0; 8])))
+    });
+    std::hint::black_box(sum)
+}
+
 #[cfg(test)]
 mod pad_probe_tests {
-    use super::{PAD_MOST, pad_write, parse_pad_probe};
+    use super::{PAD_MOST, PadProbe, pad_read, pad_write, parse_pad_probe};
 
     /// Unset, empty or `0,0` is none; each part a multiple of 8 up to the
     /// most; anything else refuses.
     #[test]
     fn the_pad_probe_knob_reads_two_parts_and_refuses_the_rest() {
+        let pad = |executor, walker, walker_reads| PadProbe {
+            executor,
+            walker,
+            walker_reads,
+        };
         for (value, want) in [
-            (None, (0, 0)),
-            (Some(""), (0, 0)),
-            (Some("0,0"), (0, 0)),
-            (Some("16,0"), (16, 0)),
-            (Some(" 32 , 0 "), (32, 0)),
-            (Some("0,16"), (0, 16)),
-            (Some("256,256"), (PAD_MOST, PAD_MOST)),
+            (None, pad(0, 0, false)),
+            (Some(""), pad(0, 0, false)),
+            (Some("0,0"), pad(0, 0, false)),
+            (Some("16,0"), pad(16, 0, false)),
+            (Some(" 32 , 0 "), pad(32, 0, false)),
+            (Some("0,16"), pad(0, 16, false)),
+            (Some("00,40,w"), pad(0, 40, false)),
+            (Some("00,40,r"), pad(0, 40, true)),
+            (Some("256,256"), pad(PAD_MOST, PAD_MOST, false)),
         ] {
             assert_eq!(parse_pad_probe(value), Ok(want), "{value:?}");
         }
-        for value in ["16", "12,0", "0,4", "264,0", "-8,0", "a,0", "8,8,8", ","] {
+        for value in [
+            "16", "12,0", "0,4", "264,0", "-8,0", "a,0", "8,8,8", "8,8,x", "8,8,r,r", ",",
+        ] {
             assert!(parse_pad_probe(Some(value)).is_err(), "{value}");
         }
+    }
+
+    /// The read form writes its buffer once, then reads its range back: the
+    /// sum is the range's words', and a second read neither grows nor moves
+    /// the buffer. 0 bytes reads nothing.
+    #[test]
+    fn the_pad_reads_its_range_after_writing_it_once() {
+        let mut buf = Vec::new();
+        assert_eq!(pad_read(&mut buf, 0, 3, 0, 7), 0);
+        assert!(buf.is_empty());
+        let sum = pad_read(&mut buf, 0, 4, 16, 10);
+        assert_eq!(buf.len(), 4 * 16);
+        assert_eq!(sum, (10..14u64).map(|w| 2 * w).sum::<u64>());
+        let at = buf.as_ptr();
+        assert_eq!(
+            pad_read(&mut buf, 1, 2, 16, 99),
+            2 * 11 + 2 * 12,
+            "the words written first"
+        );
+        assert_eq!((buf.len(), buf.as_ptr()), (4 * 16, at), "reused, not grown");
     }
 
     /// The pad writes `bytes` a cycle over exactly its cycles' range, grows
@@ -2483,7 +2554,8 @@ fn walk_window(
     lap(|t| &mut t.lists, &mut times);
     // The pad probe's walker part (`LAMBDA_VM_EXEC_PAD_PROBE`, refused at the
     // prove's start when malformed): dead bytes a cycle beside the batch.
-    let pad_bytes = exec_pad_probe().map_or(0, |(_, walker)| walker);
+    let pad = exec_pad_probe().unwrap_or_default();
+    let pad_bytes = pad.walker;
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
     for part in logs.chunks(batch) {
@@ -2505,14 +2577,17 @@ fn walk_window(
             defer_ecrec,
         )?;
         if pad_bytes > 0 {
-            WALK_PAD.with(|pad| {
-                pad_write(
-                    &mut pad.borrow_mut(),
+            WALK_PAD.with(|buf| {
+                let (buf, at, seed) = (
+                    &mut buf.borrow_mut(),
                     from - part.len(),
-                    part.len(),
-                    pad_bytes,
                     (first + from) as u64,
-                )
+                );
+                if pad.walker_reads {
+                    pad_read(buf, at, part.len(), pad_bytes, seed);
+                } else {
+                    pad_write(buf, at, part.len(), pad_bytes, seed);
+                }
             });
         }
         lap(|t| &mut t.walk, &mut times);

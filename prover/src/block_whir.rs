@@ -9455,10 +9455,15 @@ fn prove_streamed(
                     && multilinear::pinned::ready();
                 // The pad probe's executor part: dead bytes a cycle into a
                 // buffer reused window after window (0: none).
-                let (pad_bytes, walker_pad) = exec_pad_probe().map_err(Error::Prover)?;
-                if pad_bytes > 0 || walker_pad > 0 {
+                let pad = exec_pad_probe().map_err(Error::Prover)?;
+                let pad_bytes = pad.executor;
+                if pad.executor > 0 || pad.walker > 0 {
                     eprintln!(
-                        "★ BLOCK PAD PROBE: executor {pad_bytes} · each walker {walker_pad} dead bytes a cycle (LAMBDA_VM_EXEC_PAD_PROBE)"
+                        "★ BLOCK PAD PROBE: executor {} · each walker {} dead bytes a cycle, the walkers' {} \
+                         (LAMBDA_VM_EXEC_PAD_PROBE)",
+                        pad.executor,
+                        pad.walker,
+                        if pad.walker_reads { "read" } else { "written" }
                     );
                 }
                 let mut pad_buf: Vec<u8> = Vec::new();
