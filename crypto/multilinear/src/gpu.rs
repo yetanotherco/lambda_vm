@@ -2612,6 +2612,7 @@ where
     E: math::field::traits::IsField + 'static,
     C: crate::narrow::HostColumns<F> + ?Sized,
 {
+    let resident = resident.filter(|(store, _)| store.here().is_some());
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
     use std::any::TypeId;
@@ -3406,6 +3407,7 @@ where
     E: math::field::traits::IsField + 'static,
     C: crate::narrow::HostColumns<F> + ?Sized,
 {
+    let resident = resident.filter(|(store, _)| store.here().is_some());
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
     use std::any::TypeId;
@@ -3488,6 +3490,7 @@ pub(crate) fn evaluate_resident_run<E>(
 where
     E: math::field::traits::IsField + 'static,
 {
+    store.here()?;
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use std::any::TypeId;
 
@@ -4960,6 +4963,79 @@ impl ResidentColumns {
     pub fn download(&self) -> Option<Vec<Vec<u64>>> {
         self.0.download().ok()
     }
+
+    /// The store, when this thread works for the backend it was uploaded on;
+    /// otherwise `None` and one more [`cross_card_declines`]: the caller then
+    /// takes the path a card refusal takes (the host's columns, the same
+    /// bytes). Every function handed a store asks here first.
+    pub fn here(&self) -> Option<&math_cuda::columns::DeviceColumns> {
+        if self.0.on_this_backend() {
+            Some(&self.0)
+        } else {
+            CROSS_CARD_DECLINES.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// ★ Card, run alone. A store uploaded on card 0 and read from a thread in
+/// the openings' role (a second backend: forced on one card, card 1 with two)
+/// is declined and counted; read from card 0 it is served.
+#[cfg(all(test, feature = "cuda"))]
+mod cross_card_store_tests {
+    use math_cuda::device::{
+        DeviceRole, TwoCardOpenings, card_count, enter_role, set_two_card_openings_for_test,
+    };
+
+    #[test]
+    #[ignore = "card: run alone"]
+    fn a_store_read_from_the_other_backend_is_declined_and_counted() {
+        use math::field::{element::FieldElement, goldilocks::GoldilocksField as Fp};
+        set_two_card_openings_for_test(Some(if card_count() >= 2 {
+            TwoCardOpenings::Auto
+        } else {
+            TwoCardOpenings::Forced
+        }));
+        let column = crate::mle::Mle::new(
+            (0..1u64 << 12)
+                .map(FieldElement::<Fp>::from)
+                .collect::<Vec<_>>(),
+        )
+        .expect("a column");
+        let store = super::upload_columns(&[&column]).expect("a store on card 0");
+        let before = super::cross_card_declines();
+        assert!(store.here().is_some(), "card 0 reads its own store");
+        assert_eq!(super::cross_card_declines(), before);
+        {
+            let _role = enter_role(DeviceRole::Openings);
+            assert!(
+                store.here().is_none(),
+                "the other backend reads card 0's store"
+            );
+        }
+        assert_eq!(
+            super::cross_card_declines(),
+            before + 1,
+            "and it is counted"
+        );
+        set_two_card_openings_for_test(None);
+    }
+}
+
+/// Stores declined because the thread asking works for another backend than
+/// the store's ([`ResidentColumns::here`]): 0 in every run that is right.
+#[cfg(feature = "cuda")]
+static CROSS_CARD_DECLINES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`ResidentColumns::here`]; 0 without a device build.
+#[cfg(feature = "cuda")]
+pub fn cross_card_declines() -> u64 {
+    CROSS_CARD_DECLINES.load(Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn cross_card_declines() -> u64 {
+    0
 }
 
 impl std::fmt::Debug for ResidentColumns {
@@ -5824,6 +5900,7 @@ pub fn gather_resident(
     columns: &[usize],
     extra: &[&[u64]],
 ) -> Option<ResidentColumns> {
+    store.here()?;
     math_cuda::device::backend().ok()?;
     math_cuda::columns::DeviceColumns::gather(&store.0, columns, extra).map(ResidentColumns)
 }
@@ -5855,6 +5932,7 @@ pub fn pack_resident(
     first: usize,
     width: usize,
 ) -> Option<crate::narrow::NarrowColumns> {
+    store.here()?;
     if width == 0 || first >= store.0.num_columns() {
         return None;
     }
@@ -5887,6 +5965,7 @@ where
     F: math::field::traits::IsField + 'static,
     C: crate::narrow::HostColumns<F> + ?Sized,
 {
+    let resident = resident.filter(|(store, _)| store.here().is_some());
     let width = columns.width();
     if let Some((store, first)) = resident
         && store.0.is_run(first, width)
@@ -6087,6 +6166,7 @@ where
     E: math::field::traits::IsField + 'static,
     C: crate::narrow::HostColumns<F> + ?Sized,
 {
+    let resident = resident.filter(|(store, _)| store.here().is_some());
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
     use std::any::TypeId;
@@ -8279,6 +8359,7 @@ impl CosetSource {
         num_vars: usize,
         log_blowup: usize,
     ) -> Option<Self> {
+        store.here()?;
         math_cuda::whir_coset::StackSlices::from_resident(&store.0, parts, num_vars, log_blowup)
             .ok()
             .map(Self)
@@ -8769,6 +8850,7 @@ pub(crate) fn commit_resident(
     hash: crate::whir_hash::DeviceHashKey,
     leaves: crate::whir_commit::LeafOrder,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
+    store.here()?;
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
@@ -8810,6 +8892,7 @@ pub(crate) fn encode_resident(
     transient: bool,
     carried: Option<CarriedRoom>,
 ) -> Option<DeviceCodeword> {
+    store.here()?;
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
