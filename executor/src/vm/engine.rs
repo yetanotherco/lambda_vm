@@ -154,6 +154,30 @@ impl Engine {
         }
     }
 
+    /// Turns the fast engine's lean stream on
+    /// ([`FastExecutor::enable_lean_stream`]); the reference has none.
+    pub fn enable_lean_stream(&mut self) -> Result<(), ExecutorError> {
+        match self {
+            Self::Reference(_) => Err(ExecutorError::History(
+                "the lean stream needs the fast engine".into(),
+            )),
+            Self::Fast(e) => e.enable_lean_stream(),
+        }
+    }
+
+    /// [`FastExecutor::resume_word_lean`].
+    pub fn resume_word_lean(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<(usize, WindowHistory)>, ExecutorError> {
+        match self {
+            Self::Reference(_) => Err(ExecutorError::History(
+                "the lean stream needs the fast engine".into(),
+            )),
+            Self::Fast(e) => e.resume_word_lean(limit),
+        }
+    }
+
     /// [`FastExecutor::take_word_history_final`].
     pub fn take_word_history_final(&mut self) -> Option<WordHistoryFinal> {
         match self {
