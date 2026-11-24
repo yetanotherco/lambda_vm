@@ -231,13 +231,35 @@ pub fn tree_drop_for(zf: &ZfFormat) -> multilinear::whir_commit::TreeDrop {
         }
         multilinear::whir_chain::WhirFolds::First(k0) => k0.get(),
     };
-    let needed = zf
-        .whir_stack
-        .get()
-        .saturating_sub(CARD_COSET_FOLD_LEVELS + first_fold);
+    tree_drop_at(zf.whir_stack.get(), first_fold)
+}
+
+/// [`tree_drop_for`]'s rule at a `2^stack` stack cap and a first fold of
+/// `first_fold`.
+fn tree_drop_at(stack: usize, first_fold: usize) -> multilinear::whir_commit::TreeDrop {
+    let needed = stack.saturating_sub(CARD_COSET_FOLD_LEVELS + first_fold);
     multilinear::whir_commit::TreeDrop {
         device: BLOCK_TREE_DROP_LEVELS_DEVICE.max(needed),
         host: BLOCK_TREE_DROP_LEVELS,
+    }
+}
+
+/// The levels a retired tree drops for a chain under `config` (a W-LFM
+/// level's own, whose first fold may not be the process format's): the
+/// knob's value when set ([`tree_drop_from_env`]), else [`tree_drop_for`]'s
+/// rule at the config's own stack cap and first fold. A prover's choice: the
+/// proof does not depend on it.
+pub fn tree_drop_for_chain(config: &ChainConfig) -> multilinear::whir_commit::TreeDrop {
+    let value = std::env::var("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS").ok();
+    match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        None => {
+            let first_fold = match config.format.folds {
+                multilinear::whir_chain::WhirFolds::Uniform => config.log_folding,
+                multilinear::whir_chain::WhirFolds::First(k0) => k0.get(),
+            };
+            tree_drop_at(config.format.stack.get(), first_fold)
+        }
+        Some(v) => parse_tree_drop(Some(v)).unwrap_or(TREE_DROP_DEFAULT),
     }
 }
 

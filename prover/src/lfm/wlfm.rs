@@ -584,6 +584,13 @@ pub fn wlfm_config_levers(
         grind,
         ..
     } = *levers;
+    // The blowup-4 count is pinned apart (`WLFM_B4_QUERIES`), not sized over
+    // a schedule, so a first fold there would not re-size it.
+    if first_fold.is_some() && rate == WlfmRate::Four {
+        return Err(format!(
+            "a first fold {first_fold:?} at blowup 4, whose count is pinned, not sized"
+        ));
+    }
     let first = first_fold.map(first_fold_schedule).transpose()?;
     if first.is_some() && fold.is_some() {
         return Err(format!(
@@ -1241,7 +1248,7 @@ fn commit_under<H: WhirHash>(
     // STARK build: the prepared commits run on the device, so concurrent
     // siblings serialize them. Inert unless a driver armed it.
     let _card = super::device_permit::hold_labeled("build_artifacts");
-    let drop = crate::block_whir::BlockOptions::production().drop_levels;
+    let drop = crate::block_whir::tree_drop_for_chain(config);
     // One stack at a time: committed, then held or let go before the next.
     stacks
         .into_iter()
@@ -2570,7 +2577,7 @@ fn prove_traces_under<H: WhirHash>(
                 tables,
                 &artifacts.sizes,
                 config,
-                options.drop_levels,
+                crate::block_whir::tree_drop_for_chain(config),
                 options.narrow,
                 options.upload_ahead && uploads_beside(stacks),
             )
