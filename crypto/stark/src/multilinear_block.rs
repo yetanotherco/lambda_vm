@@ -5057,6 +5057,8 @@ where
     /// host's columns (their upload there declined).
     second_declined: usize,
     ledger_most: u64,
+    /// This card's ledger budget.
+    budget: u64,
 }
 
 /// [`block_prove_on_forks_observed`] with phase B taking the groups in
@@ -5213,51 +5215,51 @@ where
     // its own fork of the post-roots transcript and its share is put back by
     // group index, so the groups split over two cards prove the same bytes.
     // Card 0 keeps what is tied to it: the caller's groups (rebuilt in phase
-    // B, each class in its order), a held prepared stack (its codewords where
-    // phase A left them) and a local argue begun in phase A. No split under
-    // a spill, with one group, or when the second card is not ready.
-    let split_card: Option<Vec<u8>> = match &two_card_split {
-        Some(keep)
-            if n >= 2
-                && !spill_on
-                && (split_on_host || multilinear::gpu::two_card_split_ready()) =>
-        {
+    // B, each class in its order) and a held prepared stack (its codewords
+    // where phase A left them). One card when the knob is off, the second
+    // card is not ready, or fewer than two groups are free of a pin.
+    // The plan: each group's card, or one card and why. A spill is no reason
+    // for one card (a parked table comes back under its own lock, per group),
+    // nor a local argue begun in phase A (host data). Pinned to card 0: the
+    // caller's groups and a held prepared stack's.
+    let plan: Result<Vec<u8>, &'static str> = match &two_card_split {
+        None => Err("not asked by the caller"),
+        Some(_) if !split_on_host && !multilinear::gpu::two_card_split_on() => {
+            Err("the knob is off")
+        }
+        Some(_) if !split_on_host && !multilinear::gpu::two_card_split_ready() => {
+            Err("the second card is not ready")
+        }
+        Some(keep) => {
             let prices: Vec<u64> = (0..n)
                 .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
                 .collect();
             let pinned: Vec<bool> = (0..n)
-                .map(|g| {
-                    keep.get(g).copied().unwrap_or(true)
-                        || prepared_is_held(prepared, g)
-                        || local_started.get(g).is_some_and(Option::is_some)
-                })
+                .map(|g| keep.get(g).copied().unwrap_or(true) || prepared_is_held(prepared, g))
                 .collect();
-            let card = phase_b_split::assign_cards(&prices, &pinned);
-            let load = phase_b_split::card_loads(&prices, &card);
-            eprintln!(
-                "BLOCK TWO-CARD SPLIT: on (LAMBDA_VM_TWO_CARD_SPLIT) · card 0 {} groups ({} kept there), \
-                 priced {} M · card 1 {} groups, priced {} M",
-                card.iter().filter(|&&c| c == 0).count(),
-                pinned.iter().filter(|&&k| k).count(),
-                load[0] >> 20,
-                card.iter().filter(|&&c| c == 1).count(),
-                load[1] >> 20,
-            );
-            card.contains(&1).then_some(card)
-        }
-        Some(_) if split_on_host || multilinear::gpu::two_card_split_ready() => {
-            eprintln!(
-                "BLOCK TWO-CARD SPLIT: on (LAMBDA_VM_TWO_CARD_SPLIT), not applied: {}",
-                if spill_on {
-                    "a spill is on"
+            if pinned.iter().filter(|&&p| !p).count() < 2 {
+                Err("fewer than two groups free of a pin")
+            } else {
+                let card = phase_b_split::assign_cards(&prices, &pinned);
+                if card.contains(&1) {
+                    Ok(card)
                 } else {
-                    "one group"
+                    Err("no group for the second card")
                 }
-            );
-            None
+            }
         }
-        _ => None,
     };
+    let pinned_count = match (&two_card_split, &plan) {
+        (Some(keep), Ok(_)) => (0..n)
+            .filter(|&g| keep.get(g).copied().unwrap_or(true) || prepared_is_held(prepared, g))
+            .count(),
+        _ => 0,
+    };
+    if let (Some(_), Err(why)) = (&two_card_split, &plan) {
+        eprintln!("BLOCK TWO-CARD PHASE B: off ({why})");
+    }
+    let split_card = plan.ok();
+    let declines_before = multilinear::gpu::cross_card_declines();
     let lanes = if split_card.is_some() { 2 } else { 1 };
     let card = split_card.unwrap_or_else(|| vec![0; n]);
     let queue = std::sync::Mutex::new(phase_b_split::TurnQueue::new(order, card.clone()));
@@ -5542,10 +5544,8 @@ where
                                         // bytes, slower, and counted.
                                         earlier.store = upload_group(its_tables);
                                         if earlier.store.is_none() {
-                                            second_declined_ref.fetch_add(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            second_declined_ref
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
                                         open_group::<F, E, T, H>(
                                             earlier, its_tables, prepared, deviations, config,
@@ -6002,6 +6002,7 @@ where
             two_card,
             second_declined,
             ledger_most,
+            budget: multilinear::gpu::reserve_budget(),
         })
     };
 
@@ -6061,16 +6062,22 @@ where
     let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
     let mut two_card = (0usize, 0usize);
     let mut second_declined = 0usize;
-    let mut lane_summary: Vec<(usize, f64, f64, u64)> = Vec::with_capacity(outs.len());
+    // Per card: (groups, cells, argue seconds, span from its first group's
+    // start to its last group's end, its ledger's most at a turn's end, its
+    // budget).
+    let mut lane_summary: Vec<(usize, usize, f64, f64, u64, u64)> = Vec::with_capacity(outs.len());
     for (lane, mut out) in outs.into_iter().enumerate() {
         let mine: Vec<usize> = (0..n)
             .filter(|&g| usize::from(card[g].min(1)).min(lanes - 1) == lane)
             .collect();
-        let (mut argue_s, mut open_s) = (0.0f64, 0.0f64);
+        let (mut argue_s, mut cells) = (0.0f64, 0usize);
+        let (mut first, mut last) = (f64::INFINITY, 0.0f64);
         for &g in &mine {
             stamps[g] = std::mem::take(&mut out.stamps[g]);
             argue_s += stamps[g].argue;
-            open_s += stamps[g].open;
+            cells += stamps[g].cells;
+            first = first.min(stamps[g].start_b);
+            last = last.max(stamps[g].end_b);
             group_tables[g] = std::mem::take(&mut out.group_tables[g]);
             group_argue[g] = out.group_argue[g].take();
             group_local[g] = out.group_local[g].take();
@@ -6078,20 +6085,51 @@ where
             group_prepared[g] = out.group_prepared[g].take();
         }
         two_card.0 += out.two_card.0;
-        second_declined += out.second_declined;
         two_card.1 += out.two_card.1;
-        lane_summary.push((mine.len(), argue_s, open_s, out.ledger_most));
+        second_declined += out.second_declined;
+        let span = if mine.is_empty() {
+            0.0
+        } else {
+            (last - first).max(0.0)
+        };
+        lane_summary.push((
+            mine.len(),
+            cells,
+            argue_s,
+            span,
+            out.ledger_most,
+            out.budget,
+        ));
     }
     if lanes == 2 {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let card = |c: usize| {
-            lane_summary.get(c).map_or(String::new(), |&(groups, argue, open, most)| {
+            lane_summary.get(c).map_or(String::new(), |&(groups, cells, argue, span, most, budget)| {
                 format!(
-                    "card {c} {groups} groups · argue {argue:.3} s · open {open:.3} s · ledger at most {:.2} GiB",
-                    most as f64 / (1u64 << 30) as f64
+                    "card {c}: {groups} groups, {:.3} G cells, argue {argue:.3} s, span {span:.3} s, ledger peak \
+                     {:.2} of {:.2} GiB",
+                    cells as f64 / 1e9,
+                    gib(most),
+                    gib(budget)
                 )
             })
         };
-        eprintln!("BLOCK TWO-CARD SPLIT CARDS: {} || {}", card(0), card(1));
+        let gap = match (lane_summary.first(), lane_summary.get(1)) {
+            (Some(a), Some(b)) => (a.2 - b.2).abs(),
+            _ => 0.0,
+        };
+        eprintln!(
+            "BLOCK TWO-CARD PHASE B: on (LAMBDA_VM_TWO_CARD_SPLIT) · {} · {} · argue gap {gap:.3} s · pinned to card 0 \
+             {pinned_count} · cross-card declines {} · second upload {}",
+            card(0),
+            card(1),
+            multilinear::gpu::cross_card_declines().saturating_sub(declines_before),
+            if two_card.0 == 0 {
+                "none".to_string()
+            } else {
+                format!("{} groups (the two-card openings, card 0's)", two_card.0)
+            },
+        );
         SPLIT_SECOND_GROUPS.fetch_add(
             lane_summary.get(1).map_or(0, |s| s.0) as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -6102,9 +6140,7 @@ where
             "BLOCK TWO-CARD OPENINGS: on (LAMBDA_VM_TWO_CARD_OPENINGS) · {} of {n} groups opened on the \
              openings' card beside an argue · {} kept on card 0 (a held prepared stack) · the rest \
              opened alone on card 0 · {} opened there over the host's columns (their upload declined)",
-            two_card.0,
-            two_card.1,
-            second_declined
+            two_card.0, two_card.1, second_declined
         );
     }
     // Every finished group's records handed back before phase B returns.

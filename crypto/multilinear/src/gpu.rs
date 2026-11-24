@@ -1394,6 +1394,19 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     f()
 }
 
+/// Whether the two-card split's knob is on in this process
+/// ([`math_cuda::device::two_card_split`], `LAMBDA_VM_TWO_CARD_SPLIT`), ready
+/// or not; `false` without a device build.
+#[cfg(feature = "cuda")]
+pub fn two_card_split_on() -> bool {
+    math_cuda::device::two_card_split()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn two_card_split_on() -> bool {
+    false
+}
+
 /// Whether phase B may split its groups over two cards
 /// ([`math_cuda::device::two_card_split_ready`], `LAMBDA_VM_TWO_CARD_SPLIT`):
 /// the split on, its second backend and pool started; `false` without a

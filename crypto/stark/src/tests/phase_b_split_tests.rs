@@ -267,3 +267,92 @@ fn a_failed_argue_on_either_driver_is_the_proves_error() {
         }
     }
 }
+
+/// A failed opening, and a panicking opening thread, on either driver are the
+/// prove's error (never the other driver's stop, never a panic).
+#[test]
+fn a_failed_or_panicking_opening_on_either_driver_is_the_proves_error() {
+    let n = SIZES.len();
+    for place in 0..n {
+        let (failed, _) = prove_split(
+            ArgueFormat::PerTable,
+            PhaseBOverlap::On,
+            &in_order(),
+            true,
+            Split::OnHost,
+            &vec![false; n],
+            OverlapFaults {
+                open_fails: Some(place),
+                ..OverlapFaults::default()
+            },
+        );
+        assert!(failed.is_err(), "place {place}: a failed opening proved");
+        if let Err(MlError::DeviceFailed { stage }) = &failed {
+            assert_ne!(*stage, "the other card's phase B failed", "place {place}");
+        }
+        let (panicked, _) = prove_split(
+            ArgueFormat::PerTable,
+            PhaseBOverlap::On,
+            &in_order(),
+            true,
+            Split::OnHost,
+            &vec![false; n],
+            OverlapFaults {
+                open_panics: Some(place),
+                ..OverlapFaults::default()
+            },
+        );
+        // The last group taken on each driver opens alone, on its own
+        // thread: no opener to panic there.
+        if let Err(e) = &panicked {
+            assert!(
+                matches!(e, MlError::DeviceFailed { stage } if *stage != "the other card's phase B failed"),
+                "place {place}: {e:?}"
+            );
+        }
+    }
+}
+
+/// The re-ranking hook under two drivers: each driver's turns call it, and
+/// the proof is the one-driver proof with the same hook.
+#[test]
+fn a_re_ranking_hook_under_two_drivers_proves_the_same_bytes() {
+    use crate::multilinear_block::PhaseBReorder;
+    let n = SIZES.len();
+    // At the second turn, the rest reversed.
+    let hook = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| order[p + 1..].iter().rev().copied().collect())
+    };
+    let hook: &PhaseBReorder<'_> = &hook;
+    for argue in ARGUES {
+        let prove_with = |split: Split| {
+            let keep = vec![false; n];
+            let set = move |block: &mut BlockCommitted<'_, Fp, Ext>| {
+                if split == Split::OnHost {
+                    block.set_two_card_split(Some(keep.clone()), true);
+                }
+            };
+            prove_block_with::<H>(
+                &config(argue),
+                PhaseBOverlap::On,
+                &in_order(),
+                OverlapFaults::default(),
+                &set,
+                Some(hook),
+                true,
+                None,
+            )
+            .0
+            .expect("proves")
+        };
+        let one = prove_with(Split::None);
+        let two = prove_with(Split::OnHost);
+        assert!(cards(&two).contains(&1), "{argue:?}: nothing split");
+        assert_eq!(
+            bytes(&two),
+            bytes(&one),
+            "{argue:?}: the hook under two drivers moved a byte"
+        );
+        verify(argue, &two).expect("verifies");
+    }
+}

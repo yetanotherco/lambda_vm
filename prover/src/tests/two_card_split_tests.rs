@@ -69,6 +69,27 @@ fn verifies(proof: &BlockWhirProof) -> bool {
         .unwrap_or(false)
 }
 
+/// Host fallbacks, openings staged from host columns, host widens, host fills
+/// and cross-card declines: the split must move them as one card does, and the
+/// last not at all.
+fn host_path_counters() -> [u64; 5] {
+    [
+        multilinear::gpu::host_fallbacks(),
+        multilinear::gpu::openings_staged_from_host(),
+        multilinear::narrow::host_widens().0,
+        multilinear::records::fills().1,
+        multilinear::gpu::cross_card_declines(),
+    ]
+}
+
+/// `proved()`'s bytes and how far it moved [`host_path_counters`].
+fn proved_counted() -> (Vec<u8>, [u64; 5]) {
+    let before = host_path_counters();
+    let bytes = bytes(&proved());
+    let after = host_path_counters();
+    (bytes, std::array::from_fn(|k| after[k] - before[k]))
+}
+
 fn needs_grind_and_card() {
     assert!(
         std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
@@ -88,15 +109,20 @@ fn forced_split_proves_the_same_bytes_on_one_card() {
     needs_grind_and_card();
     set_two_card_openings_for_test(Some(TwoCardOpenings::Off));
     set_two_card_split_for_test(Some(TwoCardSplit::Off));
-    let off = bytes(&proved());
+    let (off, off_counts) = proved_counted();
     set_two_card_split_for_test(Some(TwoCardSplit::Forced));
     assert!(multilinear::gpu::two_card_split_ready(), "forced: ready");
     let before = stark::multilinear_block::split_second_groups();
-    let split = bytes(&proved());
+    let (split, split_counts) = proved_counted();
     let second = stark::multilinear_block::split_second_groups() - before;
     println!("TWO-CARD SPLIT forced on one card: {second} group(s) proved by the second driver");
     assert!(second > 0, "no group proved by the second driver");
     assert_eq!(split, off, "the split moved a byte");
+    assert_eq!(split_counts, off_counts, "the split took another path");
+    assert_eq!(
+        split_counts[4], 0,
+        "a store was read from the other backend"
+    );
 }
 
 /// ★ Two-card box, one process: run alone, deterministic grind. With two cards
@@ -111,16 +137,24 @@ fn split_proves_the_same_bytes_on_card_1() {
     assert!(card_count() >= 2, "needs two cards, saw {}", card_count());
     set_two_card_openings_for_test(Some(TwoCardOpenings::Off));
     set_two_card_split_for_test(Some(TwoCardSplit::Off));
-    let off = bytes(&proved());
+    let (off, off_counts) = proved_counted();
     set_two_card_split_for_test(Some(TwoCardSplit::Auto));
     assert_eq!(split_placement().ordinal, 1, "the second driver on card 1");
     assert!(multilinear::gpu::two_card_split_ready(), "card 1 ready");
     let before = stark::multilinear_block::split_second_groups();
-    let split = bytes(&proved());
+    let (split, split_counts) = proved_counted();
     let second = stark::multilinear_block::split_second_groups() - before;
-    println!("TWO-CARD SPLIT on card 1: {second} group(s) proved there");
+    println!(
+        "TWO-CARD SPLIT on card 1: {second} group(s) proved there · host paths off {off_counts:?} · \
+         split {split_counts:?}"
+    );
     assert!(second > 0, "no group proved on card 1");
     assert_eq!(split, off, "card 1 moved a byte");
+    assert_eq!(
+        split_counts, off_counts,
+        "the split on card 1 took another path"
+    );
+    assert_eq!(split_counts[4], 0, "a store was read from the other card");
     set_two_card_openings_for_test(Some(TwoCardOpenings::Auto));
     let both = bytes(&proved());
     assert_eq!(
