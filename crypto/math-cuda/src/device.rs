@@ -1759,6 +1759,7 @@ pub fn backend() -> Result<&'static Backend> {
     match DEVICE_ROLE.with(std::cell::Cell::get) {
         DeviceRole::Main => backend_once(),
         DeviceRole::Openings => openings_backend(),
+        DeviceRole::Second => split_backend(),
     }
 }
 
@@ -1775,6 +1776,9 @@ pub enum DeviceRole {
     /// Phase B's openings: card 1 under the two-card openings
     /// ([`openings_placement`]), card 0 otherwise.
     Openings,
+    /// Phase B's second driver under the two-card split, every device call of
+    /// its groups: card 1 ([`split_placement`]), card 0 otherwise.
+    Second,
 }
 
 thread_local! {
@@ -1856,7 +1860,10 @@ pub const MAIN_PLACEMENT: RolePlacement = RolePlacement {
 /// (auto or forced), on a second backend of card 0 when forced with one card.
 pub fn placement_for(role: DeviceRole, setting: TwoCardOpenings, cards: usize) -> RolePlacement {
     match (role, setting, cards) {
-        (DeviceRole::Main, _, _) | (_, TwoCardOpenings::Off, _) | (_, _, 0) => MAIN_PLACEMENT,
+        // The split's role is placed by its own knob ([`split_placement`]).
+        (DeviceRole::Main | DeviceRole::Second, _, _)
+        | (_, TwoCardOpenings::Off, _)
+        | (_, _, 0) => MAIN_PLACEMENT,
         (DeviceRole::Openings, TwoCardOpenings::Auto, 1) => MAIN_PLACEMENT,
         (DeviceRole::Openings, TwoCardOpenings::Forced, 1) => RolePlacement {
             slot: 1,
@@ -1938,7 +1945,9 @@ pub fn two_card_openings() -> bool {
 static SECOND_BACKEND: OnceLock<Backend> = OnceLock::new();
 
 /// Which of the process's backends an object belongs to: card 0's
-/// ([`backend_once`]) or the openings' own ([`SECOND_BACKEND`]). What holds
+/// ([`backend_once`]) or the second slot's ([`SECOND_BACKEND`]: the
+/// openings' own under the two-card openings, the second driver's under the
+/// split; one backend for both). What holds
 /// a backend's ledger bytes or pooled events keeps its slot, so it gives them
 /// back to that backend even when a thread in another role drops it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2006,14 +2015,34 @@ fn openings_backend() -> Result<&'static Backend> {
     if placement.slot == 0 {
         return backend_once();
     }
+    second_backend(placement, Asker::Openings)
+}
+
+/// Which knob asks for the second backend: it names the lines said when it
+/// starts or does not.
+#[derive(Clone, Copy)]
+enum Asker {
+    Openings,
+    Split,
+}
+
+/// Set once the second slot's backend failed to start: every later call is
+/// card 0's.
+static SECOND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The second slot's backend, on `placement`'s card, made on first use: the
+/// one backend of that slot, whichever of the two-card openings or the split
+/// asks first (both place it on card 1 with two cards, on card 0 forced with
+/// one). A failure to start is said once (in the asker's words) and card 0's
+/// backend is returned instead, then and on every later call.
+fn second_backend(placement: RolePlacement, asker: Asker) -> Result<&'static Backend> {
     // Card 0's first: the pinned pool and the process's first context are
-    // card 0's, as without the openings' backend.
+    // card 0's, as without a second backend.
     let main = backend_once()?;
     if let Some(b) = SECOND_BACKEND.get() {
         return Ok(b);
     }
-    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+    if SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(main);
     }
     static INIT: Mutex<()> = Mutex::new(());
@@ -2023,12 +2052,20 @@ fn openings_backend() -> Result<&'static Backend> {
     }
     match Backend::init_on(placement.ordinal) {
         Ok(b) => {
-            eprintln!(
-                "[gpu] two-card openings: phase B's openings on card {} ({TWO_CARD_OPENINGS_ENV}={:?}, {} card(s) seen)",
-                placement.ordinal,
-                two_card_openings_setting(),
-                card_count()
-            );
+            match asker {
+                Asker::Openings => eprintln!(
+                    "[gpu] two-card openings: phase B's openings on card {} ({TWO_CARD_OPENINGS_ENV}={:?}, {} card(s) seen)",
+                    placement.ordinal,
+                    two_card_openings_setting(),
+                    card_count()
+                ),
+                Asker::Split => eprintln!(
+                    "[gpu] two-card split: phase B's second driver on card {} ({TWO_CARD_SPLIT_ENV}={:?}, {} card(s) seen)",
+                    placement.ordinal,
+                    two_card_split_setting(),
+                    card_count()
+                ),
+            }
             // Two backends on one card (forced, one card): two full ledgers
             // would promise the card twice, so each gets half.
             if placement.ordinal == main.ordinal() {
@@ -2048,11 +2085,17 @@ fn openings_backend() -> Result<&'static Backend> {
             }
         }
         Err(e) => {
-            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "[gpu] two-card openings: card {}'s backend did not start ({e}); the openings stay on card 0",
-                placement.ordinal
-            );
+            SECOND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            match asker {
+                Asker::Openings => eprintln!(
+                    "[gpu] two-card openings: card {}'s backend did not start ({e}); the openings stay on card 0",
+                    placement.ordinal
+                ),
+                Asker::Split => eprintln!(
+                    "[gpu] two-card split: card {}'s backend did not start ({e}); phase B stays on one card",
+                    placement.ordinal
+                ),
+            }
             Ok(main)
         }
     }
@@ -2107,6 +2150,200 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         }
         // Without a pool of their own the openings stay on card 0 whole: a
         // role on this thread alone would split them over two cards.
+        None => f(),
+    }
+}
+
+// ── The two-card split: phase B's groups over two cards ─────────────────────
+
+/// `LAMBDA_VM_TWO_CARD_SPLIT`: phase B's groups split over two cards, each
+/// card driving its own groups (argue and openings) on its own backend.
+pub const TWO_CARD_SPLIT_ENV: &str = "LAMBDA_VM_TWO_CARD_SPLIT";
+
+/// The two-card split's setting ([`TWO_CARD_SPLIT_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoCardSplit {
+    /// `auto`: on when the process sees two cards or more. Not the default
+    /// until a two-card box has measured it (bytes and time).
+    Auto,
+    /// Unset or `0`: off, one driver on card 0 (today's). The default.
+    Off,
+    /// `1`: on. With one card, the second driver gets a backend of its own on
+    /// card 0 (its own streams, staging and ledger, the same context): the
+    /// split's bookkeeping on a one-card box, for tests.
+    Forced,
+}
+
+impl TwoCardSplit {
+    /// The knob's reading: unset or `0` off (the default), `auto`
+    /// [`Self::Auto`], `1` forced; anything else is refused.
+    pub fn parse(word: Option<&str>) -> std::result::Result<Self, String> {
+        match word.map(str::trim) {
+            None | Some("0") => Ok(Self::Off),
+            Some("auto") => Ok(Self::Auto),
+            Some("1") => Ok(Self::Forced),
+            Some(other) => Err(format!("{TWO_CARD_SPLIT_ENV}={other}: auto, 0 or 1")),
+        }
+    }
+}
+
+/// Test only: the split's setting in place of the environment's (0 none,
+/// 1 auto, 2 off, 3 forced).
+static TWO_CARD_SPLIT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test only, not for production callers: the split's setting in place of
+/// [`TWO_CARD_SPLIT_ENV`] (`None`: the environment's). Process-wide; a second
+/// backend already made stays made.
+#[doc(hidden)]
+pub fn set_two_card_split_for_test(setting: Option<TwoCardSplit>) {
+    let v = match setting {
+        None => 0,
+        Some(TwoCardSplit::Auto) => 1,
+        Some(TwoCardSplit::Off) => 2,
+        Some(TwoCardSplit::Forced) => 3,
+    };
+    TWO_CARD_SPLIT_FORCED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process's split setting: a test's, else the environment's, read once
+/// (an unrecognised word is said once and read as off).
+pub fn two_card_split_setting() -> TwoCardSplit {
+    match TWO_CARD_SPLIT_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return TwoCardSplit::Auto,
+        2 => return TwoCardSplit::Off,
+        3 => return TwoCardSplit::Forced,
+        _ => {}
+    }
+    static SETTING: OnceLock<TwoCardSplit> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        TwoCardSplit::parse(std::env::var(TWO_CARD_SPLIT_ENV).ok().as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e} — read as off");
+            TwoCardSplit::Off
+        })
+    })
+}
+
+/// Where the split's second driver runs under `setting` with `cards` cards:
+/// the same table as the openings' ([`placement_for`]): card 1 with two cards
+/// or more unless off, a second backend of card 0 when forced with one card,
+/// card 0's own backend otherwise (no split).
+pub fn split_placement_for(setting: TwoCardSplit, cards: usize) -> RolePlacement {
+    let as_openings = match setting {
+        TwoCardSplit::Auto => TwoCardOpenings::Auto,
+        TwoCardSplit::Off => TwoCardOpenings::Off,
+        TwoCardSplit::Forced => TwoCardOpenings::Forced,
+    };
+    placement_for(DeviceRole::Openings, as_openings, cards)
+}
+
+/// Where the split's second driver runs in this process. Off, the driver is
+/// not asked for its cards.
+pub fn split_placement() -> RolePlacement {
+    match two_card_split_setting() {
+        TwoCardSplit::Off => MAIN_PLACEMENT,
+        setting => split_placement_for(setting, card_count()),
+    }
+}
+
+/// Whether the split is on in this process (a second backend placed).
+pub fn two_card_split() -> bool {
+    split_placement().slot != 0
+}
+
+/// The backend of [`DeviceRole::Second`]: the second slot's under the split.
+///
+/// Never card 0's by fallback: a group planned on the second card must not be
+/// worked on card 0 by accident, so without a second backend this is `Err`.
+fn split_backend() -> Result<&'static Backend> {
+    let placement = split_placement();
+    if placement.slot == 0 {
+        return Err(crate::invalid_value());
+    }
+    let be = second_backend(placement, Asker::Split)?;
+    if BackendSlot::of(be) == BackendSlot::Second {
+        Ok(be)
+    } else {
+        Err(crate::invalid_value())
+    }
+}
+
+/// The split's second driver's rayon pool (its argue), and its openings' own
+/// pool, once made; `None` inside when one could not be built.
+static SECOND_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+static SECOND_OPENINGS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+/// A pool whose workers are all [`DeviceRole::Second`] (background-class
+/// stream draws when `background`, as phase B's openings take them), as many
+/// as the global pool's and at least two.
+fn second_role_pool(
+    cell: &'static OnceLock<Option<rayon::ThreadPool>>,
+    name: &'static str,
+    background: bool,
+) -> Option<&'static rayon::ThreadPool> {
+    cell.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads().max(2))
+            .thread_name(move |i| format!("{name}-{i}"))
+            .start_handler(move |_| {
+                set_thread_role(DeviceRole::Second);
+                if background {
+                    std::mem::forget(crate::stream_class::enter(
+                        crate::stream_class::StreamClass::Background,
+                    ));
+                }
+            })
+            .build()
+            .map_err(|e| eprintln!("[gpu] two-card split: no {name} pool ({e}); no split"))
+            .ok()
+    })
+    .as_ref()
+}
+
+/// The second driver's pool: every parallel iterator of its argue draws the
+/// second backend.
+fn second_pool() -> Option<&'static rayon::ThreadPool> {
+    second_role_pool(&SECOND_POOL, "second-card", false)
+}
+
+/// The second driver's openings' pool, apart from its argue's: an opening
+/// installed whole into the argue's pool could be run nested inside a worker
+/// waiting in the argue's join, and the argue would wait for all of it.
+fn second_openings_pool() -> Option<&'static rayon::ThreadPool> {
+    second_role_pool(&SECOND_OPENINGS_POOL, "second-open", true)
+}
+
+/// Whether phase B may split its groups over two cards: the split on, the
+/// second backend started on its own (not fallen back to card 0's) and the
+/// second driver's pool built. Makes both on its first call; the caller asks
+/// before it splits, so a split never runs half on card 0.
+pub fn two_card_split_ready() -> bool {
+    if !two_card_split() {
+        return false;
+    }
+    let Ok(be) = split_backend() else {
+        return false;
+    };
+    BackendSlot::of(be) == BackendSlot::Second
+        && second_pool().is_some()
+        && second_openings_pool().is_some()
+}
+
+/// Runs `f` as the split's second driver's work: inside its pool, in
+/// [`DeviceRole::Second`] (inline when this thread is already one of its
+/// workers). Without the pool (the split not ready) it is `f()` here; callers
+/// check [`two_card_split_ready`] first.
+pub fn on_second_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match SECOND_POOL.get().and_then(Option::as_ref) {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
+/// Runs `f` as the second driver's openings: inside their own pool, in
+/// [`DeviceRole::Second`]; `f()` here without it ([`on_second_card`]).
+pub fn on_second_card_openings<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match SECOND_OPENINGS_POOL.get().and_then(Option::as_ref) {
+        Some(pool) => pool.install(f),
         None => f(),
     }
 }
@@ -3738,7 +3975,7 @@ mod device_state_scan_tests {
     /// knob readings, the card count, the backends themselves, pools of host
     /// threads, host function pointers). A new one fails here until a person
     /// has read it and added it, per the rule.
-    const ONCE_CELLS: [(&str, &str); 35] = [
+    const ONCE_CELLS: [(&str, &str); 38] = [
         ("argue_fused.rs", "ON"),
         ("blake3_whir.rs", "KERNELS"),
         ("card_rows.rs", "BYTES"),
@@ -3752,6 +3989,10 @@ mod device_state_scan_tests {
         ("device.rs", "EVICTOR"),
         ("device.rs", "OPENINGS_POOL"),
         ("device.rs", "SECOND_BACKEND"),
+        // The split's two pools of host threads, and its knob's reading.
+        ("device.rs", "SECOND_OPENINGS_POOL"),
+        ("device.rs", "SECOND_POOL"),
+        ("device.rs", "SETTING"),
         ("device.rs", "SETTING"),
         ("device.rs", "WARNED"),
         ("fill.rs", "FROM_ENV"),
@@ -3800,5 +4041,165 @@ mod device_state_scan_tests {
             "the crate's process-wide Once / OnceLock / PerBackend cells changed: read the new \
              one against the per-card rule, then pin it"
         );
+    }
+}
+
+#[cfg(test)]
+mod two_card_split_tests {
+    use super::{
+        DeviceRole, MAIN_PLACEMENT, RolePlacement, TwoCardOpenings, TwoCardSplit, current_role,
+        on_second_card, on_second_card_openings, placement_for, set_two_card_split_for_test,
+        split_placement_for, two_card_split, two_card_split_ready,
+    };
+
+    #[test]
+    fn the_split_knob_reads_its_words_and_refuses_the_rest() {
+        assert_eq!(
+            TwoCardSplit::parse(None),
+            Ok(TwoCardSplit::Off),
+            "off by default"
+        );
+        assert_eq!(TwoCardSplit::parse(Some("0")), Ok(TwoCardSplit::Off));
+        assert_eq!(TwoCardSplit::parse(Some(" auto ")), Ok(TwoCardSplit::Auto));
+        assert_eq!(TwoCardSplit::parse(Some("1")), Ok(TwoCardSplit::Forced));
+        for bad in ["", "on", "2", "base"] {
+            let err = TwoCardSplit::parse(Some(bad)).expect_err(bad);
+            assert!(err.contains("LAMBDA_VM_TWO_CARD_SPLIT"), "{err}");
+        }
+    }
+
+    /// The second driver's placement: card 1 with two cards or more unless
+    /// off, a second backend of card 0 forced with one card, card 0's own
+    /// backend otherwise (no split); nothing without a card.
+    #[test]
+    fn the_second_driver_goes_to_card_1_with_two_cards_unless_off() {
+        let card1 = RolePlacement {
+            slot: 1,
+            ordinal: 1,
+        };
+        let second_on_card0 = RolePlacement {
+            slot: 1,
+            ordinal: 0,
+        };
+        for setting in [TwoCardSplit::Auto, TwoCardSplit::Off, TwoCardSplit::Forced] {
+            assert_eq!(split_placement_for(setting, 0), MAIN_PLACEMENT);
+        }
+        assert_eq!(split_placement_for(TwoCardSplit::Auto, 1), MAIN_PLACEMENT);
+        assert_eq!(split_placement_for(TwoCardSplit::Off, 1), MAIN_PLACEMENT);
+        assert_eq!(
+            split_placement_for(TwoCardSplit::Forced, 1),
+            second_on_card0
+        );
+        for cards in 2..5 {
+            assert_eq!(split_placement_for(TwoCardSplit::Auto, cards), card1);
+            assert_eq!(split_placement_for(TwoCardSplit::Forced, cards), card1);
+            assert_eq!(
+                split_placement_for(TwoCardSplit::Off, cards),
+                MAIN_PLACEMENT
+            );
+        }
+    }
+
+    /// The openings' knob never moves the split's role: under every openings
+    /// setting and card count, `Second` is placed by the split's knob alone.
+    #[test]
+    fn the_openings_knob_does_not_place_the_second_driver() {
+        for setting in [
+            TwoCardOpenings::Auto,
+            TwoCardOpenings::Off,
+            TwoCardOpenings::Forced,
+        ] {
+            for cards in 0..4 {
+                assert_eq!(
+                    placement_for(DeviceRole::Second, setting, cards),
+                    MAIN_PLACEMENT
+                );
+            }
+        }
+    }
+
+    /// Off, or without a card (forced on a host with none): no split is ready,
+    /// and the second driver's work runs on the caller's thread in its role.
+    #[test]
+    fn off_or_without_a_card_the_split_is_not_ready() {
+        set_two_card_split_for_test(Some(TwoCardSplit::Off));
+        assert!(!two_card_split());
+        assert!(!two_card_split_ready());
+        if super::card_count() == 0 {
+            set_two_card_split_for_test(Some(TwoCardSplit::Forced));
+            assert!(!two_card_split(), "forced without a card places nothing");
+            assert!(!two_card_split_ready());
+        }
+        set_two_card_split_for_test(None);
+        let caller = std::thread::current().id();
+        let (thread, role) = on_second_card(|| (std::thread::current().id(), current_role()));
+        assert_eq!((thread, role), (caller, DeviceRole::Main));
+        let (thread, role) =
+            on_second_card_openings(|| (std::thread::current().id(), current_role()));
+        assert_eq!((thread, role), (caller, DeviceRole::Main));
+    }
+
+    /// ★ Card, run alone. Each card keeps its own ledger: a reservation made
+    /// in the second driver's role (on a thread of its own, or inside its
+    /// pools) is the second backend's and not card 0's, and goes back there
+    /// when it drops on a card-0 thread. Forced on one card, or on card 1 with
+    /// two.
+    #[test]
+    #[ignore = "card: run alone"]
+    fn a_reservation_in_the_second_role_is_the_second_backends() {
+        use super::{BackendSlot, SECOND_BACKEND, backend, backend_once, enter_role, reserve};
+        let setting = if super::card_count() >= 2 {
+            TwoCardSplit::Auto
+        } else {
+            TwoCardSplit::Forced
+        };
+        set_two_card_split_for_test(Some(setting));
+        assert!(two_card_split_ready(), "the split is ready on this box");
+        let main = backend_once().expect("card 0");
+        let second = SECOND_BACKEND.get().expect("the second backend");
+        assert!(!std::ptr::eq(main, second), "two backends");
+        let held = |be: &super::Backend| be.reserved_bytes();
+        let (m0, s0) = (held(main), held(second));
+        const MIB: u64 = 1 << 20;
+        let r = std::thread::spawn(|| {
+            let _role = enter_role(DeviceRole::Second);
+            assert_eq!(
+                BackendSlot::of(backend().expect("backend")),
+                BackendSlot::Second
+            );
+            reserve(MIB)
+        })
+        .join()
+        .expect("thread")
+        .expect("the second card has a MiB");
+        assert_eq!(
+            (held(main), held(second)),
+            (m0, s0 + MIB),
+            "a thread in the role"
+        );
+        drop(r);
+        assert_eq!(
+            (held(main), held(second)),
+            (m0, s0),
+            "dropped on card 0's thread"
+        );
+        let r = on_second_card(|| {
+            assert_eq!(current_role(), DeviceRole::Second, "the pool's worker");
+            reserve(MIB)
+        })
+        .expect("a MiB in the driver's pool");
+        let o = on_second_card_openings(|| {
+            assert_eq!(current_role(), DeviceRole::Second, "the openings' worker");
+            reserve(MIB)
+        })
+        .expect("a MiB in the openings' pool");
+        assert_eq!(
+            (held(main), held(second)),
+            (m0, s0 + 2 * MIB),
+            "inside both pools"
+        );
+        drop((r, o));
+        assert_eq!((held(main), held(second)), (m0, s0));
+        set_two_card_split_for_test(None);
     }
 }
