@@ -268,8 +268,9 @@ fn windowed(root: FieldElement<GoldilocksField>) -> Vec<u64> {
 }
 
 pub(crate) fn root_tables(be: &Backend) -> Result<&'static RootTables> {
-    static TABLES: OnceLock<RootTables> = OnceLock::new();
-    if let Some(t) = TABLES.get() {
+    static TABLES: crate::device::PerBackend<RootTables> = crate::device::PerBackend::new();
+    let cell = TABLES.of(be);
+    if let Some(t) = cell.get() {
         return Ok(t);
     }
     let root = GoldilocksField::get_primitive_root_of_unity(32).expect("2^32-th root");
@@ -279,8 +280,8 @@ pub(crate) fn root_tables(be: &Backend) -> Result<&'static RootTables> {
     let inv = stream.clone_htod(&windowed(root_inv))?;
     stream.synchronize()?;
     // A racing initialiser's tables are dropped; either set is the same bytes.
-    let _ = TABLES.set(RootTables { fwd, inv });
-    Ok(TABLES.get().expect("root tables just set"))
+    let _ = cell.set(RootTables { fwd, inv });
+    Ok(cell.get().expect("root tables just set"))
 }
 
 /// Columns per chunk: as many whole columns (trace scratch plus LDE) as fit

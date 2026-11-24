@@ -13,7 +13,7 @@
 //! `crate::grinding`): the STARK pipeline's `DeviceHash::Blake3` dispatches
 //! keep `crate::blake3`'s handles at the build's round count.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -57,8 +57,9 @@ pub struct Kernels {
 /// Load the kernels once, refusing a module whose round count is not
 /// [`ROUNDS`].
 pub fn kernels() -> Result<&'static Kernels> {
-    static KERNELS: OnceLock<Kernels> = OnceLock::new();
-    if let Some(k) = KERNELS.get() {
+    static KERNELS: crate::device::PerBackend<Kernels> = crate::device::PerBackend::new();
+    let cell = KERNELS.current()?;
+    if let Some(k) = cell.get() {
         return Ok(k);
     }
     let be = backend()?;
@@ -98,7 +99,7 @@ pub fn kernels() -> Result<&'static Kernels> {
         grind_search: module.load_function("b3w_grind_search")?,
         _module: module,
     };
-    Ok(KERNELS.get_or_init(|| k))
+    Ok(cell.get_or_init(|| k))
 }
 
 /// The compiled round count of the loaded module (7, or the load fails).

@@ -89,11 +89,14 @@ fn through_staging() -> bool {
     pinned
 }
 
-/// A pinned buffer and the blocking-sync event its copies record.
+/// A pinned buffer and the blocking-sync event its copies record, both made
+/// in one context (`ctx`, a card's): an event is recorded only on a stream of
+/// its own context, so a buffer serves only that card's read-backs.
 struct Staging {
     ptr: *mut u8,
     bytes: usize,
     event: cudarc::driver::sys::CUevent,
+    ctx: usize,
 }
 
 // SAFETY: the buffer and the event are used by one thread at a time: the
@@ -102,10 +105,16 @@ unsafe impl Send for Staging {}
 
 impl Staging {
     /// A buffer of at least `bytes`, from the pool or new, in the context bound
-    /// to this thread.
-    fn take(bytes: usize) -> Result<Staging, DriverError> {
+    /// to this thread (`ctx`): the pool's buffers of another context stay there.
+    fn take(bytes: usize, ctx: usize) -> Result<Staging, DriverError> {
         use cudarc::driver::sys;
-        let pooled = POOL.lock().map(|mut pool| pool.pop()).unwrap_or(None);
+        let pooled = POOL
+            .lock()
+            .map(|mut pool| {
+                let at = pool.iter().rposition(|s| s.ctx == ctx)?;
+                Some(pool.swap_remove(at))
+            })
+            .unwrap_or(None);
         let mut staging = match pooled {
             Some(staging) => staging,
             None => {
@@ -118,6 +127,7 @@ impl Staging {
                     ptr: std::ptr::null_mut(),
                     bytes: 0,
                     event,
+                    ctx,
                 }
             }
         };
@@ -164,16 +174,23 @@ impl Drop for Staging {
     }
 }
 
-/// The buffer a thread holds; given back to the pool when the thread ends.
+/// The buffer a thread holds; given back to the pool when the thread ends,
+/// or when the thread reads back from another context's stream.
 struct Lent(Option<Staging>);
+
+/// Gives `staging` back to the pool, or frees it past [`POOL_KEEPS`].
+fn give_back(staging: Staging) {
+    if let Ok(mut pool) = POOL.lock()
+        && pool.len() < POOL_KEEPS
+    {
+        pool.push(staging);
+    }
+}
 
 impl Drop for Lent {
     fn drop(&mut self) {
-        if let Some(staging) = self.0.take()
-            && let Ok(mut pool) = POOL.lock()
-            && pool.len() < POOL_KEEPS
-        {
-            pool.push(staging);
+        if let Some(staging) = self.0.take() {
+            give_back(staging);
         }
     }
 }
@@ -190,14 +207,19 @@ fn through_pinned<T: DeviceRepr, Src: DevicePtr<T>>(
         return Ok(());
     }
     stream.context().bind_to_thread()?;
+    let ctx = stream.context().cu_ctx() as usize;
     STAGING.with(|cell| {
         let mut lent = cell.borrow_mut();
         let staging = match lent.0.take() {
-            Some(mut staging) => {
+            Some(mut staging) if staging.ctx == ctx => {
                 staging.grow(bytes)?;
                 lent.0.insert(staging)
             }
-            None => lent.0.insert(Staging::take(bytes)?),
+            Some(other) => {
+                give_back(other);
+                lent.0.insert(Staging::take(bytes, ctx)?)
+            }
+            None => lent.0.insert(Staging::take(bytes, ctx)?),
         };
         {
             let (src_ptr, _record) = src.device_ptr(stream);

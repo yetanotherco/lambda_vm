@@ -602,8 +602,9 @@ struct Module {
 }
 
 fn module() -> crate::Result<&'static Module> {
-    static MODULE: OnceLock<Module> = OnceLock::new();
-    if let Some(m) = MODULE.get() {
+    static MODULE: crate::device::PerBackend<Module> = crate::device::PerBackend::new();
+    let cell = MODULE.current()?;
+    if let Some(m) = cell.get() {
         return Ok(m);
     }
     let be = backend()?;
@@ -615,7 +616,7 @@ fn module() -> crate::Result<&'static Module> {
         registers: module.load_function("derive_registers_from_cache")?,
         _module: module,
     };
-    Ok(MODULE.get_or_init(|| m))
+    Ok(cell.get_or_init(|| m))
 }
 
 // ---------------------------------------------------------------------------

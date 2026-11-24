@@ -28,7 +28,7 @@
 //! The module is loaded on first use from its own cubin, never by
 //! [`crate::device::Backend::init`].
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -68,8 +68,9 @@ struct Module {
 }
 
 fn module() -> Result<&'static Module> {
-    static MODULE: OnceLock<Module> = OnceLock::new();
-    if let Some(m) = MODULE.get() {
+    static MODULE: crate::device::PerBackend<Module> = crate::device::PerBackend::new();
+    let cell = MODULE.current()?;
+    if let Some(m) = cell.get() {
         return Ok(m);
     }
     let be = backend()?;
@@ -87,7 +88,7 @@ fn module() -> Result<&'static Module> {
         leaf_order: module.load_function("coset_leaf_order")?,
         _module: module,
     };
-    Ok(MODULE.get_or_init(|| m))
+    Ok(cell.get_or_init(|| m))
 }
 
 fn fmul(a: u64, b: u64) -> u64 {

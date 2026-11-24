@@ -6,7 +6,6 @@
 //! [`crate::device::Backend::init`], so a proving process never loads it.
 //! Digests are four canonical `u64`s per node (a measurement format).
 
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig, PushKernelArg};
@@ -71,8 +70,9 @@ pub struct Module {
 
 /// Load the module once.
 pub fn module() -> Result<&'static Module> {
-    static MODULE: OnceLock<Module> = OnceLock::new();
-    if let Some(m) = MODULE.get() {
+    static MODULE: crate::device::PerBackend<Module> = crate::device::PerBackend::new();
+    let cell = MODULE.current()?;
+    if let Some(m) = cell.get() {
         return Ok(m);
     }
     let be = backend()?;
@@ -106,7 +106,7 @@ pub fn module() -> Result<&'static Module> {
         fill: module.load_function("p1w16_fill")?,
         _module: module,
     };
-    Ok(MODULE.get_or_init(|| m))
+    Ok(cell.get_or_init(|| m))
 }
 
 fn cfg(threads: u64) -> LaunchConfig {
