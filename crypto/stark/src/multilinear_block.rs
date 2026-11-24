@@ -4532,8 +4532,6 @@ where
     }
 }
 
-/// Whether `group`'s prepared stack was committed and let go: it is revived
-/// at the group's opening ([`open_prepared`]).
 /// Groups whose openings ran on the openings' own card, process-wide: what a
 /// test reads to know the two-card openings ran ([`two_card_opened`]).
 static TWO_CARD_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4557,6 +4555,8 @@ where
         .any(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Held(_)))
 }
 
+/// Whether `group`'s prepared stack was committed and let go: it is revived
+/// at the group's opening ([`open_prepared`]).
 fn prepared_is_retired<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
 where
     F: IsFFTField + IsPrimeField,
