@@ -2026,8 +2026,8 @@ enum Asker {
     Split,
 }
 
-/// Set once the second slot's backend failed to start: every later call is
-/// card 0's.
+/// Set once the second slot's backend failed to start, or a prove marked it
+/// failed ([`mark_second_failed`]): every later call is card 0's.
 static SECOND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The second slot's backend, on `placement`'s card, made on first use: the
@@ -2039,11 +2039,12 @@ fn second_backend(placement: RolePlacement, asker: Asker) -> Result<&'static Bac
     // Card 0's first: the pinned pool and the process's first context are
     // card 0's, as without a second backend.
     let main = backend_once()?;
-    if let Some(b) = SECOND_BACKEND.get() {
-        return Ok(b);
-    }
+    // Failed (at its start, or later: `mark_second_failed`): card 0's.
     if SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(main);
+    }
+    if let Some(b) = SECOND_BACKEND.get() {
+        return Ok(b);
     }
     static INIT: Mutex<()> = Mutex::new(());
     let _init = INIT.lock().unwrap_or_else(|e| e.into_inner());
@@ -2110,7 +2111,8 @@ static OPENINGS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 /// 0's) and their pool built. A counter of groups opened there reads it after
 /// the openings ran, so a fallback to card 0 is not counted.
 pub fn openings_on_own_backend() -> bool {
-    two_card_openings()
+    !SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+        && two_card_openings()
         && SECOND_BACKEND.get().is_some()
         && OPENINGS_POOL.get().is_some_and(Option::is_some)
 }
@@ -2310,6 +2312,18 @@ fn second_pool() -> Option<&'static rayon::ThreadPool> {
 /// waiting in the argue's join, and the argue would wait for all of it.
 fn second_openings_pool() -> Option<&'static rayon::ThreadPool> {
     second_role_pool(&SECOND_OPENINGS_POOL, "second-open", true)
+}
+
+/// The second card failed mid-prove (its phase-B driver returned a device
+/// failure): said once, and from now on every two-card knob is inert for the
+/// process (the second slot resolves to card 0's backend, or to none under
+/// [`DeviceRole::Second`]), so later proves use one card.
+pub fn mark_second_failed(why: &str) {
+    if !SECOND_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[gpu] two-card: the second card is marked failed ({why}); every later prove uses card 0"
+        );
+    }
 }
 
 /// Whether phase B may split its groups over two cards: the split on, the

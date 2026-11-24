@@ -356,3 +356,31 @@ fn a_re_ranking_hook_under_two_drivers_proves_the_same_bytes() {
         verify(argue, &two).expect("verifies");
     }
 }
+
+/// Both drivers fail (each at a place of its own, the failure set to two
+/// places): the prove's error is a failure's own, never the other driver's
+/// stop.
+#[test]
+fn of_two_failures_the_answer_is_a_failure_not_a_stop() {
+    let n = SIZES.len();
+    let (proved, _) = prove_split(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::Off,
+        &in_order(),
+        true,
+        Split::OnHost,
+        &vec![false; n],
+        OverlapFaults {
+            argue_fails: Some(1),
+            open_fails: Some(0),
+            ..OverlapFaults::default()
+        },
+    );
+    match proved {
+        Err(MlError::DeviceFailed { stage }) => {
+            assert_ne!(stage, "the other card's phase B failed")
+        }
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("proved with two failures"),
+    }
+}
