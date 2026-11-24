@@ -561,6 +561,14 @@ impl DeviceColumns {
         &self.stream
     }
 
+    /// Whether this thread's backend ([`crate::device::backend`]) is the one
+    /// the store was uploaded on: its stream's context is that backend's. Two
+    /// backends on one card have two context handles, so this tells them
+    /// apart there too.
+    pub fn on_this_backend(&self) -> bool {
+        crate::device::backend().is_ok_and(|be| Arc::ptr_eq(self.stream.context(), &be.ctx))
+    }
+
     /// Copies column `k` into `dst` at `offset`, on the card.
     ///
     /// Issued on the **destination's** stream, so whatever reads `dst` next is
