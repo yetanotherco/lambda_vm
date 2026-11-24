@@ -3,7 +3,9 @@
 //! (`LAMBDA_VM_LEVELS_FILL_PARTS`): a fill's three parts at once give the
 //! fill in series (the same tables, the same level proof bytes, every one
 //! verifying), honour the thread's lean holding, and fail as the series fill
-//! fails.
+//! fails. Step 2 (`LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY`) moves only when the
+//! driver commits; its identity is a box-tier driver test
+//! (`levels_tests::the_blake3_driver_committing_level_2_early_proves_the_same_level_bytes`).
 
 use crate::tables::types::FE;
 
@@ -171,14 +173,21 @@ fn lean_shape(filled: &mut LfmFilled) -> Vec<(usize, usize, bool)> {
 // The knobs
 // =============================================================================
 
-/// The knob is named, off by default, and on only for `1`; a test's
+/// Both knobs are named, off by default, and on only for `1`; a test's
 /// override is this thread's alone.
 #[test]
-fn the_fill_parts_knob_is_named_and_off_by_default() {
-    use super::levels::{FILL_PARTS_ENV, fill_parts, set_fill_parts_for_test};
+fn the_chain_knobs_are_named_and_off_by_default() {
+    use super::levels::{
+        COMMIT_NEXT_EARLY_ENV, FILL_PARTS_ENV, commit_next_early, fill_parts,
+        set_commit_next_early_for_test, set_fill_parts_for_test,
+    };
     assert_eq!(FILL_PARTS_ENV, "LAMBDA_VM_LEVELS_FILL_PARTS");
+    assert_eq!(COMMIT_NEXT_EARLY_ENV, "LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY");
     if std::env::var_os(FILL_PARTS_ENV).is_none() {
         assert!(!fill_parts(), "off by default");
+    }
+    if std::env::var_os(COMMIT_NEXT_EARLY_ENV).is_none() {
+        assert!(!commit_next_early(), "off by default");
     }
     for (word, on) in [
         (None, false),
@@ -192,11 +201,17 @@ fn the_fill_parts_knob_is_named_and_off_by_default() {
         assert_eq!(knob_word_on(word), on, "{word:?}");
     }
     set_fill_parts_for_test(Some(true));
-    assert!(fill_parts(), "the override");
-    let other = std::thread::spawn(fill_parts).join().expect("joins");
+    set_commit_next_early_for_test(Some(true));
+    assert!(fill_parts() && commit_next_early(), "the overrides");
+    let other = std::thread::spawn(|| (fill_parts(), commit_next_early()))
+        .join()
+        .expect("joins");
     set_fill_parts_for_test(None);
-    if std::env::var_os(FILL_PARTS_ENV).is_none() {
-        assert!(!other, "another thread reads the knob");
+    set_commit_next_early_for_test(None);
+    if std::env::var_os(FILL_PARTS_ENV).is_none()
+        && std::env::var_os(COMMIT_NEXT_EARLY_ENV).is_none()
+    {
+        assert_eq!(other, (false, false), "another thread reads the knobs");
     }
 }
 
