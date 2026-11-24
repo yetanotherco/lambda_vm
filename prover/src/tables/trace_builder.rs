@@ -2183,6 +2183,48 @@ pub(crate) fn inrow_sides_pinned() -> bool {
     })
 }
 
+/// MEASUREMENT PROBE, never for landing: `LAMBDA_VM_PROBE_SKIP_REG_CHECK=1`
+/// skips the record walk's register check ([`HistoryOverlay::registers_match`])
+/// on every cycle that is no ECALL, to bound what a cheaper check can give.
+/// The check is a guard only (it never changes a row), so the tables and the
+/// proof are the same; an executor history the walk disagrees with is then
+/// not refused on those cycles. Unset or any other word: today's check.
+pub(crate) const PROBE_SKIP_REG_CHECK_ENV: &str = "LAMBDA_VM_PROBE_SKIP_REG_CHECK";
+
+/// [`PROBE_SKIP_REG_CHECK_ENV`] of the knob's value: on for `1` alone.
+fn probe_skip_reg_check_word(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// [`PROBE_SKIP_REG_CHECK_ENV`] of the process's environment, read once.
+pub(crate) fn probe_skip_reg_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = probe_skip_reg_check_word(std::env::var(PROBE_SKIP_REG_CHECK_ENV).ok().as_deref());
+        if on {
+            eprintln!(
+                "★ PROBE REG CHECK: skipped on every cycle that is no ECALL ({PROBE_SKIP_REG_CHECK_ENV}=1; a measurement, \
+                 the tables are the same)"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+mod probe_skip_reg_check_tests {
+    use super::probe_skip_reg_check_word;
+
+    /// On for `1` alone; unset or any other word is today's check.
+    #[test]
+    fn the_reg_check_probe_is_on_for_1_alone() {
+        assert!(probe_skip_reg_check_word(Some("1")) && probe_skip_reg_check_word(Some(" 1 ")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("on")] {
+            assert!(!probe_skip_reg_check_word(value), "{value:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod inrow_sides_pinned_tests {
     use super::inrow_sides_pinned_setting as setting;
@@ -2563,6 +2605,8 @@ fn walk_cpu_ops<const REST: bool>(
     let start_commit_index = register_state.read_index().0;
     let mut current_commit_index = start_commit_index;
 
+    // The register check's measurement probe, read once a batch.
+    let skip_reg_check = memory_state.overlay.is_some() && probe_skip_reg_check();
     for op in cpu_ops {
         let op = decode.op(op);
         // Record mode: the cycle's cells from the executor's history, its
@@ -2584,7 +2628,8 @@ fn walk_cpu_ops<const REST: bool>(
             } else {
                 overlay.begin(op.timestamp);
             }
-            if !overlay.registers_match(&op, register_state) {
+            // Under the probe a light cycle's check is skipped (short-circuit).
+            if !(light && skip_reg_check || overlay.registers_match(&op, register_state)) {
                 memory_state.missing.store(true, Relaxed);
             }
         }
