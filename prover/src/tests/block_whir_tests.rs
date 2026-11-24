@@ -3355,6 +3355,51 @@ fn the_rest_airs_built_beside_prove_the_same_bytes() {
     }
 }
 
+/// The walkers' count moves no byte: a block of many windows proves the same
+/// partition and tables (and, under the deterministic grind, the same bytes)
+/// on 4, 6 and 8 walkers, and every proof verifies. The count reaches the walk
+/// through the test's own deviation, not the environment.
+#[test]
+fn more_walkers_prove_the_same_bytes() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let o = streamed(MaxRowsConfig::small(), 16, 3);
+    let proved = |walkers: usize| {
+        let (proof, _) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                walkers: Some(walkers),
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "{walkers} walkers");
+        proof
+    };
+    let four = proved(4);
+    for walkers in [6, 8] {
+        let more = proved(walkers);
+        assert_eq!(four.groups, more.groups, "the partition at {walkers}");
+        assert_eq!(four.table_num_vars, more.table_num_vars);
+        assert_eq!(
+            format!("{:?}", four.table_counts),
+            format!("{:?}", more.table_counts)
+        );
+        if crypto::grinding::deterministic() {
+            let bytes = |p: &BlockWhirProof| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serialize")
+                    .to_vec()
+            };
+            assert_eq!(bytes(&four), bytes(&more), "the proof's bytes at {walkers}");
+        }
+    }
+}
+
 /// With the AIR set built beside them, an early KECCAK_RND table laid out
 /// with an AIR that is not the run's at its place (each named for the next
 /// table) is refused once the set exists: the prove ends in an error, not a

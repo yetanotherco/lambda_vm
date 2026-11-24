@@ -2496,17 +2496,21 @@ fn records_admission(
     }
 }
 
-/// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes: each walker holds
-/// a window's state and walked lists, and this is the most whose memory was
-/// measured on the largest blocks.
-const MAX_WALKERS: usize = 4;
+/// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes. Nothing is sized
+/// by it: the walk's channels and permits take the run's own count. Each
+/// walker past the default holds one more window in flight and its own lookup
+/// histogram (about 0.2 GiB on the largest blocks).
+const MAX_WALKERS: usize = 8;
+
+/// The walkers a run takes when `LAMBDA_VM_BLOCK_WALKERS` is unset: the most
+/// whose memory was measured on the largest blocks.
+const DEFAULT_WALKERS: usize = 4;
 
 /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty walks the run's windows on
-/// [`MAX_WALKERS`] threads (the default), each window from the bytes it
-/// touches as they stood before it ([`parallel::walk_windows`]); `1` to
-/// [`MAX_WALKERS`] on that many; `0` on one thread, the walk before the
-/// walkers (the rollback). The tables and their order are the same. Anything
-/// else refuses the prove.
+/// [`DEFAULT_WALKERS`] threads, each window from the bytes it touches as they
+/// stood before it ([`parallel::walk_windows`]); `1` to [`MAX_WALKERS`] on
+/// that many; `0` on one thread, the walk before the walkers (the rollback).
+/// The tables and their order are the same. Anything else refuses the prove.
 fn block_walkers() -> Result<usize, Error> {
     parse_walkers(std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref())
 }
@@ -2514,7 +2518,7 @@ fn block_walkers() -> Result<usize, Error> {
 /// [`block_walkers`] of the knob's value.
 fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
     match value.map(str::trim) {
-        None | Some("") => Ok(MAX_WALKERS),
+        None | Some("") => Ok(DEFAULT_WALKERS),
         Some("0") => Ok(0),
         Some(v) => v
             .parse::<usize>()
@@ -5451,6 +5455,9 @@ pub(crate) struct Deviations {
     /// ops ([`WindowedTraceBuilder::rest_bitwise_last`]): what BITWISE's
     /// lookups from the tables are compared with.
     pub rest_bitwise_last: bool,
+    /// The run's walkers instead of `LAMBDA_VM_BLOCK_WALKERS`'s (a test's
+    /// own count, no environment read): an honest prover at another count.
+    pub walkers: Option<usize>,
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, BITWISE
     /// last (`Some(true)`), or from their ops in phase 4, BITWISE first
     /// (`Some(false)`), instead of the default (`None`: from the tables;
@@ -9106,7 +9113,10 @@ fn prove_streamed(
     let waits = &waits;
     let tag = block_format_tag(format);
     crate::with_base_hash!(format.zf.base, |H| {
-        let walkers = block_walkers()?;
+        let walkers = match deviations.walkers {
+            Some(walkers) => walkers,
+            None => block_walkers()?,
+        };
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let pages_first = pages_first(deviations.pages_first)?;
@@ -13730,10 +13740,10 @@ mod walkers_knob_tests {
     }
 
     /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is four walkers (the
-    /// default); 0 one walker (the rollback); 1 to 4 that many; any other
+    /// default); 0 one walker (the rollback); 1 to 8 that many; any other
     /// word refuses the prove.
     #[test]
-    fn the_walkers_knob_defaults_to_4_takes_0_to_4_and_refuses_anything_else() {
+    fn the_walkers_knob_defaults_to_4_takes_0_to_8_and_refuses_anything_else() {
         for (value, walkers) in [
             (None, 4),
             (Some(""), 4),
@@ -13742,10 +13752,13 @@ mod walkers_knob_tests {
             (Some("1"), 1),
             (Some(" 3 "), 3),
             (Some("4"), 4),
+            (Some("5"), 5),
+            (Some("6"), 6),
+            (Some(" 8 "), 8),
         ] {
             assert_eq!(parse_walkers(value).ok(), Some(walkers), "{value:?}");
         }
-        for value in ["5", "8", "16", "17", "-1", "auto", "4x", "1.5"] {
+        for value in ["9", "16", "17", "-1", "auto", "4x", "1.5"] {
             assert!(parse_walkers(Some(value)).is_err(), "{value}");
         }
     }
