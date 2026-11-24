@@ -1685,6 +1685,14 @@ impl WlfmPrebuild {
         Ok(())
     }
 
+    /// Each stack's columns, for a test that compares two prebuilds.
+    #[cfg(test)]
+    pub(crate) fn stack_columns_for_test(&self) -> Option<Vec<&[Vec<FieldElement<F>>]>> {
+        self.stacks
+            .as_ref()
+            .map(|stacks| stacks.iter().map(|s| s.columns.as_slice()).collect())
+    }
+
     /// The build: every prepared stack committed where `place` says, the
     /// coverage rule checked, and under [`WlfmPrep::Stacked`] the program's
     /// identity over the roots (under [`WlfmPrep::Evaluated`] the preparation
@@ -1770,6 +1778,19 @@ pub fn prepare_wlfm_rounds(
     levers: WlfmLevers,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
+    prepare_wlfm_tiled(program, hasher, rate, levers, rounds, columns_tiled())
+}
+
+/// [`prepare_wlfm_rounds`] with its columns made by tiles, its chips' chunks
+/// read in place, when `tiled` ([`COLUMNS_TILED_ENV`]). The same prebuild.
+pub(crate) fn prepare_wlfm_tiled(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    rate: WlfmRate,
+    levers: WlfmLevers,
+    rounds: Option<u8>,
+    tiled: bool,
+) -> Result<WlfmPrebuild, String> {
     let t = std::time::Instant::now();
     let WlfmLevers {
         prep,
@@ -1795,32 +1816,46 @@ pub fn prepare_wlfm_rounds(
             chip_groups.len()
         ));
     }
-    // Each chip cut at the chunk cap: its groups' rows sliced as its tables'.
+    // Each chip cut at the chunk cap: its groups' rows sliced as its tables'
+    // (copied out, or under `tiled` read in place by their row ranges).
     let cut = chunk_log();
     let mut lfm_chunks: Vec<Vec<usize>> = Vec::with_capacity(chip_groups.len());
-    let mut groups: Vec<Cow<'_, ColumnGroup>> = Vec::with_capacity(chip_groups.len());
+    let mut groups: Vec<PrepTable<'_>> = Vec::with_capacity(chip_groups.len());
     for group in chip_groups {
         let chunks = chip_chunk_rows(group.real_rows, group.padded_rows, cut);
         if chunks.len() == 1 {
-            groups.push(group);
+            groups.push(PrepTable::whole(group));
         } else {
+            let group = std::sync::Arc::new(group);
             let mut start = 0usize;
             for &rows in &chunks {
                 let end = (start + rows).min(group.real_rows.max(start));
-                let mut data = group.data[start * group.width..end * group.width].to_vec();
-                data.resize(rows * group.width, FieldElement::zero());
-                groups.push(Cow::Owned(ColumnGroup {
-                    width: group.width,
-                    real_rows: end - start,
-                    padded_rows: rows,
-                    data,
-                }));
+                if tiled {
+                    groups.push(PrepTable {
+                        group: std::sync::Arc::clone(&group),
+                        rows: start..end,
+                        padded_rows: rows,
+                    });
+                } else {
+                    let mut data = group.data[start * group.width..end * group.width].to_vec();
+                    data.resize(rows * group.width, FieldElement::zero());
+                    groups.push(PrepTable::whole(Cow::Owned(ColumnGroup {
+                        width: group.width,
+                        real_rows: end - start,
+                        padded_rows: rows,
+                        data,
+                    })));
+                }
                 start += rows;
             }
         }
         lfm_chunks.push(chunks);
     }
-    groups.extend(b3l_prep_groups(program).into_iter().map(Cow::Owned));
+    groups.extend(
+        b3l_prep_groups(program)
+            .into_iter()
+            .map(|g| PrepTable::whole(Cow::Owned(g))),
+    );
     let airs = WlfmAirs {
         lfm,
         lfm_chunks: lfm_chunks.clone(),
@@ -1839,11 +1874,11 @@ pub fn prepare_wlfm_rounds(
     let mut counts = Vec::with_capacity(refs.len());
     for (air, group) in refs.iter().zip(&groups) {
         let count = air.num_precomputed_columns();
-        if group.width != count {
+        if group.width() != count {
             return Err(format!(
                 "{}: the program commits {} preprocessed columns and the AIR declares {count}",
                 air.name(),
-                group.width
+                group.width()
             ));
         }
         if !group.padded_rows.is_power_of_two() {
@@ -1872,14 +1907,14 @@ pub fn prepare_wlfm_rounds(
             .collect()
     };
     let columns_from = std::time::Instant::now();
-    let columns: Vec<PreparedColumns> = if prepare_par() {
+    let columns: Vec<PreparedColumns> = if prepare_par() && !tiled {
         use rayon::prelude::*;
         groups
             .par_iter()
             .zip(&counts)
             .enumerate()
             .filter(|&(_, (_, &count))| count > 0)
-            .map(|(table, (group, _))| (table, group_columns_par(group)))
+            .map(|(table, (group, _))| (table, group_columns_par(&group.group)))
             .collect()
     } else {
         groups
@@ -1887,7 +1922,7 @@ pub fn prepare_wlfm_rounds(
             .zip(&counts)
             .enumerate()
             .filter(|&(_, (_, &count))| count > 0)
-            .map(|(table, (group, _))| (table, group_columns(group)))
+            .map(|(table, (group, _))| (table, group.columns(tiled)))
             .collect()
     };
     let columns_secs = columns_from.elapsed().as_secs_f64();
@@ -3324,6 +3359,127 @@ pub fn prepare_par() -> bool {
     *ON.get_or_init(|| {
         super::wlfm_knobs::knob_word_on(super::wlfm_knobs::env_word(PREPARE_PAR_ENV).as_deref())
     })
+}
+
+/// `LAMBDA_VM_LEVELS_COLUMNS_TILED=1`: a W-LFM build's host part turns its
+/// tables' row-major groups into columns a tile of rows at a time
+/// ([`group_columns_tiled`]), each tile read from memory once for all its
+/// columns, where it otherwise reads the whole table once a column; and a chip
+/// cut at the chunk cap is read in place, by its chunks' row ranges, where it
+/// is otherwise copied chunk by chunk first. One thread, as today. The same
+/// columns, cell for cell. Off by default (and for any word but `1`); read
+/// once a process.
+pub const COLUMNS_TILED_ENV: &str = "LAMBDA_VM_LEVELS_COLUMNS_TILED";
+
+/// A test's [`columns_tiled`], process wide (0 the knob, 1 off, 2 on).
+static COLUMNS_TILED_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`columns_tiled`] forced for the whole process (`None`
+/// restores the knob): a level's prepare runs on threads of the driver's own.
+/// A test that sets it runs alone.
+#[doc(hidden)]
+pub fn set_columns_tiled_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    COLUMNS_TILED_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`COLUMNS_TILED_ENV`] is on (or a test's override).
+pub fn columns_tiled() -> bool {
+    match COLUMNS_TILED_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(super::wlfm_knobs::env_word(COLUMNS_TILED_ENV).as_deref())
+    })
+}
+
+/// Rows a tile of [`group_columns_tiled`] holds: `2^12` rows of a table a few
+/// tens of words wide stay in a core's cache while every column takes its
+/// cells from them.
+pub(crate) const TILE_ROWS: usize = 1 << 12;
+
+/// Rows `rows` of a row-major table `width` words wide (`data`, row `r` at
+/// `data[r * width..]`) as its columns, each padded with zeros to `padded`
+/// cells: for each tile of [`TILE_ROWS`] rows, every column takes that
+/// tile's cells, so each cache line of the table is read once. [`group_columns`]
+/// of the rows copied out and padded, cell for cell.
+pub(crate) fn group_columns_tiled(
+    data: &[FieldElement<F>],
+    width: usize,
+    rows: std::ops::Range<usize>,
+    padded: usize,
+) -> Vec<Vec<FieldElement<F>>> {
+    assert!(
+        rows.start <= rows.end && rows.end - rows.start <= padded,
+        "rows {rows:?} past {padded} padded rows"
+    );
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut columns: Vec<Vec<FieldElement<F>>> =
+        (0..width).map(|_| Vec::with_capacity(padded)).collect();
+    let mut at = rows.start;
+    while at < rows.end {
+        let end = (at + TILE_ROWS).min(rows.end);
+        let tile = &data[at * width..end * width];
+        for (column, out) in columns.iter_mut().enumerate() {
+            out.extend(tile.iter().skip(column).step_by(width).copied());
+        }
+        at = end;
+    }
+    for out in &mut columns {
+        out.resize(padded, FieldElement::zero());
+    }
+    columns
+}
+
+/// One table's rows as a build's host part takes them: a group of the
+/// program's (borrowed, or made for the build), the rows of it the table
+/// holds and the height it is padded to. Today's path copies a chip's
+/// chunks into groups of their own (`rows` all of it); the tiled path
+/// ([`columns_tiled`]) reads them in place.
+struct PrepTable<'a> {
+    group: std::sync::Arc<Cow<'a, ColumnGroup>>,
+    rows: std::ops::Range<usize>,
+    padded_rows: usize,
+}
+
+impl<'a> PrepTable<'a> {
+    fn whole(group: Cow<'a, ColumnGroup>) -> Self {
+        let padded_rows = group.padded_rows;
+        PrepTable {
+            group: std::sync::Arc::new(group),
+            rows: 0..padded_rows,
+            padded_rows,
+        }
+    }
+
+    fn width(&self) -> usize {
+        self.group.width
+    }
+
+    /// The table's columns: [`group_columns_tiled`] under `tiled`, today's
+    /// [`group_columns`] (on a group that is the whole table) otherwise.
+    fn columns(&self, tiled: bool) -> Vec<Vec<FieldElement<F>>> {
+        if tiled {
+            group_columns_tiled(
+                &self.group.data,
+                self.group.width,
+                self.rows.clone(),
+                self.padded_rows,
+            )
+        } else {
+            debug_assert!(self.rows == (0..self.group.padded_rows));
+            group_columns(&self.group)
+        }
+    }
 }
 
 /// Rows a [`group_columns_par`] task gathers of one column.

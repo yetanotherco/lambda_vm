@@ -6,6 +6,9 @@
 //! fails. Step 2 (`LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY`) moves only when the
 //! driver commits; its identity is a box-tier driver test
 //! (`levels_tests::the_blake3_driver_committing_level_2_early_proves_the_same_level_bytes`).
+//! Step 3 (`LAMBDA_VM_LEVELS_COLUMNS_TILED`): the tiled columns are today's
+//! cell for cell, and a build's host part made by tiles, its chips' chunks
+//! read in place, is today's stack for stack.
 
 use crate::tables::types::FE;
 
@@ -349,4 +352,126 @@ fn a_failing_part_fails_the_fill_at_once_as_in_series() {
     let (series, at_once) = (message(false), message(true));
     assert!(series.contains("one LEAN_MUX record a mux row"), "{series}");
     assert_eq!(series, at_once, "the same refusal");
+}
+
+// =============================================================================
+// Step 3: the program's tables into columns by tiles
+// =============================================================================
+
+/// A row-major table `width` words wide and `rows` rows tall, every cell its
+/// own value.
+fn table(width: usize, rows: usize) -> Vec<FE> {
+    (0..width * rows)
+        .map(|i| FE::from((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 7))
+        .collect()
+}
+
+/// [`super::wlfm::group_columns`] of rows `rows` of `data` copied out and
+/// padded with zeros to `padded`: today's path for a chip's chunk.
+fn copied_columns(
+    data: &[FE],
+    width: usize,
+    rows: std::ops::Range<usize>,
+    padded: usize,
+) -> Vec<Vec<FE>> {
+    let mut cut = data[rows.start * width..rows.end * width].to_vec();
+    cut.resize(padded * width, FE::zero());
+    super::wlfm::group_columns(&super::compiler::ColumnGroup {
+        width,
+        real_rows: rows.len(),
+        padded_rows: padded,
+        data: cut,
+    })
+}
+
+/// ★ PIN: the tiled columns are today's, cell for cell: widths 1 to 33 (under,
+/// at and over a cache line of words), heights of 4 rows, a tile, a tile ± 1
+/// and several tiles, the whole table and row ranges that start and end
+/// inside a tile, padded or not.
+#[test]
+fn the_tiled_columns_are_the_columns() {
+    use super::wlfm::{TILE_ROWS, group_columns_tiled};
+    for width in [1usize, 2, 7, 8, 9, 33] {
+        for height in [
+            4usize,
+            TILE_ROWS - 1,
+            TILE_ROWS,
+            TILE_ROWS + 1,
+            3 * TILE_ROWS + 5,
+        ] {
+            let data = table(width, height);
+            let whole = super::wlfm::group_columns(&super::compiler::ColumnGroup {
+                width,
+                real_rows: height,
+                padded_rows: height,
+                data: data.clone(),
+            });
+            assert_eq!(
+                group_columns_tiled(&data, width, 0..height, height),
+                whole,
+                "width {width} height {height}: the whole table"
+            );
+            let inner = [
+                (1, height),
+                (0, height / 2),
+                (height / 3, height - 1),
+                (TILE_ROWS.min(height) - 1, height),
+            ];
+            for (a, b) in inner {
+                for padded in [
+                    b - a,
+                    (b - a).next_power_of_two(),
+                    2 * (b - a).next_power_of_two(),
+                ] {
+                    assert_eq!(
+                        group_columns_tiled(&data, width, a..b, padded),
+                        copied_columns(&data, width, a..b, padded),
+                        "width {width} height {height}: rows {a}..{b} padded to {padded}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        group_columns_tiled(&[], 0, 0..0, 4).is_empty(),
+        "no columns"
+    );
+}
+
+/// ★ PIN: a build's host part with its columns made by tiles, its chips'
+/// chunks read in place, is today's: the same stacks column for column, the
+/// same prepared cells and the same committed identity, with chips cut into
+/// several chunks, under both families.
+#[test]
+fn a_tiled_prepare_is_the_prepare() {
+    use super::wlfm::{StackPlace, WlfmFamily, WlfmLevers, WlfmRate, prepare_wlfm_tiled};
+    let _chunks = test_format::set_chunk_log(2);
+    for (program, family) in [
+        (super::wlfm_tests::honest(), WlfmFamily::P1),
+        (super::b3l_wlfm_tests::honest(), WlfmFamily::B3),
+    ] {
+        let levers = WlfmLevers::with_family(family);
+        let [today, tiled] = [false, true].map(|tiled| {
+            prepare_wlfm_tiled(&program, HASHER, WlfmRate::Two, levers, None, tiled)
+                .unwrap_or_else(|e| panic!("{family:?} tiled {tiled}: prepares: {e}"))
+        });
+        let (a, b) = (
+            today.stack_columns_for_test().expect("stacks"),
+            tiled.stack_columns_for_test().expect("stacks"),
+        );
+        assert!(!a.is_empty(), "{family:?}: prepared stacks");
+        assert!(a == b, "{family:?}: the same stacks, column for column");
+        assert_eq!(today.prepared_cells(), tiled.prepared_cells());
+        let [today, tiled] =
+            [today, tiled].map(|pre| pre.commit(StackPlace::Host).expect("commits"));
+        assert!(
+            today.artifacts.lfm_chunks.iter().any(|c| c.len() > 1),
+            "{family:?}: a chip cut into chunks"
+        );
+        assert_eq!(today.artifacts.lfm_chunks, tiled.artifacts.lfm_chunks);
+        assert_eq!(
+            today.artifacts.program_id, tiled.artifacts.program_id,
+            "{family:?}: the same committed identity"
+        );
+    }
 }
