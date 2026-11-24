@@ -5264,6 +5264,11 @@ where
     let card = split_card.unwrap_or_else(|| vec![0; n]);
     let queue = std::sync::Mutex::new(phase_b_split::TurnQueue::new(order, card.clone()));
     let abort = std::sync::atomic::AtomicBool::new(false);
+    // Each driver's place in phase B's order at its latest turn.
+    let places = [
+        std::sync::atomic::AtomicUsize::new(usize::MAX),
+        std::sync::atomic::AtomicUsize::new(usize::MAX),
+    ];
 
     // Each card's own state: its groups' tables and spill slots, stamps,
     // retired stacks, claims and begun local argues, by group (another card's
@@ -5389,6 +5394,8 @@ where
                 }
                 (turn.group, turn.turn, queue.claim_next(lane))
             };
+            // The place this driver is at, for the error of the lower place.
+            places[lane.min(1)].store(p, std::sync::atomic::Ordering::Relaxed);
             stamps[g].start_b = entered.elapsed().as_secs_f64();
             stamps[g].card = lane as u8;
             if sched {
@@ -6044,12 +6051,28 @@ where
         (Ok(a), None) => vec![a],
         (Ok(a), Some(Ok(b))) => vec![a, b],
         (Err(e), None) => return Err(e),
-        (Err(e), Some(Ok(_))) | (Ok(_), Some(Err(e))) => return Err(e),
+        (Err(e), Some(Ok(_))) => return Err(e),
+        (Ok(_), Some(Err(e))) => {
+            if !split_on_host && matches!(e, MlError::DeviceFailed { .. }) && !is_abort(&e) {
+                multilinear::gpu::mark_second_failed("its phase-B driver failed");
+            }
+            return Err(e);
+        }
         (Err(e0), Some(Err(e1))) => {
-            return Err(if is_abort(&e0) && !is_abort(&e1) {
-                e1
-            } else {
-                e0
+            // A driver's own failure over the other's stop; of two failures,
+            // the one at the lower place in phase B's order.
+            if !split_on_host && matches!(e1, MlError::DeviceFailed { .. }) && !is_abort(&e1) {
+                multilinear::gpu::mark_second_failed("its phase-B driver failed");
+            }
+            let (p0, p1) = (
+                places[0].load(std::sync::atomic::Ordering::Relaxed),
+                places[1].load(std::sync::atomic::Ordering::Relaxed),
+            );
+            return Err(match (is_abort(&e0), is_abort(&e1)) {
+                (true, false) => e1,
+                (false, true) => e0,
+                _ if p1 < p0 => e1,
+                _ => e0,
             });
         }
     };

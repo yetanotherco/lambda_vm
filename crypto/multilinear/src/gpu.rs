@@ -1394,6 +1394,16 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     f()
 }
 
+/// The second card failed mid-prove: every two-card knob inert from now on
+/// ([`math_cuda::device::mark_second_failed`]); nothing without a device build.
+#[cfg(feature = "cuda")]
+pub fn mark_second_failed(why: &str) {
+    math_cuda::device::mark_second_failed(why);
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn mark_second_failed(_why: &str) {}
+
 /// Whether the two-card split's knob is on in this process
 /// ([`math_cuda::device::two_card_split`], `LAMBDA_VM_TWO_CARD_SPLIT`), ready
 /// or not; `false` without a device build.
