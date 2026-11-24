@@ -173,6 +173,7 @@ impl Setup {
             keep_logs: false,
             batch: self.batch,
             defer_ecrec: self.defer_ecrec,
+            cuts: crate::tables::trace_builder::WalkCuts::default(),
             counts: None,
             listless: false,
             sizes: &mut sizes,

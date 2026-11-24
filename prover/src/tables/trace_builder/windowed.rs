@@ -328,6 +328,8 @@ pub struct WindowedTraceBuilder<'a> {
     cpu_listless: bool,
     /// [`Self::light_walk`]: 0, 1 or 2.
     light_walk: u8,
+    /// [`Self::walk_cuts`].
+    walk_cuts: super::WalkCuts,
     /// The split walker's counts ([`Self::count_where_made`]).
     own_counts: WalkCounts,
     /// The counts of the walkers of a run walked from its entries or its
@@ -648,6 +650,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             count_made: true,
             cpu_listless: true,
             light_walk: 0,
+            walk_cuts: super::WalkCuts::default(),
             own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
@@ -856,6 +859,24 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         self.light_walk = level;
         Ok(self)
+    }
+
+    /// The walk's cuts (`LAMBDA_VM_WALK_CUTS`, [`super::WalkCuts`]): work
+    /// taken out of the walkers' loop. The same lists, counts and tables.
+    /// Refused after a window was walked.
+    pub fn walk_cuts(mut self, cuts: super::WalkCuts) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "walk_cuts after a window was walked".to_string(),
+            ));
+        }
+        self.walk_cuts = cuts;
+        Ok(self)
+    }
+
+    /// The walk's cuts in effect ([`Self::walk_cuts`]).
+    pub(crate) fn walk_cuts_on(&self) -> super::WalkCuts {
+        self.walk_cuts
     }
 
     /// The walkers' light walk in effect ([`Self::light_walk`]): its cells
@@ -1955,6 +1976,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
                 defer_ecrec: self.defer_ecrec,
+                cuts: self.walk_cuts,
                 counts: made.then_some(&mut self.own_counts),
                 listless,
                 sizes: &mut self.walk_sizes,
@@ -2404,6 +2426,8 @@ pub struct Walker<'b> {
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
     defer_ecrec: bool,
+    /// [`WindowedTraceBuilder::walk_cuts`].
+    cuts: super::WalkCuts,
     /// What it counts of the rows it makes
     /// ([`WindowedTraceBuilder::count_where_made`]); `None` when it counts none.
     counts: Option<&'b mut WalkCounts>,
@@ -2436,6 +2460,7 @@ impl Walker<'_> {
             self.lookups,
             self.batch,
             self.defer_ecrec,
+            self.cuts,
             self.counts.as_deref_mut(),
             list,
             false,
@@ -2493,6 +2518,7 @@ fn walk_window(
     lookups: bool,
     batch: usize,
     defer_ecrec: bool,
+    cuts: super::WalkCuts,
     mut counts: Option<&mut WalkCounts>,
     list: bool,
     route: bool,
@@ -2513,8 +2539,9 @@ fn walk_window(
             *at = now;
         }
     };
-    // As a whole-run build: only the last cycle may halt.
-    if logs.iter().any(|log| log.next_pc == 0) {
+    // As a whole-run build: only the last cycle may halt. Under the cut
+    // `prescan` the collect refuses a halting cycle as it reads its log.
+    if !cuts.prescan && logs.iter().any(|log| log.next_pc == 0) {
         return Err(Error::HaltInNonFinalEpoch);
     }
     lap(|t| &mut t.prescan, &mut times);
@@ -2564,7 +2591,11 @@ fn walk_window(
             cpu_ops.clear();
         }
         let marks = BatchMarks::of(&walk);
-        super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
+        if cuts.prescan {
+            super::collect_cpu_ops_checked_into::<true>(part, decode, first + from, &mut cpu_ops)?;
+        } else {
+            super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
+        }
         lap(|t| &mut t.collect, &mut times);
         from += part.len();
         super::collect_window_ops_into(
@@ -6114,6 +6145,8 @@ mod cpu_listless_tests;
 mod light_walk_tests;
 #[cfg(test)]
 mod register_words_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod walk_cuts_tests;
 
 #[cfg(test)]
 mod tail_tests;

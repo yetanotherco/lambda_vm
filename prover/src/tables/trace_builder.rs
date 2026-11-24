@@ -998,6 +998,7 @@ mod host_hoist_tests;
 mod lean_walk_tests;
 #[cfg(test)]
 mod lt_merge_tests;
+pub mod walk_cuts;
 mod windowed;
 use blocks::{BlockVec, block_len};
 use compact_branch::CompactBranch;
@@ -1007,6 +1008,7 @@ use compact_eq::CompactEq;
 pub(crate) use finish::hand_on_order_first;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 pub use host_hoist::HostHoist;
+pub use walk_cuts::WalkCuts;
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
@@ -1683,6 +1685,19 @@ fn collect_cpu_ops_into(
     first: usize,
     cpu_ops: &mut Vec<CpuOperation>,
 ) -> Result<(), Error> {
+    collect_cpu_ops_checked_into::<false>(logs, decode, first, cpu_ops)
+}
+
+/// [`collect_cpu_ops_into`]; with `REFUSE_HALT` a halting cycle
+/// (`next_pc == 0`) is refused as its log is read
+/// ([`Error::HaltInNonFinalEpoch`]): a window that is not the run's last
+/// checked without a pass of its own (`LAMBDA_VM_WALK_CUTS=prescan`).
+fn collect_cpu_ops_checked_into<const REFUSE_HALT: bool>(
+    logs: &[Log],
+    decode: &DecodeTable,
+    first: usize,
+    cpu_ops: &mut Vec<CpuOperation>,
+) -> Result<(), Error> {
     clock::check_clock(
         clock::window_max_timestamp(first, logs.len()),
         "the run's walk",
@@ -1693,6 +1708,9 @@ fn collect_cpu_ops_into(
     // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
+        if REFUSE_HALT && log.next_pc == 0 {
+            return Err(Error::HaltInNonFinalEpoch);
+        }
         let timestamp = ((first + i) as u64) * 4 + 4;
         let row = decode
             .row(log.current_pc)
