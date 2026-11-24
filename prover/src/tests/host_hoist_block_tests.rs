@@ -2,7 +2,8 @@
 //! hoisted part on is the block proved with none, under the word memory
 //! format (pages one table a page and in runs) and the split format, with a
 //! private input across two pages: the same partition, heights, counts,
-//! output and group roots, the proof verifies, and under the deterministic
+//! output and group roots, the proof verifies (in record mode, the default,
+//! the hoisted final state built once), and under the deterministic
 //! grind (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once a process: run alone)
 //! the same bytes. The proving tests run where a block can be proved (the
 //! box's lib run and CI).
@@ -51,6 +52,11 @@ fn bytes(proof: &BlockWhirProof) -> Vec<u8> {
 
 #[test]
 fn the_host_hoist_proves_the_same_block() {
+    use crate::tables::trace_builder::host_hoist::calls;
+    let _turn = calls::turn();
+    // Record mode unless the walkers or the history are turned off.
+    let record = std::env::var("LAMBDA_VM_BLOCK_WALKERS").map_or(true, |v| v.trim() != "0")
+        && std::env::var("LAMBDA_VM_EXEC_HISTORY").map_or(true, |v| v.trim() != "0");
     let opts = ProofOptions::default_test_options();
     for (what, format) in [
         (
@@ -72,8 +78,19 @@ fn the_host_hoist_proves_the_same_block() {
                 .with_page_run(0),
         ),
     ] {
+        let _ = calls::take_states();
         let (elf, off) = proved(&format, HostHoist::default());
+        assert_eq!(
+            calls::take_states(),
+            0,
+            "{what}: off never hoists the state"
+        );
         let (_, on) = proved(&format, HostHoist::all());
+        assert_eq!(
+            calls::take_states(),
+            usize::from(record),
+            "{what}: the state hoisted once in record mode"
+        );
         assert!(
             matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
             "{what}: hoisted verifies"

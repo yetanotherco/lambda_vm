@@ -8,6 +8,10 @@
 //! - `image`: the builder writes the initial image a run of bytes at a time
 //!   (a copy a page) instead of a byte at a time, and maps the walk's memory
 //!   state from it on the pool, a page a job, so the walk starts sooner.
+//! - `state`: in record mode, the finish's memory state, the windows'
+//!   last step, is built on the builder's setup state instead of mapping the
+//!   image again, its new pages allocated and filled on the pool, and the
+//!   run's end read as the history keeps its timestamps.
 
 use crate::Error;
 
@@ -20,27 +24,31 @@ pub struct HostHoist {
     /// The builder's image written a run at a time, its memory state mapped
     /// on the pool.
     pub image: bool,
+    /// Record mode's final memory state built on the setup state, its new
+    /// pages on the pool.
+    pub state: bool,
 }
 
 impl HostHoist {
     /// The knob's words.
-    pub(crate) const WORDS: &'static str = "pages, image";
+    pub(crate) const WORDS: &'static str = "pages, image, state";
 
     /// Every part on.
     pub fn all() -> Self {
         Self {
             pages: true,
             image: true,
+            state: true,
         }
     }
 
     /// Whether any part is on.
     pub fn any(self) -> bool {
-        self.pages || self.image
+        self.pages || self.image || self.state
     }
 
     /// The knob's reading: unset or empty, no part; else a comma-separated
-    /// list of parts (`pages`, `image`). A word it does not take refuses the prove.
+    /// list of parts (`pages`, `image`, `state`). A word it does not take refuses the prove.
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, Error> {
         let mut hoist = Self::default();
         let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
@@ -50,6 +58,7 @@ impl HostHoist {
             match word {
                 "pages" => hoist.pages = true,
                 "image" => hoist.image = true,
+                "state" => hoist.state = true,
                 _ => {
                     return Err(Error::Prover(format!(
                         "LAMBDA_VM_HOST_HOIST={value}: a comma-separated list of {} (unset: \
@@ -69,10 +78,14 @@ impl HostHoist {
 
     /// The parts on, as the knob names them, or `none`.
     pub fn describe(self) -> String {
-        let parts: Vec<&str> = [(self.pages, "pages"), (self.image, "image")]
-            .into_iter()
-            .filter_map(|(on, word)| on.then_some(word))
-            .collect();
+        let parts: Vec<&str> = [
+            (self.pages, "pages"),
+            (self.image, "image"),
+            (self.state, "state"),
+        ]
+        .into_iter()
+        .filter_map(|(on, word)| on.then_some(word))
+        .collect();
         if parts.is_empty() {
             "none".to_string()
         } else {
@@ -111,6 +124,28 @@ pub(crate) mod calls {
     /// The layout computed from whole pages (`page_configs_hoisted`).
     pub(crate) fn note_hoisted() {
         HOISTED.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Final memory states built hoisted, process-wide (they are built on
+    /// the walk's record thread): a test that reads it holds its own lock.
+    static STATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A final memory state built hoisted (`finish_state_hoisted`).
+    pub(crate) fn note_state() {
+        STATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The final states built hoisted since the last take; reset.
+    pub(crate) fn take_states() -> usize {
+        STATES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Tests that read [`take_states`] take turns through this.
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// This test's turn at the final-state counter.
+    pub(crate) fn turn() -> std::sync::MutexGuard<'static, ()> {
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// `(by byte, hoisted)` since the last take, and both reset.
@@ -156,9 +191,18 @@ mod tests {
             }
         );
         assert_eq!(image.describe(), "image");
-        let both = HostHoist::parse(Some("image,pages")).unwrap();
-        assert_eq!(both, HostHoist::all());
-        assert_eq!(both.describe(), "pages,image");
+        let state = HostHoist::parse(Some("state")).unwrap();
+        assert_eq!(
+            state,
+            HostHoist {
+                state: true,
+                ..HostHoist::default()
+            }
+        );
+        assert_eq!(state.describe(), "state");
+        let all = HostHoist::parse(Some("state,image,pages")).unwrap();
+        assert_eq!(all, HostHoist::all());
+        assert_eq!(all.describe(), "pages,image,state");
     }
 
     #[test]

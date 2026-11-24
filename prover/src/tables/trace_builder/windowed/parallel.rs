@@ -734,6 +734,24 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         light: builder.light_walks().0,
         route: builder.light_walks().1,
     });
+    // Record mode with the final state hoisted (`LAMBDA_VM_HOST_HOIST=state`):
+    // the builder's setup state, the image mapped, is the finish's state's
+    // base instead of mapping the image again. Untouched before the run's
+    // first window, which `install_walked` replaces with the finish's state.
+    let base = if record.is_some() && builder.emitted.host_hoist.state {
+        if builder.cycles != 0 {
+            return Err(Error::Prover(format!(
+                "the finish's state hoisted needs the setup state, but {} cycles were walked",
+                builder.cycles
+            )));
+        }
+        Some(std::mem::replace(
+            &mut builder.memory_state,
+            MemoryState::new(),
+        ))
+    } else {
+        None
+    };
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;
@@ -768,6 +786,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     check_tx,
                     job_tx,
                     permit_tx,
+                    base,
                 ),
                 None => pass_thread(
                     decode,
@@ -1100,6 +1119,7 @@ fn record_thread<W: Into<ExecWindow>>(
     check: Option<SyncSender<CheckWindow>>,
     jobs: SyncSender<Ticket>,
     permits: SyncSender<()>,
+    mut base: Option<MemoryState>,
 ) -> Result<PassEnd, Error> {
     fn stopped<T>(_: T) -> Error {
         Error::Prover(WALKERS_STOPPED.into())
@@ -1181,7 +1201,10 @@ fn record_thread<W: Into<ExecWindow>>(
             let end = end.ok_or_else(|| {
                 Error::Prover("record mode: the run's last window came without its end".into())
             })?;
-            let state = Arc::new(finish_state(&end, &history, image, lean));
+            let state = Arc::new(match base.take() {
+                Some(base) => finish_state_hoisted(&end, &history, image, base, lean)?,
+                None => finish_state(&end, &history, image, lean),
+            });
             if let Some(after) = waiting.take() {
                 let _ = after.send(After::Finish {
                     registers: registers.clone(),
@@ -1247,6 +1270,144 @@ fn by_word(cells: &[(u64, u64)]) -> Vec<(u64, u64)> {
     }
     words.into_iter().collect()
 }
+
+/// One 64 KiB shadow page of the run's end at the last window's start, read
+/// where [`finish_state`] expands it: its timestamps as the history keeps
+/// them (a byte's, or a word's for each of its bytes), its bytes, and the
+/// last window's first cells on it (by offset), which override both.
+struct ShadowPage<'e> {
+    base: u64,
+    stamps: &'e [u32],
+    /// Bytes a stamp: 1 under the byte history, a word's under the word one.
+    per_stamp: usize,
+    values: Vec<u8>,
+    undo: &'e [(usize, u8, u64)],
+}
+
+impl ShadowPage<'_> {
+    /// Each offset's `(value, timestamp)` at the window's start whose
+    /// timestamp is not 0, in offset order: [`finish_state`]'s cells.
+    fn for_each_stamped(&self, mut f: impl FnMut(usize, u8, u64)) {
+        let mut undo = self.undo.iter().peekable();
+        for (off, &value) in self.values.iter().enumerate() {
+            let ts = match undo.peek() {
+                Some(&&(at, _, before)) if at == off => {
+                    undo.next();
+                    before
+                }
+                _ => u64::from(self.stamps[off / self.per_stamp]),
+            };
+            if ts > 0 {
+                f(off, value, ts);
+            }
+        }
+    }
+
+    /// Whether any offset holds a timestamp other than 0.
+    fn any_stamped(&self) -> bool {
+        if self.undo.is_empty() {
+            return self.stamps.iter().any(|&t| t > 0);
+        }
+        let mut any = false;
+        self.for_each_stamped(|_, _, _| any = true);
+        any
+    }
+}
+
+/// [`finish_state`] with its serial work hoisted (`LAMBDA_VM_HOST_HOIST=state`):
+/// `base`, the builder's setup state (the image mapped, untouched), in place
+/// of mapping the image again; each page the base lacks allocated and filled
+/// on the pool instead of allocated in turn; and the run's end read as the
+/// history keeps its timestamps instead of expanded a byte at a time. The same
+/// state. A base whose pages or cells are not the image's is refused.
+fn finish_state_hoisted(
+    end: &RunEnd,
+    last: &WindowHistory,
+    image: &PagedMem<u8>,
+    base: MemoryState,
+    lean: bool,
+) -> Result<MemoryState, Error> {
+    use rayon::prelude::*;
+    const PAGE: usize = 1 << 16;
+    #[cfg(test)]
+    crate::tables::trace_builder::host_hoist::calls::note_state();
+    if base.overlay.is_some()
+        || !base.cells.page_bases().eq(image.page_bases())
+        || base.cells.len() != image.len()
+    {
+        return Err(Error::Prover(
+            "the finish's state hoisted: the setup state is not the image's".into(),
+        ));
+    }
+    // The window's first cells, by 64 KiB page, each page's in offset order.
+    let mut undo: BTreeMap<u64, Vec<(usize, u8, u64)>> = BTreeMap::new();
+    for (address, value, ts) in last.first_touches() {
+        undo.entry(address & !(PAGE as u64 - 1)).or_default().push((
+            (address as usize) & (PAGE - 1),
+            value,
+            ts,
+        ));
+    }
+    for cells in undo.values_mut() {
+        cells.sort_unstable_by_key(|&(off, _, _)| off);
+    }
+    let (shadow, per_stamp) = match end {
+        RunEnd::Bytes(end) => (end.shadow.pages(), 1),
+        RunEnd::Words(end) => (
+            end.shadow.pages(),
+            executor::vm::history::WORD_BYTES as usize,
+        ),
+    };
+    // Each shadow page's cells at the window's start; a page holding none
+    // stamped is left out.
+    let mut pages: Vec<ShadowPage<'_>> = shadow
+        .into_par_iter()
+        .filter_map(|(base, stamps)| {
+            let mut values = vec![0u8; PAGE];
+            end.memory().read(base, &mut values);
+            let undo = undo.get(&base).map_or(&[][..], Vec::as_slice);
+            for &(off, value, _) in undo {
+                values[off] = value;
+            }
+            let page = ShadowPage {
+                base,
+                stamps,
+                per_stamp,
+                values,
+                undo,
+            };
+            page.any_stamped().then_some(page)
+        })
+        .collect();
+    pages.sort_unstable_by_key(|page| page.base);
+    let MemoryState { cells, .. } = base;
+    let mut memory = MemoryState {
+        cells,
+        lean,
+        hot: NO_PAGE,
+        missing: std::sync::atomic::AtomicBool::new(false),
+        overlay: None,
+    };
+    let mut bases: Vec<u64> = pages
+        .iter()
+        .map(|page| PagedMem::<(u8, u64)>::page_of(page.base).0)
+        .collect();
+    bases.dedup();
+    memory.cells.fill_pages_on_pool(&bases, |mut state| {
+        let from = pages.partition_point(|page| page.base < state.base());
+        let to = from
+            + pages[from..]
+                .partition_point(|page| page.base - state.base() < DEFAULT_PAGE_SIZE as u64);
+        for page in &pages[from..to] {
+            let at = (page.base - state.base()) as usize;
+            page.for_each_stamped(|off, value, ts| state.set(at + off, (value, ts)));
+        }
+    });
+    Ok(memory)
+}
+
+#[cfg(test)]
+mod state_tests;
 
 /// A window as record mode's check thread takes it.
 struct CheckWindow {

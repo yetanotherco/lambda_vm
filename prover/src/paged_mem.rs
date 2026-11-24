@@ -222,6 +222,54 @@ impl<T: Copy> PagedMem<T> {
         }
     }
 
+    /// Hands each page of `bases` (page-aligned, ascending, distinct) to
+    /// `fill` on the pool, a page a job: the store's own page where it holds
+    /// one, else a new page allocated filled and written inside the job, the
+    /// new pages then added in base order. The store [`Self::page_index_or_insert`]
+    /// on each base, then `fill` on each of those pages, makes.
+    #[cfg(feature = "parallel")]
+    pub fn fill_pages_on_pool(&mut self, bases: &[u64], fill: impl Fn(PageMut<'_, T>) + Sync)
+    where
+        T: Send + Sync,
+    {
+        use rayon::prelude::*;
+        debug_assert!(
+            bases.windows(2).all(|pair| pair[0] < pair[1]),
+            "fill_pages_on_pool: bases ascending and distinct"
+        );
+        debug_assert!(
+            bases
+                .iter()
+                .all(|base| base.is_multiple_of(DEFAULT_PAGE_SIZE as u64)),
+            "fill_pages_on_pool: bases page-aligned"
+        );
+        let value = self.fill;
+        let held = &*self;
+        let new: Vec<(u64, Page<T>)> = bases
+            .par_iter()
+            .filter(|&&base| held.page_index(base).is_none())
+            .map(|&base| {
+                let mut page = Page {
+                    data: vec![value; DEFAULT_PAGE_SIZE].into_boxed_slice(),
+                    occupied: vec![0u64; OCC_WORDS].into_boxed_slice(),
+                };
+                fill(PageMut {
+                    base,
+                    page: &mut page,
+                });
+                (base, page)
+            })
+            .collect();
+        self.pages
+            .par_iter_mut()
+            .filter(|(base, _)| bases.binary_search(base).is_ok())
+            .for_each(|(base, page)| fill(PageMut { base: *base, page }));
+        if !new.is_empty() {
+            self.pages.extend(new);
+            self.pages.sort_unstable_by_key(|(base, _)| *base);
+        }
+    }
+
     /// Base addresses of the pages that hold at least one `set` cell, ascending.
     /// (For a `DEFAULT_PAGE_SIZE`-aligned page, this equals `page_base_for_address`
     /// of every cell in it, so it replaces `cells.keys().map(page_base)`.)
