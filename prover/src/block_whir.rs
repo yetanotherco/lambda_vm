@@ -3327,6 +3327,56 @@ pub struct ExecutorStamps {
     pub pooled_bytes: u64,
     pub pageable_windows: usize,
     pub pageable_bytes: u64,
+    /// The executor thread's page faults and CPU seconds over its windows
+    /// (`getrusage(RUSAGE_THREAD)`; Linux only).
+    pub usage: Option<ThreadUsage>,
+}
+
+/// A thread's page faults and CPU seconds, as `getrusage(RUSAGE_THREAD)`
+/// counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ThreadUsage {
+    pub minor_faults: u64,
+    pub major_faults: u64,
+    pub system: f64,
+    pub user: f64,
+}
+
+impl ThreadUsage {
+    /// The calling thread's counts so far; `None` off Linux or on a failed call.
+    #[cfg(target_os = "linux")]
+    pub fn now() -> Option<Self> {
+        let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `ru` is a valid, zeroed `rusage` the call fills.
+        if unsafe { libc::getrusage(libc::RUSAGE_THREAD, ru.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: filled by the successful call above (and zeroed before it).
+        let ru = unsafe { ru.assume_init() };
+        let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        Some(Self {
+            minor_faults: u64::try_from(ru.ru_minflt).unwrap_or(0),
+            major_faults: u64::try_from(ru.ru_majflt).unwrap_or(0),
+            system: secs(ru.ru_stime),
+            user: secs(ru.ru_utime),
+        })
+    }
+
+    /// The calling thread's counts so far; `None` off Linux.
+    #[cfg(not(target_os = "linux"))]
+    pub fn now() -> Option<Self> {
+        None
+    }
+
+    /// What was counted from `before` to `self`.
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            minor_faults: self.minor_faults.saturating_sub(before.minor_faults),
+            major_faults: self.major_faults.saturating_sub(before.major_faults),
+            system: self.system - before.system,
+            user: self.user - before.user,
+        }
+    }
 }
 
 impl ExecutorStamps {
@@ -3367,6 +3417,19 @@ impl ExecutorStamps {
             self.windows,
             send,
             self.setup + self.run + self.handoff,
+        )
+        .replace(
+            '\n',
+            &(self
+                .usage
+                .map(|u| {
+                    format!(
+                        " · faults minor {} major {} · system {:.2}s · user {:.2}s",
+                        u.minor_faults, u.major_faults, u.system, u.user
+                    )
+                })
+                .unwrap_or_default()
+                + "\n"),
         )
     }
 }
@@ -9340,6 +9403,7 @@ fn prove_streamed(
                 own.logs_pooled = pool_exec_logs()
                     && kind == EngineKind::Fast
                     && multilinear::pinned::ready();
+                let usage_before = ThreadUsage::now();
                 loop {
                     let t = Instant::now();
                     if own.logs_pooled {
@@ -9432,6 +9496,9 @@ fn prove_streamed(
                     ProducerWaits::add(&waits.executor_send, t);
                 }
                 let executed = start.elapsed().as_secs_f64();
+                own.usage = usage_before
+                    .zip(ThreadUsage::now())
+                    .map(|(before, after)| after.since(before));
                 drop(executor);
                 if let Some(check) = shadow {
                     let counts = check.finish().map_err(Error::Execution)?;
@@ -13235,7 +13302,7 @@ mod keccak_rnd_first_tests {
 mod producer_report_tests {
     use super::{
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
-        ExecutorStamps, ProducerStamps, StreamTable,
+        ExecutorStamps, ProducerStamps, StreamTable, ThreadUsage,
     };
     use super::{
         exec_mode_from, parse_exec_history, parse_exec_history_check, parse_light_walk,
@@ -13379,8 +13446,51 @@ mod producer_report_tests {
                  (134 windows, logs moved) · send-blocked 3.50s · own 2.55s"
             )
         );
+        // The thread's faults and seconds after it.
+        stamps.executor.usage = Some(ThreadUsage {
+            minor_faults: 3400,
+            major_faults: 0,
+            system: 0.21,
+            user: 3.1,
+        });
+        assert_eq!(
+            line(&stamps).as_deref(),
+            Some(
+                "BLOCK EXECUTOR: started at 0.02s · setup 0.01s · execute 2.50s · hand-off 0.04s \
+                 (134 windows, logs moved) · send-blocked 3.50s · own 2.55s · faults minor 3400 major 0 \
+                 · system 0.21s · user 3.10s"
+            )
+        );
         stamps.executor = ExecutorStamps::default();
         assert_eq!(line(&stamps), None);
+    }
+
+    /// A thread's counts between two readings, field by field; read on
+    /// Linux, `None` elsewhere.
+    #[test]
+    fn a_threads_usage_is_counted_between_two_readings() {
+        let before = ThreadUsage {
+            minor_faults: 10,
+            major_faults: 1,
+            system: 0.5,
+            user: 2.0,
+        };
+        let after = ThreadUsage {
+            minor_faults: 25,
+            major_faults: 1,
+            system: 0.75,
+            user: 3.5,
+        };
+        assert_eq!(
+            after.since(before),
+            ThreadUsage {
+                minor_faults: 15,
+                major_faults: 0,
+                system: 0.25,
+                user: 1.5,
+            }
+        );
+        assert_eq!(ThreadUsage::now().is_some(), cfg!(target_os = "linux"));
     }
 
     /// The readout's two producer lines: what each thread waited on, and the
