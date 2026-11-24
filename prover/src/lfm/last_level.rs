@@ -57,7 +57,8 @@ pub const LAST_FINAL_ENV: &str = "LAMBDA_VM_LAST_LEVEL_FINAL";
 /// one the prover made). Unset is `rkyv`, today's archive.
 pub const LAST_WIRE_ENV: &str = "LAMBDA_VM_LAST_LEVEL_WIRE";
 
-/// The first fold [`LAST_FIRST_FOLD_ENV`] is measured at: D-SIZE's row 2.
+/// The first fold [`LAST_FIRST_FOLD_ENV`] is measured at: a round-0 leaf of
+/// 16 values a polynomial, where today's first fold of 6 opens 64.
 pub const LAST_FIRST_FOLD_MEASURED: u8 = 4;
 
 /// The final polynomial's width [`LAST_FINAL_ENV`] is measured at: the BLAKE3
