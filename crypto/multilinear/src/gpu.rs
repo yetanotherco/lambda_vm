@@ -1394,6 +1394,60 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     f()
 }
 
+/// Whether phase B may split its groups over two cards
+/// ([`math_cuda::device::two_card_split_ready`], `LAMBDA_VM_TWO_CARD_SPLIT`):
+/// the split on, its second backend and pool started; `false` without a
+/// device build.
+#[cfg(feature = "cuda")]
+pub fn two_card_split_ready() -> bool {
+    math_cuda::device::two_card_split_ready()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn two_card_split_ready() -> bool {
+    false
+}
+
+/// Runs `f` as the split's second driver's work: in its own pool, every
+/// device call on the second card ([`math_cuda::device::on_second_card`]);
+/// `f()` here without a device build.
+#[cfg(feature = "cuda")]
+pub fn on_second_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    math_cuda::device::on_second_card(f)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn on_second_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    f()
+}
+
+/// Runs `f` as the split's second driver's openings, in their own pool on the
+/// second card ([`math_cuda::device::on_second_card_openings`]); `f()` here
+/// without a device build.
+#[cfg(feature = "cuda")]
+pub fn on_second_card_openings<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    math_cuda::device::on_second_card_openings(f)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn on_second_card_openings<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    f()
+}
+
+/// Runs `f` on this thread in the split's second role: every device call on
+/// the second card; for work with no parallel iterator of its own (an
+/// upload). `f()` without a device build.
+#[cfg(feature = "cuda")]
+pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
+    let _role = math_cuda::device::enter_role(math_cuda::device::DeviceRole::Second);
+    f()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Marks this thread's stream draws as background work until the guard drops.
 #[cfg(feature = "cuda")]
 pub fn background_streams() -> BackgroundStreams {
