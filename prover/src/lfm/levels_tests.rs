@@ -2117,11 +2117,15 @@ fn rta_one_run(
         end - t.base
     );
     print_level_chains(t, l1_prove_from);
-    // Each level's proof bytes, digested: equal across arms that only move
-    // when host work runs (under `LAMBDA_VM_DETERMINISTIC_GRIND=1`).
+    // The base's and each level's proof bytes, digested: equal across arms
+    // that only move when host work runs (under
+    // `LAMBDA_VM_DETERMINISTIC_GRIND=1`).
+    let base_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes");
     println!(
-        "RTA PROOF DIGEST: deterministic grind {} · {}",
+        "RTA PROOF DIGEST: deterministic grind {} · base {} B {} · {}",
         std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        base_bytes.len(),
+        &blake3::hash(&base_bytes).to_hex()[..16],
         run.proofs
             .iter()
             .enumerate()
