@@ -372,6 +372,49 @@ pub(crate) fn lfm_fill_executed_prefilled(
     hold_chips: bool,
     lean: Option<super::b3l_tables::LeanPrefilled>,
 ) -> LfmFilled {
+    lfm_fill_executed_parts(
+        program,
+        execution,
+        hasher,
+        execute_secs,
+        plan,
+        hold_chips,
+        lean,
+        false,
+    )
+}
+
+/// [`lfm_fill_executed_prefilled`] with, when `at_once` (the levels'
+/// `LAMBDA_VM_LEVELS_FILL_PARTS`), its three parts run at the same time on
+/// threads of their own: the fixed chip set's traces on this thread, the lean
+/// BLAKE3 tables on one, the one-output selects' and the cap tables on
+/// another. Each part reads records of its own (the chips' traces read none
+/// of the lean records), so the same tables from the same records: the same
+/// [`LfmFilled`]. A part that panics panics here, at the join, as it does
+/// today in series. The split stamps keep their meaning: the chips' seconds
+/// and the fill's past them; the lean tables' and the selects' and caps' own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lfm_fill_executed_parts(
+    program: &LfmProgram,
+    execution: LfmExecution,
+    hasher: HasherKind,
+    execute_secs: f64,
+    plan: &super::merge::MergePlan,
+    hold_chips: bool,
+    lean: Option<super::b3l_tables::LeanPrefilled>,
+    at_once: bool,
+) -> LfmFilled {
+    if at_once {
+        return lfm_fill_parts_at_once(
+            program,
+            execution,
+            hasher,
+            execute_secs,
+            plan,
+            hold_chips,
+            lean,
+        );
+    }
     let LfmExecution {
         mut records,
         public_words,
@@ -431,6 +474,112 @@ pub(crate) fn lfm_fill_executed_prefilled(
     // here on; holding the records as well doubles the values through the card
     // phase.
     drop(records);
+    LfmFilled {
+        traces,
+        public_words,
+        hasher,
+        execute_secs,
+        fill_secs,
+        exec_split,
+        b3l,
+        chips,
+        lean_prefilled,
+    }
+}
+
+/// [`lfm_fill_executed_parts`]' three parts at once. The lean records are
+/// taken before the chips' traces are built (they read none of them); the
+/// holding the lean tables take is read on this thread, where a test's
+/// override lives ([`super::b3l_tables::fill_hold`]).
+fn lfm_fill_parts_at_once(
+    program: &LfmProgram,
+    execution: LfmExecution,
+    hasher: HasherKind,
+    execute_secs: f64,
+    plan: &super::merge::MergePlan,
+    hold_chips: bool,
+    lean: Option<super::b3l_tables::LeanPrefilled>,
+) -> LfmFilled {
+    use super::b3l_tables::{
+        build_b3l_traces_held, build_b3l_traces_prefilled, build_cap_tables, build_mux_tables,
+        fill_hold,
+    };
+    let LfmExecution {
+        mut records,
+        public_words,
+        memory,
+        split: exec_split,
+    } = execution;
+    let b3l_records = core::mem::take(&mut records.b3l);
+    let mux_records = core::mem::take(&mut records.mux);
+    let cap_records = core::mem::take(&mut records.cap);
+    let read_records = core::mem::take(&mut records.cap_read);
+    // As in series: a diagnostic surface nothing on the proving path reads.
+    drop(memory);
+    let selects_empty = mux_records.is_empty() && cap_records.is_empty() && read_records.is_empty();
+    // A program with no compression has no lean tables (both builders return
+    // `None` at zero rows): its selects and caps are not built, only checked
+    // absent, as in series.
+    let has_lean = program.groups.b3l.real_rows > 0;
+    let hold = fill_hold();
+    // A part's panic is resumed here, as the same panic in series would be.
+    fn joined<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+        h.join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+    let t = Instant::now();
+    let (traces, chips, chips_secs, (b3l, lean_prefilled, tables_secs), selects) =
+        std::thread::scope(|scope| {
+            let lean_part = scope.spawn(move || {
+                let t = Instant::now();
+                let prefilled =
+                    lean.and_then(|p| build_b3l_traces_prefilled(program, &b3l_records, p));
+                let lean_prefilled = prefilled.is_some();
+                let b3l = prefilled.or_else(|| build_b3l_traces_held(program, &b3l_records, hold));
+                drop(b3l_records);
+                (b3l, lean_prefilled, t.elapsed().as_secs_f64())
+            });
+            let selects_part = has_lean.then(|| {
+                scope.spawn(move || {
+                    let t = Instant::now();
+                    let muxes = build_mux_tables(program, &mux_records);
+                    let (caps, cap_reads) = build_cap_tables(program, &cap_records, &read_records);
+                    drop((mux_records, cap_records, read_records));
+                    (muxes, caps, cap_reads, t.elapsed().as_secs_f64())
+                })
+            });
+            let t = Instant::now();
+            let chips = (hold_chips && plan.is_empty())
+                .then(|| super::chip_records::LfmChipValues::take(&mut records));
+            let traces = match chips {
+                Some(_) => super::trace::build_traces_chips_held(program, &records, hasher),
+                None => build_traces_with_merge(program, &records, hasher, plan),
+            };
+            let chips_secs = t.elapsed().as_secs_f64();
+            // The chips' records are dead once their traces exist.
+            drop(records);
+            let lean = joined(lean_part);
+            let selects = selects_part.map(joined);
+            (traces, chips, chips_secs, lean, selects)
+        });
+    let mut b3l = b3l;
+    let selects_secs = match (b3l.as_mut(), selects) {
+        (Some(lean), Some((muxes, caps, cap_reads, secs))) => {
+            lean.muxes = muxes;
+            (lean.caps, lean.cap_reads) = (caps, cap_reads);
+            secs
+        }
+        _ => {
+            assert!(
+                selects_empty,
+                "one-output selects or cap reads in a program with no lean compression"
+            );
+            0.0
+        }
+    };
+    let fill_secs = t.elapsed().as_secs_f64();
+    LAST_FILL_SPLIT.with(|c| c.set(Some((chips_secs, (fill_secs - chips_secs).max(0.0)))));
+    LAST_LEAN_PARTS.with(|c| c.set(Some((tables_secs, selects_secs))));
     LfmFilled {
         traces,
         public_words,

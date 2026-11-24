@@ -825,6 +825,69 @@ fn the_blake3_driver_with_level_2_streamed_proves_the_same_level_bytes() {
     }
 }
 
+/// Each level's fill with its three parts at once
+/// (`LAMBDA_VM_LEVELS_FILL_PARTS`) forced on this thread as given, the small
+/// BLAKE3 block driven under it, and each level's proof bytes against
+/// [`prove_levels`] over the same base. The run, for its stamps.
+fn driven_under_chain_steps(fill_parts: bool) -> super::levels::LevelsRun {
+    use super::levels::{prove_block_levels, set_fill_parts_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_fill_parts_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        set_fill_parts_for_test(Some(fill_parts));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS CHAIN STEPS (fill parts {fill_parts}) IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+    run
+}
+
+/// ★ Each level's fill with its three parts at once
+/// (`LAMBDA_VM_LEVELS_FILL_PARTS`) is the same fill: a small BLAKE3 block
+/// driven with the knob on proves each level's bytes as [`prove_levels`] does
+/// over the same base. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed
+/// identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_its_fill_parts_at_once_proves_the_same_level_bytes() {
+    let run = driven_under_chain_steps(true);
+    assert!(run.proofs.len() >= 2, "level 2 filled too");
+}
+
 /// The level-2 streaming knob's name; it is on by default, and only `0`
 /// turns it off.
 #[test]
@@ -1514,7 +1577,8 @@ fn rta_a_real_block_through_its_levels() {
 
 /// Level 1's and level 2's host chains, on the driver's clock: what each
 /// waited for before its prove could start, so a lever on the chain reads as
-/// a moved stamp.
+/// a moved stamp (the levels' chain steps, `LAMBDA_VM_LEVELS_FILL_PARTS`,
+/// `LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY`).
 fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
     let p = t.plan_split;
     println!(
@@ -1549,7 +1613,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
     println!(
         "RTA LEVEL1 CHAIN: planned {:.3}s · emitted {:.3}s · front {front:.3}s · last piece {last:.3}s · \
          last piece could land at {could:.3}s · fill {:.3}s · builder ended at {} · commit {commit:.3}s · \
-         base end {:.3}s · slack {} · chain floor {} · prove from {l1_prove_from:.3}s",
+         base end {:.3}s · slack {} · chain floor {} · prove from {l1_prove_from:.3}s · fill parts {}",
         t.planned,
         t.emitted,
         l1.fill,
@@ -1557,6 +1621,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
         t.base,
         fmt(t.builder_end.map(|b| t.base - b)),
         fmt(floor),
+        super::levels::fill_parts(),
     );
     let l2 = t.levels.get(1).copied().unwrap_or_default();
     if let (Some(ns), Some(nc), Some(b)) = (t.next_stream, t.next_commit, t.builds.get(1)) {
