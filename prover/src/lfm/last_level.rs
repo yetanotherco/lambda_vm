@@ -28,14 +28,15 @@
 //! [`super::levels::level_levers`]), and a lever asked for there is refused.
 //! Each knob can turn its own lever off (or, under BLAKE3, back on) in a
 //! process, for measurement and as a fallback; an unset knob is the family's
-//! pinned value. Both sides of one process read the same value
-//! ([`last_level`]): the levels' prover gives it to the last level only, and
-//! the levels' verifier re-derives the last level's artifacts under it.
-//! Nothing is read from a proof: the levers are folded into the last level's
-//! config and identity, which its statement absorbs, so a proof made under
-//! one format is refused under any other. The public verifier names the
-//! pinned format and refuses a process whose knobs ask for another
-//! (`levels::check_process_format`).
+//! pinned value. The levels' prover reads the process's value
+//! ([`last_level`]) once and gives it to the last level only. The public
+//! verifier never reads it: it names the family's pinned format, derives the
+//! last level's artifacts under that, and refuses a process whose knobs
+//! resolve to another before deriving anything
+//! (`levels::check_process_format`). Nothing is read from a proof: the levers
+//! are folded into the last level's config and identity, which its statement
+//! absorbs, so a proof made under one format is refused under any other.
+//! Only the formats proved end to end are taken ([`LastLevel::is_tested`]).
 //!
 //! # The file
 //!
@@ -131,6 +132,21 @@ impl LastLevel {
     /// Whether every lever is off.
     pub fn is_off(&self) -> bool {
         *self == Self::OFF
+    }
+
+    /// Whether this format has been proved and verified end to end: every
+    /// lever off, every lever on, or one lever alone. The two-lever mixes
+    /// the knobs can reach are refused until they are.
+    pub fn is_tested(&self) -> bool {
+        let on = [
+            self.evaluated,
+            self.first_fold.is_some(),
+            self.final_poly != FinalPoly::Off,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        on != 2 && self.code().is_some()
     }
 
     /// The levers the last level proves under: every level's
@@ -241,7 +257,9 @@ pub fn evaluated_word(word: Option<&str>) -> Result<Option<bool>, String> {
         None => Ok(None),
         Some("0") | Some("off") => Ok(Some(false)),
         Some("1") | Some("on") => Ok(Some(true)),
-        Some(other) => Err(format!("{LAST_EVALUATED_ENV}={other:?}: expected 0 or 1")),
+        Some(other) => Err(format!(
+            "{LAST_EVALUATED_ENV}={other:?}: expected 0, 1, off or on"
+        )),
     }
 }
 
@@ -389,7 +407,8 @@ pub fn last_level_file(
 /// that checks the last level's format `format`. Refused before anything is
 /// decoded unless the file opens with the magic, is of [`LAST_FILE_VERSION`]
 /// and names `format`'s code: a file made in another format is refused with
-/// both formats named. The body must be exactly one proof's encoding. The
+/// both formats named. A compact body must be exactly one proof's encoding;
+/// an archive body is validated by rkyv and is not held to one encoding. The
 /// proof read is then verified in full by the caller; the header decides
 /// nothing the verifier checks.
 pub fn read_last_level_file(

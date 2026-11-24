@@ -19,7 +19,7 @@
 //! # Never from a proof
 //!
 //! Every level's program and artifacts come from the plan (the trusted ELF and
-//! the statement) and the level below's artifacts ([`derive_levels`]): a
+//! the statement) and the level below's artifacts ([`derive_levels_last`]): a
 //! verifier derives them all, with every prepared stack committed on the host,
 //! and checks only the last proof ([`verify_levels`]); each level below is
 //! checked by the one above it, in-guest. A proof is read only to fill the next
@@ -125,11 +125,20 @@ pub fn is_last_level(stop: LevelStop, index: usize, groups: usize) -> bool {
     }
 }
 
+/// Only a format proved end to end is taken ([`LastLevel::is_tested`]:
+/// every lever off, every lever on, or one lever alone).
+///
 /// The last level's own format is the BLAKE3 levels' alone: every lever of
 /// it is tested there (the lean tables, the binary trees); under
 /// [`WlfmFamily::P1`] (4-ary trees) any lever on ([`LastLevel::OFF`] is
 /// the only format there) is refused rather than proved untested.
 pub fn check_last_level_family(last: LastLevel, family: WlfmFamily) -> Result<(), String> {
+    if !last.is_tested() {
+        return Err(format!(
+            "the last level's format ({last}) has not been proved end to end: every lever off, \
+             every lever on or one lever alone"
+        ));
+    }
     if family == WlfmFamily::P1 && !last.is_off() {
         return Err(format!(
             "the last level's own format ({last}) is the BLAKE3 levels' alone, not {family:?}'s"
@@ -1329,11 +1338,13 @@ fn child_of_build(plan: &WhirBlockPlan, build: &WlfmBuild) -> WlfmChild {
     }
 }
 
-/// ★ Every level of `plan`'s chain, its programs emitted and built: ONE
-/// derivation for the prover (`on_host = false`: prepared commits on the
-/// card) and the verifier (`on_host = true`). `plan` must be one leaf over
-/// every group.
-pub fn derive_levels(
+/// Every level of `plan`'s chain under the default stop, the last level
+/// under the process's last-level format: the tests' derivation (the
+/// verifier derives through [`derive_levels_last`] under its named format).
+/// `on_host = false` commits the prepared stacks on the card. `plan` must be
+/// one leaf over every group.
+#[cfg(test)]
+pub(crate) fn derive_levels(
     plan: &WhirBlockPlan,
     family: WlfmFamily,
     on_host: bool,
@@ -1342,8 +1353,10 @@ pub fn derive_levels(
 }
 
 /// [`derive_levels`] under the chain stop `stop`, the last level under the
-/// process's last-level format ([`super::last_level::last_level`]).
-pub fn derive_levels_to(
+/// process's last-level format ([`super::last_level::last_level`]); test
+/// only.
+#[cfg(test)]
+pub(crate) fn derive_levels_to(
     plan: &WhirBlockPlan,
     family: WlfmFamily,
     stop: LevelStop,
@@ -1353,7 +1366,11 @@ pub fn derive_levels_to(
     derive_levels_last(plan, family, stop, last, on_host)
 }
 
-/// [`derive_levels_to`] with the last level under `last`.
+/// ★ Every level of `plan`'s chain, its programs emitted and built, the last
+/// level under the NAMED format `last`: ONE derivation for the prover
+/// (`on_host = false`: prepared commits on the card) and the verifier
+/// (`on_host = true`). It reads no knob. `plan` must be one leaf over every
+/// group.
 pub fn derive_levels_last(
     plan: &WhirBlockPlan,
     family: WlfmFamily,
@@ -1640,6 +1657,7 @@ fn verify_block_levels_pinned(
     last: &WlfmProof,
 ) -> Result<(), String> {
     check_process_format(family, last_level)?;
+    check_last_level_family(last_level, family)?;
     let plan = verifier_level_plan(elf, format, statement, family, cap_mux)?;
     verify_levels_to(&plan, family, stop, last_level, last)
 }
@@ -2078,9 +2096,12 @@ pub fn prove_block_levels(
 
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
-    // The last level's own format, read once: the same value the verifier's
-    // derivation reads ([`derive_levels_to`]).
+    // The last level's own format, read once (the process's knobs over the
+    // family's pinned format: what the public verifier names unless a knob
+    // turns a lever off), and refused now, before the base proves, when the
+    // family cannot take it.
     let last = super::last_level::last_level(family)?;
+    check_last_level_family(last, family)?;
     // Level 1's groups arrive as a streamed base's phase B opens them; the
     // whole-run base prover opens them without telling anyone.
     if options.window_log2.is_none() {

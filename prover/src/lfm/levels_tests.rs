@@ -2735,7 +2735,15 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         let end = rest.find("\n}\n").expect("a body's end");
         rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
     };
-    let knobs = ["share_inverse()", "cap_mux()", "b3_base_", "std::env"];
+    // `last_level(` and `last_wire(` are the process's last-level knobs.
+    let knobs = [
+        "share_inverse()",
+        "cap_mux()",
+        "b3_base_",
+        "std::env",
+        "last_level(",
+        "last_wire(",
+    ];
     for public in ["verify_block_levels", "verify_block_levels_at"] {
         let b = body(public);
         assert!(
@@ -2786,6 +2794,33 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
             "verify_block_levels passes {constant}"
         );
     }
+    // The file entry: read for the family's pinned format, then the pinned
+    // entry; no knob read.
+    assert!(src.contains("\npub fn verify_block_levels_file("));
+    let file = body("verify_block_levels_file");
+    for call in [
+        "read_last_level_file(file, LastLevel::pinned(family))?",
+        "verify_block_levels(elf, statement, family, &last)",
+    ] {
+        assert!(
+            file.contains(call),
+            "verify_block_levels_file must contain `{call}`"
+        );
+    }
+    for knob in knobs {
+        assert!(
+            !file.contains(knob),
+            "verify_block_levels_file reads {knob}"
+        );
+    }
+    // The derivations that read the process's last-level format are test
+    // only.
+    for derive in ["derive_levels", "derive_levels_to"] {
+        assert!(
+            src.contains(&format!("#[cfg(test)]\npub(crate) fn {derive}(")),
+            "{derive} is test only"
+        );
+    }
     for (function, call) in links {
         assert!(
             body(function).contains(call),
@@ -2799,6 +2834,8 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
     // A knob is read by a bare call; `plan.cap_mux()` reads the plan's.
     let reads = |b: &str, knob: &str| b.match_indices(knob).any(|(at, _)| !b[..at].ends_with('.'));
     for function in [
+        "verify_block_levels",
+        "verify_block_levels_at",
         "verify_block_levels_pinned",
         "verifier_level_plan",
         "verifier_level_plan_with",

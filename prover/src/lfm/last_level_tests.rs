@@ -210,6 +210,54 @@ fn the_last_levels_format_is_refused_under_poseidon1() {
     assert!(refused.contains("BLAKE3 levels' alone"), "{refused}");
 }
 
+/// Only a format proved end to end is taken: every lever off, every lever
+/// on and each lever alone pass; the three two-lever mixes the knobs can
+/// reach are refused, by the check, by the preparation it guards and by the
+/// pinned verifier's body.
+#[test]
+fn a_two_lever_last_level_is_refused_until_it_is_tested() {
+    use super::levels::check_last_level_family;
+    for (name, last) in settings() {
+        assert!(last.is_tested(), "{name}");
+    }
+    assert!(LastLevel::OFF.is_tested());
+    let mixes = [
+        LastLevel {
+            evaluated: false,
+            ..ALL_ON
+        },
+        LastLevel {
+            first_fold: None,
+            ..ALL_ON
+        },
+        LastLevel {
+            final_poly: FinalPoly::Off,
+            ..ALL_ON
+        },
+    ];
+    for mix in mixes {
+        assert!(!mix.is_tested(), "{mix}");
+        let e = check_last_level_family(mix, WlfmFamily::B3).expect_err("a mix");
+        assert!(e.contains("not been proved end to end"), "{e}");
+        let refused =
+            super::levels::prepare_as_level(LevelStop::Levels(2), 2, mix, WlfmFamily::B3, |_| {
+                panic!("nothing is prepared under a refused format")
+            })
+            .err()
+            .expect("refused before any preparation");
+        assert!(refused.contains("not been proved end to end"), "{refused}");
+    }
+    let src = include_str!("levels.rs");
+    let at = src
+        .find("fn verify_block_levels_pinned(")
+        .expect("the pinned body");
+    let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+    assert!(
+        body.contains("check_last_level_family(last_level, family)?;"),
+        "the pinned verifier refuses an untested named format"
+    );
+}
+
 /// One binary, one format: the verifier's named last level must be the
 /// process's, both ways; equal passes.
 #[test]
@@ -364,6 +412,32 @@ fn the_last_levels_levers_give_a_sized_round_form_config() {
     }
 }
 
+/// A level's retired trees drop the levels its OWN chain config needs for
+/// the card's coset plan, not the process format's: at a 2^27 stack, 8 under
+/// every level's first fold of 6 and 10 under the last level's first fold of
+/// 4. Skipped when `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS` sets the drop.
+#[test]
+fn a_levels_tree_drop_follows_its_own_first_fold() {
+    if std::env::var_os("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS").is_some() {
+        println!("SKIPPED: LAMBDA_VM_BLOCK_TREE_DROP_LEVELS sets the drop");
+        return;
+    }
+    let shapes = PRODUCTION_SHAPES;
+    let every = level_levers(WlfmFamily::B3);
+    let off =
+        wlfm_config_levers(WlfmRate::Two, &every, Some(SHRINK), &shapes).expect("every level's");
+    let on = wlfm_config_levers(
+        WlfmRate::Two,
+        &ALL_ON.levers(WlfmFamily::B3),
+        Some(SHRINK),
+        &shapes,
+    )
+    .expect("the last level's");
+    assert_eq!((off.format.stack.get(), on.format.stack.get()), (27, 27));
+    assert_eq!(crate::block_whir::tree_drop_for_chain(&off).device, 8);
+    assert_eq!(crate::block_whir::tree_drop_for_chain(&on).device, 10);
+}
+
 // =============================================================================
 // The lean BLAKE3 fixture under the last level's levers
 // =============================================================================
@@ -399,6 +473,11 @@ fn compact(proof: &WlfmProof) -> usize {
 fn the_lean_fixture_proves_under_each_last_level_lever() {
     let program = honest();
     let today = build_last(&program, LastLevel::OFF);
+    assert_eq!(
+        today.artifacts.program_id,
+        super::wlfm::wlfm_program_id(&today.artifacts),
+        "every lever off: the identity is its recomputation"
+    );
     let today_proof = prove_last(&program, &today);
     verify_wlfm(&today.artifacts, &today_proof, &today_proof.public_words)
         .expect("today's proof verifies");
@@ -415,6 +494,13 @@ fn the_lean_fixture_proves_under_each_last_level_lever() {
         let build = build_last(&program, last);
         let a = &build.artifacts;
         assert_ne!(a.program_id, today.artifacts.program_id, "{name}: identity");
+        // The identity a build carries is its artifacts' own: an evaluated
+        // build settles it at the preparation, a stacked one at the commit.
+        assert_eq!(
+            a.program_id,
+            super::wlfm::wlfm_program_id(a),
+            "{name}: the identity is its recomputation"
+        );
         let proof = prove_last(&program, &build);
         verify_wlfm(a, &proof, &proof.public_words)
             .unwrap_or_else(|e| panic!("{name}: the proof verifies: {e}"));

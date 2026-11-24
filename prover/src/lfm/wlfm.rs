@@ -1579,7 +1579,10 @@ pub fn build_wlfm_placed(
 /// A build's host part: the artifacts but the prepared roots, and the
 /// prepared stacks' columns, uncommitted ([`prepare_wlfm`]).
 pub struct WlfmPrebuild {
-    /// Every field but `stacks` and `program_id`, which the commit settles.
+    /// Every field but `stacks` and, under [`WlfmPrep::Stacked`],
+    /// `program_id`, which the commit settles; under
+    /// [`WlfmPrep::Evaluated`] the identity is settled here (no prepared root
+    /// moves it).
     artifacts: WlfmArtifacts,
     /// Under [`WlfmPrep::Stacked`], the stacks to commit; `None` otherwise.
     stacks: Option<Vec<GroupStack>>,
@@ -1595,7 +1598,8 @@ pub struct WlfmPrebuild {
 
 impl WlfmPrebuild {
     /// The artifacts as prepared: every field but the prepared stacks' views
-    /// and the identity, which the commit settles.
+    /// and, under [`WlfmPrep::Stacked`], the identity, which the commit
+    /// settles (under [`WlfmPrep::Evaluated`] it is final here).
     pub fn artifacts(&self) -> &WlfmArtifacts {
         &self.artifacts
     }
