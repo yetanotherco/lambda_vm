@@ -1056,6 +1056,16 @@ fn production(lb: usize, k0: usize, shrink: Option<usize>, g: u8) -> ChainConfig
     }
 }
 
+// The no-final cases' values, as the calculator prints them (first fold 6, then 4).
+const FOLD6: f64 = 128.344;
+const OOD6: f64 = 153.5;
+const SHIFT6: f64 = 130.911;
+const FINAL6: f64 = 132.272;
+const FOLD4: f64 = 128.344;
+const OOD4: f64 = 153.5;
+const SHIFT4: f64 = 130.907;
+const FINAL4: f64 = 131.738;
+
 fn close(got: f64, want: f64, places: i32) -> bool {
     (got - want).abs() <= 0.5 * 10f64.powi(-places) + 1e-9
 }
@@ -1122,6 +1132,74 @@ fn every_phase_of_the_round_form_keeps_the_per_proof_target() {
     for (label, cfg, fold, ood, shift, final_round) in cases {
         let b = phase_bits(&cfg, 27, 2, 18.0);
         let min_shift = b.shift.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(close(b.fold, fold, 3), "{label}: fold {} vs {fold}", b.fold);
+        assert!(close(b.ood, ood, 1), "{label}: ood {} vs {ood}", b.ood);
+        assert!(
+            close(min_shift, shift, 3),
+            "{label}: shift {min_shift} vs {shift}"
+        );
+        assert!(
+            close(b.final_round, final_round, 3),
+            "{label}: final {} vs {final_round}",
+            b.final_round
+        );
+        assert!(
+            b.fold >= 128.0 && b.ood >= 128.0 && b.final_round >= 128.0,
+            "{label}"
+        );
+        for (i, s) in b.shift.iter().enumerate() {
+            assert!(*s >= 128.0, "{label}: round {}'s shift term {s}", i + 1);
+        }
+    }
+}
+
+/// ★ THE ROUND FORM WITH NO FINAL POLYNOMIAL, first fold 4 and 6: every
+/// round's count pinned (all seven at a `2^27` stack), and every phase at or
+/// over 128 bits per proof, as the final-polynomial cases above. The last
+/// round of these chains is a query round (its count the rule's at its own
+/// rate), which the cases with a final polynomial never price.
+#[test]
+fn the_round_form_without_a_final_polynomial_keeps_the_per_proof_target() {
+    let off = |k0: usize| {
+        let mut cfg = production(1, k0, Some(3), 18);
+        cfg.format.final_poly = FinalPoly::Off;
+        cfg
+    };
+    // (label, config, the seven counts, fold, ood, min shift, final).
+    type Case = (&'static str, ChainConfig, [usize; 7], f64, f64, f64, f64);
+    let cases: [Case; 2] = [
+        (
+            "first6, no final",
+            off(6),
+            [229, 57, 46, 39, 33, 29, 26],
+            FOLD6,
+            OOD6,
+            SHIFT6,
+            FINAL6,
+        ),
+        (
+            "first4, no final",
+            off(4),
+            [229, 114, 76, 57, 46, 39, 33],
+            FOLD4,
+            OOD4,
+            SHIFT4,
+            FINAL4,
+        ),
+    ];
+    for (label, cfg, counts, fold, ood, shift, final_round) in cases {
+        assert_eq!(cfg.final_round(27), None, "{label}: no final round");
+        assert_eq!(
+            cfg.round_queries(27),
+            counts.to_vec(),
+            "{label}: the counts"
+        );
+        let b = phase_bits(&cfg, 27, 2, 18.0);
+        let min_shift = b.shift.iter().copied().fold(f64::INFINITY, f64::min);
+        println!(
+            "NO FINAL {label}: fold {:.3} · ood {:.1} · min shift {min_shift:.3} · final {:.3} · shifts {:?}",
+            b.fold, b.ood, b.final_round, b.shift
+        );
         assert!(close(b.fold, fold, 3), "{label}: fold {} vs {fold}", b.fold);
         assert!(close(b.ood, ood, 1), "{label}: ood {} vs {ood}", b.ood);
         assert!(

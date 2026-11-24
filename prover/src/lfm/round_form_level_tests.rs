@@ -1480,3 +1480,36 @@ fn the_last_levels_levers_prove_a_small_block() {
         );
     }
 }
+
+/// ★ Box tier, a two-head pin: a small BLAKE3 block's two levels under the
+/// round form at shrink 3 (the benchmark's), derived on the host at today's
+/// format, each printed as its fold word, round-0 count, round counts at its
+/// tallest stack and program identity. The same test is compiled into both
+/// heads; the printed lines must be equal.
+#[test]
+#[ignore = "derives a small BLAKE3 block's levels; box tier, two-head pin"]
+fn round_form_level_pins_print() {
+    use super::levels::derive_levels;
+    let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
+    let (elf, proof) = base("test_commit_4", &format);
+    let plan = plan(&elf, &proof, &format);
+    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    for (k, level) in levels.iter().enumerate() {
+        let a = &level.build.artifacts;
+        let (layouts, _) =
+            crate::multilinear_prove::stacks(&a.shapes(&a.airs()), &a.sizes, &a.config)
+                .expect("the layouts");
+        let tallest = layouts.iter().map(|l| l.n_stack()).max().expect("a stack");
+        println!(
+            "LEVEL PIN {}: fold word {:#x} · Q {} · rounds at {tallest} {:?} · id {}",
+            k + 1,
+            a.config.fold_word(),
+            a.config.num_queries,
+            a.config.round_queries(tallest),
+            a.program_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+}
