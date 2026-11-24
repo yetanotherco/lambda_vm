@@ -401,6 +401,8 @@ impl CountMode {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SetupStamps {
     pub image: f64,
+    /// Of `image`, the walk's memory state mapped from the image's pages.
+    pub state: f64,
     pub decode: f64,
 }
 
@@ -575,14 +577,17 @@ impl<'a> WindowedTraceBuilder<'a> {
         // The initial image as pages, and the walk's memory state seeded from
         // them page by page: the state the image as a map of bytes, seeded byte
         // by byte, gives.
-        let (image, mut memory_state) = if hoist.image {
+        // The state's map is timed apart on the builder's setup line.
+        let (image, mut memory_state, state_secs) = if hoist.image {
             let image = super::build_initial_image_by_runs(elf, private_input);
+            let mapped = std::time::Instant::now();
             let memory_state = MemoryState::from_pages_on_pool(&image);
-            (image, memory_state)
+            (image, memory_state, mapped.elapsed().as_secs_f64())
         } else {
             let image = build_initial_image_paged(elf, private_input);
+            let mapped = std::time::Instant::now();
             let memory_state = MemoryState::from_pages(&image);
-            (image, memory_state)
+            (image, memory_state, mapped.elapsed().as_secs_f64())
         };
         let register_init = register::register_init_from_entry_point(elf.entry_point);
         let register_state = RegisterState::from_init(&register_init);
@@ -649,6 +654,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             walk_sizes: WalkSizes::default(),
             setup: SetupStamps {
                 image: image_secs,
+                state: state_secs,
                 decode: decode_secs,
             },
             slide_rest: false,
@@ -1641,6 +1647,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             logs: None,
             made: None,
             routed: None,
+            times: None,
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -1998,9 +2005,115 @@ pub struct WalkedWindow {
     /// ([`WindowedTraceBuilder::light_walk`] at 2); `None` when the
     /// accumulator routes it.
     routed: Option<super::RoutedSegments>,
+    /// Its walk's parts timed, under [`WALK_TIMES_ENV`]; `None` otherwise.
+    times: Option<WalkTimes>,
+}
+
+/// `LAMBDA_VM_WALK_TIMES=1`: each window's walk timed by its parts
+/// ([`WalkTimes`]), summed over the run on the `BLOCK WALKERS` line. A
+/// measurement: the walk, its lists and the tables are the same either way;
+/// unset or any other word, nothing is timed and the line is today's.
+pub(crate) const WALK_TIMES_ENV: &str = "LAMBDA_VM_WALK_TIMES";
+
+/// Whether the walk's parts are timed ([`WALK_TIMES_ENV`]).
+fn walk_times_on() -> bool {
+    walk_times_word(std::env::var(WALK_TIMES_ENV).ok().as_deref())
+}
+
+/// [`walk_times_on`] of the knob's value: on for `1` alone.
+fn walk_times_word(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+mod walk_times_tests {
+    use super::{WalkTimes, walk_times_word};
+
+    /// The knob is on for `1` alone; unset or any other word, nothing is
+    /// timed.
+    #[test]
+    fn the_walk_times_knob_is_on_for_1_alone() {
+        assert!(walk_times_word(Some("1")) && walk_times_word(Some(" 1\n")));
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("2"),
+            Some("on"),
+            Some("true"),
+        ] {
+            assert!(!walk_times_word(value), "{value:?}");
+        }
+    }
+
+    /// Parts add part by part.
+    #[test]
+    fn walk_times_add_part_by_part() {
+        let one = WalkTimes {
+            prescan: 1.0,
+            lists: 2.0,
+            collect: 3.0,
+            walk: 4.0,
+            count: 5.0,
+            route: 6.0,
+        };
+        let mut sum = WalkTimes::default();
+        sum.add(&one);
+        sum.add(&one);
+        assert_eq!(
+            sum,
+            WalkTimes {
+                prescan: 2.0,
+                lists: 4.0,
+                collect: 6.0,
+                walk: 8.0,
+                count: 10.0,
+                route: 12.0,
+            }
+        );
+    }
+}
+
+/// A window walk's parts, in seconds: the pre-scan for a halting cycle, the
+/// lists' allocation, and per batch the operations collected from the logs,
+/// walked into rows, counted, and routed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WalkTimes {
+    pub prescan: f64,
+    pub lists: f64,
+    pub collect: f64,
+    pub walk: f64,
+    pub count: f64,
+    pub route: f64,
+}
+
+impl WalkTimes {
+    /// Adds `other`'s parts to these.
+    pub fn add(&mut self, other: &WalkTimes) {
+        self.prescan += other.prescan;
+        self.lists += other.lists;
+        self.collect += other.collect;
+        self.walk += other.walk;
+        self.count += other.count;
+        self.route += other.route;
+    }
+
+    /// The parts as the `BLOCK WALKERS` line prints them.
+    pub fn line(&self) -> String {
+        format!(
+            "walk times (summed) prescan {:.2}s lists {:.2}s collect {:.2}s walk {:.2}s count {:.2}s route {:.2}s",
+            self.prescan, self.lists, self.collect, self.walk, self.count, self.route
+        )
+    }
 }
 
 impl WalkedWindow {
+    /// Its walk's parts timed ([`WALK_TIMES_ENV`]); `None` when untimed.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn times(&self) -> Option<&WalkTimes> {
+        self.times.as_ref()
+    }
+
     /// A digest of everything the window's walk emitted, its CPU ops and
     /// every list (the in-row register format's side records among them),
     /// through their `Debug` forms: two walks that emit the same give the
@@ -2184,10 +2297,21 @@ fn walk_window(
     logs: &[Log],
     words: Option<super::register_words::WordWindow>,
 ) -> Result<WalkedWindow, Error> {
+    // Each part's seconds added to `times` when the walk is timed.
+    let mut times = walk_times_on().then(WalkTimes::default);
+    let mut at = times.map(|_| std::time::Instant::now());
+    let mut lap = |part: fn(&mut WalkTimes) -> &mut f64, times: &mut Option<WalkTimes>| {
+        if let (Some(t), Some(at)) = (times.as_mut(), at.as_mut()) {
+            let now = std::time::Instant::now();
+            *part(t) += (now - *at).as_secs_f64();
+            *at = now;
+        }
+    };
     // As a whole-run build: only the last cycle may halt.
     if logs.iter().any(|log| log.next_pc == 0) {
         return Err(Error::HaltInNonFinalEpoch);
     }
+    lap(|t| &mut t.prescan, &mut times);
     let mut cpu_ops = Vec::with_capacity(if list {
         logs.len()
     } else {
@@ -2221,6 +2345,7 @@ fn walk_window(
         super::CpuRouter::with_capacities(sizes.routed_for(logs.len()))
             .routing_stores(routes_stores(memory_format))
     });
+    lap(|t| &mut t.lists, &mut times);
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
     for part in logs.chunks(batch) {
@@ -2230,6 +2355,7 @@ fn walk_window(
         }
         let marks = BatchMarks::of(&walk);
         super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
+        lap(|t| &mut t.collect, &mut times);
         from += part.len();
         super::collect_window_ops_into(
             &cpu_ops[start..],
@@ -2240,6 +2366,7 @@ fn walk_window(
             lookups,
             defer_ecrec,
         )?;
+        lap(|t| &mut t.walk, &mut times);
         if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
             counts.count_batch(decode, &cpu_ops[start..], &walk, marks, last_ecall);
             // A walk that lists no lookup of its own still lists each in-row
@@ -2249,8 +2376,10 @@ fn walk_window(
                 counts.count_listed(&walk.bitwise_ops[marks.bitwise..]);
                 walk.bitwise_ops.truncate(marks.bitwise);
             }
+            lap(|t| &mut t.count, &mut times);
             if let Some(router) = router.as_mut() {
                 counts.route_batch(decode, &cpu_ops[start..], router);
+                lap(|t| &mut t.route, &mut times);
             }
         }
     }
@@ -2276,6 +2405,7 @@ fn walk_window(
         logs: None,
         made,
         routed,
+        times,
     })
 }
 
@@ -3674,6 +3804,7 @@ impl Kept {
             logs,
             made: _,
             routed: _,
+            times: _,
         } = window;
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs

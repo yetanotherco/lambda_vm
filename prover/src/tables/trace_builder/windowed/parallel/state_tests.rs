@@ -123,8 +123,8 @@ fn the_hoisted_final_state_is_the_final_state() {
                             input.len()
                         );
                         let (history, end) = last_window(&program, &input, window, words);
-                        let want = finish_state(&end, &history, &image, lean);
-                        let got = finish_state_hoisted(
+                        let (want, _) = finish_state(&end, &history, &image, lean);
+                        let (got, _) = finish_state_hoisted(
                             &end,
                             &history,
                             &image,
