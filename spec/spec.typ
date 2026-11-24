@@ -2,6 +2,16 @@
 
 #set document(author: meta.authors, title: meta.title)
 
+#let PAGE_MARGINS = 25mm // Typst's default for A4 paper
+#set page(
+  margin: PAGE_MARGINS,
+  header-ascent: 50%,
+  header: pad(
+    left: -0.5 * PAGE_MARGINS,
+    link(<outline>, text(size: 0.8em, underline[Back to Contents])),
+  ),
+)
+
 #align(center, title(meta.title))
 #align(center, text(style: "italic", fill: luma(40%))[Version #meta.version])
 #align(center, meta.authors.join(", "))
@@ -18,7 +28,7 @@
   v(10pt, weak: true)
   it
 }
-#outline(depth: 3)
+#outline(depth: 3) <outline>
 
 // chapter pages
 #show heading.where(level: 1): it => align(center + horizon)[#underline(it, offset: 10pt, extent: 5pt)]
