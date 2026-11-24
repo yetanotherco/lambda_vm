@@ -991,6 +991,9 @@ mod finish_oracle;
 #[cfg(test)]
 mod finish_tests;
 pub(crate) mod gate;
+pub mod host_hoist;
+#[cfg(test)]
+mod host_hoist_tests;
 #[cfg(test)]
 mod lean_walk_tests;
 #[cfg(test)]
@@ -1003,6 +1006,7 @@ use compact_eq::CompactEq;
 #[cfg(feature = "parallel")]
 pub(crate) use finish::hand_on_order_first;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
+pub use host_hoist::HostHoist;
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
@@ -6491,18 +6495,9 @@ fn touched_cells_from_memory_state(memory_state: &MemoryState) -> local_to_globa
 }
 
 /// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
+/// A byte at a time ([`crate::paged_mem::init_page_data_by_byte`]).
 pub(crate) fn build_init_page_data<I: ImageSource>(image: &I) -> HashMap<u64, Vec<u8>> {
-    let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
-    for (addr, value) in image.image_iter() {
-        let page_base = page::page_base_for_address(addr);
-        let offset = page::offset_in_page(addr);
-        let page_data = init_page_data
-            .entry(page_base)
-            .or_insert_with(|| vec![0u8; page_size]);
-        page_data[offset] = value;
-    }
-    init_page_data
+    crate::paged_mem::init_page_data_by_byte(image)
 }
 
 fn collect_bitwise_from_page<I: ImageSource>(
@@ -7486,6 +7481,8 @@ fn page_configs_of<I: ImageSource>(
     private_input: &[u8],
 ) -> Vec<PageConfig> {
     use std::collections::BTreeSet;
+    #[cfg(test)]
+    host_hoist::calls::note_by_byte();
 
     // Per-page init bytes from the initial-memory image.
     let init_page_data = build_init_page_data(image);
@@ -7505,6 +7502,35 @@ fn page_configs_of<I: ImageSource>(
                 PageConfig::with_private_input(page_base, init_data)
             } else if let Some(init_data) = init_page_data.get(&page_base) {
                 PageConfig::with_data(page_base, init_data.clone())
+            } else {
+                PageConfig::zero_init(page_base)
+            }
+        })
+        .collect()
+}
+
+/// [`page_configs_of`] from the image's whole pages
+/// ([`ImageSource::init_page_data`]), each page's bytes moved into its config
+/// rather than copied: the same configs (`LAMBDA_VM_HOST_HOIST=pages`).
+fn page_configs_hoisted<I: ImageSource>(
+    image: &I,
+    memory_state: &MemoryState,
+    private_input: &[u8],
+) -> Vec<PageConfig> {
+    #[cfg(test)]
+    host_hoist::calls::note_hoisted();
+    let mut init_page_data = image.init_page_data();
+    let num_private_input_pages = page::private_input_page_count(private_input);
+    // Page bases ascending, as `page_configs_of`'s set of them iterates.
+    memory_state
+        .cells
+        .page_bases()
+        .map(|page_base| {
+            if page::is_private_input_page(page_base, num_private_input_pages) {
+                let init_data = init_page_data.remove(&page_base).unwrap_or_default();
+                PageConfig::with_private_input(page_base, init_data)
+            } else if let Some(init_data) = init_page_data.remove(&page_base) {
+                PageConfig::with_data(page_base, init_data)
             } else {
                 PageConfig::zero_init(page_base)
             }
@@ -7959,6 +7985,9 @@ pub struct StreamSkip {
     /// at ([`super::page_w::page_tables`]; the block format's
     /// `page_run_log2`): 0, the default, one PAGE_W table a page.
     pub page_run_log2: u8,
+    /// The serial host work the build hoists (`LAMBDA_VM_HOST_HOIST`). The
+    /// tables are the same; the default hoists none.
+    pub host_hoist: HostHoist,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,

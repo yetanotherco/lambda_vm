@@ -637,6 +637,13 @@ impl<'a> WindowedTraceBuilder<'a> {
         })
     }
 
+    /// The serial host work the build hoists (`LAMBDA_VM_HOST_HOIST`,
+    /// [`super::HostHoist`]). The tables are the same.
+    pub fn host_hoist(mut self, hoist: super::HostHoist) -> Self {
+        self.emitted.host_hoist = hoist;
+        self
+    }
+
     /// Count what the table phase reads from each handed-out chunk on a
     /// thread of its own (`true`, the default) or on the accumulator's
     /// (`false`) ([`handout_count`]). The tables

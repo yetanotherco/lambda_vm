@@ -103,6 +103,9 @@ pub mod hash_pin_enumeration;
 #[cfg(test)]
 pub mod hint_tests;
 #[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod host_hoist_block_tests;
+#[cfg(test)]
 pub mod ir_stats_dump;
 #[cfg(test)]
 pub mod is_wh_tests;

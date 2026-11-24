@@ -48,8 +48,8 @@ use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::local_bytes::{self, LocalCounts};
 use crate::tables::trace_builder::{
-    ChunkJob, CutPadding, RowFamilies, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
-    head_log, parallel,
+    ChunkJob, CutPadding, HostHoist, RowFamilies, StreamTable, Traces, WindowStamps,
+    WindowedTraceBuilder, head_log, parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -5463,6 +5463,9 @@ pub(crate) struct Deviations {
     /// The page tables handed on right after KECCAK_RND's (`Some(true)`) or
     /// in AIR order (`Some(false)`), instead of the knob ([`pages_first`]).
     pub pages_first: Option<bool>,
+    /// The serial host work hoisted, instead of the knob
+    /// (`LAMBDA_VM_HOST_HOIST`, [`HostHoist`]).
+    pub host_hoist: Option<HostHoist>,
     /// The run's AIR set built on a thread of its own while the first
     /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
     /// first table (`Some(false)`), instead of the knob
@@ -8877,6 +8880,16 @@ fn prove_streamed(
             }
         );
     }
+    // The serial host work hoisted: a word it does not take refuses the
+    // prove. The tables are the same with any part on.
+    let host_hoist = match deviations.host_hoist {
+        Some(hoist) => hoist,
+        None => HostHoist::from_env()?,
+    };
+    eprintln!(
+        "★ BLOCK HOST HOIST: {} (LAMBDA_VM_HOST_HOIST)",
+        host_hoist.describe()
+    );
     // The walkers' light walk: a word it does not take refuses the prove.
     let light_walk = parse_light_walk(std::env::var("LAMBDA_VM_LIGHT_WALK").ok().as_deref())?;
     eprintln!(
@@ -9431,7 +9444,8 @@ fn prove_streamed(
                     ledger.thread("builder");
                 }
                 let mut builder =
-                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
+                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?
+                        .host_hoist(host_hoist);
                 if stream_keccak_rnd {
                     // Checked above: KECCAK_RND is cut into its tables.
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
