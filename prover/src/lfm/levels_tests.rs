@@ -337,7 +337,14 @@ fn a_chain_stopped_at_one_group_is_its_own_verifiers() {
     assert!(levels.last().expect("a level").build.artifacts.sizes.len() <= 1);
     let (proofs, _) = prove_levels(&plan, &levels, &proof).expect("proves");
     let last = proofs.last().expect("a last level");
-    verify_levels_to(&plan, WlfmFamily::P1, stop, last).expect("its own verifier accepts");
+    verify_levels_to(
+        &plan,
+        WlfmFamily::P1,
+        stop,
+        super::last_level::LastLevel::DEFAULT,
+        last,
+    )
+    .expect("its own verifier accepts");
     if levels.len() != 2 {
         assert!(verify_levels(&plan, WlfmFamily::P1, last).is_err());
     }
@@ -1825,6 +1832,19 @@ fn rta_one_run(
             l.prove,
             l.end
         );
+        // The level's compact bytes (canonical, unlike the archive's) as one
+        // digest: two heads' runs under `LAMBDA_VM_DETERMINISTIC_GRIND=1`
+        // compare it, off the clock.
+        {
+            use digest::Digest;
+            let d: [u8; 32] =
+                <crypto::hash::blake3::Blake3Std as Digest>::digest(super::wire::encode(p)).into();
+            println!(
+                "RTA LEVEL {} COMPACT HASH: {}",
+                k + 1,
+                d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+        }
         // The proof's bytes by component (printed after the run, off the
         // clock): the compact encoding's parts, which sum to its total.
         print_level_census(k + 1, level, p);
@@ -2736,9 +2756,17 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
     let links = [
         (
             "verify_block_levels_pinned",
-            "check_process_format(family)?;",
+            "check_process_format(family, last_level)?;",
         ),
         ("verify_block_levels_pinned", "verifier_level_plan("),
+        (
+            "verify_block_levels_pinned",
+            "verify_levels_to(&plan, family, stop, last_level, last)",
+        ),
+        (
+            "verify_levels_to",
+            "derive_levels_last(plan, family, stop, last_level, true)",
+        ),
         ("verifier_level_plan", "verifier_level_plan_with("),
         ("verifier_level_plan_with", "level_plan_with("),
         ("verifier_level_plan_with", "None, true, Some(cap_mux)"),
@@ -2753,6 +2781,7 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         "BlockFormat::pinned_with(GroupFold::Indexed)",
         "B3Rounds::Fri",
         "LevelStop::DEFAULT",
+        "LastLevel::DEFAULT",
         "CapMux::Packed",
     ] {
         assert!(
@@ -2778,7 +2807,9 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         "verifier_level_plan_with",
         "level_plan_with",
         "verify_levels_to",
-        "derive_levels_to",
+        "derive_levels_last",
+        "build_level",
+        "prepare_as_level",
         "child_of_build",
         "pin_family",
     ] {
@@ -2849,7 +2880,7 @@ fn the_levels_verifier_refuses_format_knobs_off_their_pinned_values() {
 
 /// The scenarios [`the_levels_verifier_reads_no_knob_in_a_process_off_the_defaults`]
 /// runs in processes of their own: an environment, and its child test's name.
-const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 5] = [
+const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 7] = [
     (
         "cap",
         &[
@@ -2870,6 +2901,14 @@ const KNOB_CHILDREN: [(&str, &[(&str, &str)]); 5] = [
             ("LAMBDA_VM_LFM_HASH_SPLIT", "maybe"),
         ],
     ),
+    (
+        "last-level",
+        &[
+            ("LAMBDA_VM_LAST_LEVEL_EVALUATED", "1"),
+            ("LAMBDA_VM_LAST_LEVEL_FIRST_FOLD", "4"),
+        ],
+    ),
+    ("last-level-word", &[("LAMBDA_VM_LAST_LEVEL_FINAL", "5")]),
 ];
 
 /// ★ In processes whose knobs are off the defaults, the public entries'
@@ -2963,6 +3002,32 @@ fn the_levels_pins_hold_under_knobs_off_the_default() {
                     .expect_err("a malformed knob word");
                 assert!(
                     refused.contains("LAMBDA_VM_B3_BASE_CAP"),
+                    "{family:?}: {refused}"
+                );
+            }
+        }
+        "last-level" => {
+            // The knobs took, and a verifier naming today's last level refuses
+            // the process under either family; one naming the knobs' format
+            // passes the last-level check.
+            let named = super::last_level::last_level().expect("the knobs read");
+            assert!(named.evaluated && named.first_fold == Some(4), "{named:?}");
+            for family in [WlfmFamily::B3, WlfmFamily::P1] {
+                let refused = super::levels::check_process_format_for_tests(family)
+                    .expect_err("a last level off today's");
+                assert!(
+                    refused.contains("the process asks for the last level"),
+                    "{family:?}: {refused}"
+                );
+            }
+            super::levels::check_last_level_knobs(named, named).expect("the named format");
+        }
+        "last-level-word" => {
+            for family in [WlfmFamily::B3, WlfmFamily::P1] {
+                let refused = super::levels::check_process_format_for_tests(family)
+                    .expect_err("a malformed last-level word");
+                assert!(
+                    refused.contains("LAMBDA_VM_LAST_LEVEL_FINAL"),
                     "{family:?}: {refused}"
                 );
             }
@@ -3130,4 +3195,150 @@ fn the_public_levels_verifier_accepts_at_the_pinned_format() {
         refused.starts_with("the last level does not verify"),
         "the derivation ran to the last level's verify: {refused}"
     );
+}
+
+/// [`super::levels::verify_block_levels_at`] with every named choice at the
+/// pinned entry's value (the tree's pinned format, `Indexed`, on the BLAKE3
+/// base, its FRI round form, the packed cap check, the default stop) and the
+/// last level's format `last_level`.
+fn verify_at_pinned(
+    elf: &[u8],
+    statement: crate::block_whir::BlockStatement<'_>,
+    last_level: super::last_level::LastLevel,
+    last: &super::wlfm::WlfmProof,
+) -> Result<(), String> {
+    use crate::block_whir::{B3Rounds, BlockFormat};
+    use multilinear::whir_chain::{ArgueFormat, GroupFold};
+    let f = BlockFormat::pinned_with(GroupFold::Indexed);
+    let blowup = match f.zf.whir_blowup {
+        2 => crate::zf_format::WhirBlowup::Two,
+        4 => crate::zf_format::WhirBlowup::Four,
+        other => return Err(format!("a pinned blowup of {other}")),
+    };
+    let ArgueFormat::Batched { pack, .. } = f.argue else {
+        return Err("the pinned argue is batched".into());
+    };
+    super::levels::verify_block_levels_at(
+        elf,
+        statement,
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        last_level,
+        last,
+        GroupFold::Indexed,
+        blowup,
+        f.zf.whir_leaves,
+        f.zf.whir_trees,
+        f.leaf_scale,
+        f.leaf_query,
+        pack,
+        f.memory,
+        f.page_run_log2,
+        B3Rounds::Fri,
+        super::merkle_cap::CapMux::Packed,
+    )
+}
+
+/// ★ The last level's format is a NAMED constant of the public entries: a
+/// small block proved at the pinned format twice, today's last level and the
+/// last level under every lever of its own. Through `verify_block_levels_at`
+/// with the format named, each proof is accepted by its own verifier and
+/// refused by the other's AT THE LAST LEVEL'S VERIFY (the process's knobs
+/// naming the verifier's format both times, so the process check passes); the
+/// argument-less `verify_block_levels` is today's and refuses the knob-on
+/// proof; and a process whose knobs differ from the named format is refused
+/// before anything is derived.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice at the pinned format; box tier"]
+fn the_public_entries_name_the_last_levels_format() {
+    use super::last_level::{LastLevel, set_last_level_for_test};
+    use crate::block_whir::{B3Rounds, BlockFormat};
+    use multilinear::whir_chain::{FinalPoly, GroupFold};
+    let all = LastLevel {
+        evaluated: true,
+        first_fold: Some(4),
+        final_poly: FinalPoly::Vars(9),
+    };
+    let format = super::levels::pin_family(
+        BlockFormat::pinned_with(GroupFold::Indexed),
+        WlfmFamily::B3,
+        B3Rounds::Fri,
+    )
+    .expect("the pin");
+    let opts = super::proof::block_base_options_under(&format.zf);
+    let elf = crate::test_utils::asm_elf_bytes("test_keccak");
+    let prove = |last: LastLevel| {
+        let _last = set_last_level_for_test(last);
+        super::levels::prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("the block proves under {last:?}: {e}"))
+    };
+    let today = prove(LastLevel::DEFAULT);
+    let on = prove(all);
+    let statement = today.base_proof.statement();
+    let (t_last, o_last) = (
+        today.proofs.last().expect("today's last"),
+        on.proofs.last().expect("the last level's own"),
+    );
+    assert_eq!(
+        on.levels[1].build.artifacts.prep,
+        super::wlfm::WlfmPrep::Evaluated
+    );
+    // Today's process: the default entry and the named default accept today's
+    // proof and refuse the knob-on one at the last level's verify.
+    super::levels::verify_block_levels(&elf, statement, WlfmFamily::B3, t_last)
+        .expect("the pinned entry accepts today's last level");
+    verify_at_pinned(&elf, statement, LastLevel::DEFAULT, t_last)
+        .expect("the named entry at today's format accepts today's last level");
+    for (name, e) in [
+        (
+            "the pinned entry",
+            super::levels::verify_block_levels(
+                &elf,
+                on.base_proof.statement(),
+                WlfmFamily::B3,
+                o_last,
+            )
+            .expect_err("the knob-on last level under today's verifier"),
+        ),
+        (
+            "the named entry at today's format",
+            verify_at_pinned(&elf, on.base_proof.statement(), LastLevel::DEFAULT, o_last)
+                .expect_err("the knob-on last level under today's verifier"),
+        ),
+    ] {
+        println!("TODAY'S VERIFIER, KNOB-ON PROOF ({name}): {e}");
+        assert!(
+            e.starts_with("the last level does not verify"),
+            "{name}: {e}"
+        );
+    }
+    // The knob-on process: the named entry at that format accepts the knob-on
+    // proof and refuses today's at the last level's verify; the pinned
+    // entry refuses the process before deriving anything.
+    {
+        let _last = set_last_level_for_test(all);
+        verify_at_pinned(&elf, on.base_proof.statement(), all, o_last)
+            .expect("the named entry at the last level's format accepts its proof");
+        let e = verify_at_pinned(&elf, statement, all, t_last)
+            .expect_err("today's last level under the knob-on verifier");
+        println!("KNOB-ON VERIFIER, TODAY'S PROOF: {e}");
+        assert!(e.starts_with("the last level does not verify"), "{e}");
+        let e = super::levels::verify_block_levels(&elf, statement, WlfmFamily::B3, t_last)
+            .expect_err("a knob-on process under the pinned entry");
+        assert!(e.contains("the process asks for the last level"), "{e}");
+    }
+    // Today's process, the named knob-on format: refused before any derivation.
+    let e = verify_at_pinned(&elf, on.base_proof.statement(), all, o_last)
+        .expect_err("a process whose knobs are not the named format");
+    assert!(e.contains("the process asks for the last level"), "{e}");
 }

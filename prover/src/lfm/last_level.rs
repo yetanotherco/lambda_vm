@@ -43,13 +43,13 @@ use super::wlfm::{WlfmFamily, WlfmLevers, WlfmPrep};
 /// today's stacked binding.
 pub const LAST_EVALUATED_ENV: &str = "LAMBDA_VM_LAST_LEVEL_EVALUATED";
 
-/// `LAMBDA_VM_LAST_LEVEL_FIRST_FOLD=k` (`1..=6`): the last level's chains fold
-/// `k` variables in their first round. Unset or `off` is today's first fold.
+/// `LAMBDA_VM_LAST_LEVEL_FIRST_FOLD=4`: the last level's chains fold 4
+/// variables in their first round. Unset, `off` or `6` is today's first fold.
 pub const LAST_FIRST_FOLD_ENV: &str = "LAMBDA_VM_LAST_LEVEL_FIRST_FOLD";
 
-/// `LAMBDA_VM_LAST_LEVEL_FINAL=v` (`1..=10`): the last level's chains stop at
-/// a final polynomial of at most `v` variables. Unset, `0` or `off` is
-/// today's: every round commits its successor.
+/// `LAMBDA_VM_LAST_LEVEL_FINAL=9`: the last level's chains stop at a final
+/// polynomial of at most 9 variables. Unset, `0` or `off` is today's: every
+/// round commits its successor.
 pub const LAST_FINAL_ENV: &str = "LAMBDA_VM_LAST_LEVEL_FINAL";
 
 /// `LAMBDA_VM_LAST_LEVEL_WIRE=rkyv|compact|dedup`: the encoding of the last
@@ -120,39 +120,29 @@ pub fn evaluated_word(word: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// [`LAST_FIRST_FOLD_ENV`]'s word: unset, empty or `off` is today's; a width
-/// in `1..=6` is that first fold; anything else is refused.
+/// [`LAST_FIRST_FOLD_ENV`]'s word: unset, empty, `off` or `6` (today's first
+/// fold, under its own name) is today's; `4` is [`LAST_FIRST_FOLD_MEASURED`];
+/// anything else is refused until it is tested.
 pub fn first_fold_word(word: Option<&str>) -> Result<Option<u8>, String> {
-    match word.map(|w| w.trim().to_ascii_lowercase()) {
-        None => Ok(None),
-        Some(w) if w.is_empty() || w == "off" => Ok(None),
-        Some(w) => match w.parse::<u8>() {
-            Ok(k) if (1..=multilinear::whir_chain::MAX_FOLD as u8).contains(&k) => Ok(Some(k)),
-            _ => Err(format!(
-                "{LAST_FIRST_FOLD_ENV}={w:?}: expected off or a fold from 1 to {}",
-                multilinear::whir_chain::MAX_FOLD
-            )),
-        },
+    match word.map(|w| w.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("off") | Some("6") => Ok(None),
+        Some("4") => Ok(Some(LAST_FIRST_FOLD_MEASURED)),
+        Some(other) => Err(format!(
+            "{LAST_FIRST_FOLD_ENV}={other:?}: expected off or {LAST_FIRST_FOLD_MEASURED}"
+        )),
     }
 }
 
 /// [`LAST_FINAL_ENV`]'s word: unset, empty, `0` or `off` is no final
-/// polynomial; a width in `1..=10` is that final polynomial; anything else
-/// is refused.
+/// polynomial; `9` is [`LAST_FINAL_MEASURED`]; anything else is refused until
+/// it is tested.
 pub fn final_word(word: Option<&str>) -> Result<FinalPoly, String> {
-    match word.map(|w| w.trim().to_ascii_lowercase()) {
-        None => Ok(FinalPoly::Off),
-        Some(w) if w.is_empty() || w == "0" || w == "off" => Ok(FinalPoly::Off),
-        Some(w) => w
-            .parse::<u8>()
-            .ok()
-            .and_then(FinalPoly::vars)
-            .ok_or_else(|| {
-                format!(
-                    "{LAST_FINAL_ENV}={w:?}: expected off or a width from 1 to {}",
-                    multilinear::whir_chain::MAX_FINAL_VARS
-                )
-            }),
+    match word.map(|w| w.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("0") | Some("off") => Ok(FinalPoly::Off),
+        Some("9") => Ok(FinalPoly::Vars(LAST_FINAL_MEASURED)),
+        Some(other) => Err(format!(
+            "{LAST_FINAL_ENV}={other:?}: expected off or {LAST_FINAL_MEASURED}"
+        )),
     }
 }
 

@@ -76,13 +76,16 @@ fn the_last_level_knobs_read_their_words_and_refuse_the_rest() {
     assert!(evaluated_word(Some("yes")).is_err());
     assert_eq!(first_fold_word(Some("4")), Ok(Some(4)));
     assert_eq!(first_fold_word(Some("OFF")), Ok(None));
-    for bad in ["0", "7", "four", "-1"] {
+    // Today's first fold under its own name is today's format, not a lever.
+    assert_eq!(first_fold_word(Some("6")), Ok(None));
+    // Only the measured width is taken until another is tested.
+    for bad in ["0", "1", "2", "3", "5", "7", "four", "-1"] {
         assert!(first_fold_word(Some(bad)).is_err(), "{bad}");
     }
     assert_eq!(final_word(Some("9")), Ok(FinalPoly::Vars(9)));
     assert_eq!(final_word(Some("0")), Ok(FinalPoly::Off));
     assert_eq!(final_word(Some("off")), Ok(FinalPoly::Off));
-    for bad in ["11", "nine", "-3"] {
+    for bad in ["1", "6", "8", "10", "11", "nine", "-3"] {
         assert!(final_word(Some(bad)).is_err(), "{bad}");
     }
     assert_eq!(wire_word(None), Ok(WireFormat::Rkyv));
@@ -116,6 +119,42 @@ fn the_default_last_level_is_every_levels_levers() {
         assert_eq!((on.fold, on.grind, on.family), (None, None, family));
     }
     assert_eq!(level_levers(WlfmFamily::P1), WlfmLevers::DEFAULT);
+}
+
+/// The last level's own format is the BLAKE3 levels' alone: refused under
+/// Poseidon1, by the check and by the preparation it guards; today's passes
+/// under both.
+#[test]
+fn the_last_levels_format_is_refused_under_poseidon1() {
+    use super::levels::check_last_level_family;
+    for (name, last) in settings() {
+        assert!(
+            check_last_level_family(last, WlfmFamily::P1).is_err(),
+            "{name} under Poseidon1"
+        );
+        check_last_level_family(last, WlfmFamily::B3).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        check_last_level_family(LastLevel::DEFAULT, family).expect("today's");
+    }
+    let refused =
+        super::levels::prepare_as_level(LevelStop::Levels(1), 1, ALL_ON, WlfmFamily::P1, |_| {
+            panic!("nothing is prepared under a refused format")
+        })
+        .err()
+        .expect("refused before any preparation");
+    assert!(refused.contains("BLAKE3 levels' alone"), "{refused}");
+}
+
+/// One binary, one format: the verifier's named last level must be the
+/// process's, both ways; equal passes.
+#[test]
+fn the_process_last_level_must_be_the_verifiers_named_one() {
+    use super::levels::check_last_level_knobs;
+    check_last_level_knobs(LastLevel::DEFAULT, LastLevel::DEFAULT).expect("today's");
+    check_last_level_knobs(ALL_ON, ALL_ON).expect("the same named format");
+    assert!(check_last_level_knobs(ALL_ON, LastLevel::DEFAULT).is_err());
+    assert!(check_last_level_knobs(LastLevel::DEFAULT, ALL_ON).is_err());
 }
 
 /// Which level is the last: by its index under `Levels`, by its group count
@@ -210,7 +249,11 @@ fn the_last_levels_levers_give_a_sized_round_form_config() {
         "round 0 keeps its count"
     );
     assert_eq!(on.num_queries, 229);
-    assert_eq!(&queries[..5], &[229, 114, 76, 57, 46]);
+    assert_eq!(
+        queries,
+        vec![229, 114, 76, 57, 46, 39, 33],
+        "all seven counts"
+    );
     assert_ne!(
         on.fold_word(),
         today_w.fold_word(),
@@ -237,6 +280,14 @@ fn the_last_levels_levers_give_a_sized_round_form_config() {
     let e = wlfm_config_levers(WlfmRate::Two, &stamped, Some(SHRINK), &shapes)
         .expect_err("a stamped fold");
     assert!(e.contains("stamped fold"), "{e}");
+    // A first fold at blowup 4, whose count is pinned rather than sized.
+    let first = WlfmLevers {
+        first_fold: Some(4),
+        ..WlfmLevers::DEFAULT
+    };
+    let e = wlfm_config_levers(WlfmRate::Four, &first, None, &shapes)
+        .expect_err("a first fold at blowup 4");
+    assert!(e.contains("blowup 4"), "{e}");
     let both = WlfmLevers {
         fold: Some(5),
         first_fold: Some(4),
@@ -414,6 +465,103 @@ fn every_lean_tables_derived_columns_are_bound_by_the_evaluation() {
         !checked.is_empty(),
         "the fixture has lean tables with prefixes"
     );
+}
+
+/// A lean program with every lean table kind: two compressions (round,
+/// head and byte tables), one-output selects (the select table), two cap
+/// tables and reads through them (the cap and cap-read tables), every
+/// output published.
+fn every_kind() -> super::compiler::LfmProgram {
+    use super::builder::{B3Block, B3Cv, LfmBuilder};
+    use super::edsl::WrapHash;
+    let mut b = LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(true);
+    let cell = |b: &mut LfmBuilder, v: u64| b.digest_const([FE::from(v); 4]).as_cell();
+    let block: [super::builder::Cell; 4] = core::array::from_fn(|i| cell(&mut b, i as u64 + 1));
+    let d = b.b3_compress(B3Cv::Iv, B3Block::Lanes(block), 64, 11);
+    let e = b.b3_compress(B3Cv::Words(d), B3Block::Lanes(block), 64, 3);
+    let x = b.felt_const(FE::from(0b101u64));
+    let bits = b.bit_dec(x, 3);
+    let (l, r) = (cell(&mut b, 10), cell(&mut b, 20));
+    let (a, _) = b.select(bits[0], l, r);
+    let (_, c) = b.select(bits[1], l, r);
+    let tree_a: Vec<super::builder::Cell> = (0..8).map(|v| cell(&mut b, 100 + v)).collect();
+    let tree_b: Vec<super::builder::Cell> = (0..4).map(|v| cell(&mut b, 200 + v)).collect();
+    let ha = b.cap_table(&tree_a);
+    let hb = b.cap_table(&tree_b);
+    let mut outs = vec![a, c, e[0], e[1]];
+    for (handle, nbits, index) in [(ha, 3, 5u64), (ha, 3, 2), (hb, 2, 1)] {
+        let x = b.felt_const(FE::from(index));
+        let bits = b.bit_dec(x, nbits);
+        outs.push(b.cap_read(handle, &bits));
+    }
+    for o in outs {
+        b.public(o);
+    }
+    super::compiler::compile(b.finish())
+}
+
+/// ★ Every lean table KIND's instruction columns are bound by the last
+/// level's evaluation, on a program that has them all: the round, head and
+/// byte tables, the select table, the cap and cap-read tables. One value of
+/// any column changed in the verifier's copy refuses the honest proof, and
+/// with the preprocessed check off (a mutation) it does not. The checked list
+/// names every kind.
+#[test]
+fn every_lean_table_kinds_columns_are_bound_by_the_last_levels_evaluation() {
+    use super::b3l_tables::{CAP_NAME, CAP_READ_NAME, HEAD_NAME, MUX_NAME, ROUND_NAME, TABLE_NAME};
+    let program = every_kind();
+    super::validator::validate(&program).expect("admissible");
+    let build = build_last(&program, ALL_ON);
+    let proof = prove_last(&program, &build);
+    let a = &build.artifacts;
+    verify_wlfm(a, &proof, &proof.public_words).expect("the honest proof verifies");
+    let airs = a.airs();
+    let refs = airs.air_refs();
+    let lean_from = refs.len() - airs.b3l.refs().len();
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut checked = 0usize;
+    for (t, air) in refs.iter().enumerate().skip(lean_from) {
+        for c in 0..a.counts[t] {
+            let mut tampered = a.clone();
+            let mut values = tampered.evaluated[t][c].evals().to_vec();
+            values[0] += FE::one();
+            tampered.evaluated[t][c] = multilinear::mle::Mle::new(values).expect("a column");
+            let name = air.name();
+            assert!(
+                verify_wlfm(&tampered, &proof, &proof.public_words).is_err(),
+                "{name} column {c}: a changed value is refused"
+            );
+            verify_wlfm_with(
+                &tampered,
+                &proof,
+                &proof.public_words,
+                false,
+                VerifierChecks {
+                    preprocessed: false,
+                    ..VerifierChecks::ALL
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name} column {c}: with the check off: {e}"));
+            kinds.insert(name.to_string());
+            checked += 1;
+        }
+    }
+    println!("LEAN KINDS BOUND: {checked} columns over {kinds:?}");
+    for kind in [
+        ROUND_NAME,
+        HEAD_NAME,
+        TABLE_NAME,
+        MUX_NAME,
+        CAP_NAME,
+        CAP_READ_NAME,
+    ] {
+        assert!(
+            kinds.contains(kind),
+            "the checked list names {kind}: {kinds:?}"
+        );
+    }
 }
 
 /// The final polynomial is bound: one value of it changed is refused.
