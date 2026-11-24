@@ -148,6 +148,31 @@ impl<T: Copy> PagedMem<T> {
         page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
     }
 
+    /// Sets `values.len()` cells from `addr` on to `values`, in order, as
+    /// [`Self::set`] on each would: per page one copy and one run of marks.
+    /// A run that wraps the address space is set cell by cell.
+    pub fn set_slice(&mut self, addr: u64, values: &[T]) {
+        let Some(last) = values.len().checked_sub(1) else {
+            return;
+        };
+        if addr.checked_add(last as u64).is_none() {
+            for (i, &value) in values.iter().enumerate() {
+                self.set(addr.wrapping_add(i as u64), value);
+            }
+            return;
+        }
+        let mut done = 0usize;
+        while done < values.len() {
+            let (base, off) = Self::split(addr + done as u64);
+            let take = (DEFAULT_PAGE_SIZE - off).min(values.len() - done);
+            let i = self.page_index_or_insert(base);
+            let page = &mut self.pages[i].1;
+            page.data[off..off + take].copy_from_slice(&values[done..done + take]);
+            mark_run(&mut page.occupied, off, off + take);
+            done += take;
+        }
+    }
+
     /// The store with each cell's value mapped through `f`, page by page: the
     /// same pages and the same `set` cells, each offset holding `f` of what it
     /// held. `f(fill)` should be `fill` (the new store's), so that an offset
@@ -157,6 +182,32 @@ impl<T: Copy> PagedMem<T> {
             pages: self
                 .pages
                 .iter()
+                .map(|(base, page)| {
+                    (
+                        *base,
+                        Page {
+                            data: page.data.iter().map(|&value| f(value)).collect(),
+                            occupied: page.occupied.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            fill,
+        }
+    }
+
+    /// [`Self::map`] with the pages mapped on the pool, a page a job: the
+    /// same store.
+    #[cfg(feature = "parallel")]
+    pub fn par_map<U: Copy + Send>(&self, fill: U, f: impl Fn(T) -> U + Sync) -> PagedMem<U>
+    where
+        T: Sync,
+    {
+        use rayon::prelude::*;
+        PagedMem {
+            pages: self
+                .pages
+                .par_iter()
                 .map(|(base, page)| {
                     (
                         *base,
@@ -331,6 +382,22 @@ impl ImageSource for PagedMem<u8> {
     }
 }
 
+/// Marks offsets `start..end` of a page's occupancy bitmap.
+fn mark_run(occupied: &mut [u64], start: usize, end: usize) {
+    let mut off = start;
+    while off < end {
+        let bit = off % WORD_BITS;
+        let n = (WORD_BITS - bit).min(end - off);
+        let mask = if n == WORD_BITS {
+            u64::MAX
+        } else {
+            ((1u64 << n) - 1) << bit
+        };
+        occupied[off / WORD_BITS] |= mask;
+        off += n;
+    }
+}
+
 /// Yields the set-bit indices of a 64-bit word, low to high.
 struct BitIter {
     bits: u64,
@@ -393,6 +460,73 @@ mod tests {
         assert_eq!(mapped.len(), cells.len());
         assert_eq!(mapped.get(page + 1), (0, 0));
         assert_eq!(mapped.get(3 * page), (0, 0));
+    }
+
+    /// A store's pages, each page's offsets and its set cells.
+    #[allow(clippy::type_complexity)]
+    fn parts<T: Copy>(m: &PagedMem<T>) -> (Vec<u64>, Vec<Vec<T>>, Vec<(u64, T)>) {
+        let bases: Vec<u64> = m.page_bases().collect();
+        let data = bases
+            .iter()
+            .map(|&b| m.page_data(b).expect("a page").to_vec())
+            .collect();
+        (bases, data, m.iter().collect())
+    }
+
+    /// A run set at once ([`PagedMem::set_slice`]) is the run set a cell at a
+    /// time: within a page, across one and two page ends, a whole page,
+    /// overwriting earlier cells (the later wins), wrapping the address space,
+    /// empty, and on a store whose fill is not 0; the bitmap's word edges
+    /// included.
+    #[test]
+    fn a_run_set_at_once_is_the_run_set_a_cell_at_a_time() {
+        let page = DEFAULT_PAGE_SIZE as u64;
+        let run = |n: usize, seed: u8| -> Vec<u8> {
+            (0..n).map(|i| (i as u8).wrapping_mul(31) ^ seed).collect()
+        };
+        let runs: Vec<(u64, Vec<u8>)> = vec![
+            (0x10, run(100, 1)),
+            (63, run(2, 2)),
+            (64, run(64, 3)),
+            (0x40, run(5, 4)),
+            (page - 3, run(10, 5)),
+            (3 * page - 1, run(DEFAULT_PAGE_SIZE + 2, 6)),
+            (8 * page, run(DEFAULT_PAGE_SIZE, 7)),
+            (0x20, run(0, 8)),
+            (u64::MAX - 3, run(9, 9)),
+        ];
+        for fill in [0u8, 7] {
+            let mut at_once = PagedMem::new(fill);
+            let mut by_cell = PagedMem::new(fill);
+            for (addr, values) in &runs {
+                at_once.set_slice(*addr, values);
+                for (i, &v) in values.iter().enumerate() {
+                    by_cell.set(addr.wrapping_add(i as u64), v);
+                }
+            }
+            assert_eq!(parts(&at_once), parts(&by_cell), "fill {fill}");
+            assert_eq!(at_once.len(), by_cell.len());
+        }
+    }
+
+    /// The store mapped on the pool is the store mapped page by page.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_store_mapped_on_the_pool_is_the_store_mapped_in_turn() {
+        let page = DEFAULT_PAGE_SIZE as u64;
+        let mut bytes = PagedMem::new(0u8);
+        for (i, addr) in [0x10, page - 1, 2 * page + 5, 9 * page, u64::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            bytes.set(addr, i as u8 + 1);
+        }
+        bytes.set_slice(4 * page, &[3u8; 1000]);
+        let f = |value: u8| (value, u64::from(value) * 3);
+        assert_eq!(
+            parts(&bytes.par_map((0, 0), f)),
+            parts(&bytes.map((0, 0), f))
+        );
     }
 
     /// The whole-page copy ([`PagedMem::init_page_data`]) is the map built a

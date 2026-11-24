@@ -9443,9 +9443,12 @@ fn prove_streamed(
                 if let Some(ledger) = ledger {
                     ledger.thread("builder");
                 }
-                let mut builder =
-                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?
-                        .host_hoist(host_hoist);
+                let mut builder = WindowedTraceBuilder::new_with(
+                    program,
+                    private_inputs,
+                    &options.max_rows,
+                    host_hoist,
+                )?;
                 if stream_keccak_rnd {
                     // Checked above: KECCAK_RND is cut into its tables.
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;

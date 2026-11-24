@@ -558,13 +558,33 @@ impl<'a> WindowedTraceBuilder<'a> {
         private_input: &'a [u8],
         max_rows: &crate::tables::MaxRowsConfig,
     ) -> Result<Self, Error> {
+        Self::new_with(elf, private_input, max_rows, super::HostHoist::default())
+    }
+
+    /// [`Self::new`] with the serial host work `hoist` names hoisted
+    /// (`LAMBDA_VM_HOST_HOIST`): under `image` the image is written a run of
+    /// bytes at a time and the walk's memory state mapped from it on the
+    /// pool, a page a job. The same image and state.
+    pub fn new_with(
+        elf: &Elf,
+        private_input: &'a [u8],
+        max_rows: &crate::tables::MaxRowsConfig,
+        hoist: super::HostHoist,
+    ) -> Result<Self, Error> {
         let t = std::time::Instant::now();
         // The initial image as pages, and the walk's memory state seeded from
         // them page by page: the state the image as a map of bytes, seeded byte
         // by byte, gives.
-        let image = build_initial_image_paged(elf, private_input);
+        let (image, mut memory_state) = if hoist.image {
+            let image = super::build_initial_image_by_runs(elf, private_input);
+            let memory_state = MemoryState::from_pages_on_pool(&image);
+            (image, memory_state)
+        } else {
+            let image = build_initial_image_paged(elf, private_input);
+            let memory_state = MemoryState::from_pages(&image);
+            (image, memory_state)
+        };
         let register_init = register::register_init_from_entry_point(elf.entry_point);
-        let mut memory_state = MemoryState::from_pages(&image);
         let register_state = RegisterState::from_init(&register_init);
         let image_secs = t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
@@ -594,7 +614,10 @@ impl<'a> WindowedTraceBuilder<'a> {
             cycles: 0,
             windows: Vec::new(),
             segments: RoutedBlocks::new(max_rows),
-            emitted: StreamSkip::default(),
+            emitted: StreamSkip {
+                host_hoist: hoist,
+                ..StreamSkip::default()
+            },
             counted: PreCounted {
                 histogram: bitwise::BitwiseHistogram::new(),
                 bitwise_ops: 0,
