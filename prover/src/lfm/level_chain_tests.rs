@@ -183,11 +183,16 @@ fn lean_shape(filled: &mut LfmFilled) -> Vec<(usize, usize, bool)> {
 #[test]
 fn the_chain_knobs_are_named_and_off_by_default() {
     use super::levels::{
-        COMMIT_NEXT_EARLY_ENV, FILL_PARTS_ENV, commit_next_early, fill_parts,
-        set_commit_next_early_for_test, set_fill_parts_for_test,
+        COMMIT_NEXT_EARLY_ENV, FILL_PARTS_ENV, NEXT_BESIDE_ENV, commit_next_early, fill_parts,
+        next_beside, set_commit_next_early_for_test, set_fill_parts_for_test,
+        set_next_beside_for_test,
     };
     assert_eq!(FILL_PARTS_ENV, "LAMBDA_VM_LEVELS_FILL_PARTS");
     assert_eq!(COMMIT_NEXT_EARLY_ENV, "LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY");
+    assert_eq!(NEXT_BESIDE_ENV, "LAMBDA_VM_LEVELS_NEXT_BESIDE");
+    if std::env::var_os(NEXT_BESIDE_ENV).is_none() {
+        assert!(!next_beside(), "off by default");
+    }
     if std::env::var_os(FILL_PARTS_ENV).is_none() {
         assert!(!fill_parts(), "off by default");
     }
@@ -207,16 +212,26 @@ fn the_chain_knobs_are_named_and_off_by_default() {
     }
     set_fill_parts_for_test(Some(true));
     set_commit_next_early_for_test(Some(true));
-    assert!(fill_parts() && commit_next_early(), "the overrides");
-    let other = std::thread::spawn(|| (fill_parts(), commit_next_early()))
+    set_next_beside_for_test(Some(true));
+    assert!(
+        fill_parts() && commit_next_early() && next_beside(),
+        "the overrides"
+    );
+    let other = std::thread::spawn(|| (fill_parts(), commit_next_early(), next_beside()))
         .join()
         .expect("joins");
     set_fill_parts_for_test(None);
     set_commit_next_early_for_test(None);
+    set_next_beside_for_test(None);
     if std::env::var_os(FILL_PARTS_ENV).is_none()
         && std::env::var_os(COMMIT_NEXT_EARLY_ENV).is_none()
+        && std::env::var_os(NEXT_BESIDE_ENV).is_none()
     {
-        assert_eq!(other, (false, false), "another thread reads the knobs");
+        assert_eq!(
+            other,
+            (false, false, false),
+            "another thread reads the knobs"
+        );
     }
 }
 
@@ -529,4 +544,152 @@ fn the_packs_at_once_are_the_packs_in_turn() {
             "{family:?}: the same packs"
         );
     }
+}
+
+// =============================================================================
+// Level 2 beside its preparation (LAMBDA_VM_LEVELS_NEXT_BESIDE)
+// =============================================================================
+
+/// The arena's marks the beside tests cut [`arena`] at: a front and two
+/// groups.
+const MARKS: [u32; 3] = [8, 16, (4 * CHAINS) as u32];
+
+/// [`arena`]'s pieces at [`MARKS`], in `order`, on a channel whose sender is
+/// dropped once they are sent.
+fn pieces_in(order: &[usize]) -> std::sync::mpsc::Receiver<(usize, Vec<LfmWord>)> {
+    let words = arena();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for &i in order {
+        let start = if i == 0 { 0 } else { MARKS[i - 1] as usize };
+        tx.send((i, words[start..MARKS[i] as usize].to_vec()))
+            .expect("sends");
+    }
+    rx
+}
+
+/// A prebuild's stacks, column for column, and the identity it commits to on
+/// the host.
+fn prebuild_identity(pre: super::wlfm::WlfmPrebuild) -> (Vec<Vec<Vec<FE>>>, [u8; 32]) {
+    let columns = pre
+        .stack_columns_for_test()
+        .expect("stacks")
+        .iter()
+        .map(|c| c.to_vec())
+        .collect();
+    let build = pre.commit(super::wlfm::StackPlace::Host).expect("commits");
+    (columns, build.artifacts.program_id)
+}
+
+/// The level proof of an execution `filled`, under a build of `program`
+/// prepared on this thread (under its test format: ungrinded, so the bytes
+/// are the execution's alone).
+fn execution_bytes(program: &LfmProgram, filled: LfmFilled) -> Vec<u8> {
+    let pre =
+        super::levels::prepare_level(program, super::wlfm::WlfmFamily::B3, None).expect("prepares");
+    let build = pre.commit(super::wlfm::StackPlace::Host).expect("commits");
+    let proof = prove_wlfm_traces_as(&build, filled, true, WlfmProving::Streamed).expect("proves");
+    rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+        .expect("serializes")
+        .to_vec()
+}
+
+/// ★ PIN: level 2 prepared beside its streamed execution is level 2 prepared
+/// before it: the same prebuild (stacks column for column, the same committed
+/// identity; both prepared off this thread, as the driver prepares) and the
+/// same execution (the same level proof bytes under one build), its pieces
+/// landing in any order, every piece sent before the call; with an early
+/// commit the prebuild is handed on and not returned.
+#[test]
+fn level_2_beside_its_prepare_is_level_2_after_it() {
+    use super::levels::{prepare_and_stream, prepare_level, stream_level_over_pieces};
+    use super::wlfm::WlfmFamily;
+    let _fast = test_format::set(Some(2));
+    let program = program(true);
+    let family = WlfmFamily::B3;
+    let hasher =
+        program.hasher(<crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET);
+    let t0 = std::time::Instant::now();
+    let reference = std::thread::scope(|s| {
+        s.spawn(|| prepare_level(&program, family, None))
+            .join()
+            .expect("joins")
+    })
+    .expect("prepares");
+    let want_pre = prebuild_identity(reference);
+    let (filled, _) = stream_level_over_pieces(&program, &MARKS, hasher, pieces_in(&[0, 1, 2]), t0)
+        .expect("streams");
+    let want_exec = execution_bytes(&program, filled);
+    for order in [[0, 1, 2], [2, 0, 1]] {
+        let (pre, streamed) = prepare_and_stream(
+            &program,
+            &MARKS,
+            family,
+            None,
+            pieces_in(&order),
+            t0,
+            false,
+            None,
+        )
+        .expect("prepares and streams");
+        let (filled, times) = streamed.expect("streamed");
+        assert!(times.prebuilt.is_some(), "{order:?}: the prebuild's stamp");
+        assert!(
+            prebuild_identity(pre.expect("the prebuild returned")) == want_pre,
+            "{order:?}: the same prebuild"
+        );
+        assert!(
+            execution_bytes(&program, filled) == want_exec,
+            "{order:?}: the same execution"
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (pre, streamed) = prepare_and_stream(
+        &program,
+        &MARKS,
+        family,
+        None,
+        pieces_in(&[1, 2, 0]),
+        t0,
+        true,
+        Some(tx),
+    )
+    .expect("prepares and streams");
+    assert!(pre.is_none(), "handed on, not returned");
+    let handed = rx.recv().expect("the prebuild on the channel");
+    assert!(
+        prebuild_identity(handed) == want_pre,
+        "the handed-on prebuild"
+    );
+    let (filled, _) = streamed.expect("streamed");
+    assert!(
+        execution_bytes(&program, filled) == want_exec,
+        "the execution"
+    );
+}
+
+/// A preparation that fails fails level 2 beside it without hanging: the
+/// pieces never come (their sender dropped), the call returns the
+/// preparation's refusal, and a receiver of the early commit finds its
+/// channel closed.
+#[test]
+fn a_failing_prepare_fails_level_2_beside_without_hanging() {
+    use super::levels::prepare_and_stream;
+    use super::wlfm::WlfmFamily;
+    let program = program(true);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // A round form no chain takes: the preparation refuses it.
+    let err = prepare_and_stream(
+        &program,
+        &MARKS,
+        WlfmFamily::B3,
+        Some(0),
+        pieces_in(&[]),
+        std::time::Instant::now(),
+        false,
+        Some(tx),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.contains("round form"), "{err}");
+    assert!(rx.recv().is_err(), "the early channel closed");
 }

@@ -829,6 +829,8 @@ struct ChainSteps {
     tiled: bool,
     /// `LAMBDA_VM_LEVELS_PACKS_BESIDE`.
     packs: bool,
+    /// `LAMBDA_VM_LEVELS_NEXT_BESIDE`.
+    next_beside: bool,
 }
 
 /// The levels' chain steps forced as given (the first two on this thread,
@@ -838,7 +840,7 @@ struct ChainSteps {
 fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     use super::levels::{
         prove_block_levels, set_commit_next_early_for_test, set_fill_parts_for_test,
-        set_packs_beside_for_test,
+        set_next_beside_for_test, set_packs_beside_for_test,
     };
     use super::wlfm::set_columns_tiled_for_test;
     struct Restore;
@@ -848,6 +850,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             set_commit_next_early_for_test(None);
             set_columns_tiled_for_test(None);
             set_packs_beside_for_test(None);
+            set_next_beside_for_test(None);
         }
     }
     let ChainSteps {
@@ -855,6 +858,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         commit_early,
         tiled,
         packs,
+        next_beside,
     } = steps;
 
     assert!(
@@ -870,6 +874,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         set_packs_beside_for_test(Some(packs));
         set_fill_parts_for_test(Some(fill_parts));
         set_commit_next_early_for_test(Some(commit_early));
+        set_next_beside_for_test(Some(next_beside));
         prove_block_levels(
             &elf,
             &[],
@@ -981,8 +986,35 @@ fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
         commit_early: true,
         tiled: true,
         packs: true,
+        next_beside: true,
     });
     assert!(run.times.next_commit.is_some_and(|c| c.early));
+    assert!(run.times.next_stream.is_some_and(|s| s.prebuilt.is_some()));
+}
+
+/// ★ Level 2 executed beside its own preparation
+/// (`LAMBDA_VM_LEVELS_NEXT_BESIDE`), alone and with its stacks committed
+/// early, is the same level: a small BLAKE3 block driven with the knob on
+/// proves each level's bytes as [`prove_levels`] does over the same base, and
+/// the driver stamps the prebuild made beside the stream. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels three times; box tier, deterministic grind"]
+fn the_blake3_driver_with_level_2_beside_its_prepare_proves_the_same_level_bytes() {
+    for commit_early in [false, true] {
+        let run = driven_under_chain_steps(ChainSteps {
+            next_beside: true,
+            commit_early,
+            ..ChainSteps::default()
+        });
+        let stream = run.times.next_stream.expect("level 2 streamed");
+        assert!(stream.prebuilt.is_some(), "the prebuild made beside");
+        assert_eq!(
+            run.times.next_commit.map(|c| c.early),
+            Some(commit_early),
+            "committed early as asked"
+        );
+    }
 }
 
 /// The level-2 streaming knob's name; it is on by default, and only `0`
@@ -1724,7 +1756,8 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
         println!(
             "RTA LEVEL2 CHAIN: prepared {:.3}s · first piece {:.3}s · last piece {:.3}s · executed {:.3}s · \
              fill {:.3}s · filled {:.3}s · commit from {:.3}s · early {} · joined {} · committed {:.3}s · \
-             level 1 proved {:.3}s · prove from {prove_from:.3}s · after level 1 {:.3}s",
+             level 1 proved {:.3}s · prove from {prove_from:.3}s · after level 1 {:.3}s · prebuilt {} · \
+             next beside {}",
             ns.from,
             ns.first,
             ns.last,
@@ -1737,6 +1770,8 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
             b.committed,
             l1.end,
             prove_from - l1.end,
+            fmt(ns.prebuilt),
+            super::levels::next_beside(),
         );
     } else {
         println!("RTA LEVEL2 CHAIN: not streamed");
