@@ -1012,7 +1012,7 @@ pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
     Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, RecordsRoom, RegenBuilder,
     RowFamilies, SetupStamps, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
-    WindowedTraceBuilder,
+    WindowedTraceBuilder, exec_pad_probe, pad_write,
 };
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::{head_log, keccak_rnd_arrivals, parallel};
