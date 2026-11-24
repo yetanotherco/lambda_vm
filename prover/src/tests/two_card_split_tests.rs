@@ -40,6 +40,16 @@ fn elf() -> Vec<u8> {
     crate::test_utils::asm_elf_bytes("test_commit_4")
 }
 
+/// The block's options: streamed (the base path a real block takes, the
+/// only one that opts phase B into two cards) with each group's openings
+/// beside the next group's argue.
+fn streamed_overlapped() -> crate::block_whir::BlockOptions {
+    let mut o = options(3);
+    o.window_log2 = Some(3);
+    o.phase_b_overlap = stark::multilinear_block::PhaseBOverlap::On;
+    o
+}
+
 /// A small BLAKE3 block over many groups, proved and checked by the host
 /// verifier.
 fn proved() -> BlockWhirProof {
@@ -52,7 +62,7 @@ fn proved() -> BlockWhirProof {
             &[],
             &opts,
             &format,
-            &options(3),
+            &streamed_overlapped(),
             &Deviations::default(),
         )
     })
