@@ -22,8 +22,8 @@ nonzero multiplicity as a push; `not_consistent` shows the gap is real: over Gol
 not `Consistent`, so it cannot be finished in a `SoundEnsemble` until that premise carries the
 bound. With `N = 1` the counted channel is `Normal`, hence `Consistent`; it is still a channel of
 its own, not `channel.toRaw`. With the bounded balance `BalancedUpTo N` of the modified Clean
-(the fork's `counted-pulls`, which `lakefile.toml` pins by sha at `73309694`), `consistentUpTo`
-closes the gap.
+(the fork's `pr-base-upstream-main`, which `lakefile.toml` pins by sha at `8552c7a1`),
+`consistentUpTo` closes the gap.
 
 This file's `countedCharged` is **not** the fork's `Channel.counted`, which is what `Tables/Lt.lean`,
 `Tables/MinToy.lean` and `Ensembles/CountedSameBus.lean` pull on. On an out-of-range pull this

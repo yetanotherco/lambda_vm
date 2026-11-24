@@ -184,13 +184,15 @@ Counted pulls in the LT model need two things Clean main lacks:
 
 The model takes both from the `yetanotherco/clean` fork, pinned in
 `lakefile.toml` by sha at
-[`73309694`](https://github.com/yetanotherco/clean/commit/73309694ae33279094597f7f3f819fb8a3439620)
-— by sha, not by branch name, so the pin survives the branch being renamed or
-deleted once the upstream PRs land. That is Clean main `f3abad7c` plus three
-commits, and four review fixes answering the audit of them: `Balance.logUpUpTo N` with
-`RawChannel.ConsistentUpTo N`, the typed `Channel.counted N`, and
-`Ensemble.tableSoundness_of_staged` / `_stagedOn` (soundness by finishing
-order of channels, and of message classes within a channel). On top of it:
+[`8552c7a1`](https://github.com/yetanotherco/clean/commit/8552c7a10dac340de34bfff9e19a6967ed3b1bba)
+— by sha, not by branch name, so the pin survives the branch moving, being
+renamed or deleted once the upstream PRs land. That sha is the merge putting the
+counted-pulls work onto the fork's `pr-base-upstream-main`, where the fork's PRs
+land; its two parents are the upstream mirror `a985c76c` and `e30c5c44`, the work
+itself: `Balance.logUpUpTo N` with `RawChannel.ConsistentUpTo N`, the typed
+`Channel.counted N`, and `Ensemble.tableSoundness_of_stagedRequirements` /
+`_stagedRequirementsOn` (soundness by finishing order of channels, and of
+message classes within a channel). On top of it:
 
 - `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ` through
   `Channel.counted 255`, bounded by its own pull of `ARE_BYTES[μ, 0]`, exactly
@@ -266,9 +268,12 @@ ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
 pulls, and `Bitwise.IsHalf.toRaw`, which `Tables/Eq.lean` and `Tables/Shift.lean`
 pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, and
 `Ensemble.unique_channel_names` rejects a `tables` list holding both. `MSB16` is
-the same. A combined ensemble would have to put EQ and SHIFT on the counted
-channel too, at `N = 1`; the pinned fork has no lemma collapsing `Channel.counted
-1` to the plain channel, so that is a proof obligation, not a rename. No ensemble
+the same. A combined ensemble would have to put EQ and SHIFT on the *same*
+counted channel LT uses, at `N = 255`. Dropping them onto `Channel.counted 1`
+would not do: it keeps the base name too, so it collides with `Channel.counted
+255` for exactly the reason above, and the pinned fork has no lemma collapsing it
+to the plain channel either. EQ and SHIFT reach the channel through `pullIf`, so
+moving them is a proof obligation about their rows, not a rename. No ensemble
 here needs it yet: `LtStaged` and `CountedSameBus` hold LT and its toy MIN only.
 
 ## What is intentionally not proven
