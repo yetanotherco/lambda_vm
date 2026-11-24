@@ -3365,6 +3365,54 @@ fn parse_exec_history_check(value: Option<&str>) -> Result<usize, Error> {
     }
 }
 
+/// The executor's stream: unset, empty or `full` (the default), it writes
+/// each window's logs and its per-cycle history; `lean`, only the access
+/// records, the ECALLs' cells and each window's starting cells, and each
+/// walker re-runs its window from them, rebuilding the logs byte for byte
+/// ([`executor::vm::fast::Replay`]). The tables and the proof are the same.
+pub const EXEC_STREAM_ENV: &str = "LAMBDA_VM_EXEC_STREAM";
+
+/// [`EXEC_STREAM_ENV`]'s reading: `true` for `lean`. Anything else than
+/// `lean`, `full`, empty or unset refuses the prove.
+fn parse_exec_stream(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "full") => Ok(false),
+        Some("lean") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{EXEC_STREAM_ENV}={v}: full (the default: the executor writes the logs) or lean \
+             (the walkers re-run each window from its access records)"
+        ))),
+    }
+}
+
+/// Refuses the lean stream ([`EXEC_STREAM_ENV`]) where it does not run: it
+/// needs record mode (the fast engine's history, read by walkers) under the
+/// word memory format, the light walk (a cycle's record found by counting),
+/// and neither the sampled re-execution nor the history check (both read the
+/// executor's logs). Never silently another mode.
+fn refuse_lean_stream(
+    history: bool,
+    word_history: bool,
+    light_walk: u8,
+    shadow: bool,
+    history_check: usize,
+) -> Result<(), Error> {
+    let why = if !history {
+        "record mode (LAMBDA_VM_EXEC_HISTORY on the fast engine, with walkers)"
+    } else if !word_history {
+        "the word memory format"
+    } else if light_walk == 0 {
+        "the light walk (LAMBDA_VM_LIGHT_WALK 1 or 2)"
+    } else if shadow {
+        "no sampled re-execution (LAMBDA_VM_EXEC_SHADOW off): it reads the executor's logs"
+    } else if history_check > 0 {
+        "no history check (LAMBDA_VM_EXEC_HISTORY_CHECK 0): it re-walks the executor's logs"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Prover(format!("{EXEC_STREAM_ENV}=lean needs {why}")))
+}
+
 /// The streamed build's executor thread, its own work apart from its waits
 /// ([`BlockStamps::executor`]); with `send` ([`ProducerStamps::executor_send`])
 /// they add up to the thread's span. A measurement; it changes nothing.
@@ -3397,6 +3445,14 @@ pub struct ExecutorStamps {
     /// The pad probe's dead bytes a cycle and the seconds writing them
     /// (`LAMBDA_VM_EXEC_PAD_PROBE`'s executor part; `None` when 0).
     pub pad: Option<(usize, f64)>,
+    /// The lean stream ([`EXEC_STREAM_ENV`]): the executor wrote no logs, its
+    /// walkers re-ran its windows.
+    pub lean: bool,
+    /// The cycles run, and the bytes the executor wrote for them: logs and
+    /// history (the lists' lengths).
+    pub cycles: u64,
+    pub log_bytes: u64,
+    pub history_bytes: u64,
 }
 
 /// A thread's page faults and CPU seconds, as `getrusage(RUSAGE_THREAD)`
@@ -3470,6 +3526,20 @@ impl ExecutorStamps {
             self.pooled_bytes as f64 / 1e9,
             self.pageable_windows,
             self.pageable_bytes as f64 / 1e9,
+        )
+    }
+
+    /// The `BLOCK EXECUTOR STREAM:` line: the stream and the bytes the
+    /// executor wrote, in all and a cycle.
+    fn stream_line(&self) -> String {
+        let written = self.log_bytes + self.history_bytes;
+        format!(
+            "BLOCK EXECUTOR STREAM: {} ({EXEC_STREAM_ENV}) · {} cycles · written: logs {:.3} GB, history {:.3} GB · {:.2} bytes a cycle\n",
+            if self.lean { "lean" } else { "full" },
+            self.cycles,
+            self.log_bytes as f64 / 1e9,
+            self.history_bytes as f64 / 1e9,
+            written as f64 / self.cycles.max(1) as f64,
         )
     }
 
@@ -3630,6 +3700,7 @@ impl BlockStamps {
             if self.executor.windows > 0 {
                 out.push_str(&self.executor.line(p.executor_send));
                 out.push_str(&self.executor.log_buffers_line());
+                out.push_str(&self.executor.stream_line());
             }
             let h = &self.windows.handout;
             let tables: Vec<String> = StreamTable::ALL
@@ -5682,6 +5753,9 @@ pub(crate) struct Deviations {
     /// Whether the word memory format's word families stream in chunks as
     /// the walk fills them, instead of the knob (`LAMBDA_VM_WORD_STREAM`).
     pub word_stream: Option<bool>,
+    /// Whether the executor's stream is lean, instead of the knob
+    /// ([`EXEC_STREAM_ENV`]).
+    pub exec_stream_lean: Option<bool>,
     /// Whether phase A's head is stamped, instead of the knob
     /// ([`head_log::knob`]).
     pub head_log: Option<bool>,
@@ -6480,6 +6554,15 @@ fn prove_block_whir_body(
             &mut stamps,
         )?;
         return Ok((proof, stamps));
+    }
+    // The lean stream is the windowed build's: refused here, never ignored.
+    if deviations.exec_stream_lean.map_or_else(
+        || parse_exec_stream(std::env::var(EXEC_STREAM_ENV).ok().as_deref()),
+        Ok,
+    )? {
+        return Err(Error::Prover(format!(
+            "{EXEC_STREAM_ENV}=lean needs the windowed build (`window_log2`)"
+        )));
     }
     // The whole-run build counts BITWISE for KECCAK_RND's Full form alone.
     if format.keccak_rnd != crate::tables::keccak_rnd::KeccakRndForm::Full {
@@ -9461,6 +9544,39 @@ fn prove_streamed(
         // read it.
         let (kind, history) = exec_mode(walkers)?;
         let history_check = exec_history_check()?;
+        // The lean stream: refused, never degraded, where it does not run.
+        let lean_stream = match deviations.exec_stream_lean {
+            Some(on) => on,
+            None => parse_exec_stream(std::env::var(EXEC_STREAM_ENV).ok().as_deref())?,
+        };
+        if lean_stream {
+            let shadow = kind == EngineKind::Fast
+                && ShadowCheck::every_from_env()
+                    .map_err(Error::Execution)?
+                    .is_some();
+            refuse_lean_stream(
+                history,
+                format.memory == crate::tables::fused_memory::MemoryFormat::Words,
+                light_walk,
+                shadow,
+                history_check,
+            )?;
+        }
+        // The walkers' window buffers under the lean stream come from the
+        // page-locked pool as the executor's would.
+        let lean_pooled = lean_stream && pool_exec_logs() && multilinear::pinned::ready();
+        eprintln!(
+            "★ BLOCK EXEC STREAM: {} ({EXEC_STREAM_ENV})",
+            if lean_stream {
+                if lean_pooled {
+                    "lean: the walkers re-run each window from its access records, its logs into the page-locked pool"
+                } else {
+                    "lean: the walkers re-run each window from its access records"
+                }
+            } else {
+                "full: the executor writes the logs, the default"
+            }
+        );
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
@@ -9497,6 +9613,9 @@ fn prove_streamed(
                     format.memory == crate::tables::fused_memory::MemoryFormat::Words;
                 if history && word_history {
                     executor.enable_word_history().map_err(failed)?;
+                    if lean_stream {
+                        executor.enable_lean_stream().map_err(failed)?;
+                    }
                 } else if history {
                     executor.enable_history().map_err(failed)?;
                 }
@@ -9518,9 +9637,14 @@ fn prove_streamed(
                 // The window's buffer capacity, and whether each next one
                 // comes from the page-locked pool (`LAMBDA_VM_POOL_EXEC_LOGS`).
                 let log_capacity = executor::vm::fast::log_window_capacity(window);
-                own.logs_pooled = pool_exec_logs()
-                    && kind == EngineKind::Fast
-                    && multilinear::pinned::ready();
+                // Under the lean stream the walkers write the logs, into the
+                // pool when it is on ([`WindowedTraceBuilder::lean_stream`]).
+                own.logs_pooled = if lean_stream {
+                    lean_pooled
+                } else {
+                    pool_exec_logs() && kind == EngineKind::Fast && multilinear::pinned::ready()
+                };
+                own.lean = lean_stream;
                 // The pad probe's executor part: dead bytes a cycle into a
                 // buffer reused window after window (0: none).
                 let pad = exec_pad_probe().map_err(Error::Prover)?;
@@ -9539,7 +9663,7 @@ fn prove_streamed(
                 let usage_before = ThreadUsage::now();
                 loop {
                     let t = Instant::now();
-                    if own.logs_pooled {
+                    if own.logs_pooled && !lean_stream {
                         // Taken when this window is handed out, as the next
                         // window's buffer; a buffer of another capacity is
                         // never taken (and freed).
@@ -9566,7 +9690,14 @@ fn prove_streamed(
                         && own.windows.is_multiple_of(history_check))
                     .then(|| executor.snapshot());
                     // `ran`: the window executed.
-                    let (logs, ran) = if history {
+                    let (logs, ran) = if lean_stream {
+                        // No logs: the window's walker re-runs it.
+                        let window = executor.resume_word_lean(window).map_err(failed)?;
+                        (
+                            window.map(|(_, h)| (Vec::new(), Some(h))),
+                            Instant::now(),
+                        )
+                    } else if history {
                         let window = if word_history {
                             executor.resume_word_history(window).map_err(failed)?
                         } else {
@@ -9581,13 +9712,25 @@ fn prove_streamed(
                     let Some((logs, window_history)) = logs else {
                         break;
                     };
+                    let window_cycles = match &window_history {
+                        Some(h) if h.lean => h.cycles,
+                        _ => logs.len(),
+                    };
                     if pad_bytes > 0 {
                         let t = Instant::now();
-                        pad_write(&mut pad_buf, 0, logs.len(), pad_bytes, cycles);
+                        pad_write(&mut pad_buf, 0, window_cycles, pad_bytes, cycles);
                         pad_secs += t.elapsed().as_secs_f64();
                     }
-                    cycles += logs.len() as u64;
-                    own.note_logs(&logs, logs.capacity());
+                    cycles += window_cycles as u64;
+                    own.cycles += window_cycles as u64;
+                    own.log_bytes +=
+                        (logs.len() * std::mem::size_of::<executor::vm::logs::Log>()) as u64;
+                    own.history_bytes += window_history
+                        .as_ref()
+                        .map_or(0, |h| h.written_bytes() as u64);
+                    if !lean_stream {
+                        own.note_logs(&logs, logs.capacity());
+                    }
                     if let Some(check) = &mut shadow {
                         if let Some(start) = sampled {
                             check.submit(start, &logs, executor.pc(), executor.registers());
@@ -9614,8 +9757,14 @@ fn prove_streamed(
                     own.windows += 1;
                     own.handoff += ran.elapsed().as_secs_f64();
                     if let Some(ledger) = ledger {
-                        // The executor keeps a window of logs of its own.
-                        let bytes = memlog::logs_bytes(&logs);
+                        // The executor keeps a window of logs of its own;
+                        // under the lean stream its walker writes them (the
+                        // walk takes a window's logs off as it absorbs it).
+                        let bytes = if lean_stream {
+                            window_cycles * std::mem::size_of::<executor::vm::logs::Log>()
+                        } else {
+                            memlog::logs_bytes(&logs)
+                        };
                         ledger.logs.fetch_add(bytes, Relaxed);
                         ledger
                             .exec
@@ -9763,6 +9912,11 @@ fn prove_streamed(
                     }
                 }
                 builder = builder.light_walk(light_walk)?.walk_cuts(walk_cuts)?;
+                if lean_stream {
+                    let replay = executor::vm::fast::Replay::new(program)
+                        .map_err(|e| Error::Execution(format!("{e}")))?;
+                    builder = builder.lean_stream(std::sync::Arc::new(replay), lean_pooled)?;
+                }
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);
                     ledger.line("builder created");
@@ -13445,9 +13599,10 @@ mod producer_report_tests {
         ExecutorStamps, ProducerStamps, StreamTable, ThreadUsage,
     };
     use super::{
-        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_light_walk,
-        parse_word_stream,
+        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_stream,
+        parse_light_walk, parse_word_stream, refuse_lean_stream,
     };
+    use crate::Error;
 
     /// `LAMBDA_VM_WORD_STREAM`: on unless `0`; any other word refused.
     #[test]
@@ -13463,6 +13618,39 @@ mod producer_report_tests {
         }
         for bad in ["2", "on", "true", "-1"] {
             assert!(parse_word_stream(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// `LAMBDA_VM_EXEC_STREAM`: full unless `lean`; any other word refused.
+    /// The lean stream is refused, with its reason, wherever it does not run.
+    #[test]
+    fn the_exec_stream_is_full_unless_lean_and_refused_where_it_does_not_run() {
+        for (word, lean) in [
+            (None, false),
+            (Some(""), false),
+            (Some("full"), false),
+            (Some(" lean "), true),
+        ] {
+            assert_eq!(parse_exec_stream(word).ok(), Some(lean), "{word:?}");
+        }
+        for bad in ["1", "0", "Lean", "on"] {
+            assert!(parse_exec_stream(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(refuse_lean_stream(true, true, 2, false, 0).is_ok());
+        assert!(refuse_lean_stream(true, true, 1, false, 0).is_ok());
+        for (args, why) in [
+            ((false, true, 2, false, 0), "record mode"),
+            ((true, false, 2, false, 0), "word memory format"),
+            ((true, true, 0, false, 0), "light walk"),
+            ((true, true, 2, true, 0), "sampled re-execution"),
+            ((true, true, 2, false, 4), "history check"),
+        ] {
+            let (h, w, l, s, c) = args;
+            let err = refuse_lean_stream(h, w, l, s, c);
+            assert!(
+                matches!(&err, Err(Error::Prover(m)) if m.contains(why)),
+                "{args:?}: {err:?}"
+            );
         }
     }
 
