@@ -445,7 +445,7 @@ theorem soundness :
     .inr hcount, .inr hcount, ?_, ?_⟩
   · -- the `high = 0` message: the low 64 bits of the product, the MUL clause at `high = 0`
     intro _
-    refine Alu.Guarantees.of_mul (high := 0) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
+    refine Alu.Guarantees.of_mul (high := 0) hls2 hrs2 (by norm_num) ?_ ?_
     · flag_byte
     · dsimp only [dword]
       refine ⟨by omega, by omega, ?_⟩
@@ -454,7 +454,7 @@ theorem soundness :
       ring
   · -- the `high = 1` message: the high 64 bits of the product, the MUL clause at `high = 1`
     intro _
-    refine Alu.Guarantees.of_mul (high := 1) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
+    refine Alu.Guarantees.of_mul (high := 1) hls2 hrs2 (by norm_num) ?_ ?_
     · flag_byte
     · dsimp only [dword]
       refine ⟨by omega, by omega, ?_⟩

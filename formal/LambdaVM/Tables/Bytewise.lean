@@ -269,9 +269,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- the push: `op` is AND, OR or XOR, and the clause of that one becomes all of them
     intro _
     rcases hop with h | h | h <;> [
-      refine Alu.Guarantees.of_and h fun _ _ _ _ => ?_;
-      refine Alu.Guarantees.of_or h fun _ _ _ _ => ?_;
-      refine Alu.Guarantees.of_xor h fun _ _ _ _ => ?_]
+      refine Alu.Guarantees.of_and h ?_;
+      refine Alu.Guarantees.of_or h ?_;
+      refine Alu.Guarantees.of_xor h ?_]
     all_goals
       dsimp only [dword]
       refine ⟨by rw [wr0]; omega, by rw [wr1]; omega, ?_⟩

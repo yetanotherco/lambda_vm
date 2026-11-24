@@ -455,7 +455,10 @@ same static tables. Every `LT` row of this ensemble carries the comparison bit
 its operands determine, and every `MUL` row holds the low and high halves of the
 128-bit product of its two operands, each read as signed or unsigned by its own
 flag. **Every chip of this ensemble concludes about its rows, and no component
-assumes anything.**
+assumes anything** — with one caveat the ensemble does not close: it carries no
+consumer of the `ALU` bus, so whether those three conclusions are about live rows
+or hold vacuously turns on what a balanced witness does to an unmatched push. See
+"What is intentionally not proven".
 
 All three are stated about this ensemble, which asks all of `LT`, `MUL` and
 `DVRM` to balance together. The narrower statement, about one chip and its own

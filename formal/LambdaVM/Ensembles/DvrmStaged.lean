@@ -21,7 +21,7 @@ once for a `LT` comparison (`|r| < |d|`) and twice for `MUL` products (`d·q = n
 `ALU` twice with its own `DIVREM` results. Ordering whole channels cannot express that: `ALU`
 would have to be finished both before and after DVRM. Ordering *stages* can, a stage being a
 channel together with a class of its messages, so the `DIVREM` messages are finished after the
-`LT` and `MUL` ones. That is what `Ensemble.tableSoundness_of_stagedOn` is for, and this is its
+`LT` and `MUL` ones. That is what `Ensemble.tableSoundness_of_stagedRequirementsOn` is for, and this is its
 only user in either repo.
 
 The two classes are read off the `flags` field of the message, which carries the `alu_op`
@@ -223,12 +223,18 @@ theorem modelChannel_covered (c : RawChannel (F p)) (hc : c ∈ Buses.modelChann
 /-- Every pull of every table lands in a finished stage. This is `tables_channels` composed
 with the covering above, so it costs nothing beyond what the guard already proved: no list of
 what each chip receives on is written out here. -/
-theorem covered : ∀ component ∈ ensemble.tables,
-    ∀ c ∈ component.circuit.channelsWithGuarantees, ∀ msg,
-      ∃ s ∈ finished, s.channel = c ∧ s.cls msg := by
-  intro component h c hc msg
-  refine modelChannel_covered c ?_ msg
-  exact ensemble.tables_channels component h (List.mem_append_left _ hc)
+theorem covered : ∀ table : Table (F p), table.component ∈ ensemble.tables →
+    ∀ c ∈ table.component.circuit.channelsWithGuarantees,
+    ∀ i ∈ table.interactionsWith c, i.direction = .pull →
+      ∃ s ∈ finished, s.channel = c ∧ s.cls i.msg := by
+  -- The binder is a `Table`, not a `Component`, and the message arrives inside an interaction.
+  -- The last two hypotheses -- that the interaction is one this table makes, and that it is a
+  -- pull -- go unused on purpose: every stage of `finished` covers its channel whole, so the
+  -- covering holds for any message on it, pulled or not. Upstream weakened what it asks for
+  -- here; nothing of what this proof had is lost.
+  intro table h c hc i _ _
+  refine modelChannel_covered c ?_ i.msg
+  exact ensemble.tables_channels table.component h (List.mem_append_left _ hc)
 
 /-! ## Staged requirements
 
@@ -295,10 +301,10 @@ theorem lt_staged : ltComponent.StagedRequirementsOn finished := by
 /-- MUL's multiplicity is the sum of two bytes, so `ARE_BYTES[μ_lo, μ_hi]` bounds it by `510`,
 which is `muMax`. LT's is a single byte and its lemma says `< 256`; this is the two-byte form. -/
 lemma mul_mu_count {a b : F p} (ha : a.val < 256) (hb : b.val < 256) :
-    a + b = 0 ∨ Channel.CountUpTo muMax (a + b) := by
+    a + b = 0 ∨ CountUpTo muMax (a + b) := by
   by_cases h0 : a + b = 0
   · exact .inl h0
-  refine .inr (Channel.countUpTo_of_val h0 ?_)
+  refine .inr (countUpTo_of_ne_zero_of_val_le h0 ?_)
   have hsum : (a + b).val = a.val + b.val :=
     val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
   simp only [hsum, muMax]
@@ -581,7 +587,7 @@ lemma isDivrem_pulled (env : Environment (F p)) (N : ℕ) (ch : Channel (F p) Al
 of that row active. Both multiplicities are bytes, so their sum vanishes only when both do; this
 is the step that turns "this push is not suppressed" into "this row's lookups answered". -/
 lemma mu_count_of_ne_zero {a b : F p} (ha : a.val < 256) (hb : b.val < 256)
-    (h : a ≠ 0 ∨ b ≠ 0) : Channel.CountUpTo muMax (a + b) := by
+    (h : a ≠ 0 ∨ b ≠ 0) : CountUpTo muMax (a + b) := by
   have hsum : (a + b).val = a.val + b.val :=
     val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
   have hne : a + b ≠ 0 := by
@@ -590,7 +596,7 @@ lemma mu_count_of_ne_zero {a b : F p} (ha : a.val < 256) (hb : b.val < 256)
     rcases h with h | h
     · exact h ((ZMod.val_eq_zero a).mp (by omega))
     · exact h ((ZMod.val_eq_zero b).mp (by omega))
-  exact Channel.countUpTo_of_val hne (by simp only [hsum, muMax]; omega)
+  exact countUpTo_of_ne_zero_of_val_le hne (by simp only [hsum, muMax]; omega)
 
 /-! The opcodes `DVRM` borrows are never `DIVREM`'s. `LT`'s is the literal `4`; `MUL`'s is
 `7 + 32 * signed + 64 * sign_q` and the same plus `128` for the high half, which with both flags
@@ -730,7 +736,7 @@ theorem dvrm_stageDivrem {earlier : List (Stage (F p))}
   simp only [Component.rowOperations, dvrmComponent, DVRM.circuit] at hc
   have hflags := DVRM.flags_of_constraints hc
   clear hc
-  have ovf : Channel.CountUpTo muMax
+  have ovf : CountUpTo muMax
       (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).muQ +
         Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).muR) →
       IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).overflow) :=
@@ -785,12 +791,12 @@ theorem dvrm_staged : dvrmComponent.StagedRequirementsOn finished := by
 
 /-- Every table of the ensemble meets its spec.
 
-This is the first use of `Ensemble.tableSoundness_of_stagedOn` anywhere: ordering whole channels
+This is the first use of `Ensemble.tableSoundness_of_stagedRequirementsOn` anywhere: ordering whole channels
 cannot hold this ensemble, because `DVRM` both pulls from `ALU` and pushes to it, so the bus
 would have to be finished before itself. Splitting it by message class breaks the cycle, and
 nothing else in the model needed that until `DVRM` arrived. -/
 theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
-  apply Ensemble.tableSoundness_of_stagedOn finished rfl finished_channels covered consistent
+  apply Ensemble.tableSoundness_of_stagedRequirementsOn finished rfl finished_channels covered consistent
   intro component h
   simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
   rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl

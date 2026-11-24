@@ -418,8 +418,7 @@ lemma lt_of_guarantees {a0 a1 b0 b1 o : F p} (ha0 : a0.val < 2^32) (ha1 : a1.val
     (hb0 : b0.val < 2^32) (hb1 : b1.val < 2^32)
     (h : Alu.Guarantees (⟨a0, a1, b0, b1, 4, o, 0⟩ : Alu.Msg (F p))) :
     o = ((if dword a0 a1 < dword b0 b1 then 1 else 0 : ℕ) : F p) := by
-  obtain ⟨-, ho⟩ := h.lt ha0 ha1 hb0 hb1 (s := 0) (i := 0) (by norm_num) (by norm_num)
-    (by flag_byte)
+  obtain ⟨-, ho⟩ := h.lt (s := 0) (i := 0) (by norm_num) (by norm_num) (by flag_byte) ha0 hb0
   dsimp only at ho
   rw [ho, Alu.ltBit_unsigned (by simp only [dword]; omega) (by simp only [dword]; omega)]
 
@@ -690,11 +689,9 @@ theorem soundness :
       exact absurd heq (by norm_num)
   clear h_sgeq
   -- the two `MUL` pulls: `d · q` is the 128-bit product that `n − r` names
-  have hlow := (Alu.Guarantees.mul (h_mulA hcount) (by dsimp only; omega) (by dsimp only; omega)
-    (by dsimp only; omega) (by dsimp only; omega) hsigned2 hsignQ2 (high := 0) (by norm_num)
+  have hlow := (Alu.Guarantees.mul (h_mulA hcount) hsigned2 hsignQ2 (high := 0) (by norm_num)
     (by flag_byte)).2.2
-  have hhigh := (Alu.Guarantees.mul (h_mulB hcount) (by dsimp only; omega) (by dsimp only; omega)
-    (by dsimp only; omega) (by dsimp only; omega) hsigned2 hsignQ2 (high := 1) (by norm_num)
+  have hhigh := (Alu.Guarantees.mul (h_mulB hcount) hsigned2 hsignQ2 (high := 1) (by norm_num)
     (by flag_byte)).2.2
   clear h_mulA h_mulB
   rw [show ∀ ls rs x y : ℕ, Alu.mulResult ls rs 0 x y
@@ -812,9 +809,9 @@ theorem soundness :
     eq_zero_or_countUpTo hsignedb,
     .inr hcount,
     fun _ => Alu.Guarantees.of_divrem hsigned2 (rm := 0) (by norm_num) (by flag_byte)
-      fun _ _ _ _ => by dsimp only; exact ⟨by omega, by omega, by rw [hQw, hNw, hDw]; exact hQR.1⟩,
+      (by dsimp only; exact ⟨by omega, by omega, by rw [hQw, hNw, hDw]; exact hQR.1⟩),
     fun _ => Alu.Guarantees.of_divrem hsigned2 (rm := 1) (by norm_num) (by flag_byte)
-      fun _ _ _ _ => by dsimp only; exact ⟨by omega, by omega, by rw [hRw, hNw, hDw]; exact hQR.2⟩⟩
+      (by dsimp only; exact ⟨by omega, by omega, by rw [hRw, hNw, hDw]; exact hQR.2⟩)⟩
 
 /-- The value of a sign-extension word `fill s`, for a bit `s`. -/
 lemma val_fill {s : F p} (hs : s.val < 2) :
@@ -914,7 +911,7 @@ lemma alu_lt_message {rlo rhi dlo dhi dz : F p} {data : ProverData (F p)}
     Alu.channel.Guarantees ⟨rlo, rhi, dlo, dhi, 4, 1 - dz, 0⟩ data := by
   show Alu.Guarantees _
   refine Alu.Guarantees.of_lt (s := 0) (i := 0) (by norm_num) (by norm_num) (by flag_byte)
-    fun _ _ _ _ => ⟨rfl, ?_⟩
+    fun _ _ => ⟨rfl, ?_⟩
   dsimp only [dword]
   rw [Alu.ltBit_unsigned (by omega) (by omega), hbit]
   rcases eq_zero_or_one_of_val hdz with ⟨h, hv⟩ | ⟨h, hv⟩ <;> rw [hv, h] <;> norm_num
@@ -928,7 +925,7 @@ lemma alu_mul_message {dlo dhi qlo qhi olo ohi flags : F p} {data : ProverData (
     (hres : olo.val + 2^32 * ohi.val
       = Alu.mulResult ls rs high (dlo.val + 2^32 * dhi.val) (qlo.val + 2^32 * qhi.val)) :
     Alu.channel.Guarantees ⟨dlo, dhi, qlo, qhi, flags, olo, ohi⟩ data :=
-  Alu.Guarantees.of_mul hls hrs hhigh (by simp [hflags, opselMUL]) fun _ _ _ _ =>
+  Alu.Guarantees.of_mul hls hrs hhigh (by simp [hflags, opselMUL])
     ⟨holo, hohi, hres⟩
 
 /-- The two halves of the `MUL` bus result, read off the 128-bit product. -/
@@ -1340,6 +1337,15 @@ theorem requirementsChannelsLawful : ∀ (input : Var Row (F p)) (offset : ℕ),
       elaborated.channelsWithGuarantees
       [AluC, IsHalfC, ZeroC] := by
   intro input offset
+  -- Open the row before the big `simp`s, as the other five chips do. Upstream's
+  -- `proveProjectionEvalEq` (Clean `a2ff3c47`) lifts `eval env input.c` to
+  -- `(ProvableStruct.eval env input).c` through the structure's eta law, and against an opaque
+  -- base it now reaches that by a `cases` on the whole row plus two inner `simp`s, once per
+  -- column. `Row` is the only one here with nested components, so the lift has two levels and
+  -- the cost is worst. Destructured, every column is an atom and the path never runs.
+  obtain ⟨⟨n0, n1, n2, n3⟩, ⟨d0, d1, d2, d3⟩, signed, ⟨q0, q1, q2, q3⟩, ⟨r0, r1, r2, r3⟩,
+    divByZero, overflow, ⟨absRlo, absRhi⟩, ⟨absDlo, absDhi⟩, ⟨s0, s1, s2, s3⟩, signNSubR,
+    signN, signD, signQ, signR, muQ, muR⟩ := input
   apply requirementsChannelsLawful_of_cover
   · -- the chip has no subcircuits
     simp only [circuit_norm, main]
@@ -1349,14 +1355,21 @@ theorem requirementsChannelsLawful : ∀ (input : Var Row (F p)) (offset : ℕ),
     tauto
   · -- the one `ARE_BYTES` pull and the three `MSB16` pulls, met in place
     intro env hc
-    simp only [circuit_norm, main] at hc
+    simp only [circuit_norm, main, isBit, sign, neg] at hc
+    -- `isBit signed` is the first `assertZero` `main` writes -- the nine operations before it are
+    -- interactions, which `ConstraintsHold.Shallow` skips -- and `flags_of_constraints` reads it
+    -- in the same place. Naming it once keeps a `tauto` from rediscovering it inside every
+    -- branch of the `all_goals` below, and letting `hb` infer its type keeps it in whatever
+    -- spelling `circuit_norm` currently produces.
+    obtain ⟨hs, -⟩ := hc
+    have hb := mul_one_sub_eq_zero_iff.mp hs
     simp only [circuit_norm, main, List.not_mem_nil]
     intro i hi
     repeat' rcases hi with rfl | hi
     all_goals intro hne
     all_goals try (revert hne; simp only [circuit_norm, AluC, Alu.channelC, IsHalfC, ZeroC,
       Bitwise.IsHalf, Bitwise.Zero, Alu.channel, StaticLookupChannel.toChannel])
-    all_goals exact fun _ => eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp (by tauto))
+    all_goals exact fun _ => eq_zero_or_countUpTo hb
 
 /-! ## What an ensemble reads off a row
 
@@ -1377,7 +1390,7 @@ theorem flags_of_constraints {env : Environment (F p)} {input : Var Row (F p)} {
     IsBool (Expression.eval env input.signed) ∧
       Expression.eval env input.signed * (1 - Expression.eval env input.overflow)
         - Expression.eval env input.signQ = 0 := by
-  simp only [circuit_norm, main, isBit, sign, neg, forall_eq_or_imp, forall_eq] at hc
+  simp only [circuit_norm, main, isBit, sign, neg, forall_eq_or_imp, forall_eq] at hc ⊢
   obtain ⟨hs,-,-,-,-,-,hq,-,-,-,-,-,-,-,-,-,-,-,-⟩ := hc
   exact ⟨mul_one_sub_eq_zero_iff.mp hs, hq⟩
 
@@ -1388,7 +1401,7 @@ theorem bytes_mu {env : Environment (F p)} {input : Var Row (F p)} {offset : ℕ
     (g : ((main input).operations offset).ChannelGuarantees Bitwise.AreBytes.toRaw env) :
     (Expression.eval env input.muQ).val < 256 ∧ (Expression.eval env input.muR).val < 256 := by
   simp only [circuit_norm, main, isBit, sign, neg, areBytes, Bitwise.AreBytes,
-    Bitwise.areBytesTable, StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at g
+    Bitwise.areBytesTable, StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at g ⊢
   exact g.1
 
 /-- The quotient's sign is a bit once `overflow` is one, which is what `ZERO` says. -/
@@ -1401,19 +1414,19 @@ lemma isBool_signQ {signed overflow signQ : F p} (hb : IsBool signed) (ho : IsBo
 answer only arrives when the pull is active, which is what `hmu` carries. The `obtain` reads the
 thirty-three pulls in the order `main` emits them, where the overflow check is the fifteenth. -/
 theorem isBool_overflow {env : Environment (F p)} {input : Var Row (F p)} {offset : ℕ}
-    (hmu : Channel.CountUpTo muMax
+    (hmu : CountUpTo muMax
       (Expression.eval env input.muQ + Expression.eval env input.muR))
     (g : ((main input).operations offset).ChannelGuarantees ZeroC env) :
     IsBool (Expression.eval env input.overflow) := by
   simp only [circuit_norm, main, isBit, sign, neg, ZeroC, Bitwise.Zero,
-    StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at g
+    StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at hmu g ⊢
   obtain ⟨-,-,-,-,-,-,-,-,-,-,-,-,-,-,gov,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-⟩ := g
   exact Bitwise.isBool_of_zero (gov hmu)
 
 /-- A sign flag is a bit: zero on an unsigned row by the chip's own constraint, and otherwise the
 top bit `MSB16` returned. -/
 lemma isBool_sign {signed x s : F p} (hb : IsBool signed) (hz : (1 - signed) * s = 0)
-    (g : Channel.CountUpTo muMax signed → Bitwise.msb16Table.Guarantees (x, s)) : IsBool s := by
+    (g : CountUpTo muMax signed → Bitwise.msb16Table.Guarantees (x, s)) : IsBool s := by
   rcases hb with rfl | rfl
   · left; simpa using hz
   · exact Bitwise.isBool_of_msb16 (g countUpTo_one)
@@ -1434,10 +1447,10 @@ theorem isBool_signs {env : Environment (F p)} {input : Var Row (F p)} {offset :
     IsBool (Expression.eval env input.signN) ∧ IsBool (Expression.eval env input.signR) ∧
       IsBool (Expression.eval env input.signD) := by
   simp only [circuit_norm, main, isBit, sign, neg, Msb16C, Bitwise.Msb16,
-    StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at hc g
+    StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at hc g ⊢
   obtain ⟨-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,gN,gR,gD,-⟩ := g
   obtain ⟨hs,-,-,-,-,-,-,-,-,-,-,-,hzN,hzR,hzD,-,-,-,-⟩ := hc
-  have hb : IsBool (Expression.eval env input.signed) := mul_one_sub_eq_zero_iff.mp hs
+  have hb := mul_one_sub_eq_zero_iff.mp hs
   exact ⟨isBool_sign hb hzN gN, isBool_sign hb hzR gR, isBool_sign hb hzD gD⟩
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
