@@ -4239,7 +4239,8 @@ type Built = (usize, usize, usize, usize, Result<Table, Error>, f64);
 
 /// A family's tables built by [`emit_units_sliding`], for the build's marks:
 /// how many, when the first started and the last was built (seconds since the
-/// marks' start), their jobs' seconds summed and their bytes.
+/// marks' start), their jobs' seconds summed, the longest job's seconds and
+/// their bytes.
 #[cfg(feature = "parallel")]
 #[derive(Clone, Copy, Default)]
 struct FamilyBuild {
@@ -4247,6 +4248,7 @@ struct FamilyBuild {
     first_started: Option<f64>,
     last_built: f64,
     busy: f64,
+    longest: f64,
     bytes: usize,
 }
 
@@ -4438,6 +4440,7 @@ fn slide_units(
                 f.tables += 1;
                 f.last_built = build_stamps::since_start().unwrap_or(0.0);
                 f.busy += secs;
+                f.longest = f.longest.max(secs);
                 f.bytes += bytes;
             }
             ready[position] = Some(Some(table));
@@ -4455,6 +4458,15 @@ fn slide_units(
                 ));
             }
         }
+        // Each family's longest table, the one-thread job that bounds when
+        // the family can end: a measurement.
+        let longest: Vec<String> = families
+            .iter()
+            .zip(&FAMILIES)
+            .filter(|(f, _)| f.first_started.is_some())
+            .map(|(f, &(name, _))| format!("{name} {:.3}s", f.longest))
+            .collect();
+        build_stamps::mark(&format!("p5 longest table a family: {}", longest.join(" ")));
         build_stamps::mark(&LT_ROWS_BUILT.mark());
         build_stamps::mark("p5 end");
         Ok(())
