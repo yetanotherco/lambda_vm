@@ -931,12 +931,49 @@ fn prepare_next(
     index: usize,
     last: LastLevel,
 ) -> Result<PreparedNext, String> {
-    let (program, marks) = wlfm_leg_program_marked(&child)?;
+    let (program, marks) = next_program(&child)?;
     let rounds = child.artifacts.rounds;
     let pre = prepare_as_level(stop, index, last, family, |levers| {
         prepare_level_as(&program, levers, rounds)
     })?;
     Ok((program, pre, marks))
+}
+
+/// The level after `child`'s: its program and where its arena's pieces end.
+fn next_program(child: &WlfmChild) -> Result<(LfmProgram, Vec<u32>), String> {
+    wlfm_leg_program_marked(child)
+}
+
+/// `LAMBDA_VM_LEVELS_NEXT_BESIDE=1`: when level 2 executes beside level 1's
+/// prove ([`stream_next`]), its execution is set up and streamed as soon as
+/// its program exists, its host preparation (columns, stacks, packs) on a
+/// thread of its own beside it ([`stream_next_level_beside`]), where today the
+/// execution waits for that preparation. The same program, prebuild and
+/// execution: the same proofs. Off by default (and for any word but `1`).
+/// Read once a process, on the driver's thread.
+pub const NEXT_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_NEXT_BESIDE";
+
+std::thread_local! {
+    /// A test's [`next_beside`] on this thread.
+    static NEXT_BESIDE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`next_beside`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_next_beside_for_test(on: Option<bool>) {
+    NEXT_BESIDE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`NEXT_BESIDE_ENV`] is on (or this thread's test override).
+pub fn next_beside() -> bool {
+    if let Some(on) = NEXT_BESIDE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(NEXT_BESIDE_ENV).ok().as_deref())
+    })
 }
 
 /// [`prepare_next`]'s level: its program, its prebuild and its arena's marks.
@@ -996,6 +1033,9 @@ pub struct NextStream {
     pub last: f64,
     pub executed: f64,
     pub fill: f64,
+    /// Under [`next_beside`], when its prebuild was made beside the execution
+    /// (`None` on today's path, where it was made before the execution).
+    pub prebuilt: Option<f64>,
 }
 
 /// When level 2's stacks' commit started (the driver's clock), whether early
@@ -1400,6 +1440,83 @@ fn stream_next_level(
     let streamed =
         stream_level_over_pieces_parts(&program, &marks, hasher, pieces, t0, fill_parts)?;
     Ok((program, pre, Some(streamed)))
+}
+
+/// [`stream_next_level`] with level 2's preparation beside its execution
+/// ([`next_beside`]): the program is made here, then the prebuild on a thread
+/// of its own while this one streams the execution ([`prepare_and_stream`]).
+/// The same program, prebuild and execution. Level `index` is prepared under
+/// the levers it proves at ([`prepare_as_level`]), as [`prepare_next`] does.
+#[allow(clippy::too_many_arguments)]
+fn stream_next_level_beside(
+    child: WlfmChild,
+    family: WlfmFamily,
+    stop: LevelStop,
+    index: usize,
+    last: LastLevel,
+    pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
+    t0: std::time::Instant,
+    fill_parts: bool,
+    early: Option<mpsc::SyncSender<WlfmPrebuild>>,
+) -> Result<StreamedNext, String> {
+    let (program, marks) = next_program(&child)?;
+    let rounds = child.artifacts.rounds;
+    let prepare = || {
+        prepare_as_level(stop, index, last, family, |levers| {
+            prepare_level_as(&program, levers, rounds)
+        })
+    };
+    let (pre, streamed) =
+        prepare_and_stream(&program, &marks, prepare, pieces, t0, fill_parts, early)?;
+    Ok((program, pre, streamed))
+}
+
+/// [`prepare_and_stream`]'s level: its prebuild (`None` when handed on) and
+/// its execution streamed and filled (`None` when it does not stream).
+type PreparedBeside = (
+    Option<WlfmPrebuild>,
+    Option<(super::proof::LfmFilled, NextStream)>,
+);
+
+/// `program`'s prebuild (`prepare`) on a scoped thread of its own,
+/// handed on to `early` the moment it exists (it comes back only if `early`
+/// has stopped taking it), beside its execution streamed over `pieces` on
+/// this thread ([`stream_level_over_pieces_parts`]; none when its arena has
+/// more pieces than a streamed execution lands). A failed or panicking
+/// preparation is refused after the execution has ended; its sender is
+/// dropped as it ends, so a receiver on `early` never waits for it.
+pub(super) fn prepare_and_stream(
+    program: &LfmProgram,
+    marks: &[u32],
+    prepare: impl FnOnce() -> Result<WlfmPrebuild, String> + Send,
+    pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
+    t0: std::time::Instant,
+    fill_parts: bool,
+    early: Option<mpsc::SyncSender<WlfmPrebuild>>,
+) -> Result<PreparedBeside, String> {
+    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    std::thread::scope(|inner| {
+        let prepare = inner.spawn(move || -> Result<(Option<WlfmPrebuild>, f64), String> {
+            let pre = prepare()?;
+            let at = t0.elapsed().as_secs_f64();
+            let pre = match early {
+                Some(tx) => tx.send(pre).err().map(|mpsc::SendError(pre)| pre),
+                None => Some(pre),
+            };
+            Ok((pre, at))
+        });
+        let streamed = (marks.len() <= MAX_STREAM_PIECES).then(|| {
+            stream_level_over_pieces_parts(program, marks, hasher, pieces, t0, fill_parts)
+        });
+        let (pre, at) = prepare
+            .join()
+            .map_err(|_| "level 2's preparation panicked".to_string())??;
+        let streamed = streamed.transpose()?.map(|(filled, mut times)| {
+            times.prebuilt = Some(at);
+            (filled, times)
+        });
+        Ok((pre, streamed))
+    })
 }
 
 /// `program`'s execution over one arena cut at `marks` (each piece's end:
@@ -2409,6 +2526,7 @@ pub fn prove_block_levels(
     let fill_beside_on = fill_beside();
     let fill_parts_on = fill_parts();
     let commit_next_early_on = commit_next_early();
+    let next_beside_on = next_beside();
     let late = settle_late() || super::wlfm_knobs::levels_untrimmed();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -2925,7 +3043,48 @@ pub fn prove_block_levels(
                 })
             })
         };
-        let mut next = spawn_next(&levels[0].build, 1);
+        // Under the knob, level 2 executes beside level 1's prove, its arena
+        // landing piece by piece as level 1 opens its groups.
+        let mut streamed: Option<std::thread::ScopedJoinHandle<'_, Result<StreamedNext, String>>> =
+            None;
+        let (piece_tx, piece_rx) = mpsc::channel::<(usize, Vec<LfmWord>)>();
+        let mut piece_rx = Some(piece_rx);
+        // Under [`commit_next_early`], level 2's prebuild comes back on its
+        // own as soon as it exists, to be committed when level 1's prove
+        // returns rather than after level 2's fill.
+        let mut early_rx: Option<mpsc::Receiver<WlfmPrebuild>> = None;
+        let mut early_channel = || {
+            commit_next_early_on.then(|| {
+                let (tx, rx) = mpsc::sync_channel::<WlfmPrebuild>(1);
+                early_rx = Some(rx);
+                tx
+            })
+        };
+        // Under [`next_beside`], level 2's thread starts here with its program
+        // alone and prepares beside its execution; otherwise its program and
+        // preparation run here and its stream waits for both.
+        let beside = next_beside_on && stream_next_on && level_more(stop, 1, &levels[0].build);
+        let mut next = if beside {
+            let child = child_of_build(&plan, &levels[0].build);
+            let early_tx = early_channel();
+            let rx = piece_rx.take().ok_or("level 2's pieces")?;
+            streamed = Some(scope.spawn(move || {
+                stream_next_level_beside(
+                    child,
+                    family,
+                    stop,
+                    2,
+                    last,
+                    rx,
+                    t0,
+                    fill_parts_on,
+                    early_tx,
+                )
+            }));
+            None
+        } else {
+            spawn_next(&levels[0].build, 1)
+        };
         let (filled, fill) = match execution {
             Level1Ready::Executed(execution, lean) => {
                 let t = std::time::Instant::now();
@@ -2955,27 +3114,19 @@ pub fn prove_block_levels(
             times.resident.push(("level 1 filled", r));
         }
         let _ = super::wlfm::take_wlfm_stamps();
-        // Under the knob, level 2 executes beside level 1's prove, its arena
-        // landing piece by piece as level 1 opens its groups.
-        let mut streamed: Option<std::thread::ScopedJoinHandle<'_, Result<StreamedNext, String>>> =
-            None;
-        let (piece_tx, piece_rx) = mpsc::channel::<(usize, Vec<LfmWord>)>();
-        // Under [`commit_next_early`], level 2's prebuild comes back on its
-        // own as soon as it is joined, to be committed when level 1's prove
-        // returns rather than after level 2's fill.
-        let mut early_rx: Option<mpsc::Receiver<WlfmPrebuild>> = None;
-        if stream_next_on && let Some(prepared) = next.take() {
-            let early_tx = commit_next_early_on.then(|| {
-                let (tx, rx) = mpsc::sync_channel::<WlfmPrebuild>(1);
-                early_rx = Some(rx);
-                tx
-            });
-            streamed =
-                Some(scope.spawn(move || {
-                    stream_next_level(prepared, piece_rx, t0, fill_parts_on, early_tx)
-                }));
-        } else {
-            drop(piece_rx);
+        if !beside {
+            if stream_next_on
+                && let Some(prepared) = next.take()
+                && let Some(rx) = piece_rx.take()
+            {
+                let early_tx = early_channel();
+                streamed =
+                    Some(scope.spawn(move || {
+                        stream_next_level(prepared, rx, t0, fill_parts_on, early_tx)
+                    }));
+            } else {
+                drop(piece_rx.take());
+            }
         }
         let streaming = streamed.is_some();
         let child = child_of(&plan, &levels[0]);
