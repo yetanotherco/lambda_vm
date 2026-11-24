@@ -1690,9 +1690,56 @@ struct WaveBuckets {
     /// Per bucket: the same for its other instructions (`others_at(level)`).
     other_runs: Vec<Vec<(u32, u32, u32)>>,
     other_pos: Vec<Vec<u32>>,
+    /// Per bucket, its instructions' program indices, ascending: what a wave
+    /// in program order reads ([`Self::build_in_order`]). Empty when the
+    /// buckets were built for level-order waves ([`Self::build`]).
+    order: Vec<Vec<u32>>,
 }
 
 impl WaveBuckets {
+    /// The buckets of `need` with each bucket's instructions in program order
+    /// and no level positions: what an in-order wave reads
+    /// ([`StreamedExecution::wave_in_order`]). One pass over `need`; the same
+    /// buckets (the same sets, each holding the same instructions) as
+    /// [`Self::build`]'s. `cached`: as there.
+    fn build_in_order(need: &[u64], cached: bool) -> Self {
+        let mut index: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        let mut b = Self {
+            masks: Vec::new(),
+            hash_runs: Vec::new(),
+            hash_pos: Vec::new(),
+            other_runs: Vec::new(),
+            other_pos: Vec::new(),
+            order: Vec::new(),
+        };
+        let mut last: Option<(u64, usize)> = None;
+        for (i, &mask) in need.iter().enumerate() {
+            let k = match last {
+                Some((m, k)) if cached && m == mask => k,
+                _ => {
+                    let k = *index.entry(mask).or_insert_with(|| {
+                        b.masks.push(mask);
+                        b.hash_runs.push(Vec::new());
+                        b.hash_pos.push(Vec::new());
+                        b.other_runs.push(Vec::new());
+                        b.other_pos.push(Vec::new());
+                        b.order.push(Vec::new());
+                        b.masks.len() - 1
+                    });
+                    last = Some((mask, k));
+                    k
+                }
+            };
+            b.order[k].push(i as u32);
+        }
+        b
+    }
+
+    /// Whether the buckets were built for in-order waves.
+    fn in_order(&self) -> bool {
+        !self.order.is_empty()
+    }
+
     /// `cached`: each instruction's bucket is found from the one before it
     /// when they wait for the same groups (most neighbours do), and from the
     /// map only otherwise. The same buckets.
@@ -1704,6 +1751,7 @@ impl WaveBuckets {
             hash_pos: Vec::new(),
             other_runs: Vec::new(),
             other_pos: Vec::new(),
+            order: Vec::new(),
         };
         let mut last: Option<(u64, usize)> = None;
         let mut bucket =
@@ -1800,6 +1848,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             false,
             None,
             false,
+            false,
         )
     }
 
@@ -1832,7 +1881,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         lean_tap: bool,
         bucketed: bool,
     ) -> Result<Self, LfmExecError> {
-        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed, false)
+        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed, false, false)
     }
 
     /// [`Self::new_pieced_bucketed`] with its setup made the fast way when
@@ -1849,7 +1898,29 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         bucketed: bool,
         setup_fast: bool,
     ) -> Result<Self, LfmExecError> {
-        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed, setup_fast)
+        Self::pieced_with(
+            program, pieces, hasher, lean_tap, bucketed, setup_fast, false,
+        )
+    }
+
+    /// [`Self::new_pieced_setup`] whose bucketed waves run their instructions
+    /// in program order when `in_order` ([`Self::wave_in_order`]): each wave on
+    /// this thread, hashing inline, instead of level by level of the whole
+    /// program's schedule with its hashes on the pool. The same instructions
+    /// each wave, in another order that respects every dependency, so the same
+    /// execution. Without `bucketed` the flag does nothing.
+    pub fn new_pieced_in_order(
+        program: &'p LfmProgram,
+        pieces: Vec<ArenaPiece>,
+        hasher: &'p H,
+        lean_tap: bool,
+        bucketed: bool,
+        setup_fast: bool,
+        in_order: bool,
+    ) -> Result<Self, LfmExecError> {
+        Self::pieced_with(
+            program, pieces, hasher, lean_tap, bucketed, setup_fast, in_order,
+        )
     }
 
     /// [`Self::new_pieced`] with, when `lean_tap`, a copy of every lean BLAKE3
@@ -1862,9 +1933,10 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         hasher: &'p H,
         lean_tap: bool,
     ) -> Result<Self, LfmExecError> {
-        Self::pieced_with(program, pieces, hasher, lean_tap, false, false)
+        Self::pieced_with(program, pieces, hasher, lean_tap, false, false, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pieced_with(
         program: &'p LfmProgram,
         pieces: Vec<ArenaPiece>,
@@ -1872,6 +1944,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         lean_tap: bool,
         bucketed: bool,
         setup_fast: bool,
+        in_order: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let mut sorted = pieces.clone();
@@ -1960,6 +2033,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             bucketed,
             prebuilt,
             setup_fast,
+            in_order,
         )?;
         streamed.split.need_pass = need_pass;
         streamed.m.pieces = by_arena
@@ -2034,6 +2108,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         bucketed: bool,
         prebuilt: Option<(LevelSchedule, f64)>,
         cached_buckets: bool,
+        in_order: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let t = Instant::now();
@@ -2046,7 +2121,13 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             }
         };
         let t_buckets = Instant::now();
-        let buckets = bucketed.then(|| WaveBuckets::build(&levels, &need, cached_buckets));
+        let buckets = bucketed.then(|| {
+            if in_order {
+                WaveBuckets::build_in_order(&need, cached_buckets)
+            } else {
+                WaveBuckets::build(&levels, &need, cached_buckets)
+            }
+        });
         let bucket_build = t_buckets.elapsed().as_secs_f64();
         // Bucketed, the waves read the buckets' sets, never `need` again.
         let need = if bucketed { Vec::new() } else { need };
@@ -2163,6 +2244,9 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
     /// Runs the instructions whose groups have all landed and had not all
     /// landed `before` (every instruction that reads no arena, at `None`).
     fn wave(&mut self, before: Option<u64>) -> Result<(), LfmExecError> {
+        if self.buckets.as_ref().is_some_and(WaveBuckets::in_order) {
+            return self.wave_in_order(before);
+        }
         if self.buckets.is_some() {
             return self.wave_bucketed(before);
         }
@@ -2269,6 +2353,119 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         }
         self.ran += ran;
         Ok(())
+    }
+
+    /// [`Self::wave`] over in-order buckets ([`WaveBuckets::build_in_order`]):
+    /// the picked buckets' instructions merged by program index and run in
+    /// that order on this thread, each hash computed and applied in place.
+    /// Program order is a topological order (every operand address is below
+    /// its destination), and an input's writer either ran in an earlier wave
+    /// or is picked in this one at a lower index; memory is write-once and
+    /// every instruction writes its own record slot, so the order changes no
+    /// value. The hashes count as the thread's own; the wave's whole time is
+    /// its residue.
+    fn wave_in_order(&mut self, before: Option<u64>) -> Result<(), LfmExecError> {
+        let Some(b) = self.buckets.as_ref() else {
+            return Err(LfmExecError::Internal("an in-order wave without buckets"));
+        };
+        let picked = b.picked(self.landed, before);
+        let mut heads = vec![0usize; picked.len()];
+        let (mut ran, mut hashes) = (0usize, 0usize);
+        let t = Instant::now();
+        loop {
+            // The picked bucket with the lowest next index, and the lowest
+            // next index of the others: run the first up to the second.
+            let (mut best, mut first, mut limit) = (usize::MAX, u32::MAX, u32::MAX);
+            for (j, &k) in picked.iter().enumerate() {
+                if let Some(&i) = b.order[k].get(heads[j]) {
+                    if i < first {
+                        limit = first;
+                        first = i;
+                        best = j;
+                    } else if i < limit {
+                        limit = i;
+                    }
+                }
+            }
+            if best == usize::MAX {
+                break;
+            }
+            let run = &b.order[picked[best]];
+            while let Some(&i) = run.get(heads[best]) {
+                if i >= limit {
+                    break;
+                }
+                heads[best] += 1;
+                let i = i as usize;
+                #[cfg(test)]
+                wave_trace::note_index(i);
+                let instr = &self.program.instrs[i];
+                let slot = self.levels.record_row(i);
+                match instr {
+                    Instr::Hash { .. } | Instr::Hash16(_) | Instr::B3l(_) => {
+                        let out = hash_one(&self.m.memory, self.hasher, instr)?;
+                        apply_hash_out(
+                            &mut self.m,
+                            &mut self.records,
+                            self.lean_tap.as_mut(),
+                            instr,
+                            slot,
+                            &out,
+                        )?;
+                        hashes += 1;
+                    }
+                    _ => step(
+                        &mut self.m,
+                        &mut self.records,
+                        &mut self.public_words,
+                        instr,
+                        self.hasher,
+                        Sink::Slot(slot),
+                    )?,
+                }
+                ran += 1;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        self.split.serial_hashes += hashes;
+        self.split.residue += secs;
+        self.ran += ran;
+        Ok(())
+    }
+
+    /// The wave buckets, for a test: each bucket's set of groups and its
+    /// instructions' program indices, ascending (from its level positions
+    /// for level-order buckets, its order for in-order ones), sorted by set.
+    /// `None` when the waves are not bucketed.
+    #[cfg(test)]
+    pub(crate) fn buckets_for_test(&self) -> Option<Vec<(u64, Vec<u32>)>> {
+        let b = self.buckets.as_ref()?;
+        let mut out: Vec<(u64, Vec<u32>)> = (0..b.masks.len())
+            .map(|k| {
+                let mut ix: Vec<u32> = if b.in_order() {
+                    b.order[k].clone()
+                } else {
+                    let mut v = Vec::new();
+                    for &(d, start, len) in &b.hash_runs[k] {
+                        let rows = self.levels.hashes_at(d as usize);
+                        for &p in &b.hash_pos[k][start as usize..(start + len) as usize] {
+                            v.push(self.levels.instr_of_row(rows[p as usize]) as u32);
+                        }
+                    }
+                    for &(d, start, len) in &b.other_runs[k] {
+                        let others = self.levels.others_at(d as usize);
+                        for &p in &b.other_pos[k][start as usize..(start + len) as usize] {
+                            v.push(others[p as usize]);
+                        }
+                    }
+                    v
+                };
+                ix.sort_unstable();
+                (b.masks[k], ix)
+            })
+            .collect();
+        out.sort();
+        Some(out)
     }
 
     /// Where the execution's time has gone so far ([`ExecSplit`]).
@@ -2475,33 +2672,7 @@ fn run_level(
         let index = levels.instr_of_row(row);
         let instr = &program.instrs[index];
         let slot = levels.record_row(index);
-        // The hash chip's row goes through the same slot write as every
-        // other chip's: the vector's length is zero until `commit_slots`.
-        match (instr, row_value) {
-            // Each entry's slot is its own chip's record row: a level holds
-            // the hash chip's rows and the lean compressions' together, so
-            // an entry's position among them is neither chip's row.
-            (Instr::Hash { mode, outs, .. }, HashOut::Narrow(r)) => {
-                hash_apply(&mut m.memory, *mode, outs, r)?;
-                Sink::Slot(slot).put(&mut records.hash, r.clone());
-            }
-            (Instr::Hash16(h), HashOut::Wide(r)) => {
-                hash16_apply(&mut m.memory, &h.outs, r)?;
-                Sink::Slot(slot).put(&mut records.hash16, (**r).clone());
-            }
-            (Instr::B3l(op), HashOut::Lean(values, digest)) => {
-                b3l_apply(&mut m.memory, op, digest)?;
-                if let Some(tap) = lean_tap.as_deref_mut() {
-                    tap.push((slot, *values));
-                }
-                Sink::Slot(slot).put(&mut records.b3l, *values);
-            }
-            _ => {
-                return Err(LfmExecError::Internal(
-                    "the schedule listed a non-hash instruction as a hash row",
-                ));
-            }
-        }
+        apply_hash_out(m, records, lean_tap.as_deref_mut(), instr, slot, row_value)?;
     }
     split.apply += t.elapsed().as_secs_f64();
 
@@ -2523,6 +2694,47 @@ fn run_level(
     }
     split.residue += t.elapsed().as_secs_f64();
     Ok(ran)
+}
+
+/// A hash instruction's computed `out` applied: its outputs written and its
+/// record put in its own chip's slot `slot` (and, for a lean compression, a
+/// copy handed to `lean_tap`).
+fn apply_hash_out(
+    m: &mut Machine<'_>,
+    records: &mut LfmRecords,
+    lean_tap: Option<&mut Vec<(u32, B3lValues)>>,
+    instr: &Instr,
+    slot: u32,
+    out: &HashOut,
+) -> Result<(), LfmExecError> {
+    // The hash chip's row goes through the same slot write as every
+    // other chip's: the vector's length is zero until `commit_slots`.
+    match (instr, out) {
+        // Each entry's slot is its own chip's record row: a level holds
+        // the hash chip's rows and the lean compressions' together, so
+        // an entry's position among them is neither chip's row.
+        (Instr::Hash { mode, outs, .. }, HashOut::Narrow(r)) => {
+            hash_apply(&mut m.memory, *mode, outs, r)?;
+            Sink::Slot(slot).put(&mut records.hash, r.clone());
+        }
+        (Instr::Hash16(h), HashOut::Wide(r)) => {
+            hash16_apply(&mut m.memory, &h.outs, r)?;
+            Sink::Slot(slot).put(&mut records.hash16, (**r).clone());
+        }
+        (Instr::B3l(op), HashOut::Lean(values, digest)) => {
+            b3l_apply(&mut m.memory, op, digest)?;
+            if let Some(tap) = lean_tap {
+                tap.push((slot, *values));
+            }
+            Sink::Slot(slot).put(&mut records.b3l, *values);
+        }
+        _ => {
+            return Err(LfmExecError::Internal(
+                "the schedule listed a non-hash instruction as a hash row",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A level's computed hash row: a twelve-felt one, or a width-16 one (boxed,
@@ -2679,6 +2891,25 @@ pub(crate) mod wave_trace {
     std::thread_local! {
         static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
         static REORDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static INDICES: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+    }
+
+    /// An in-order wave ran instruction `i` (recorded under [`indices`]).
+    pub(super) fn note_index(i: usize) {
+        INDICES.with(|t| {
+            if let Some(v) = t.borrow_mut().as_mut() {
+                v.push(i);
+            }
+        });
+    }
+
+    /// Runs `f` with the indices in-order waves run on this thread recorded,
+    /// in the order they ran; returns its result and the record.
+    pub(crate) fn indices<R>(f: impl FnOnce() -> R) -> (R, Vec<usize>) {
+        INDICES.with(|t| *t.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let v = INDICES.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        (out, v)
     }
 
     /// A bucketed wave's level share whose buckets' positions, one bucket

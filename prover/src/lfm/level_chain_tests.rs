@@ -178,20 +178,25 @@ fn lean_shape(filled: &mut LfmFilled) -> Vec<(usize, usize, bool)> {
 // The knobs
 // =============================================================================
 
-/// Both knobs are named, off by default, and on only for `1`; a test's
-/// override is this thread's alone.
+/// The driver-read knobs are named, off by default, and on only for `1`; a
+/// test's override is this thread's alone.
 #[test]
 fn the_chain_knobs_are_named_and_off_by_default() {
     use super::levels::{
-        COMMIT_NEXT_EARLY_ENV, FILL_PARTS_ENV, NEXT_BESIDE_ENV, commit_next_early, fill_parts,
-        next_beside, set_commit_next_early_for_test, set_fill_parts_for_test,
-        set_next_beside_for_test,
+        COMMIT_NEXT_EARLY_ENV, FILL_PARTS_ENV, NEXT_BESIDE_ENV, WAVES_IN_ORDER_ENV,
+        commit_next_early, fill_parts, next_beside, set_commit_next_early_for_test,
+        set_fill_parts_for_test, set_next_beside_for_test, set_waves_in_order_for_test,
+        waves_in_order,
     };
     assert_eq!(FILL_PARTS_ENV, "LAMBDA_VM_LEVELS_FILL_PARTS");
     assert_eq!(COMMIT_NEXT_EARLY_ENV, "LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY");
     assert_eq!(NEXT_BESIDE_ENV, "LAMBDA_VM_LEVELS_NEXT_BESIDE");
     if std::env::var_os(NEXT_BESIDE_ENV).is_none() {
         assert!(!next_beside(), "off by default");
+    }
+    assert_eq!(WAVES_IN_ORDER_ENV, "LAMBDA_VM_LEVELS_WAVES_IN_ORDER");
+    if std::env::var_os(WAVES_IN_ORDER_ENV).is_none() {
+        assert!(!waves_in_order(), "off by default");
     }
     if std::env::var_os(FILL_PARTS_ENV).is_none() {
         assert!(!fill_parts(), "off by default");
@@ -213,23 +218,37 @@ fn the_chain_knobs_are_named_and_off_by_default() {
     set_fill_parts_for_test(Some(true));
     set_commit_next_early_for_test(Some(true));
     set_next_beside_for_test(Some(true));
+    set_waves_in_order_for_test(Some(true));
     assert!(
-        fill_parts() && commit_next_early() && next_beside(),
+        fill_parts() && commit_next_early() && next_beside() && waves_in_order(),
         "the overrides"
     );
-    let other = std::thread::spawn(|| (fill_parts(), commit_next_early(), next_beside()))
-        .join()
-        .expect("joins");
+    let other = std::thread::spawn(|| {
+        (
+            fill_parts(),
+            commit_next_early(),
+            next_beside(),
+            waves_in_order(),
+        )
+    })
+    .join()
+    .expect("joins");
     set_fill_parts_for_test(None);
     set_commit_next_early_for_test(None);
     set_next_beside_for_test(None);
-    if std::env::var_os(FILL_PARTS_ENV).is_none()
-        && std::env::var_os(COMMIT_NEXT_EARLY_ENV).is_none()
-        && std::env::var_os(NEXT_BESIDE_ENV).is_none()
+    set_waves_in_order_for_test(None);
+    if [
+        FILL_PARTS_ENV,
+        COMMIT_NEXT_EARLY_ENV,
+        NEXT_BESIDE_ENV,
+        WAVES_IN_ORDER_ENV,
+    ]
+    .iter()
+    .all(|k| std::env::var_os(k).is_none())
     {
         assert_eq!(
             other,
-            (false, false, false),
+            (false, false, false, false),
             "another thread reads the knobs"
         );
     }
@@ -601,7 +620,7 @@ fn execution_bytes(program: &LfmProgram, filled: LfmFilled) -> Vec<u8> {
 /// commit the prebuild is handed on and not returned.
 #[test]
 fn level_2_beside_its_prepare_is_level_2_after_it() {
-    use super::levels::{prepare_and_stream, prepare_level, stream_level_over_pieces};
+    use super::levels::{StreamOpts, prepare_and_stream, prepare_level, stream_level_over_pieces};
     use super::wlfm::WlfmFamily;
     let _fast = test_format::set(Some(2));
     let program = program(true);
@@ -627,7 +646,7 @@ fn level_2_beside_its_prepare_is_level_2_after_it() {
             None,
             pieces_in(&order),
             t0,
-            false,
+            StreamOpts::default(),
             None,
         )
         .expect("prepares and streams");
@@ -650,7 +669,7 @@ fn level_2_beside_its_prepare_is_level_2_after_it() {
         None,
         pieces_in(&[1, 2, 0]),
         t0,
-        true,
+        StreamOpts::default(),
         Some(tx),
     )
     .expect("prepares and streams");
@@ -673,7 +692,7 @@ fn level_2_beside_its_prepare_is_level_2_after_it() {
 /// channel closed.
 #[test]
 fn a_failing_prepare_fails_level_2_beside_without_hanging() {
-    use super::levels::prepare_and_stream;
+    use super::levels::{StreamOpts, prepare_and_stream};
     use super::wlfm::WlfmFamily;
     let program = program(true);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -685,11 +704,74 @@ fn a_failing_prepare_fails_level_2_beside_without_hanging() {
         Some(0),
         pieces_in(&[]),
         std::time::Instant::now(),
-        false,
+        StreamOpts::default(),
         Some(tx),
     )
     .err()
     .expect("refused");
     assert!(err.contains("round form"), "{err}");
     assert!(rx.recv().is_err(), "the early channel closed");
+}
+
+// =============================================================================
+// Waves in program order (LAMBDA_VM_LEVELS_WAVES_IN_ORDER)
+// =============================================================================
+
+/// The lean compressions a tapped streamed execution of [`program`] reports,
+/// its pieces at [`MARKS`] landing in `order`, its waves in program order or
+/// level by level: every `(row, values)` the waves tapped, sorted by row.
+fn tapped_compressions(program: &LfmProgram, order: &[usize], in_order: bool) -> Vec<String> {
+    let words = arena();
+    let pieces: Vec<ArenaPiece> = (0..MARKS.len())
+        .map(|i| {
+            let start = if i == 0 { 0 } else { MARKS[i - 1] };
+            ArenaPiece {
+                arena: 0,
+                start,
+                len: MARKS[i] - start,
+                group: i,
+            }
+        })
+        .collect();
+    let mut ex = StreamedExecution::new_pieced_in_order(
+        program,
+        pieces.clone(),
+        &HASHER,
+        true,
+        true,
+        true,
+        in_order,
+    )
+    .expect("starts");
+    let mut tapped = ex.take_lean_tap();
+    for &i in order {
+        let p = pieces[i];
+        ex.land_piece(
+            p.group,
+            &words[p.start as usize..(p.start + p.len) as usize],
+        )
+        .expect("lands");
+        tapped.extend(ex.take_lean_tap());
+    }
+    ex.finish().expect("finishes");
+    tapped.sort_by_key(|(row, _)| *row);
+    tapped.iter().map(|t| format!("{t:?}")).collect()
+}
+
+/// In-order waves tap every lean compression exactly once, the same rows and
+/// values as the level-order waves, in any landing order.
+#[test]
+fn in_order_waves_tap_every_compression_once() {
+    let program = program(true);
+    let n = program.groups.b3l.real_rows;
+    assert!(n > 0, "compressions");
+    for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+        let level = tapped_compressions(&program, &order, false);
+        let in_order = tapped_compressions(&program, &order, true);
+        assert_eq!(in_order.len(), n, "{order:?}: every compression once");
+        let mut rows: Vec<&String> = in_order.iter().collect();
+        rows.dedup();
+        assert_eq!(rows.len(), n, "{order:?}: none twice");
+        assert_eq!(level, in_order, "{order:?}: the level-order waves' taps");
+    }
 }
