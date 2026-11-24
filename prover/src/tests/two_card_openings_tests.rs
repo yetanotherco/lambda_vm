@@ -28,6 +28,16 @@ fn bytes(p: &BlockWhirProof) -> Vec<u8> {
         .to_vec()
 }
 
+/// The block's options: streamed (the base path a real block takes, the
+/// only one that opts phase B into two cards) with each group's openings
+/// beside the next group's argue, which is where the openings move.
+fn streamed_overlapped() -> crate::block_whir::BlockOptions {
+    let mut o = options(3);
+    o.window_log2 = Some(3);
+    o.phase_b_overlap = stark::multilinear_block::PhaseBOverlap::On;
+    o
+}
+
 /// A small BLAKE3 block over many groups (several groups open beside an
 /// argue), proved and checked by the host verifier: its bytes.
 fn proved() -> Vec<u8> {
@@ -40,7 +50,7 @@ fn proved() -> Vec<u8> {
             &[],
             &opts,
             &format,
-            &options(3),
+            &streamed_overlapped(),
             &Deviations::default(),
         )
     })
