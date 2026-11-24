@@ -1159,6 +1159,15 @@ impl<'a> FinishPlan<'a> {
         // KECCAK's state pointers), deduplicated once and shared by its BITWISE
         // lookups and its table, so the two read the same rows by construction.
         let is_wh_rows = is_wh::dedup_is_wh_rows(keccak_ops.parts().flat_map(keccak::is_wh_keys));
+        // With the page layout hoisted (`LAMBDA_VM_HOST_HOIST=pages`), it is
+        // computed once, here, from the image's whole pages, and both its
+        // readers below take it: the same configs as computing it twice.
+        let hoisted_pages: Option<Arc<Vec<PageConfig>>> = match initial_image {
+            Some(image) if skip.host_hoist.pages && !l2g_memory_bookend => Some(Arc::new(
+                super::page_configs_hoisted(image, memory_state, private_input),
+            )),
+            _ => None,
+        };
         // PAGE's lookups, from the initial image (a continuation epoch's L2G
         // table owns them).
         // Under the word memory format PAGE_W's: `IS_HALF` on each initial
@@ -1166,6 +1175,16 @@ impl<'a> FinishPlan<'a> {
         let page = initial_image
             .filter(|_| !l2g_memory_bookend)
             .map(|image| -> PageCount<'a> {
+                if let (true, Some(configs)) = (words, &hoisted_pages) {
+                    let configs = Arc::clone(configs);
+                    return Box::new(move |h: &mut bitwise::BitwiseHistogram| {
+                        for config in configs.iter().filter(|config| config.is_private_input) {
+                            for op in super::super::page_w::bitwise_ops(config) {
+                                h.bump(op);
+                            }
+                        }
+                    });
+                }
                 if words {
                     let private: Vec<PageConfig> =
                         page_configs_of(image, memory_state, private_input)
@@ -1264,8 +1283,11 @@ impl<'a> FinishPlan<'a> {
 
         // The PAGE layout: none in a continuation epoch (the L2G table owns every
         // touched cell's Memory init/fini there) or without an image.
-        let page_configs = match initial_image {
-            Some(image) if !l2g_memory_bookend => {
+        let page_configs = match (hoisted_pages, initial_image) {
+            // The hoisted layout: moved out if BITWISE's count no longer
+            // holds it, else copied.
+            (Some(configs), _) => Arc::try_unwrap(configs).unwrap_or_else(|held| (*held).clone()),
+            (None, Some(image)) if !l2g_memory_bookend => {
                 page_configs_of(image, memory_state, private_input)
             }
             _ => Vec::new(),

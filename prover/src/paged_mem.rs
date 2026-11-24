@@ -271,6 +271,29 @@ pub trait ImageSource {
     fn image_get(&self, addr: u64) -> u8;
     /// Iterate `(addr, byte)` over every byte present in the image.
     fn image_iter(&self) -> impl Iterator<Item = (u64, u8)> + '_;
+    /// The image bucketed into whole pages: each page that holds a byte of
+    /// the image, as `DEFAULT_PAGE_SIZE` bytes, each offset the image's byte
+    /// or 0. [`init_page_data_by_byte`]'s map.
+    fn init_page_data(&self) -> HashMap<u64, Vec<u8>> {
+        init_page_data_by_byte(self)
+    }
+}
+
+/// [`ImageSource::init_page_data`] a byte at a time: each byte the image
+/// holds written into its page's array, the page allocated zeroed on its first
+/// byte.
+pub(crate) fn init_page_data_by_byte<I: ImageSource + ?Sized>(image: &I) -> HashMap<u64, Vec<u8>> {
+    let mask = DEFAULT_PAGE_SIZE as u64 - 1;
+    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+    for (addr, value) in image.image_iter() {
+        let page_base = addr & !mask;
+        let offset = (addr & mask) as usize;
+        let page_data = init_page_data
+            .entry(page_base)
+            .or_insert_with(|| vec![0u8; DEFAULT_PAGE_SIZE]);
+        page_data[offset] = value;
+    }
+    init_page_data
 }
 
 impl ImageSource for HashMap<u64, u8> {
@@ -290,6 +313,21 @@ impl ImageSource for PagedMem<u8> {
     }
     fn image_iter(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
         self.iter()
+    }
+    /// Each page that holds a `set` cell copied whole. A page is allocated
+    /// filled with `fill` and only `set` writes it (marking the cell), so with
+    /// `fill` 0 the copy holds each `set` cell's byte and 0 elsewhere: the map
+    /// [`init_page_data_by_byte`] builds a byte at a time. Any other `fill`
+    /// takes that path.
+    fn init_page_data(&self) -> HashMap<u64, Vec<u8>> {
+        if self.fill != 0 {
+            return init_page_data_by_byte(self);
+        }
+        self.pages
+            .iter()
+            .filter(|(_, page)| page.occupied.iter().any(|&bits| bits != 0))
+            .map(|(base, page)| (*base, page.data.to_vec()))
+            .collect()
     }
 }
 
@@ -355,5 +393,47 @@ mod tests {
         assert_eq!(mapped.len(), cells.len());
         assert_eq!(mapped.get(page + 1), (0, 0));
         assert_eq!(mapped.get(3 * page), (0, 0));
+    }
+
+    /// The whole-page copy ([`PagedMem::init_page_data`]) is the map built a
+    /// byte at a time, and the map a `HashMap` image of the same bytes
+    /// gives: on a sparse page, a dense page, a page whose only set bytes are
+    /// zero, a page's last byte, the top of the address space, an allocated
+    /// page with no set byte (in neither map) and a store whose fill is not 0
+    /// (the byte path, so its unset offsets read 0 as there).
+    #[test]
+    fn whole_pages_are_the_pages_built_a_byte_at_a_time() {
+        let page = DEFAULT_PAGE_SIZE as u64;
+        let mut cells: Vec<(u64, u8)> = vec![(0x10, 7), (0x11, 0), (page - 1, 200)];
+        cells.extend((0..page).map(|off| (2 * page + off, (off * 13 + 1) as u8)));
+        cells.extend([(4 * page + 5, 0), (4 * page + 9, 0)]);
+        cells.extend([(u64::MAX - 1, 3), (u64::MAX, 9)]);
+        for fill in [0u8, 7] {
+            let mut image = PagedMem::new(fill);
+            let mut bytes = HashMap::new();
+            for &(addr, value) in &cells {
+                image.set(addr, value);
+                bytes.insert(addr, value);
+            }
+            let empty = image.page_index_or_insert(6 * page);
+            assert_eq!(image.pages[empty].0, 6 * page);
+            let whole = image.init_page_data();
+            assert_eq!(whole, init_page_data_by_byte(&image), "fill {fill}");
+            assert_eq!(whole, init_page_data_by_byte(&bytes), "fill {fill}");
+            assert_eq!(whole, bytes.init_page_data(), "fill {fill}");
+            let mut bases: Vec<u64> = whole.keys().copied().collect();
+            bases.sort_unstable();
+            assert_eq!(
+                bases,
+                [0, 2 * page, 4 * page, u64::MAX - (page - 1)],
+                "fill {fill}"
+            );
+            assert!(whole.values().all(|data| data.len() == DEFAULT_PAGE_SIZE));
+            assert_eq!(whole[&0][0x10], 7);
+            assert_eq!(whole[&0][0x12], 0, "an unset offset reads 0");
+            assert_eq!(whole[&0][DEFAULT_PAGE_SIZE - 1], 200);
+            assert!(whole[&(4 * page)].iter().all(|&b| b == 0));
+            assert_eq!(whole[&(u64::MAX - (page - 1))][DEFAULT_PAGE_SIZE - 1], 9);
+        }
     }
 }
