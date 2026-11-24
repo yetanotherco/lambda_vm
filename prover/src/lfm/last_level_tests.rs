@@ -9,8 +9,9 @@ use stark::multilinear_table::batched::VerifierChecks;
 use super::b3l_wlfm_tests::{honest, program};
 use super::hash::HasherKind;
 use super::last_level::{
-    LAST_FINAL_MEASURED, LAST_FIRST_FOLD_MEASURED, LastLevel, evaluated_word, final_word,
-    first_fold_word, last_level_setting, wire_word,
+    LAST_FILE_HEADER, LAST_FILE_VERSION, LAST_FINAL_MEASURED, LAST_FIRST_FOLD_MEASURED,
+    LAST_WIRE_DEFAULT, LastLevel, LastLevelKnobs, evaluated_word, final_word, first_fold_word,
+    last_level_file, last_level_knobs, read_last_level_file, wire_word,
 };
 use super::levels::{LevelStop, MAX_LEVELS, is_last_level, level_levers, levers_for};
 use super::wire::WireFormat;
@@ -27,12 +28,9 @@ const HASHER: HasherKind = HasherKind::Poseidon1W16;
 /// The levels' round form at the BLAKE3 base's default shrink.
 const SHRINK: u8 = 3;
 
-/// Every lever of the last level on, at the measured settings.
-const ALL_ON: LastLevel = LastLevel {
-    evaluated: true,
-    first_fold: Some(LAST_FIRST_FOLD_MEASURED),
-    final_poly: FinalPoly::Vars(LAST_FINAL_MEASURED),
-};
+/// Every lever of the last level on, at the measured settings: the BLAKE3
+/// levels' pinned format.
+const ALL_ON: LastLevel = LastLevel::ON;
 
 /// Each lever alone, then all of them.
 fn settings() -> Vec<(&'static str, LastLevel)> {
@@ -41,21 +39,21 @@ fn settings() -> Vec<(&'static str, LastLevel)> {
             "evaluated",
             LastLevel {
                 evaluated: true,
-                ..LastLevel::DEFAULT
+                ..LastLevel::OFF
             },
         ),
         (
             "first fold 4",
             LastLevel {
                 first_fold: Some(LAST_FIRST_FOLD_MEASURED),
-                ..LastLevel::DEFAULT
+                ..LastLevel::OFF
             },
         ),
         (
             "final 9",
             LastLevel {
                 final_poly: FinalPoly::Vars(LAST_FINAL_MEASURED),
-                ..LastLevel::DEFAULT
+                ..LastLevel::OFF
             },
         ),
         ("all", ALL_ON),
@@ -66,52 +64,118 @@ fn settings() -> Vec<(&'static str, LastLevel)> {
 // The knobs
 // =============================================================================
 
-/// Each knob's word: unset is today's, its own on-words are taken, and
-/// anything else is refused rather than read as off.
+/// Each knob's word: unset or empty is the family's pinned value, each
+/// knob's own off- and on-words are taken, and anything else is refused
+/// rather than read as either.
 #[test]
 fn the_last_level_knobs_read_their_words_and_refuse_the_rest() {
-    assert_eq!(last_level_setting(None, None, None), Ok(LastLevel::DEFAULT));
-    assert_eq!(evaluated_word(Some(" 1 ")), Ok(true));
-    assert_eq!(evaluated_word(Some("0")), Ok(false));
+    let unset = last_level_knobs(None, None, None).expect("unset");
+    assert_eq!(unset, LastLevelKnobs::default());
+    assert_eq!(
+        last_level_knobs(Some(""), Some(" "), Some("")),
+        Ok(unset),
+        "empty is unset"
+    );
+    assert_eq!(evaluated_word(Some(" 1 ")), Ok(Some(true)));
+    assert_eq!(evaluated_word(Some("on")), Ok(Some(true)));
+    assert_eq!(evaluated_word(Some("0")), Ok(Some(false)));
+    assert_eq!(evaluated_word(Some("OFF")), Ok(Some(false)));
     assert!(evaluated_word(Some("yes")).is_err());
-    assert_eq!(first_fold_word(Some("4")), Ok(Some(4)));
-    assert_eq!(first_fold_word(Some("OFF")), Ok(None));
-    // Today's first fold under its own name is today's format, not a lever.
-    assert_eq!(first_fold_word(Some("6")), Ok(None));
+    assert_eq!(first_fold_word(Some("4")), Ok(Some(Some(4))));
+    assert_eq!(first_fold_word(Some("OFF")), Ok(Some(None)));
+    // Every level's first fold under its own name is every level's format.
+    assert_eq!(first_fold_word(Some("6")), Ok(Some(None)));
     // Only the measured width is taken until another is tested.
     for bad in ["0", "1", "2", "3", "5", "7", "four", "-1"] {
         assert!(first_fold_word(Some(bad)).is_err(), "{bad}");
     }
-    assert_eq!(final_word(Some("9")), Ok(FinalPoly::Vars(9)));
-    assert_eq!(final_word(Some("0")), Ok(FinalPoly::Off));
-    assert_eq!(final_word(Some("off")), Ok(FinalPoly::Off));
+    assert_eq!(final_word(Some("9")), Ok(Some(FinalPoly::Vars(9))));
+    assert_eq!(final_word(Some("0")), Ok(Some(FinalPoly::Off)));
+    assert_eq!(final_word(Some("off")), Ok(Some(FinalPoly::Off)));
     for bad in ["1", "6", "8", "10", "11", "nine", "-3"] {
         assert!(final_word(Some(bad)).is_err(), "{bad}");
     }
-    assert_eq!(wire_word(None), Ok(WireFormat::Rkyv));
+    assert_eq!(LAST_WIRE_DEFAULT, WireFormat::Dedup);
+    assert_eq!(wire_word(None), Ok(WireFormat::Dedup));
+    assert_eq!(wire_word(Some("")), Ok(WireFormat::Dedup));
+    assert_eq!(wire_word(Some("rkyv")), Ok(WireFormat::Rkyv));
     assert_eq!(wire_word(Some("Dedup")), Ok(WireFormat::Dedup));
     assert_eq!(wire_word(Some("compact")), Ok(WireFormat::Compact));
     assert!(wire_word(Some("zip")).is_err());
-    assert_eq!(
-        last_level_setting(Some("1"), Some("4"), Some("9")),
-        Ok(ALL_ON)
-    );
+    let on = last_level_knobs(Some("1"), Some("4"), Some("9")).expect("on");
+    let off = last_level_knobs(Some("0"), Some("off"), Some("off")).expect("off");
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        assert_eq!(on.resolve(family), ALL_ON, "{family:?}");
+        assert_eq!(off.resolve(family), LastLevel::OFF, "{family:?}");
+    }
 }
 
-/// ★ DEFAULT-OFF: with the knobs off, the last level proves under every
-/// level's levers, so no level's format moves; and a level that is not the
-/// last proves under every level's levers whatever the knobs say.
+/// ★ THE PINNED FORMAT a family: with every knob unset the BLAKE3 levels'
+/// last level takes every lever and the Poseidon1 levels' none; each knob
+/// turns its own lever off under BLAKE3 (and only its own), and asks for it
+/// under Poseidon1 (refused there by [`check_last_level_family`]).
+///
+/// [`check_last_level_family`]: super::levels::check_last_level_family
 #[test]
-fn the_default_last_level_is_every_levels_levers() {
+fn the_pinned_last_level_is_every_lever_under_blake3_and_none_under_poseidon1() {
+    assert_eq!(LastLevel::pinned(WlfmFamily::B3), ALL_ON);
+    assert_eq!(LastLevel::pinned(WlfmFamily::P1), LastLevel::OFF);
+    let unset = LastLevelKnobs::default();
+    assert_eq!(unset.resolve(WlfmFamily::B3), ALL_ON);
+    assert_eq!(unset.resolve(WlfmFamily::P1), LastLevel::OFF);
+    let knobs = |e, f, l| last_level_knobs(e, f, l).expect("words");
+    let b3 = |e, f, l| knobs(e, f, l).resolve(WlfmFamily::B3);
+    assert_eq!(
+        b3(Some("0"), None, None),
+        LastLevel {
+            evaluated: false,
+            ..ALL_ON
+        }
+    );
+    assert_eq!(
+        b3(None, Some("off"), None),
+        LastLevel {
+            first_fold: None,
+            ..ALL_ON
+        }
+    );
+    assert_eq!(
+        b3(None, None, Some("off")),
+        LastLevel {
+            final_poly: FinalPoly::Off,
+            ..ALL_ON
+        }
+    );
+    let p1 = knobs(Some("1"), None, None).resolve(WlfmFamily::P1);
+    assert_eq!(
+        p1,
+        LastLevel {
+            evaluated: true,
+            ..LastLevel::OFF
+        }
+    );
+    assert!(super::levels::check_last_level_family(p1, WlfmFamily::P1).is_err());
+}
+
+/// ★ EVERY LEVER OFF is every level's levers, so turning the knobs off
+/// gives the last level the format every level proves under; and a level
+/// that is not the last proves under every level's levers whatever the
+/// last level's format.
+#[test]
+fn the_off_last_level_is_every_levels_levers() {
     for family in [WlfmFamily::P1, WlfmFamily::B3] {
-        assert_eq!(LastLevel::DEFAULT.levers(family), level_levers(family));
+        assert_eq!(LastLevel::OFF.levers(family), level_levers(family));
         assert_eq!(
-            levers_for(family, LastLevel::DEFAULT, true),
+            levers_for(family, LastLevel::OFF, true),
             level_levers(family)
         );
         for (_, last) in settings() {
             assert_eq!(levers_for(family, last, false), level_levers(family));
         }
+        assert_eq!(
+            levers_for(family, LastLevel::pinned(family), false),
+            level_levers(family)
+        );
         let on = ALL_ON.levers(family);
         assert_eq!(on.prep, WlfmPrep::Evaluated);
         assert_eq!(on.first_fold, Some(4));
@@ -135,7 +199,7 @@ fn the_last_levels_format_is_refused_under_poseidon1() {
         check_last_level_family(last, WlfmFamily::B3).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
     for family in [WlfmFamily::P1, WlfmFamily::B3] {
-        check_last_level_family(LastLevel::DEFAULT, family).expect("today's");
+        check_last_level_family(LastLevel::OFF, family).expect("every lever off");
     }
     let refused =
         super::levels::prepare_as_level(LevelStop::Levels(1), 1, ALL_ON, WlfmFamily::P1, |_| {
@@ -151,10 +215,10 @@ fn the_last_levels_format_is_refused_under_poseidon1() {
 #[test]
 fn the_process_last_level_must_be_the_verifiers_named_one() {
     use super::levels::check_last_level_knobs;
-    check_last_level_knobs(LastLevel::DEFAULT, LastLevel::DEFAULT).expect("today's");
+    check_last_level_knobs(LastLevel::OFF, LastLevel::OFF).expect("every lever off");
     check_last_level_knobs(ALL_ON, ALL_ON).expect("the same named format");
-    assert!(check_last_level_knobs(ALL_ON, LastLevel::DEFAULT).is_err());
-    assert!(check_last_level_knobs(LastLevel::DEFAULT, ALL_ON).is_err());
+    assert!(check_last_level_knobs(ALL_ON, LastLevel::OFF).is_err());
+    assert!(check_last_level_knobs(LastLevel::OFF, ALL_ON).is_err());
 }
 
 /// Which level is the last: by its index under `Levels`, by its group count
@@ -334,7 +398,7 @@ fn compact(proof: &WlfmProof) -> usize {
 #[test]
 fn the_lean_fixture_proves_under_each_last_level_lever() {
     let program = honest();
-    let today = build_last(&program, LastLevel::DEFAULT);
+    let today = build_last(&program, LastLevel::OFF);
     let today_proof = prove_last(&program, &today);
     verify_wlfm(&today.artifacts, &today_proof, &today_proof.public_words)
         .expect("today's proof verifies");
@@ -373,14 +437,111 @@ fn the_lean_fixture_proves_under_each_last_level_lever() {
         if name == "all" || name == "evaluated" {
             assert!(c.compact < base_bytes, "{name}: smaller");
         }
-        // The compact files round-trip to the same proof, which verifies.
-        for wire in [WireFormat::Compact, WireFormat::Dedup] {
-            let bytes = super::last_level::last_level_file(&proof, wire).expect("encodes");
-            let back = super::last_level::read_last_level_file(&bytes, wire).expect("decodes");
+        // The files round-trip to the same proof, which verifies.
+        for wire in [WireFormat::Compact, WireFormat::Dedup, WireFormat::Rkyv] {
+            let bytes = last_level_file(&proof, last, wire).expect("encodes");
+            let back = read_last_level_file(&bytes, last).expect("decodes");
             assert_eq!(super::wire::encode(&back), super::wire::encode(&proof));
             verify_wlfm(a, &back, &back.public_words)
                 .unwrap_or_else(|e| panic!("{name} {wire:?}: read back: {e}"));
         }
+    }
+}
+
+/// Each format's file code is its own, and names it back; a setting no knob
+/// gives has none, and no code past the three levers names a format.
+#[test]
+fn each_last_level_format_has_its_own_file_code() {
+    let mut seen = std::collections::BTreeSet::new();
+    for code in 0..8u8 {
+        let format = LastLevel::from_code(code).expect("a format");
+        assert_eq!(format.code(), Some(code), "{format}");
+        assert!(seen.insert(format.to_string()), "{format}: one name a code");
+    }
+    assert_eq!(LastLevel::OFF.code(), Some(0));
+    assert_eq!(ALL_ON.code(), Some(7));
+    for code in [8u8, 9, 0x80, u8::MAX] {
+        assert_eq!(LastLevel::from_code(code), None, "{code}");
+    }
+    let untested = [
+        LastLevel {
+            first_fold: Some(5),
+            ..LastLevel::OFF
+        },
+        LastLevel {
+            final_poly: FinalPoly::Vars(8),
+            ..LastLevel::OFF
+        },
+    ];
+    for format in untested {
+        assert_eq!(format.code(), None, "{format:?}");
+    }
+}
+
+/// ★ ONE FILE VERSION AND ONE FORMAT A READER, on the lean fixture: a
+/// reader for the pinned BLAKE3 format reads a file made in it, and refuses
+/// a file made with every lever off (the format before the flip) by naming
+/// both formats, before decoding anything; the reverse holds for a reader of
+/// the off format; a file of another version, without the magic, shorter
+/// than its header, of an unknown encoding or with a byte after the proof is
+/// refused; and a file whose header is rewritten to the reader's format
+/// decodes to a proof the reader's artifacts refuse (the header decides
+/// nothing the verifier checks).
+#[test]
+fn a_last_level_file_is_read_for_one_version_and_one_format() {
+    let program = honest();
+    let on_build = build_last(&program, ALL_ON);
+    let off_build = build_last(&program, LastLevel::OFF);
+    let on = prove_last(&program, &on_build);
+    let off = prove_last(&program, &off_build);
+    let pinned = LastLevel::pinned(WlfmFamily::B3);
+    for wire in [WireFormat::Dedup, WireFormat::Compact, WireFormat::Rkyv] {
+        let on_file = last_level_file(&on, pinned, wire).expect("the pinned file");
+        let off_file = last_level_file(&off, LastLevel::OFF, wire).expect("the off file");
+        let back = read_last_level_file(&on_file, pinned).expect("the pinned reader");
+        verify_wlfm(&on_build.artifacts, &back, &back.public_words)
+            .unwrap_or_else(|e| panic!("{wire:?}: read back: {e}"));
+        let e = read_last_level_file(&off_file, pinned).expect_err("the off file");
+        println!("PINNED READER, OFF FILE ({wire:?}): {e}");
+        assert!(
+            e.contains("format 0 (") && e.contains("format 7 (") && e.contains("committed"),
+            "{wire:?}: both formats named: {e}"
+        );
+        read_last_level_file(&off_file, LastLevel::OFF).expect("the off reader, the off file");
+        let e = read_last_level_file(&on_file, LastLevel::OFF).expect_err("the pinned file");
+        assert!(e.contains("format 7 (") && e.contains("format 0 ("), "{e}");
+        // The header's own refusals.
+        let mut version = on_file.clone();
+        version[4] = LAST_FILE_VERSION + 1;
+        let e = read_last_level_file(&version, pinned).expect_err("another version");
+        assert!(e.contains("last-level file version 2"), "{e}");
+        let mut magic = on_file.clone();
+        magic[0] ^= 1;
+        let e = read_last_level_file(&magic, pinned).expect_err("no magic");
+        assert!(e.contains("no LVLF header"), "{e}");
+        let e = read_last_level_file(&on_file[..LAST_FILE_HEADER - 1], pinned)
+            .expect_err("a short file");
+        assert!(e.contains("shorter than its header"), "{e}");
+        let mut encoding = on_file.clone();
+        encoding[6] = 3;
+        assert!(
+            read_last_level_file(&encoding, pinned).is_err(),
+            "encoding 3"
+        );
+        if wire != WireFormat::Rkyv {
+            let mut trailing = on_file.clone();
+            trailing.push(0);
+            assert!(read_last_level_file(&trailing, pinned).is_err(), "{wire:?}");
+        }
+        // A header rewritten to the reader's format: the proof is decoded
+        // and the reader's artifacts refuse it.
+        let mut relabelled = off_file.clone();
+        relabelled[5] = pinned.code().expect("a code");
+        let forged = read_last_level_file(&relabelled, pinned).expect("the header passes");
+        assert!(
+            verify_wlfm(&on_build.artifacts, &forged, &forged.public_words).is_err(),
+            "{wire:?}: an off proof under the pinned artifacts"
+        );
     }
 }
 

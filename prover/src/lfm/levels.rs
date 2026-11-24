@@ -127,12 +127,12 @@ pub fn is_last_level(stop: LevelStop, index: usize, groups: usize) -> bool {
 
 /// The last level's own format is the BLAKE3 levels' alone: every lever of
 /// it is tested there (the lean tables, the binary trees); under
-/// [`WlfmFamily::P1`] (4-ary trees) a format other than today's is refused
-/// rather than proved untested.
+/// [`WlfmFamily::P1`] (4-ary trees) any lever on ([`LastLevel::OFF`] is
+/// the only format there) is refused rather than proved untested.
 pub fn check_last_level_family(last: LastLevel, family: WlfmFamily) -> Result<(), String> {
-    if family == WlfmFamily::P1 && !last.is_default() {
+    if family == WlfmFamily::P1 && !last.is_off() {
         return Err(format!(
-            "the last level's own format {last:?} is the BLAKE3 levels' alone, not {family:?}'s"
+            "the last level's own format ({last}) is the BLAKE3 levels' alone, not {family:?}'s"
         ));
     }
     Ok(())
@@ -153,7 +153,7 @@ fn known_last(stop: LevelStop, index: usize) -> bool {
 /// level's, prepared again under the last level's when its group count makes
 /// it the last ([`LevelStop::Groups`]; a group count does not depend on the
 /// levers, `block_groups` reads the shapes and the stack alone). Under
-/// [`LastLevel::DEFAULT`] every level's levers are one, and nothing is
+/// [`LastLevel::OFF`] every level's levers are one, and nothing is
 /// prepared twice.
 pub(crate) fn prepare_as_level(
     stop: LevelStop,
@@ -1349,7 +1349,7 @@ pub fn derive_levels_to(
     stop: LevelStop,
     on_host: bool,
 ) -> Result<Vec<Level>, String> {
-    let last = super::last_level::last_level()?;
+    let last = super::last_level::last_level(family)?;
     derive_levels_last(plan, family, stop, last, on_host)
 }
 
@@ -1451,8 +1451,9 @@ pub fn prove_levels<L: crate::block_whir::LocalPart>(
 /// [`BlockFormat::pinned_with`](crate::block_whir::BlockFormat::pinned_with)
 /// `Indexed`'s blowup, leaf order, round-0 trees, leaf scale, leaf query, GKR
 /// packing, memory format and page runs; the BLAKE3 base's FRI round form;
-/// the packed cap check — the default chain stop and today's last level
-/// ([`LastLevel::DEFAULT`]).
+/// the packed cap check — the default chain stop and the family's pinned
+/// last level ([`LastLevel::pinned`]: every lever on under BLAKE3, every
+/// lever off under Poseidon1).
 pub fn verify_block_levels(
     elf: &[u8],
     statement: crate::block_whir::BlockStatement<'_>,
@@ -1470,10 +1471,26 @@ pub fn verify_block_levels(
         statement,
         family,
         LevelStop::DEFAULT,
-        LastLevel::DEFAULT,
+        LastLevel::pinned(family),
         CapMux::Packed,
         last,
     )
+}
+
+/// ★ [`verify_block_levels`] over the last level's FILE
+/// ([`super::last_level::last_level_file`]): the file is read for the
+/// family's pinned last level ([`LastLevel::pinned`]), so a file of another
+/// version or made in another last-level format is refused by name before
+/// anything is decoded ([`super::last_level::read_last_level_file`]), and the
+/// proof it holds is verified in full by [`verify_block_levels`].
+pub fn verify_block_levels_file(
+    elf: &[u8],
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    file: &[u8],
+) -> Result<(), String> {
+    let last = super::last_level::read_last_level_file(file, LastLevel::pinned(family))?;
+    verify_block_levels(elf, statement, family, &last)
 }
 
 /// ★ The block's public verifier over its last level, at the pinned format
@@ -1643,7 +1660,8 @@ fn verify_block_levels_pinned(
 /// The last level's own format (`LAMBDA_VM_LAST_LEVEL_EVALUATED`,
 /// `LAMBDA_VM_LAST_LEVEL_FIRST_FOLD`, `LAMBDA_VM_LAST_LEVEL_FINAL`,
 /// [`super::last_level`]) must be the verifier's named one (`last_level`;
-/// today's at [`verify_block_levels`]): a process that asks for another is
+/// the family's pinned one, [`LastLevel::pinned`], at
+/// [`verify_block_levels`]): a process whose knobs resolve to another is
 /// refused ([`check_last_level_knobs`]).
 ///
 /// Each knob's word is parsed first, from the environment, by the knob's own
@@ -1652,7 +1670,7 @@ fn verify_block_levels_pinned(
 /// process-wide cells read — the values the derivation will use — and only
 /// the family's own: a Poseidon1 verification reads no BLAKE3 cell.
 fn check_process_format(family: WlfmFamily, last_level: LastLevel) -> Result<(), String> {
-    check_last_level_knobs(super::last_level::last_level()?, last_level)?;
+    check_last_level_knobs(super::last_level::last_level(family)?, last_level)?;
     let cap = knob_word(
         crate::block_whir::B3_BASE_CAP_ENV,
         crate::block_whir::b3_base_cap_setting,
@@ -1707,11 +1725,12 @@ fn hash_split_word(raw: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// [`check_process_format`] at today's last level, for the tests that run it
-/// in a process of their own.
+/// [`check_process_format`] at the family's pinned last level (the one
+/// [`verify_block_levels`] names), for the tests that run it in a process of
+/// their own.
 #[cfg(test)]
 pub(crate) fn check_process_format_for_tests(family: WlfmFamily) -> Result<(), String> {
-    check_process_format(family, LastLevel::DEFAULT)
+    check_process_format(family, LastLevel::pinned(family))
 }
 
 /// One binary, one format, for the last level: the process's last-level
@@ -1806,7 +1825,13 @@ pub(crate) fn verify_block_levels_under(
         family,
         super::merkle_cap::cap_mux(),
     )?;
-    verify_levels_to(&plan, family, stop, super::last_level::last_level()?, last)
+    verify_levels_to(
+        &plan,
+        family,
+        stop,
+        super::last_level::last_level(family)?,
+        last,
+    )
 }
 
 /// The block's verifier over its last level, against a plan the caller
@@ -1824,7 +1849,7 @@ pub(crate) fn verify_levels(
         plan,
         family,
         LevelStop::DEFAULT,
-        super::last_level::last_level()?,
+        super::last_level::last_level(family)?,
         last,
     )
 }
@@ -1840,8 +1865,12 @@ pub(crate) fn verify_levels_to(
 ) -> Result<(), String> {
     let levels = derive_levels_last(plan, family, stop, last_level, true)?;
     let top = levels.last().expect("a level");
-    verify_wlfm(&top.build.artifacts, last, &last.public_words)
-        .map_err(|e| format!("the last level does not verify: {e}"))?;
+    verify_wlfm(&top.build.artifacts, last, &last.public_words).map_err(|e| {
+        format!(
+            "the last level does not verify (this verifier checks the last level's format: \
+             {last_level}; a proof made in another is refused): {e}"
+        )
+    })?;
     if !top_claims(plan, &last.public_words) {
         return Err("the last level does not claim this block".to_string());
     }
@@ -2051,7 +2080,7 @@ pub fn prove_block_levels(
     check_base(&format.zf.base, family)?;
     // The last level's own format, read once: the same value the verifier's
     // derivation reads ([`derive_levels_to`]).
-    let last = super::last_level::last_level()?;
+    let last = super::last_level::last_level(family)?;
     // Level 1's groups arrive as a streamed base's phase B opens them; the
     // whole-run base prover opens them without telling anyone.
     if options.window_log2.is_none() {

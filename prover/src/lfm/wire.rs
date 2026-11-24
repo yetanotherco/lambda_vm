@@ -85,7 +85,7 @@ pub struct Reader<'a> {
 /// any of it is read, so a hostile file costs no more than this.
 pub const MAX_WIRE_BYTES: usize = 256 << 20;
 
-fn check_wire_len(bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn check_wire_len(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() > MAX_WIRE_BYTES {
         return Err(format!(
             "{} bytes, past the {MAX_WIRE_BYTES} an encoding may take",

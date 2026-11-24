@@ -575,7 +575,7 @@ fn the_levels_follow_the_bases_round_form() {
             multilinear::whir_chain::check_round_form(&a.config)
                 .unwrap_or_else(|e| panic!("level {}: {e:?}", k + 1));
             match (want, a.config.format.rounds) {
-                (None, RoundForm::Fri) => {
+                (None, RoundForm::Fri) if a.levers() == super::levels::level_levers(a.family) => {
                     let today = super::wlfm::wlfm_config_under(
                         a.rate,
                         a.final_poly,
@@ -584,6 +584,19 @@ fn the_levels_follow_the_bases_round_form() {
                         &a.shapes(&a.airs()),
                     );
                     assert_eq!(a.config, today, "level {}: today's config", k + 1);
+                }
+                (None, RoundForm::Fri) => {
+                    // The last level's own levers (the pinned last level):
+                    // the config its levers give without a round form.
+                    assert_eq!(k + 1, levels.len(), "only the last level has its own");
+                    let own = super::wlfm::wlfm_config_levers(
+                        a.rate,
+                        &a.levers(),
+                        None,
+                        &a.shapes(&a.airs()),
+                    )
+                    .expect("the last level's config");
+                    assert_eq!(a.config, own, "level {}: its levers' config", k + 1);
                 }
                 (Some(s), RoundForm::Whir(w)) => {
                     assert_eq!(w.shrink(), usize::from(s), "level {}", k + 1);
@@ -1361,7 +1374,7 @@ fn the_last_levels_levers_reach_the_last_level_alone() {
     let (elf, proof) = base("test_commit_4", &format);
     let plan = plan(&elf, &proof, &format);
     let stop = LevelStop::Levels(2);
-    let today = derive_levels_last(&plan, WlfmFamily::B3, stop, LastLevel::DEFAULT, true)
+    let today = derive_levels_last(&plan, WlfmFamily::B3, stop, LastLevel::OFF, true)
         .expect("today's levels");
     let on = derive_levels_last(&plan, WlfmFamily::B3, stop, all, true).expect("the levels");
     assert_eq!(on.len(), 2);
@@ -1384,21 +1397,26 @@ fn the_last_levels_levers_reach_the_last_level_alone() {
         today[1].program.instrs.len(),
         "level 2's program is level 1's verifier either way"
     );
-    // The process's format reaches the derivation (the verifier's).
+    // The process's format reaches the derivation (the verifier's): every
+    // lever by default (the pinned BLAKE3 last level), every lever off when
+    // the process turns them off, which the pinned verifier refuses.
+    let derived = derive_levels_to(&plan, WlfmFamily::B3, stop, true).expect("derives");
+    assert_eq!(
+        derived[1].build.artifacts.program_id, o2.program_id,
+        "the pinned last level by default"
+    );
+    assert_eq!(derived[0].build.artifacts.program_id, t1.program_id);
+    super::levels::check_process_format_for_tests(WlfmFamily::B3)
+        .expect("the default process is the pinned format");
     {
-        let _last = set_last_level_for_test(all);
+        let _last = set_last_level_for_test(LastLevel::OFF);
         let derived = derive_levels_to(&plan, WlfmFamily::B3, stop, true).expect("derives");
-        assert_eq!(derived[1].build.artifacts.program_id, o2.program_id);
+        assert_eq!(derived[1].build.artifacts.program_id, t2.program_id);
         assert_eq!(derived[0].build.artifacts.program_id, t1.program_id);
         let e = super::levels::check_process_format_for_tests(WlfmFamily::B3)
             .expect_err("the pinned verifier's process check");
         assert!(e.contains("last level"), "{e}");
     }
-    let derived = derive_levels_to(&plan, WlfmFamily::B3, stop, true).expect("derives");
-    assert_eq!(
-        derived[1].build.artifacts.program_id, t2.program_id,
-        "off again"
-    );
     // Stopped by group count: the levers go to whichever level is the last.
     let groups = LevelStop::Groups(1);
     let by_groups =
@@ -1439,7 +1457,7 @@ fn the_last_levels_levers_prove_a_small_block() {
     let (elf, proof) = base("test_commit_4", &format);
     let plan = plan(&elf, &proof, &format);
     let stop = LevelStop::Levels(2);
-    let today = derive_levels_last(&plan, WlfmFamily::B3, stop, LastLevel::DEFAULT, true)
+    let today = derive_levels_last(&plan, WlfmFamily::B3, stop, LastLevel::OFF, true)
         .expect("today's levels");
     let (today_proofs, _) = prove_levels(&plan, &today, &proof).expect("today proves");
     let on = derive_levels_last(&plan, WlfmFamily::B3, stop, all, true).expect("the levels");
@@ -1456,12 +1474,23 @@ fn the_last_levels_levers_prove_a_small_block() {
         forged.public_words[0].1[0] += FE::one();
         assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
     }
-    assert!(
-        verify_levels(&plan, WlfmFamily::B3, last).is_err(),
-        "today's verifier refuses the last level's own format"
-    );
     let today_last = today_proofs.last().expect("today's last");
-    verify_levels(&plan, WlfmFamily::B3, today_last).expect("today's verifier, today's proof");
+    // The default process is the pinned last level (every lever on): it
+    // accepts the last level's own and refuses every lever off.
+    verify_levels(&plan, WlfmFamily::B3, last).expect("the default verifier accepts");
+    assert!(
+        verify_levels(&plan, WlfmFamily::B3, today_last).is_err(),
+        "the default verifier refuses every lever off"
+    );
+    {
+        let _off = set_last_level_for_test(LastLevel::OFF);
+        assert!(
+            verify_levels(&plan, WlfmFamily::B3, last).is_err(),
+            "the verifier for every lever off refuses the last level's own format"
+        );
+        verify_levels(&plan, WlfmFamily::B3, today_last)
+            .expect("the verifier for every lever off, its proof");
+    }
     if std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some() {
         assert_eq!(
             super::wire::encode(&proofs[0]),
@@ -1481,35 +1510,66 @@ fn the_last_levels_levers_prove_a_small_block() {
     }
 }
 
-/// ★ Box tier, a two-head pin: a small BLAKE3 block's two levels under the
-/// round form at shrink 3 (the benchmark's), derived on the host at today's
-/// format, each printed as its fold word, round-0 count, round counts at its
-/// tallest stack and program identity. The same test is compiled into both
-/// heads; the printed lines must be equal.
+/// One level's pin: its fold word, round-0 count, round counts at its
+/// tallest stack and program identity.
+fn level_pin(level: &super::levels::Level) -> String {
+    let a = &level.build.artifacts;
+    let (layouts, _) = crate::multilinear_prove::stacks(&a.shapes(&a.airs()), &a.sizes, &a.config)
+        .expect("the layouts");
+    let tallest = layouts.iter().map(|l| l.n_stack()).max().expect("a stack");
+    format!(
+        "fold word {:#x} · Q {} · rounds at {tallest} {:?} · id {}",
+        a.config.fold_word(),
+        a.config.num_queries,
+        a.config.round_queries(tallest),
+        a.program_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// ★ LITERAL PINS: a small BLAKE3 block's two levels under the round form at
+/// shrink 3 (the benchmark's), derived on the host. Level 1, and level 2 with
+/// every last-level lever off, are the values printed at the head before the
+/// last level had a format of its own (both heads printed them equal); level
+/// 2 at the pinned last level (every lever on, the default) is its own
+/// value, pinned when the default was flipped.
 #[test]
-#[ignore = "derives a small BLAKE3 block's levels; box tier, two-head pin"]
-fn round_form_level_pins_print() {
-    use super::levels::derive_levels;
+#[ignore = "derives a small BLAKE3 block's levels three ways; box tier, literal pins"]
+fn round_form_level_pins() {
+    use super::last_level::LastLevel;
+    use super::levels::{LevelStop, derive_levels, derive_levels_last};
+    const LEVEL_1: &str = "fold word 0x8041eb0180070006 · Q 229 · rounds at 27 [229, 57, 46, 39, \
+                           33, 29, 26] · id \
+                           b71ac280daebd66bd994de83902324d40502641e9035651a7123ca4214337469";
+    const LEVEL_2_OFF: &str = "fold word 0x8041eb0180070006 · Q 229 · rounds at 27 [229, 57, 46, \
+                               39, 33, 29, 26] · id \
+                               4e902bb869c8bbbf7d0e18a4d97eb0603540907ab1d366f77bb5ea50d6f3231e";
+    const LEVEL_2_PINNED: &str = "UNPINNED";
     let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
     let (elf, proof) = base("test_commit_4", &format);
     let plan = plan(&elf, &proof, &format);
-    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
-    for (k, level) in levels.iter().enumerate() {
-        let a = &level.build.artifacts;
-        let (layouts, _) =
-            crate::multilinear_prove::stacks(&a.shapes(&a.airs()), &a.sizes, &a.config)
-                .expect("the layouts");
-        let tallest = layouts.iter().map(|l| l.n_stack()).max().expect("a stack");
-        println!(
-            "LEVEL PIN {}: fold word {:#x} · Q {} · rounds at {tallest} {:?} · id {}",
-            k + 1,
-            a.config.fold_word(),
-            a.config.num_queries,
-            a.config.round_queries(tallest),
-            a.program_id
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
+    let pinned = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    let off = derive_levels_last(
+        &plan,
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        LastLevel::OFF,
+        true,
+    )
+    .expect("the levels derive with every lever off");
+    assert_eq!((pinned.len(), off.len()), (2, 2));
+    let got = [
+        ("level 1", level_pin(&pinned[0]), LEVEL_1),
+        ("level 1, every lever off", level_pin(&off[0]), LEVEL_1),
+        ("level 2, every lever off", level_pin(&off[1]), LEVEL_2_OFF),
+        ("level 2, pinned", level_pin(&pinned[1]), LEVEL_2_PINNED),
+    ];
+    for (name, pin, _) in &got {
+        println!("LEVEL PIN {name}: {pin}");
+    }
+    for (name, pin, want) in got {
+        assert_eq!(pin, want, "{name}");
     }
 }
