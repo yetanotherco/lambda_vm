@@ -10751,7 +10751,11 @@ fn prove_streamed(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
                     .with_overlap_faults(deviations.overlap_faults)
-                    .with_sched_stamps(phase_b_sched),
+                    .with_sched_stamps(phase_b_sched)
+                    // Under `LAMBDA_VM_TWO_CARD_SPLIT` the groups may split over
+                    // two cards; a group phase B rebuilds stays on card 0, so
+                    // each class keeps its order on one driver.
+                    .with_two_card_split(classes.iter().map(Option::is_some).collect()),
                 &config,
                 &mut transcript,
                 &openings,
