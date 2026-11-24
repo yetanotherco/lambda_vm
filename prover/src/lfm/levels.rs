@@ -435,6 +435,37 @@ pub fn fill_beside() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_FILL_PARTS=1`: each level's fill runs its three parts at
+/// once (the chips' traces, the lean BLAKE3 tables, the one-output selects'
+/// and cap tables), each on a thread of its own, where they otherwise run one
+/// after another ([`super::proof::lfm_fill_executed_parts`]). The same tables
+/// from the same records, so the same proofs. Off by default (and for any
+/// word but `1`). Read once a process, on the driver's thread.
+pub const FILL_PARTS_ENV: &str = "LAMBDA_VM_LEVELS_FILL_PARTS";
+
+std::thread_local! {
+    /// A test's [`fill_parts`] on this thread.
+    static FILL_PARTS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`fill_parts`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_fill_parts_for_test(on: Option<bool>) {
+    FILL_PARTS_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`FILL_PARTS_ENV`] is on (or this thread's test override).
+pub fn fill_parts() -> bool {
+    if let Some(on) = FILL_PARTS_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(FILL_PARTS_ENV).ok().as_deref())
+    })
+}
+
 /// Level 1's execution as its thread hands it on: executed, for the driver to
 /// fill after the stacks' commit, or already filled beside it
 /// ([`fill_beside`]).
@@ -1110,13 +1141,16 @@ const MAX_STREAM_PIECES: usize = 64;
 
 /// Level 2 beside level 1's prove ([`stream_next`]): its program and prebuild
 /// from `prepared` (joined here), and its execution streamed over the pieces
-/// `pieces` hands on ([`stream_level_over_pieces`]); `None` for the execution
+/// `pieces` hands on ([`stream_level_over_pieces_parts`]); `None` for the execution
 /// when its arena has more pieces than a streamed execution lands (level 2
 /// then executes after level 1's prove, as without the knob).
+///
+/// Its fill runs its parts at once under `fill_parts` ([`fill_parts`]).
 fn stream_next_level(
     prepared: std::thread::ScopedJoinHandle<'_, Result<PreparedNext, String>>,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
+    fill_parts: bool,
 ) -> Result<StreamedNext, String> {
     let (program, pre, marks) = prepared
         .join()
@@ -1125,7 +1159,8 @@ fn stream_next_level(
         return Ok((program, pre, None));
     }
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let streamed = stream_level_over_pieces(&program, &marks, hasher, pieces, t0)?;
+    let streamed =
+        stream_level_over_pieces_parts(&program, &marks, hasher, pieces, t0, fill_parts)?;
     Ok((program, pre, Some(streamed)))
 }
 
@@ -1134,12 +1169,26 @@ fn stream_next_level(
 /// landed as `pieces` hands it on, in any order, and filled once the last has
 /// landed: [`super::wlfm::execute_and_fill_unmerged`]'s traces over the
 /// pieces joined. The channel closing before every piece came refuses.
+#[cfg(test)]
 pub(super) fn stream_level_over_pieces(
     program: &LfmProgram,
     marks: &[u32],
     hasher: super::HasherKind,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
+) -> Result<(super::proof::LfmFilled, NextStream), String> {
+    stream_level_over_pieces_parts(program, marks, hasher, pieces, t0, false)
+}
+
+/// [`stream_level_over_pieces`] with its fill's parts at once under
+/// `fill_parts` ([`fill_parts`]).
+fn stream_level_over_pieces_parts(
+    program: &LfmProgram,
+    marks: &[u32],
+    hasher: super::HasherKind,
+    pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
+    t0: std::time::Instant,
+    fill_parts: bool,
 ) -> Result<(super::proof::LfmFilled, NextStream), String> {
     use super::executor::{ArenaPiece, StreamedExecution};
     let now = || t0.elapsed().as_secs_f64();
@@ -1210,13 +1259,15 @@ pub(super) fn stream_level_over_pieces(
     };
     times.executed = now();
     let t = std::time::Instant::now();
-    let filled = super::proof::lfm_fill_executed_holding(
+    let filled = super::proof::lfm_fill_executed_parts(
         program,
         execution,
         hasher,
         times.executed - from,
         &Vec::new(),
         super::wlfm::chip_records(),
+        None,
+        fill_parts,
     );
     times.fill = t.elapsed().as_secs_f64();
     Ok((filled, times))
@@ -2015,6 +2066,7 @@ pub fn prove_block_levels(
     );
     // Read on the driver's thread (a test's override is that thread's).
     let fill_beside_on = fill_beside();
+    let fill_parts_on = fill_parts();
     let late = settle_late() || super::wlfm_knobs::levels_untrimmed();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -2252,7 +2304,7 @@ pub fn prove_block_levels(
                     None => (None, None),
                 };
                 let t = std::time::Instant::now();
-                let filled = super::proof::lfm_fill_executed_prefilled(
+                let filled = super::proof::lfm_fill_executed_parts(
                     program,
                     execution,
                     hasher,
@@ -2260,6 +2312,7 @@ pub fn prove_block_levels(
                     &Vec::new(),
                     super::wlfm::chip_records(),
                     prefilled,
+                    fill_parts_on,
                 );
                 let fill = t.elapsed().as_secs_f64();
                 Level1Out::Filled {
@@ -2514,7 +2567,7 @@ pub fn prove_block_levels(
         let (filled, fill) = match execution {
             Level1Ready::Executed(execution, lean) => {
                 let t = std::time::Instant::now();
-                let filled = super::proof::lfm_fill_executed_prefilled(
+                let filled = super::proof::lfm_fill_executed_parts(
                     &levels[0].program,
                     execution,
                     levels[0].build.artifacts.hasher,
@@ -2522,6 +2575,7 @@ pub fn prove_block_levels(
                     &Vec::new(),
                     super::wlfm::chip_records(),
                     lean,
+                    fill_parts_on,
                 );
                 let fill = t.elapsed().as_secs_f64();
                 times.lean_prefilled = filled.lean_prefilled();
@@ -2545,7 +2599,8 @@ pub fn prove_block_levels(
             None;
         let (piece_tx, piece_rx) = mpsc::channel::<(usize, Vec<LfmWord>)>();
         if stream_next_on && let Some(prepared) = next.take() {
-            streamed = Some(scope.spawn(move || stream_next_level(prepared, piece_rx, t0)));
+            streamed =
+                Some(scope.spawn(move || stream_next_level(prepared, piece_rx, t0, fill_parts_on)));
         } else {
             drop(piece_rx);
         }
