@@ -876,11 +876,35 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
     use super::wlfm_leg::{WlfmChild, wlfm_leg_program};
     use multilinear::whir_chain::{check_round_form, check_round_form_union};
     let shapes = [(20usize, 18usize), (8, 20), (64, 12), (300, 22)];
-    for (fold, final_poly) in [(Some(5u8), FinalPoly::Off), (None, FinalPoly::Vars(6))] {
-        let refused = wlfm_config_rounds(WlfmRate::Two, final_poly, fold, None, Some(3), &shapes)
-            .expect_err("a stamped schedule under the round form");
-        assert!(refused.contains("today's schedule"), "{refused}");
-    }
+    let refused = wlfm_config_rounds(
+        WlfmRate::Two,
+        FinalPoly::Off,
+        Some(5u8),
+        None,
+        Some(3),
+        &shapes,
+    )
+    .expect_err("a stamped schedule under the round form");
+    assert!(refused.contains("stamped fold"), "{refused}");
+    // A final polynomial moves no round count (a chain's rounds are its
+    // schedule's with or without it), so the round form takes it, at today's
+    // count, and the host's count check holds (the last level's lever,
+    // `last_level_tests`).
+    let today = wlfm_config_rounds(WlfmRate::Two, FinalPoly::Off, None, None, Some(3), &shapes)
+        .expect("today's round form");
+    let with_final = wlfm_config_rounds(
+        WlfmRate::Two,
+        FinalPoly::Vars(6),
+        None,
+        None,
+        Some(3),
+        &shapes,
+    )
+    .expect("a final polynomial under the round form");
+    check_round_form(&with_final).expect("the count is the bound's");
+    assert_eq!(with_final.num_queries, today.num_queries);
+    assert_eq!(with_final.format.rounds, today.format.rounds);
+    assert_ne!(with_final.fold_word(), today.fold_word());
     // The stamping order the config refuses: today's count, then a fold, then
     // the union bound over the folded schedule, at the config's own tallest
     // stack. The pinned fold stamps nothing and passes; a fold that moves the

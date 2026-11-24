@@ -233,6 +233,13 @@ pub struct WlfmLevers {
     /// The fold width of every chain round after the first; `None` is
     /// today's (`log_folding` of the pinned chain).
     pub fold: Option<u8>,
+    /// The fold width of every chain's FIRST round; `None` is today's (the
+    /// pinned chain's first fold, 6). Unlike [`fold`](Self::fold) it is not
+    /// stamped on a sized config: the schedule it gives is the one the query
+    /// count is sized over ([`wlfm_config_levers`]). A width equal to the
+    /// later rounds' is the uniform schedule. Only for a proof whose verifier
+    /// is the host: a W-leg refuses a child with one.
+    pub first_fold: Option<u8>,
     /// The query grind's bits; `None` is the format's
     /// ([`crate::zf_format::PRODUCTION_WHIR_GRIND_BITS`]). The query count
     /// follows from it by the production rule, so more bits run fewer queries.
@@ -247,6 +254,7 @@ impl WlfmLevers {
         prep: WlfmPrep::Stacked,
         final_poly: FinalPoly::Off,
         fold: None,
+        first_fold: None,
         grind: None,
         family: WlfmFamily::P1,
     };
@@ -257,6 +265,7 @@ impl WlfmLevers {
             prep,
             final_poly: FinalPoly::Off,
             fold: None,
+            first_fold: None,
             grind: None,
             family: WlfmFamily::P1,
         }
@@ -444,10 +453,49 @@ pub fn wlfm_config_under(
     grind: Option<u8>,
     shapes: &[(usize, usize)],
 ) -> ChainConfig {
+    wlfm_config_first(rate, final_poly, None, fold, grind, shapes)
+}
+
+/// The schedule a [`WlfmLevers::first_fold`] of `k` gives: the uniform walk
+/// when `k` is the later rounds' width ([`PRODUCTION_WHIR_LOG_FOLDING`]: one
+/// schedule, one statement word, as the format's own parser has it), else
+/// `k` and then that walk. Refused outside `1..=MAX_FOLD`.
+///
+/// [`PRODUCTION_WHIR_LOG_FOLDING`]: crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING
+pub fn first_fold_schedule(k: u8) -> Result<multilinear::whir_chain::WhirFolds, String> {
+    use multilinear::whir_chain::{FirstFold, WhirFolds};
+    if usize::from(k) == crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING {
+        return Ok(WhirFolds::Uniform);
+    }
+    FirstFold::new(usize::from(k))
+        .map(WhirFolds::First)
+        .ok_or_else(|| {
+            format!(
+                "a first fold of {k} is outside 1..={}",
+                multilinear::whir_chain::MAX_FOLD
+            )
+        })
+}
+
+/// [`wlfm_config_under`] with the chains' first fold under `first` when set
+/// ([`first_fold_schedule`]): put in the format BEFORE the query count is
+/// sized, so the count is the production rule's over that schedule's round
+/// count (`ChainConfig::with_security_folds`), not a stamp on today's.
+fn wlfm_config_first(
+    rate: WlfmRate,
+    final_poly: FinalPoly,
+    first: Option<multilinear::whir_chain::WhirFolds>,
+    fold: Option<u8>,
+    grind: Option<u8>,
+    shapes: &[(usize, usize)],
+) -> ChainConfig {
     let mut zf = ZfFormat {
         whir_blowup: rate.factor() as u8,
         ..ZfFormat::DEFAULT
     };
+    if let Some(folds) = first {
+        zf.whir_folds = folds;
+    }
     match rate {
         WlfmRate::Sixteen => {
             zf.whir_stack = multilinear::whir_chain::StackVars::new(WLFM_B16_STACK)
@@ -486,7 +534,7 @@ pub fn wlfm_config_under(
 /// [`wlfm_config_under`]'s config, today's. A verifier constant of the level
 /// that builds it, never read from a proof. The round form is taken at the
 /// base's rate alone (the blowup-4 count is pinned apart, so its round 0 is
-/// not the calculator's).
+/// not the calculator's). [`wlfm_config_levers`] with no first fold.
 pub fn wlfm_config_rounds(
     rate: WlfmRate,
     final_poly: FinalPoly,
@@ -495,7 +543,54 @@ pub fn wlfm_config_rounds(
     rounds: Option<u8>,
     shapes: &[(usize, usize)],
 ) -> Result<ChainConfig, String> {
-    let config = wlfm_config_under(rate, final_poly, fold, grind, shapes);
+    let levers = WlfmLevers {
+        final_poly,
+        fold,
+        grind,
+        ..WlfmLevers::DEFAULT
+    };
+    wlfm_config_levers(rate, &levers, rounds, shapes)
+}
+
+/// ★ The chain config of a W-LFM proof under `levers` (their chain levers:
+/// final polynomial, first fold, later fold, grind; the binding and the
+/// family do not move it) at `rate`, its chains under the round form at
+/// `rounds` when set: the ONE call the build and the verifier's frame make.
+///
+/// Under the round form:
+/// - a stamped later [`fold`](WlfmLevers::fold) is refused: the query count
+///   was sized over the schedule before the stamp, and the union bound below
+///   would read the stamped one;
+/// - a [`first_fold`](WlfmLevers::first_fold) is taken: it is put in the
+///   format before the count is sized ([`wlfm_config_first`]), so the count
+///   and the union bound read one schedule;
+/// - a [`FinalPoly`] is taken: it moves no round count (a chain's rounds are
+///   its schedule's, `ChainConfig::rounds`, with or without it; the rounds
+///   after the final one open nothing, so the union over-covers them).
+///
+/// Either way the host's own checks ([`check_round_form_config`]) hold round
+/// 0's count to the rule's at the union the config states, so a config whose
+/// count and bound disagree is refused here rather than built.
+pub fn wlfm_config_levers(
+    rate: WlfmRate,
+    levers: &WlfmLevers,
+    rounds: Option<u8>,
+    shapes: &[(usize, usize)],
+) -> Result<ChainConfig, String> {
+    let WlfmLevers {
+        final_poly,
+        fold,
+        first_fold,
+        grind,
+        ..
+    } = *levers;
+    let first = first_fold.map(first_fold_schedule).transpose()?;
+    if first.is_some() && fold.is_some() {
+        return Err(format!(
+            "a first fold {first_fold:?} and a later fold {fold:?} together: one schedule lever at a time"
+        ));
+    }
+    let config = wlfm_config_first(rate, final_poly, first, fold, grind, shapes);
     let Some(shrink) = rounds else {
         return Ok(config);
     };
@@ -505,13 +600,12 @@ pub fn wlfm_config_rounds(
             rate.factor()
         ));
     }
-    // The query count was sized over today's schedule before a hand-set fold
-    // or a final polynomial was stamped on; the union bound below would read
-    // the stamped schedule, and the two need not agree. The levels take
-    // neither (a W-leg refuses both), so the round form takes neither.
-    if fold.is_some() || final_poly != FinalPoly::Off {
+    // The query count was sized over the schedule before a hand-set later
+    // fold was stamped on; the union bound below would read the stamped
+    // schedule, and the two need not agree. A W-leg refuses the stamp too.
+    if fold.is_some() {
         return Err(format!(
-            "the round form is taken over today's schedule, not fold {fold:?} final {final_poly:?}"
+            "the round form is taken over the sized schedule, not a stamped fold {fold:?}"
         ));
     }
     let zf = ZfFormat {
@@ -612,6 +706,9 @@ pub struct WlfmArtifacts {
     /// from the levers, never the reverse).
     pub final_poly: FinalPoly,
     pub fold: Option<u8>,
+    /// The first round's fold when not today's ([`WlfmLevers::first_fold`],
+    /// folded into `config`).
+    pub first_fold: Option<u8>,
     /// The query grind's bits when not the format's (folded into `config`).
     pub grind: Option<u8>,
     /// The hash family the proof commits, transcripts and grinds with.
@@ -637,6 +734,19 @@ pub struct WlfmArtifacts {
 }
 
 impl WlfmArtifacts {
+    /// The levers these artifacts were built under, as the verifier re-derives
+    /// the config from them ([`wlfm_config_levers`]).
+    pub fn levers(&self) -> WlfmLevers {
+        WlfmLevers {
+            prep: self.prep,
+            final_poly: self.final_poly,
+            fold: self.fold,
+            first_fold: self.first_fold,
+            grind: self.grind,
+            family: self.family,
+        }
+    }
+
     /// The program's AIR set, with no STARK roots ([`whir_lfm_airs`]), and
     /// its lean BLAKE3 tables after them.
     pub fn airs(&self) -> WlfmAirs {
@@ -1477,6 +1587,12 @@ pub struct WlfmPrebuild {
 }
 
 impl WlfmPrebuild {
+    /// The artifacts as prepared: every field but the prepared stacks' views
+    /// and the identity, which the commit settles.
+    pub fn artifacts(&self) -> &WlfmArtifacts {
+        &self.artifacts
+    }
+
     /// [`prepare_wlfm`]'s seconds by part: `[groups, columns, stacks]`.
     pub fn prepare_split(&self) -> [f64; 3] {
         self.split
@@ -1640,6 +1756,7 @@ pub fn prepare_wlfm_rounds(
         prep,
         final_poly,
         fold,
+        first_fold,
         grind,
         family,
     } = levers;
@@ -1721,7 +1838,7 @@ pub fn prepare_wlfm_rounds(
         counts.push(count);
     }
     let shapes = table_shapes(&refs, &table_num_vars);
-    let config = wlfm_config_rounds(rate, final_poly, fold, grind, rounds, &shapes)?;
+    let config = wlfm_config_levers(rate, &levers, rounds, &shapes)?;
     let sizes = multilinear_block::block_groups(&shapes, config.format.stack, wlfm_group_polys())
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
@@ -1776,6 +1893,7 @@ pub fn prepare_wlfm_rounds(
             prep,
             final_poly,
             fold,
+            first_fold,
             grind,
             family,
             rounds,
@@ -1809,6 +1927,7 @@ pub fn prepare_wlfm_rounds(
         prep,
         final_poly,
         fold,
+        first_fold,
         grind,
         family,
         rounds,
@@ -2619,11 +2738,9 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &WlfmAirs) -> Result<Verifier
         }
     }
     let shapes = artifacts.shapes(airs);
-    if wlfm_config_rounds(
+    if wlfm_config_levers(
         artifacts.rate,
-        artifacts.final_poly,
-        artifacts.fold,
-        artifacts.grind,
+        &artifacts.levers(),
         artifacts.rounds,
         &shapes,
     )? != artifacts.config

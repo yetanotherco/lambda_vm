@@ -33,8 +33,8 @@
 //! # ⛔ Today's chains only
 //!
 //! The in-guest chain verifier has no final-polynomial round and folds at the
-//! pinned width, so a child proved with a final polynomial or another fold is
-//! refused at emit time.
+//! pinned widths, so a child proved with a final polynomial, another later
+//! fold or another first fold is refused at emit time.
 //!
 //! # Under the BLAKE3 family
 //!
@@ -164,10 +164,10 @@ fn child_frame(
     if a.prep != WlfmPrep::Stacked {
         return Err("a W-leg verifies a child whose columns are stacked, not evaluated".into());
     }
-    if a.final_poly != FinalPoly::Off || a.fold.is_some() {
+    if a.final_poly != FinalPoly::Off || a.fold.is_some() || a.first_fold.is_some() {
         return Err(format!(
-            "a W-leg verifies today's chains, not final {:?} fold {:?}",
-            a.final_poly, a.fold
+            "a W-leg verifies today's chains, not final {:?} fold {:?} first fold {:?}",
+            a.final_poly, a.fold, a.first_fold
         ));
     }
     let plan: Vec<(usize, &[(usize, usize)])> = a

@@ -240,6 +240,7 @@ fn the_blowup_64_arm_round_trips_and_its_grind_is_another_identity() {
     let program = honest();
     let levers = |grind| WlfmLevers {
         grind,
+        first_fold: None,
         ..super::compress::folds_levers(WlfmPrep::Evaluated)
     };
     let g22 = under(&program, WlfmRate::SixtyFour, levers(Some(22)));
@@ -667,6 +668,7 @@ fn final_levers(prep: WlfmPrep) -> WlfmLevers {
         final_poly: multilinear::whir_chain::FinalPoly::Vars(6),
         fold: None,
         grind: None,
+        first_fold: None,
         family: crate::lfm::wlfm::WlfmFamily::P1,
     }
 }
@@ -814,6 +816,7 @@ fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
                         final_poly,
                         fold: None,
                         grind: None,
+                        first_fold: None,
                         family: crate::lfm::wlfm::WlfmFamily::P1,
                     },
                 );
@@ -934,6 +937,7 @@ fn the_dedup_encoding_round_trips_every_wlfm_proof() {
                     final_poly: FinalPoly::Vars(6),
                     fold: None,
                     grind: None,
+                    first_fold: None,
                     family: crate::lfm::wlfm::WlfmFamily::P1,
                 },
                 super::compress::folds_levers(prep),

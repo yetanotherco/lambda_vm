@@ -150,6 +150,7 @@ fn the_leg_refuses_a_child_only_the_host_can_check() {
             final_poly: multilinear::whir_chain::FinalPoly::Vars(6),
             fold: None,
             grind: None,
+            first_fold: None,
             family: crate::lfm::wlfm::WlfmFamily::P1,
         },
         super::compress::folds_levers(WlfmPrep::Stacked),
