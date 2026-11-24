@@ -1340,3 +1340,143 @@ fn the_two_layer_ladder_levels_prove_a_small_words_block_to_its_last_level() {
     forged.public_words[0].1[0] += FE::one();
     assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
 }
+
+/// ★ The last level's own format over a small BLAKE3 block's levels, derived
+/// on the host: under every lever of it, level 1 is today's (the same
+/// identity and config) and level 2 alone takes the levers; the process's
+/// last-level format reaches the verifier's derivation; a chain stopped by
+/// its group count gives the levers to whichever level is its last; and the
+/// pinned verifier's process check refuses a non-default last level.
+#[test]
+fn the_last_levels_levers_reach_the_last_level_alone() {
+    use super::last_level::{LastLevel, set_last_level_for_test};
+    use super::levels::{LevelStop, derive_levels_last, derive_levels_to};
+    use super::wlfm::WlfmPrep;
+    let all = LastLevel {
+        evaluated: true,
+        first_fold: Some(4),
+        final_poly: FinalPoly::Vars(9),
+    };
+    let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
+    let (elf, proof) = base("test_commit_4", &format);
+    let plan = plan(&elf, &proof, &format);
+    let stop = LevelStop::Levels(2);
+    let today = derive_levels_last(&plan, WlfmFamily::B3, stop, LastLevel::DEFAULT, true)
+        .expect("today's levels");
+    let on = derive_levels_last(&plan, WlfmFamily::B3, stop, all, true).expect("the levels");
+    assert_eq!(on.len(), 2);
+    let (t1, o1) = (&today[0].build.artifacts, &on[0].build.artifacts);
+    assert_eq!(o1.program_id, t1.program_id, "level 1's identity");
+    assert_eq!(o1.config, t1.config, "level 1's config");
+    assert_eq!(o1.prep, WlfmPrep::Stacked);
+    let (t2, o2) = (&today[1].build.artifacts, &on[1].build.artifacts);
+    assert_eq!(t2.prep, WlfmPrep::Stacked);
+    assert_eq!(o2.prep, WlfmPrep::Evaluated);
+    assert!(o2.stacks.is_empty() && !o2.evaluated.is_empty());
+    assert_eq!(
+        (o2.first_fold, o2.final_poly),
+        (Some(4), FinalPoly::Vars(9))
+    );
+    assert_eq!(o2.rounds, t2.rounds, "the base's round form");
+    assert_ne!(o2.program_id, t2.program_id);
+    assert_eq!(
+        on[1].program.instrs.len(),
+        today[1].program.instrs.len(),
+        "level 2's program is level 1's verifier either way"
+    );
+    // The process's format reaches the derivation (the verifier's).
+    {
+        let _last = set_last_level_for_test(all);
+        let derived = derive_levels_to(&plan, WlfmFamily::B3, stop, true).expect("derives");
+        assert_eq!(derived[1].build.artifacts.program_id, o2.program_id);
+        assert_eq!(derived[0].build.artifacts.program_id, t1.program_id);
+        let e = super::levels::check_process_format_for_tests(WlfmFamily::B3)
+            .expect_err("the pinned verifier's process check");
+        assert!(e.contains("last level"), "{e}");
+    }
+    let derived = derive_levels_to(&plan, WlfmFamily::B3, stop, true).expect("derives");
+    assert_eq!(
+        derived[1].build.artifacts.program_id, t2.program_id,
+        "off again"
+    );
+    // Stopped by group count: the levers go to whichever level is the last.
+    let groups = LevelStop::Groups(1);
+    let by_groups =
+        derive_levels_last(&plan, WlfmFamily::B3, groups, all, true).expect("the levels");
+    let (last, rest) = by_groups.split_last().expect("a level");
+    assert_eq!(last.build.artifacts.prep, WlfmPrep::Evaluated);
+    assert_eq!(last.build.artifacts.first_fold, Some(4));
+    for level in rest {
+        assert_eq!(level.build.artifacts.prep, WlfmPrep::Stacked);
+        assert_eq!(level.build.artifacts.first_fold, None);
+    }
+    println!(
+        "LAST LEVEL SMALL BLOCK: level 2 today {} groups, prepared {} stacks · by groups {} levels",
+        t2.sizes.len(),
+        t2.stacks.len(),
+        by_groups.len()
+    );
+}
+
+/// ★ Box tier: a small BLAKE3 block's two levels proved with the last level
+/// under all its levers; each level verifies against its own artifacts; the
+/// block's verifier under the same process format accepts the last and
+/// refuses a changed word; today's verifier refuses it; level 1's proof is
+/// today's byte for byte (compact bytes, with
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`); the last proof's census printed.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels; box tier"]
+fn the_last_levels_levers_prove_a_small_block() {
+    use super::last_level::{LastLevel, set_last_level_for_test};
+    use super::levels::{LevelStop, derive_levels_last, prove_levels, verify_levels};
+    use super::wlfm::verify_wlfm;
+    let all = LastLevel {
+        evaluated: true,
+        first_fold: Some(4),
+        final_poly: FinalPoly::Vars(9),
+    };
+    let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
+    let (elf, proof) = base("test_commit_4", &format);
+    let plan = plan(&elf, &proof, &format);
+    let stop = LevelStop::Levels(2);
+    let today = derive_levels_last(&plan, WlfmFamily::B3, stop, LastLevel::DEFAULT, true)
+        .expect("today's levels");
+    let (today_proofs, _) = prove_levels(&plan, &today, &proof).expect("today proves");
+    let on = derive_levels_last(&plan, WlfmFamily::B3, stop, all, true).expect("the levels");
+    let (proofs, _) = prove_levels(&plan, &on, &proof).expect("every level proves");
+    for (k, (level, p)) in on.iter().zip(&proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+    }
+    let last = proofs.last().expect("a last level");
+    {
+        let _last = set_last_level_for_test(all);
+        verify_levels(&plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
+        let mut forged = last.clone();
+        forged.public_words[0].1[0] += FE::one();
+        assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
+    }
+    assert!(
+        verify_levels(&plan, WlfmFamily::B3, last).is_err(),
+        "today's verifier refuses the last level's own format"
+    );
+    let today_last = today_proofs.last().expect("today's last");
+    verify_levels(&plan, WlfmFamily::B3, today_last).expect("today's verifier, today's proof");
+    if std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some() {
+        assert_eq!(
+            super::wire::encode(&proofs[0]),
+            super::wire::encode(&today_proofs[0]),
+            "level 1's proof is today's"
+        );
+    }
+    for (name, p) in [("today", today_last), ("last level", last)] {
+        let c = super::wire::census(p);
+        println!(
+            "SMALL BLOCK LEVEL 2 CENSUS {name}: rkyv {} · compact {} · dedup {} · {}",
+            c.rkyv,
+            c.compact,
+            c.dedup,
+            c.line()
+        );
+    }
+}

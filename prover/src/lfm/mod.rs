@@ -52,6 +52,9 @@ pub mod hash;
 pub mod instr;
 pub mod keccak_adapter;
 pub mod keccak_host;
+/// The last level's own format (the proof the host verifies).
+#[cfg(feature = "parallel")]
+pub mod last_level;
 pub mod layout;
 pub mod lde;
 /// The block's recursion as levels: each one W-LFM proof of one program.
@@ -180,6 +183,8 @@ mod hint_on_tests;
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
+#[cfg(all(test, feature = "parallel"))]
+mod last_level_tests;
 #[cfg(test)]
 mod leaf_kats;
 #[cfg(test)]

@@ -37,6 +37,7 @@
 use super::LfmWord;
 use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
+use super::last_level::LastLevel;
 use super::merkle_cap::CapMux;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
@@ -102,6 +103,60 @@ pub struct Level {
 /// The levers every level proves under.
 pub fn level_levers(family: WlfmFamily) -> WlfmLevers {
     WlfmLevers::with_family(family)
+}
+
+/// The levers level `index` (from 1) proves under: every level's, or the
+/// last level's own ([`LastLevel::levers`]) when it is the last.
+pub fn levers_for(family: WlfmFamily, last: LastLevel, is_last: bool) -> WlfmLevers {
+    if is_last {
+        last.levers(family)
+    } else {
+        level_levers(family)
+    }
+}
+
+/// Whether level `index` (from 1) is the chain's last under `stop`, its
+/// group count `groups`: the derivation's and the driver's one rule (a
+/// [`LevelStop::Groups`] chain stops at [`MAX_LEVELS`] at the latest).
+pub fn is_last_level(stop: LevelStop, index: usize, groups: usize) -> bool {
+    match stop {
+        LevelStop::Levels(n) => index >= n.clamp(1, MAX_LEVELS),
+        LevelStop::Groups(g) => groups <= g || index >= MAX_LEVELS,
+    }
+}
+
+/// Whether level `index` is known to be the last before it is prepared:
+/// under [`LevelStop::Levels`] by its index; under [`LevelStop::Groups`] not
+/// until its group count is known ([`prepare_as_level`]).
+fn known_last(stop: LevelStop, index: usize) -> bool {
+    match stop {
+        LevelStop::Levels(_) => is_last_level(stop, index, usize::MAX),
+        LevelStop::Groups(_) => index >= MAX_LEVELS,
+    }
+}
+
+/// Level `index`'s prebuild by `prepare` under the levers it proves at: as
+/// the last level when it is known to be ([`known_last`]), else every
+/// level's, prepared again under the last level's when its group count makes
+/// it the last ([`LevelStop::Groups`]; a group count does not depend on the
+/// levers, `block_groups` reads the shapes and the stack alone). Under
+/// [`LastLevel::DEFAULT`] every level's levers are one, and nothing is
+/// prepared twice.
+pub(crate) fn prepare_as_level(
+    stop: LevelStop,
+    index: usize,
+    last: LastLevel,
+    family: WlfmFamily,
+    prepare: impl Fn(WlfmLevers) -> Result<WlfmPrebuild, String>,
+) -> Result<WlfmPrebuild, String> {
+    let pre = prepare(levers_for(family, last, known_last(stop, index)))?;
+    let a = pre.artifacts();
+    let want = levers_for(family, last, is_last_level(stop, index, a.sizes.len()));
+    if a.levers() == want {
+        Ok(pre)
+    } else {
+        prepare(want)
+    }
 }
 
 /// The levels' family against the hash the plan's programs replay: one hash
@@ -559,14 +614,26 @@ fn beside_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// [`prepare_level`] as the driver runs it beside the base: on the beside pool
 /// under [`beside_nice`], on the prover's pool otherwise. The same prebuild.
+#[cfg(test)]
 pub(crate) fn prepare_level_beside(
     program: &LfmProgram,
     family: WlfmFamily,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
+    prepare_level_beside_as(program, level_levers(family), rounds)
+}
+
+/// A level's host part as the driver runs it beside the base, under
+/// `levers`: on the beside pool under [`beside_nice`], on the prover's pool
+/// otherwise. The same prebuild.
+pub(crate) fn prepare_level_beside_as(
+    program: &LfmProgram,
+    levers: WlfmLevers,
+    rounds: Option<u8>,
+) -> Result<WlfmPrebuild, String> {
     match beside_nice().then(beside_pool).flatten() {
-        Some(pool) => pool.install(|| prepare_level(program, family, rounds)),
-        None => prepare_level(program, family, rounds),
+        Some(pool) => pool.install(|| prepare_level_as(program, levers, rounds)),
+        None => prepare_level_as(program, levers, rounds),
     }
 }
 
@@ -620,13 +687,25 @@ pub(crate) fn joined_validation(
 
 /// A level's host part ([`prepare_wlfm`]), its chip prefixes packed with it
 /// when it holds its chips as records: nothing here waits for the card.
+#[cfg(test)]
 pub(crate) fn prepare_level(
     program: &LfmProgram,
     family: WlfmFamily,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
+    prepare_level_as(program, level_levers(family), rounds)
+}
+
+/// A level's host part ([`prepare_wlfm`]) under `levers` (every level's, or
+/// the last level's own, [`levers_for`]), its chip prefixes packed with it
+/// when it holds its chips as records: nothing here waits for the card.
+pub(crate) fn prepare_level_as(
+    program: &LfmProgram,
+    levers: WlfmLevers,
+    rounds: Option<u8>,
+) -> Result<WlfmPrebuild, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, level_levers(family), rounds)?;
+    let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, levers, rounds)?;
     if super::wlfm::chip_records() {
         pre.hold_chip_prefixes()?;
     }
@@ -677,9 +756,18 @@ fn level_more(stop: LevelStop, count: usize, last: &WlfmBuild) -> bool {
 /// over `child`), where its arena's pieces end (the front, then each of the
 /// child's groups), and its stacks' columns, uncommitted, its chains under the
 /// child's round form (every level's is the base's, [`level_rounds`]).
-fn prepare_next(child: WlfmChild, family: WlfmFamily) -> Result<PreparedNext, String> {
+fn prepare_next(
+    child: WlfmChild,
+    family: WlfmFamily,
+    stop: LevelStop,
+    index: usize,
+    last: LastLevel,
+) -> Result<PreparedNext, String> {
     let (program, marks) = wlfm_leg_program_marked(&child)?;
-    let pre = prepare_level(&program, family, child.artifacts.rounds)?;
+    let rounds = child.artifacts.rounds;
+    let pre = prepare_as_level(stop, index, last, family, |levers| {
+        prepare_level_as(&program, levers, rounds)
+    })?;
     Ok((program, pre, marks))
 }
 
@@ -1072,14 +1160,17 @@ pub fn level_rounds(plan: &WhirBlockPlan) -> Option<u8> {
     }
 }
 
-/// One level built from its program: under `family`'s levers at
-/// [`LEVEL_RATE`], its chains under `rounds` ([`level_rounds`]), its
-/// prepared stacks committed on the host when `on_host`.
+/// One level built from its program at [`LEVEL_RATE`], its chains under
+/// `rounds` ([`level_rounds`]), its prepared stacks committed on the host
+/// when `on_host`: level `at.1` of a chain stopping at `at.0`, under every
+/// level's levers, or `last`'s when it is the last ([`prepare_as_level`]).
 pub(crate) fn build_level(
     program: LfmProgram,
     family: WlfmFamily,
     rounds: Option<u8>,
     on_host: bool,
+    at: (LevelStop, usize),
+    last: LastLevel,
 ) -> Result<Level, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let place = if on_host {
@@ -1087,8 +1178,10 @@ pub(crate) fn build_level(
     } else {
         StackPlace::Card
     };
-    let build = prepare_wlfm_rounds(&program, hasher, LEVEL_RATE, level_levers(family), rounds)?
-        .commit(place)?;
+    let build = prepare_as_level(at.0, at.1, last, family, |levers| {
+        prepare_wlfm_rounds(&program, hasher, LEVEL_RATE, levers, rounds)
+    })?
+    .commit(place)?;
     Ok(Level { program, build })
 }
 
@@ -1234,11 +1327,24 @@ pub fn derive_levels(
     derive_levels_to(plan, family, LevelStop::DEFAULT, on_host)
 }
 
-/// [`derive_levels`] under the chain stop `stop`.
+/// [`derive_levels`] under the chain stop `stop`, the last level under the
+/// process's last-level format ([`super::last_level::last_level`]).
 pub fn derive_levels_to(
     plan: &WhirBlockPlan,
     family: WlfmFamily,
     stop: LevelStop,
+    on_host: bool,
+) -> Result<Vec<Level>, String> {
+    let last = super::last_level::last_level()?;
+    derive_levels_last(plan, family, stop, last, on_host)
+}
+
+/// [`derive_levels_to`] with the last level under `last`.
+pub fn derive_levels_last(
+    plan: &WhirBlockPlan,
+    family: WlfmFamily,
+    stop: LevelStop,
+    last: LastLevel,
     on_host: bool,
 ) -> Result<Vec<Level>, String> {
     check_family(plan, family)?;
@@ -1254,21 +1360,29 @@ pub fn derive_levels_to(
             LevelStop::Groups(_) => Ok(true),
         }
     };
+    if let LevelStop::Levels(0) = stop {
+        return Err("a chain has at least one level".into());
+    }
     let rounds = level_rounds(plan);
     let mut levels = vec![build_level(
         plan.closed_block_program()?,
         family,
         rounds,
         on_host,
+        (stop, 1),
+        last,
     )?];
     while more(&levels)? {
         let child = child_of(plan, levels.last().expect("a level"));
         let rounds = child.artifacts.rounds;
+        let index = levels.len() + 1;
         levels.push(build_level(
             wlfm_leg_program(&child)?,
             family,
             rounds,
             on_host,
+            (stop, index),
+            last,
         )?);
     }
     Ok(levels)
@@ -1504,12 +1618,25 @@ fn verify_block_levels_pinned(
 /// hash row (pinned by `lean_mux_tests::the_blake3_w_leg_program_is_pinned`
 /// and `levels_tests::the_public_levels_verifier_accepts_at_the_pinned_format`).
 ///
+/// The last level's own format (`LAMBDA_VM_LAST_LEVEL_EVALUATED`,
+/// `LAMBDA_VM_LAST_LEVEL_FIRST_FOLD`, `LAMBDA_VM_LAST_LEVEL_FINAL`,
+/// [`super::last_level`]) must be today's: a process that asks for another is
+/// refused.
+///
 /// Each knob's word is parsed first, from the environment, by the knob's own
 /// refusing parser: a malformed word, under either family, is an `Err` here,
 /// never the abort or panic of the process-wide reader. Only then are the
 /// process-wide cells read — the values the derivation will use — and only
 /// the family's own: a Poseidon1 verification reads no BLAKE3 cell.
 fn check_process_format(family: WlfmFamily) -> Result<(), String> {
+    // The last level's own format: the pinned one is today's, every level's.
+    let last = super::last_level::last_level()?;
+    if !last.is_default() {
+        return Err(format!(
+            "the process asks for a last level of its own ({last:?}): the levels verifier \
+             checks the pinned one"
+        ));
+    }
     let cap = knob_word(
         crate::block_whir::B3_BASE_CAP_ENV,
         crate::block_whir::b3_base_cap_setting,
@@ -1884,6 +2011,9 @@ pub fn prove_block_levels(
 
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
+    // The last level's own format, read once: the same value the verifier's
+    // derivation reads ([`derive_levels_to`]).
+    let last = super::last_level::last_level()?;
     // Level 1's groups arrive as a streamed base's phase B opens them; the
     // whole-run base prover opens them without telling anyone.
     if options.window_log2.is_none() {
@@ -2012,7 +2142,10 @@ pub fn prove_block_levels(
                     .map_err(|_| "level 1's program was never emitted")?;
                 let program = program_ref.get().ok_or("the program is set")?;
                 let plan = plan_ref.get().ok_or("the plan is set")?;
-                prepare_level_beside(program, family, level_rounds(plan))
+                let rounds = level_rounds(plan);
+                prepare_as_level(stop, 1, last, family, |levers| {
+                    prepare_level_beside_as(program, levers, rounds)
+                })
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
@@ -2417,7 +2550,10 @@ pub fn prove_block_levels(
     let (first, prepare, cells, committed, cards, settle) = match built_beside {
         Some(built) => built?,
         None => {
-            let pre = prepare_level(&program, family, level_rounds(&plan))?;
+            let rounds = level_rounds(&plan);
+            let pre = prepare_as_level(stop, 1, last, family, |levers| {
+                prepare_level_as(&program, levers, rounds)
+            })?;
             let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
             let (settled, settle_secs, trimmed) =
                 settle_base_end(settle_late() || super::wlfm_knobs::levels_untrimmed());
@@ -2469,7 +2605,8 @@ pub fn prove_block_levels(
     std::thread::scope(|scope| -> Result<(), String> {
         let spawn_next = |build: &WlfmBuild, count: usize| {
             let child = child_of_build(&plan, build);
-            level_more(stop, count, build).then(|| scope.spawn(move || prepare_next(child, family)))
+            level_more(stop, count, build)
+                .then(|| scope.spawn(move || prepare_next(child, family, stop, count + 1, last)))
         };
         let mut next = spawn_next(&levels[0].build, 1);
         let (filled, fill) = match execution {

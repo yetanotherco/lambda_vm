@@ -41,7 +41,7 @@ fn lane_words(b: &mut LfmBuilder, block: &[u8; 64]) -> [Cell; 4] {
 /// its midstate, a parent over the two digests with its reversed digest, and
 /// every digest published. `flags_last` is the parent's flags: a forged twin
 /// changes it and keeps every table's height.
-fn program(flags_last: u8) -> LfmProgram {
+pub(super) fn program(flags_last: u8) -> LfmProgram {
     use crypto::hash::blake3::chain::{block_flags, block_len_of, num_blocks};
     let mut b = LfmBuilder::new();
     // 1. Blake3Std over 150 bytes: three blocks, the last partial.

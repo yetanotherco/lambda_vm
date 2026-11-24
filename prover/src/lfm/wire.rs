@@ -459,6 +459,184 @@ pub fn encode_as(proof: &WlfmProof, wire: WireFormat) -> Option<Vec<u8>> {
     }
 }
 
+/// A W-LFM proof's bytes by component: each part's compact encoding
+/// ([`encode`]'s, no framing), the parts summing to the compact total, beside
+/// the whole proof's rkyv archive and dedup encoding. A measurement, off the
+/// clock: nothing here reaches a proof.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Census {
+    /// `(component, bytes)` in a fixed order; their sum is [`Self::compact`].
+    pub parts: Vec<(&'static str, usize)>,
+    /// The whole proof's compact bytes.
+    pub compact: usize,
+    /// The whole proof's dedup bytes ([`encode_dedup`]).
+    pub dedup: usize,
+    /// The whole proof's rkyv archive bytes (today's file).
+    pub rkyv: usize,
+    /// Per chain (main chains first, then prepared ones): each round's query
+    /// count (its opened blocks; 0 for a round that opens nothing).
+    pub queries: Vec<Vec<usize>>,
+}
+
+impl Census {
+    /// `component bytes` pairs, space-separated, for one log line.
+    pub fn line(&self) -> String {
+        self.parts
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+fn bytes_of<T: Wire>(v: &T) -> usize {
+    let mut out = Out::new(false);
+    v.put(&mut out);
+    out.bytes.len()
+}
+
+/// A chain's bytes split: round 0's opened values and paths, the later
+/// rounds' values and paths, the sumcheck messages, the rest of each round
+/// (successor root, out-of-domain answer, nonces, tags and lengths), the
+/// final value; and each round's query count.
+fn chain_census(chain: &ChainProof<F, E>, acc: &mut [usize; 7]) -> Vec<usize> {
+    let mut queries = Vec::with_capacity(chain.rounds.len());
+    for (r, round) in chain.rounds.iter().enumerate() {
+        let (vals, paths, q) = match &round.openings {
+            RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                openings_census(&p.current, &p.next)
+            }
+            RoundOpenings::Extension(p) => openings_census(&p.current, &p.next),
+            RoundOpenings::BaseGrouped(p) => {
+                let mut v = 0;
+                let mut t = 0;
+                let mut q = 0;
+                for run in &p.current {
+                    let (a, b, c) = openings_census::<F, E>(run, &[]);
+                    v += a;
+                    t += b;
+                    q = q.max(c);
+                }
+                let (a, b, _) = openings_census::<E, E>(&[], &p.next);
+                (v + a, t + b, q)
+            }
+        };
+        let whole = bytes_of(round);
+        let sumcheck = bytes_of(&round.sumcheck);
+        let (vi, pi) = if r == 0 { (0, 1) } else { (2, 3) };
+        acc[vi] += vals;
+        acc[pi] += paths;
+        acc[4] += sumcheck;
+        acc[5] += whole - vals - paths - sumcheck;
+        queries.push(q);
+    }
+    acc[6] += bytes_of(&chain.final_value) + bytes_of(&(chain.rounds.len() as u64));
+    queries
+}
+
+/// The opened values' and the paths' bytes of one round's blocks, and its
+/// query count (current blocks).
+fn openings_census<C, N>(
+    current: &[CosetOpening<C>],
+    next: &[CosetOpening<N>],
+) -> (usize, usize, usize)
+where
+    C: math::field::traits::IsField,
+    N: math::field::traits::IsField,
+    FieldElement<C>: Wire,
+    FieldElement<N>: Wire,
+{
+    let mut vals = 0;
+    let mut paths = 0;
+    for o in current {
+        vals += bytes_of(&o.values);
+        paths += bytes_of(&o.proof);
+    }
+    for o in next {
+        vals += bytes_of(&o.values);
+        paths += bytes_of(&o.proof);
+    }
+    (vals, paths, current.len())
+}
+
+/// ★ The per-component byte census of a W-LFM proof ([`Census`]).
+pub fn census(proof: &WlfmProof) -> Census {
+    let mut parts: Vec<(&'static str, usize)> = Vec::new();
+    let mut queries = Vec::new();
+    for (name, stacks) in [
+        ("main", &proof.proof.columns),
+        ("prepared", &proof.prepared),
+    ] {
+        let mut acc = [0usize; 7];
+        for stack in stacks.iter() {
+            for chain in &stack.polys {
+                queries.push(chain_census(chain, &mut acc));
+            }
+            // The stack's and its chain list's lengths.
+            acc[5] += bytes_of(&(stack.polys.len() as u64));
+        }
+        acc[5] += bytes_of(&(stacks.len() as u64));
+        let keys: [&'static str; 7] = if name == "main" {
+            [
+                "main r0 values",
+                "main r0 paths",
+                "main later values",
+                "main later paths",
+                "main sumcheck",
+                "main round rest",
+                "main final",
+            ]
+        } else {
+            [
+                "prepared r0 values",
+                "prepared r0 paths",
+                "prepared later values",
+                "prepared later paths",
+                "prepared sumcheck",
+                "prepared round rest",
+                "prepared final",
+            ]
+        };
+        parts.extend(keys.into_iter().zip(acc));
+    }
+    let mut argue = [0usize; 6];
+    for a in &proof.argues {
+        argue[0] += bytes_of(&a.gkr);
+        argue[1] += bytes_of(&a.constraint);
+        argue[2] += bytes_of(&a.factor_values);
+        argue[3] += bytes_of(&a.reduces);
+        argue[4] += bytes_of(&a.bus_outputs);
+    }
+    argue[5] = bytes_of(&(proof.argues.len() as u64));
+    parts.extend(
+        [
+            "argue gkr",
+            "argue constraint",
+            "argue factor values",
+            "argue reduces",
+            "argue bus outputs",
+            "argue lengths",
+        ]
+        .into_iter()
+        .zip(argue),
+    );
+    parts.push(("roots", bytes_of(&proof.proof.roots)));
+    parts.push(("table proofs", bytes_of(&proof.proof.tables)));
+    parts.push((
+        "out-of-band preprocessed",
+        bytes_of(&proof.proof.preprocessed),
+    ));
+    parts.push(("commit answers", bytes_of(&proof.commit_ood)));
+    parts.push(("public words", bytes_of(&proof.public_words)));
+    Census {
+        parts,
+        compact: encode(proof).len(),
+        dedup: encode_dedup(proof).len(),
+        rkyv: rkyv::to_bytes::<rkyv::rancor::Error>(proof).map_or(0, |b| b.len()),
+        queries,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
