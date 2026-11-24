@@ -442,12 +442,14 @@ pub fn search_queue_counted(
 /// reads again. `tests/grind_queue_grid_thread.rs` pins it.
 pub fn queue_grid() -> Option<u32> {
     use cudarc::driver::sys::CUdevice_attribute;
-    static GRID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    if let Some(&grid) = GRID.get() {
-        return Some(grid);
-    }
+    // A value read from a card: one per card.
+    static GRID: crate::device::PerBackend<u32> = crate::device::PerBackend::new();
     // `backend()` warns on its own failure.
     let be = backend().ok()?;
+    let grid_cell = GRID.of(be);
+    if let Some(&grid) = grid_cell.get() {
+        return Some(grid);
+    }
     let read = || -> crate::Result<(u32, u32)> {
         be.ctx.bind_to_thread()?;
         let sms = be
@@ -461,7 +463,7 @@ pub fn queue_grid() -> Option<u32> {
         Ok((sms, per_sm))
     };
     match read() {
-        Ok((sms, per_sm)) => Some(*GRID.get_or_init(|| {
+        Ok((sms, per_sm)) => Some(*grid_cell.get_or_init(|| {
             let regs = be.rpx_grind_search_queue.num_regs().unwrap_or(0);
             eprintln!(
                 "[gpu] RPX grind queue: grid {} = {sms} SMs x {per_sm} blocks of {RPX_BLOCK_DIM} \

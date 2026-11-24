@@ -345,7 +345,10 @@ struct Cache {
     bytes: u64,
 }
 
-static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+/// One cache a card: its entries are that card's device buffers and ledger
+/// promises, and each card's uploads queue on its own lock. The budget
+/// (`LAMBDA_VM_CARD_ROWS_CACHE_MIB`) is per card.
+static CACHE: [Mutex<Option<Cache>>; 2] = [Mutex::new(None), Mutex::new(None)];
 
 /// Whether uploads keep CPU logs past their own group: only between a
 /// block's [`begin`] and [`end`]. Outside one, a group still derives its
@@ -362,12 +365,18 @@ pub fn begin() {
 /// A block's prove ended: nothing more is kept, and the cache is emptied.
 pub fn end() {
     KEEPING.store(false, Ordering::Relaxed);
-    let mut cache = lock();
-    *cache = None;
+    for slot in 0..CACHE.len() {
+        *lock_slot(slot) = None;
+    }
 }
 
+/// This thread's card's cache.
 fn lock() -> std::sync::MutexGuard<'static, Option<Cache>> {
-    CACHE
+    lock_slot(crate::device::current_slot())
+}
+
+fn lock_slot(slot: usize) -> std::sync::MutexGuard<'static, Option<Cache>> {
+    CACHE[slot.min(CACHE.len() - 1)]
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -376,8 +385,9 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Cache>> {
 /// no prove reads another's logs and each block's report is its own. Its
 /// entries' memory goes back in stream order.
 pub fn clear() {
-    let mut cache = lock();
-    *cache = None;
+    for slot in 0..CACHE.len() {
+        *lock_slot(slot) = None;
+    }
     let c = counters();
     for counter in [
         &c.groups,
@@ -455,12 +465,15 @@ pub fn report_line() -> String {
     )
 }
 
-/// Entries held and their bytes.
+/// Entries held and their bytes, over both cards' caches.
 pub fn held() -> (usize, u64) {
-    let cache = lock();
-    cache
-        .as_ref()
-        .map_or((0, 0), |c| (c.entries.len(), c.bytes))
+    (0..CACHE.len()).fold((0, 0), |(n, b), slot| {
+        let cache = lock_slot(slot);
+        let (m, c) = cache
+            .as_ref()
+            .map_or((0, 0), |c| (c.entries.len(), c.bytes));
+        (n + m, b + c)
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -196,6 +196,8 @@ pub struct Backend {
     /// Device bytes promised to structures that are still alive. See
     /// [`Backend::reserve`].
     reserved: AtomicU64,
+    /// The ledger's whole-run and window peaks, this card's own.
+    peaks: LedgerPeaks,
 
     // arith.cubin
     pub vector_add_u64: CudaFunction,
@@ -595,6 +597,11 @@ pub struct DeviceReservation {
 }
 
 impl DeviceReservation {
+    /// The backend slot whose ledger holds these bytes ([`BackendSlot::index`]).
+    pub fn slot_index(&self) -> usize {
+        self.slot.index()
+    }
+
     /// Bytes this reservation currently accounts for.
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
@@ -622,9 +629,7 @@ impl DeviceReservation {
             ) {
                 Ok(_) => {
                     self.bytes.fetch_add(extra, Ordering::Relaxed);
-                    if self.slot == BackendSlot::Main {
-                        note_reserved(held + extra);
-                    }
+                    be.peaks.note(held + extra);
                     return true;
                 }
                 Err(seen) => held = seen,
@@ -920,8 +925,7 @@ pub fn note_device_fallback() {
 /// exactly what the budget gates. A control run reads argue's peak reservation
 /// demand here; and while the evictable retention holds only spare bytes, this
 /// stays below the budget by construction.
-static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
-
+///
 /// ★ The same peak over a WINDOW a caller opens and closes — one phase of one
 /// proof — beside the whole-run one, which it never touches.
 ///
@@ -929,41 +933,59 @@ static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 /// cannot say WHEN. A change that moves one phase's reservations — giving a
 /// group's room back across the argument, say — is tested by that phase's peak,
 /// epoch by epoch, and a run's single maximum hides every epoch but one.
-static WINDOW_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
-
-/// Note that `be.reserved` just rose to `now`, keeping both peaks.
-fn note_reserved(now: u64) {
-    RESERVED_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
-    WINDOW_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
+///
+/// Both peaks are a backend's own ([`LedgerPeaks`]): each card's ledger keeps
+/// its own, and the functions below read this thread's backend's.
+#[derive(Debug, Default)]
+pub struct LedgerPeaks {
+    /// The whole-run peak.
+    reserved: AtomicU64,
+    /// The peak since the window opened.
+    window: AtomicU64,
 }
 
-/// The peak simultaneous device reservation this process reached — see
-/// [`RESERVED_HIGH_WATER`].
+impl LedgerPeaks {
+    /// The ledger just rose to `now`: both peaks keep the larger.
+    fn note(&self, now: u64) {
+        self.reserved.fetch_max(now, Ordering::Relaxed);
+        self.window.fetch_max(now, Ordering::Relaxed);
+    }
+}
+
+/// The peak simultaneous device reservation this thread's backend reached
+/// (0 without one) — see [`LedgerPeaks`].
 pub fn reserved_high_water() -> u64 {
-    RESERVED_HIGH_WATER.load(Ordering::Relaxed)
+    backend().map_or(0, |be| be.peaks.reserved.load(Ordering::Relaxed))
 }
 
-/// Zero the reservation high-water. For a test asserting a delta.
+/// Zero this thread's backend's reservation high-water. For a test asserting
+/// a delta.
 pub fn reset_reserved_high_water() {
-    RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
+    if let Ok(be) = backend() {
+        be.peaks.reserved.store(0, Ordering::Relaxed);
+    }
 }
 
-/// Opens a window ([`WINDOW_HIGH_WATER`]): its peak starts at what is promised
+/// Opens a window on this thread's backend ([`LedgerPeaks`]): its peak starts at what is promised
 /// NOW, not at zero, because the total only reports when it RISES — a phase
 /// that reserved nothing peaked at whatever it inherited, and a window started
 /// at zero would read that as nothing held at all.
 ///
-/// Process-wide, like the whole-run peak: a window is one phase's only while
-/// nothing else in the process reserves during it. The WHIR base proves one
+/// One card's, like the whole-run peak: a window is one phase's only while
+/// nothing else on that card reserves during it. The WHIR base proves one
 /// epoch at a time; a caller that cannot say the same must mark what it reads.
 pub fn reset_window_high_water() {
-    let now = backend().map(|be| be.reserved_bytes()).unwrap_or(0);
-    WINDOW_HIGH_WATER.store(now, Ordering::Relaxed);
+    if let Ok(be) = backend() {
+        be.peaks
+            .window
+            .store(be.reserved_bytes(), Ordering::Relaxed);
+    }
 }
 
-/// The peak promised since the last [`reset_window_high_water`].
+/// The peak promised on this thread's backend since the last
+/// [`reset_window_high_water`].
 pub fn window_high_water() -> u64 {
-    WINDOW_HIGH_WATER.load(Ordering::Relaxed)
+    backend().map_or(0, |be| be.peaks.window.load(Ordering::Relaxed))
 }
 
 /// ★ THE RETENTION EVICTOR — the callback the WHIR leaf-layer retention installs
@@ -980,18 +1002,23 @@ pub fn window_high_water() -> u64 {
 /// frees by dropping retained layers and calling `DeviceReservation::shrink`, and
 /// it MUST NOT call `reserve` or `grow` — those would re-enter the allocator that
 /// called it and deadlock.
-static EVICTOR: OnceLock<fn(u64) -> u64> = OnceLock::new();
+///
+/// It takes the asking backend's slot ([`BackendSlot::index`]) and frees only
+/// layers whose promise is that slot's: another card's layers give no room on
+/// this card.
+static EVICTOR: OnceLock<fn(u64, usize) -> u64> = OnceLock::new();
 
 /// Install the retention evictor. Idempotent — only the first install sticks.
-pub fn set_retention_evictor(evictor: fn(u64) -> u64) {
+pub fn set_retention_evictor(evictor: fn(u64, usize) -> u64) {
     let _ = EVICTOR.set(evictor);
 }
 
-/// Ask the retention to give back at least `target` bytes of budget; returns how
-/// many it freed (0 if none is installed or nothing was reclaimable).
-fn try_evict_retained(target: u64) -> u64 {
+/// Ask the retention to give back at least `target` bytes of `slot`'s budget;
+/// returns how many it freed (0 if none is installed or nothing was
+/// reclaimable).
+fn try_evict_retained(target: u64, slot: usize) -> u64 {
     match EVICTOR.get() {
-        Some(evict) => evict(target),
+        Some(evict) => evict(target, slot),
         None => 0,
     }
 }
@@ -1471,6 +1498,19 @@ impl Backend {
             util_stream,
             vram_budget_bytes: AtomicU64::new(vram_budget_bytes),
             reserved: AtomicU64::new(0),
+            peaks: LedgerPeaks::default(),
+        })
+        .and_then(|be: Self| {
+            // Set up once per function, so once per card: the wide Möbius
+            // tile's dynamic shared memory above the 48 KiB default. A failure
+            // fails this backend's start (for the second card: no second
+            // backend, its work stays on card 0).
+            be.ctx.bind_to_thread()?;
+            be.mobius_wide_tile.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                crate::whir::MOBIUS_WIDE_TILE_BYTES as i32,
+            )?;
+            Ok(be)
         })
     }
 
@@ -1582,7 +1622,7 @@ impl Backend {
                     let deficit = held
                         .saturating_add(bytes)
                         .saturating_sub(self.vram_budget_bytes());
-                    if try_evict_retained(deficit) > 0 {
+                    if try_evict_retained(deficit, BackendSlot::of(self).index()) > 0 {
                         held = self.reserved.load(Ordering::Relaxed);
                         continue;
                     }
@@ -1596,12 +1636,9 @@ impl Backend {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // The peaks are card 0's: the openings' own backend keeps
-                    // its ledger apart and moves neither.
+                    // Each card's ledger keeps its own peaks.
                     let slot = BackendSlot::of(self);
-                    if slot == BackendSlot::Main {
-                        note_reserved(held + bytes);
-                    }
+                    self.peaks.note(held + bytes);
                     return Some(DeviceReservation {
                         bytes: AtomicU64::new(bytes),
                         slot,
@@ -1898,41 +1935,42 @@ pub fn two_card_openings() -> bool {
     openings_placement().slot != 0
 }
 
-static OPENINGS_BACKEND: OnceLock<Backend> = OnceLock::new();
+static SECOND_BACKEND: OnceLock<Backend> = OnceLock::new();
 
 /// Which of the process's backends an object belongs to: card 0's
-/// ([`backend_once`]) or the openings' own ([`OPENINGS_BACKEND`]). What holds
+/// ([`backend_once`]) or the openings' own ([`SECOND_BACKEND`]). What holds
 /// a backend's ledger bytes or pooled events keeps its slot, so it gives them
 /// back to that backend even when a thread in another role drops it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BackendSlot {
+pub enum BackendSlot {
     Main,
-    Openings,
+    Second,
 }
 
 impl BackendSlot {
     /// The slot of `be`.
-    pub(crate) fn of(be: &Backend) -> Self {
-        match OPENINGS_BACKEND.get() {
-            Some(o) if std::ptr::eq(o, be) => Self::Openings,
+    pub fn of(be: &Backend) -> Self {
+        match SECOND_BACKEND.get() {
+            Some(o) if std::ptr::eq(o, be) => Self::Second,
             _ => Self::Main,
         }
     }
 
     /// The backend of this slot.
-    pub(crate) fn backend(self) -> Result<&'static Backend> {
+    pub fn backend(self) -> Result<&'static Backend> {
         match self {
             Self::Main => backend_once(),
-            Self::Openings => OPENINGS_BACKEND.get().map_or_else(backend_once, Ok),
+            Self::Second => SECOND_BACKEND.get().map_or_else(backend_once, Ok),
         }
     }
 }
 
 impl BackendSlot {
-    fn index(self) -> usize {
+    /// 0 for card 0's backend, 1 for the second.
+    pub fn index(self) -> usize {
         match self {
             Self::Main => 0,
-            Self::Openings => 1,
+            Self::Second => 1,
         }
     }
 }
@@ -1971,7 +2009,7 @@ fn openings_backend() -> Result<&'static Backend> {
     // Card 0's first: the pinned pool and the process's first context are
     // card 0's, as without the openings' backend.
     let main = backend_once()?;
-    if let Some(b) = OPENINGS_BACKEND.get() {
+    if let Some(b) = SECOND_BACKEND.get() {
         return Ok(b);
     }
     static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1980,7 +2018,7 @@ fn openings_backend() -> Result<&'static Backend> {
     }
     static INIT: Mutex<()> = Mutex::new(());
     let _init = INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(b) = OPENINGS_BACKEND.get() {
+    if let Some(b) = SECOND_BACKEND.get() {
         return Ok(b);
     }
     match Backend::init_on(placement.ordinal) {
@@ -1991,10 +2029,23 @@ fn openings_backend() -> Result<&'static Backend> {
                 two_card_openings_setting(),
                 card_count()
             );
-            let _ = OPENINGS_BACKEND.set(b);
-            Ok(OPENINGS_BACKEND
-                .get()
-                .expect("the openings' backend just initialised"))
+            // Two backends on one card (forced, one card): two full ledgers
+            // would promise the card twice, so each gets half.
+            if placement.ordinal == main.ordinal() {
+                let half = main.vram_budget_bytes() / 2;
+                main.set_vram_budget_bytes(half);
+                b.set_vram_budget_bytes(b.vram_budget_bytes().min(half));
+                eprintln!(
+                    "[gpu] two backends on card {}: each ledger's budget halved to {:.2} GiB",
+                    placement.ordinal,
+                    half as f64 / (1u64 << 30) as f64
+                );
+            }
+            let _ = SECOND_BACKEND.set(b);
+            match SECOND_BACKEND.get() {
+                Some(b) => Ok(b),
+                None => Ok(main),
+            }
         }
         Err(e) => {
             FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2017,7 +2068,7 @@ static OPENINGS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 /// the openings ran, so a fallback to card 0 is not counted.
 pub fn openings_on_own_backend() -> bool {
     two_card_openings()
-        && OPENINGS_BACKEND.get().is_some()
+        && SECOND_BACKEND.get().is_some()
         && OPENINGS_POOL.get().is_some_and(Option::is_some)
 }
 
@@ -2073,7 +2124,20 @@ impl Backend {
 /// the context, the modules and the staging pools. A failure is left for the
 /// first use to meet.
 pub fn set_up_backend() {
-    let _ = backend_once();
+    let Ok(main) = backend_once() else { return };
+    // Under the two-card openings the second backend is started here too, and
+    // the caches its first opening would load (the BLAKE3 WHIR kernels, the
+    // root tables), so phase B does not wait for them. Off, the driver is not
+    // asked for its cards.
+    if two_card_openings() {
+        let _role = enter_role(DeviceRole::Openings);
+        if let Ok(second) = backend()
+            && !std::ptr::eq(second, main)
+        {
+            let _ = crate::blake3_whir::kernels();
+            let _ = crate::lde_cm::root_tables(second);
+        }
+    }
 }
 
 /// The backend once [`backend_once`] has made it.
@@ -2084,6 +2148,25 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 /// arena, which starts page-locking once the context exists).
 pub fn backend_if_ready() -> Option<&'static Backend> {
     BACKEND.get()
+}
+
+/// Card 0's backend by name, whatever this thread's role: for what belongs to
+/// the process rather than to a card's work (the pinned pool's page-locking,
+/// in-place registrations, the set-up at the prove's start).
+pub fn main_backend() -> Result<&'static Backend> {
+    backend_once()
+}
+
+/// The slot of this thread's backend: 0 under [`DeviceRole::Main`], without a
+/// second backend, or without a card; 1 when this thread works for the second.
+pub fn current_slot() -> usize {
+    match current_role() {
+        DeviceRole::Main => 0,
+        _ => SECOND_BACKEND
+            .get()
+            .zip(backend().ok())
+            .map_or(0, |(second, be)| usize::from(std::ptr::eq(second, be))),
+    }
 }
 
 /// [`backend`] without the entry count.
@@ -3162,11 +3245,9 @@ impl Backend {
 
 #[cfg(test)]
 mod device_fallback_counter_tests {
-    use super::{
-        device_fallbacks, note_device_fallback, note_reserved, reserved_high_water,
-        reset_device_fallbacks, reset_reserved_high_water,
-    };
+    use super::{device_fallbacks, note_device_fallback, reset_device_fallbacks};
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
 
     /// The counter is process-wide, so a test asserting an absolute value
     /// serialises against anything else in this binary that might move it.
@@ -3222,21 +3303,20 @@ mod device_fallback_counter_tests {
     /// would show here before any card run relied on the number.
     #[test]
     fn reserved_high_water_keeps_the_max() {
-        let _g = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
-        reset_reserved_high_water();
-        assert_eq!(reserved_high_water(), 0, "reset must zero the high-water");
-        note_reserved(100);
-        assert_eq!(reserved_high_water(), 100, "the first rise sets the peak");
-        note_reserved(50);
+        let peaks = super::LedgerPeaks::default();
+        let peak = |p: &super::LedgerPeaks| p.reserved.load(Ordering::Relaxed);
+        assert_eq!(peak(&peaks), 0, "a new ledger's peak is zero");
+        peaks.note(100);
+        assert_eq!(peak(&peaks), 100, "the first rise sets the peak");
+        peaks.note(50);
+        assert_eq!(peak(&peaks), 100, "a smaller rise must not lower it");
+        peaks.note(200);
+        assert_eq!(peak(&peaks), 200, "a larger rise raises it");
         assert_eq!(
-            reserved_high_water(),
-            100,
-            "a smaller rise must not lower it"
+            peaks.window.load(Ordering::Relaxed),
+            200,
+            "the window keeps the same peak"
         );
-        note_reserved(200);
-        assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
-        reset_reserved_high_water();
-        assert_eq!(reserved_high_water(), 0, "reset must zero it again");
     }
 }
 
