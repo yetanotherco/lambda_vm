@@ -1585,7 +1585,7 @@ pub struct WlfmPrebuild {
     stacks: Option<Vec<GroupStack>>,
     secs: f64,
     /// [`prepare_wlfm`]'s seconds by part: the tables' row-major groups, their
-    /// columns, the stacks.
+    /// columns, the stacks (under [`WlfmPrep::Evaluated`], the identity).
     split: [f64; 3],
     /// [`Self::hold_chip_prefixes`]'s prefixes and seconds, handed to the
     /// build (empty until then).
@@ -1600,7 +1600,8 @@ impl WlfmPrebuild {
         &self.artifacts
     }
 
-    /// [`prepare_wlfm`]'s seconds by part: `[groups, columns, stacks]`.
+    /// [`prepare_wlfm`]'s seconds by part: `[groups, columns, stacks]` (under
+    /// [`WlfmPrep::Evaluated`], `[groups, columns, identity]`).
     pub fn prepare_split(&self) -> [f64; 3] {
         self.split
     }
@@ -1719,7 +1720,12 @@ impl WlfmPrebuild {
                 committed
             }
         };
-        artifacts.program_id = wlfm_program_id(&artifacts);
+        if artifacts.prep == WlfmPrep::Evaluated && artifacts.stacks.is_empty() {
+            // Settled by the preparation (no prepared root moves it).
+            debug_assert_eq!(artifacts.program_id, wlfm_program_id(&artifacts));
+        } else {
+            artifacts.program_id = wlfm_program_id(&artifacts);
+        }
         let narrow_commit = match &committed {
             WlfmStacks::P1(s) => s.iter().filter_map(|p| p.narrow).collect(),
             WlfmStacks::B3(s) => s.iter().filter_map(|p| p.narrow).collect(),
@@ -1888,7 +1894,7 @@ pub fn prepare_wlfm_rounds(
                 .collect::<Result<_, _>>()?;
         }
         check_evaluated(&counts, &table_num_vars, &evaluated)?;
-        let artifacts = WlfmArtifacts {
+        let mut artifacts = WlfmArtifacts {
             rate,
             hasher,
             chip_set,
@@ -1910,11 +1916,19 @@ pub fn prepare_wlfm_rounds(
             evaluated,
             program_id: [0u8; 32],
         };
+        // ★ The identity here, not at the commit: with no prepared stack
+        // every input to it is known now, and its column digests (a hash of
+        // every instruction value, ≈ 1.2 GB on a large block's last level)
+        // are host work the levels' driver runs beside the level below's
+        // prove, where the commit is on the level's own critical path.
+        let identity_from = std::time::Instant::now();
+        artifacts.program_id = wlfm_program_id(&artifacts);
+        let identity_secs = identity_from.elapsed().as_secs_f64();
         return Ok(WlfmPrebuild {
             artifacts,
             stacks: None,
             secs: t.elapsed().as_secs_f64(),
-            split: [groups_secs, columns_secs, 0.0],
+            split: [groups_secs, columns_secs, identity_secs],
             chip_prefixes: Vec::new(),
             chip_prefix_secs: 0.0,
         });
