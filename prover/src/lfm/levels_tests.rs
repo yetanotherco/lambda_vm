@@ -838,6 +838,8 @@ struct ChainSteps {
     packs: bool,
     /// `LAMBDA_VM_LEVELS_NEXT_BESIDE`.
     next_beside: bool,
+    /// `LAMBDA_VM_LEVELS_WAVES_IN_ORDER`.
+    waves_in_order: bool,
 }
 
 /// The levels' chain steps forced as given (the first two on this thread,
@@ -847,7 +849,7 @@ struct ChainSteps {
 fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     use super::levels::{
         prove_block_levels, set_commit_next_early_for_test, set_fill_parts_for_test,
-        set_next_beside_for_test, set_packs_beside_for_test,
+        set_next_beside_for_test, set_packs_beside_for_test, set_waves_in_order_for_test,
     };
     use super::wlfm::set_columns_tiled_for_test;
     struct Restore;
@@ -858,6 +860,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             set_columns_tiled_for_test(None);
             set_packs_beside_for_test(None);
             set_next_beside_for_test(None);
+            set_waves_in_order_for_test(None);
         }
     }
     let ChainSteps {
@@ -866,6 +869,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         tiled,
         packs,
         next_beside,
+        waves_in_order,
     } = steps;
 
     assert!(
@@ -882,6 +886,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         set_fill_parts_for_test(Some(fill_parts));
         set_commit_next_early_for_test(Some(commit_early));
         set_next_beside_for_test(Some(next_beside));
+        set_waves_in_order_for_test(Some(waves_in_order));
         prove_block_levels(
             &elf,
             &[],
@@ -994,9 +999,25 @@ fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
         tiled: true,
         packs: true,
         next_beside: true,
+        waves_in_order: true,
     });
     assert!(run.times.next_commit.is_some_and(|c| c.early));
     assert!(run.times.next_stream.is_some_and(|s| s.prebuilt.is_some()));
+}
+
+/// ★ Level 1's and level 2's waves run in program order on their own thread
+/// (`LAMBDA_VM_LEVELS_WAVES_IN_ORDER`) are the same executions: a small
+/// BLAKE3 block driven with the knob on proves each level's bytes as
+/// [`prove_levels`] does over the same base. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_its_waves_in_order_proves_the_same_level_bytes() {
+    let run = driven_under_chain_steps(ChainSteps {
+        waves_in_order: true,
+        ..ChainSteps::default()
+    });
+    assert!(run.proofs.len() >= 2, "level 2 streamed in order too");
 }
 
 /// ★ Level 2 executed beside its own preparation
@@ -2053,7 +2074,7 @@ fn rta_one_run(
         println!(
             "RTA LEVEL1 EXEC: schedule {:.3}s · need pass {:.3}s · buckets {:.3}s · first wave {:.3}s · setup {:.3}s · \
              levels {} (on the pool {}, {} hashes) · hashing {:.3}s (on the driver's thread {} hashes in {:.3}s) · apply \
-             {:.3}s · the rest {:.3}s",
+             {:.3}s · the rest {:.3}s · waves in order {}",
             x.depth_pass,
             x.need_pass,
             x.bucket_build,
@@ -2066,7 +2087,8 @@ fn rta_one_run(
             x.serial_hashes,
             x.serial_hash_secs,
             x.apply,
-            x.residue
+            x.residue,
+            super::levels::waves_in_order(),
         );
     }
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();

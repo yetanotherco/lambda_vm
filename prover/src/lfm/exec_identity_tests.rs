@@ -925,6 +925,219 @@ fn a_fast_setup_runs_the_same_waves() {
     }
 }
 
+/// [`pieced_bucketed`] with each wave run in program order on its own thread
+/// (`StreamedExecution::new_pieced_in_order`), its setup the fast way when
+/// `fast`.
+fn pieced_in_order(
+    case: &Case,
+    pieces: &[super::executor::ArenaPiece],
+    order: &[usize],
+    fast: bool,
+) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let mut ex = StreamedExecution::new_pieced_in_order(
+        &case.program,
+        pieces.to_vec(),
+        &case.hasher,
+        false,
+        true,
+        fast,
+        true,
+    )
+    .unwrap_or_else(|e| panic!("{}: an in-order execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &i in order {
+        let p = pieces[i];
+        let words = &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+        ex.land_piece(p.group, words)
+            .unwrap_or_else(|e| panic!("{}: piece {i} lands in order: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the in-order execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+/// The leaf-shaped case's three pieces, and every identity case cut in three
+/// pieces an arena, each with landing orders that complete several buckets at
+/// once.
+type InOrderRun<'a> = (&'a Case, Vec<super::executor::ArenaPiece>, Vec<usize>);
+
+fn in_order_runs<'a>(leaf: &'a Case, halves: u32, cases: &'a [Case]) -> Vec<InOrderRun<'a>> {
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<InOrderRun<'a>> = Vec::new();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        runs.push((leaf, leaf_pieces.clone(), order.to_vec()));
+    }
+    for case in cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).collect()));
+        runs.push((case, pieces.clone(), (0..n).rev().collect()));
+        runs.push((
+            case,
+            pieces,
+            (0..n).step_by(2).chain((1..n).step_by(2)).collect(),
+        ));
+    }
+    runs
+}
+
+/// ★ PIN: waves in program order are the pieced execution: on the leaf case
+/// in all six landing orders and on every identity case cut in three pieces
+/// an arena (forwards, backwards, interleaved), set up both ways, the
+/// in-order execution gives the serial reference's witness word for word and
+/// the level-order waves' too, and runs as many instructions each wave as the
+/// filtering waves do.
+#[test]
+fn in_order_waves_are_the_pieced_execution_in_any_landing_order() {
+    let (leaf, halves) = one_arena_case();
+    let cases = cases();
+    for (case, pieces, order) in in_order_runs(&leaf, halves, &cases) {
+        let reference = reference(case);
+        let (_, filtered) = pieced(case, &pieces, &order);
+        let (bucketed, _) = pieced_bucketed(case, &pieces, &order);
+        for fast in [false, true] {
+            let (got, ran) = pieced_in_order(case, &pieces, &order, fast);
+            assert_executions_identical(case.name, case.program.num_addrs, &reference, &got);
+            assert_executions_identical(case.name, case.program.num_addrs, &bucketed, &got);
+            assert_eq!(
+                ran, filtered,
+                "{}: {order:?} fast {fast}: the same instructions each wave",
+                case.name
+            );
+        }
+    }
+}
+
+/// An in-order wave runs its instructions in ascending program index, and
+/// every instruction runs exactly once over the execution, never before its
+/// last group landed (the wave counts match the filtering waves').
+#[test]
+fn an_in_order_wave_runs_each_instruction_once_in_ascending_index() {
+    use super::executor::wave_trace;
+    let (leaf, halves) = one_arena_case();
+    let cases = cases();
+    for (case, pieces, order) in in_order_runs(&leaf, halves, &cases) {
+        let ((_, ran), indices) =
+            wave_trace::indices(|| pieced_in_order(case, &pieces, &order, true));
+        let (_, filtered) = pieced(case, &pieces, &order);
+        assert_eq!(ran, filtered, "{}: {order:?}: the waves' counts", case.name);
+        let mut at = 0usize;
+        for (w, &end) in ran.iter().enumerate() {
+            let wave = &indices[at..end];
+            assert!(
+                wave.windows(2).all(|p| p[0] < p[1]),
+                "{}: {order:?}: wave {w} not in ascending index",
+                case.name
+            );
+            at = end;
+        }
+        let mut seen = indices.clone();
+        seen.sort_unstable();
+        assert!(
+            seen == (0..case.program.instrs.len()).collect::<Vec<_>>(),
+            "{}: {order:?}: every instruction exactly once",
+            case.name
+        );
+    }
+}
+
+/// The in-order buckets are the level-order buckets: the same sets of
+/// groups, each holding the same instructions, on every identity case and the
+/// leaf case, set up both ways.
+#[test]
+fn the_in_order_buckets_are_the_buckets() {
+    use super::executor::StreamedExecution;
+    let (leaf, halves) = one_arena_case();
+    let cases = cases();
+    for (case, pieces, _) in in_order_runs(&leaf, halves, &cases) {
+        for fast in [false, true] {
+            let start = |in_order: bool| {
+                StreamedExecution::new_pieced_in_order(
+                    &case.program,
+                    pieces.clone(),
+                    &case.hasher,
+                    false,
+                    true,
+                    fast,
+                    in_order,
+                )
+                .expect("starts")
+                .buckets_for_test()
+                .expect("bucketed")
+            };
+            assert!(
+                start(false) == start(true),
+                "{}: fast {fast}: the same buckets",
+                case.name
+            );
+        }
+    }
+}
+
+/// An in-order execution refuses the landings the pieced one refuses: a
+/// piece landed twice, a short piece, a group with no piece, and a finish
+/// before every piece landed.
+#[test]
+fn an_in_order_execution_refuses_what_the_pieced_one_refuses() {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    let (leaf, h) = one_arena_case();
+    let piece = |start, len, group| ArenaPiece {
+        arena: 0,
+        start,
+        len,
+        group,
+    };
+    let pieces = vec![piece(0, h, 0), piece(h, h, 1), piece(2 * h, h, 2)];
+    let words = |k: u32| &leaf.arenas[0][(k * h) as usize..((k + 1) * h) as usize];
+    let mut ex = StreamedExecution::new_pieced_in_order(
+        &leaf.program,
+        pieces,
+        &leaf.hasher,
+        false,
+        true,
+        true,
+        true,
+    )
+    .expect("starts");
+    ex.land_piece(1, words(1)).expect("lands");
+    assert!(
+        matches!(ex.land_piece(1, words(1)), Err(LfmExecError::Internal(_))),
+        "a piece landed twice"
+    );
+    assert!(
+        matches!(
+            ex.land_piece(2, &words(2)[1..]),
+            Err(LfmExecError::ArenaLenMismatch { .. })
+        ),
+        "a short piece"
+    );
+    assert!(
+        matches!(ex.land_piece(5, words(2)), Err(LfmExecError::Internal(_))),
+        "a group with no piece"
+    );
+    assert!(
+        matches!(ex.finish(), Err(LfmExecError::Internal(_))),
+        "finished before every piece landed"
+    );
+}
+
 /// ★ The pieced execution's gate: one arena landing in pieces, in any order,
 /// gives the serial reference's witness word for word — on the leaf-shaped
 /// case in all six orders (its `HintOn` reads the first and the last piece)

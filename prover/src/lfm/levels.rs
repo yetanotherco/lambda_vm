@@ -576,6 +576,48 @@ pub fn commit_next_early() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_WAVES_IN_ORDER=1`: level 1's and level 2's streamed
+/// executions run each wave's instructions in program order on the wave's own
+/// thread, hashing inline ([`super::executor::StreamedExecution::new_pieced_in_order`]),
+/// where each wave otherwise walks the whole program's level schedule with its
+/// hashes on the shared pool. The same instructions a wave, in an order that
+/// respects every dependency, so the same executions and proofs. Acts only on
+/// bucketed waves ([`bucket_waves`], on by default). Off by default (and for
+/// any word but `1`). Read once a process, on the driver's thread.
+pub const WAVES_IN_ORDER_ENV: &str = "LAMBDA_VM_LEVELS_WAVES_IN_ORDER";
+
+std::thread_local! {
+    /// A test's [`waves_in_order`] on this thread.
+    static WAVES_IN_ORDER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`waves_in_order`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_waves_in_order_for_test(on: Option<bool>) {
+    WAVES_IN_ORDER_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`WAVES_IN_ORDER_ENV`] is on (or this thread's test override).
+pub fn waves_in_order() -> bool {
+    if let Some(on) = WAVES_IN_ORDER_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(WAVES_IN_ORDER_ENV).ok().as_deref())
+    })
+}
+
+/// How level 2's streamed execution runs, as the driver read its knobs: its
+/// fill's parts at once ([`fill_parts`]), its waves in program order
+/// ([`waves_in_order`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct StreamOpts {
+    pub(super) fill_parts: bool,
+    pub(super) in_order: bool,
+}
+
 /// Level 1's execution as its thread hands it on: executed, for the driver to
 /// fill after the stacks' commit, or already filled beside it
 /// ([`fill_beside`]).
@@ -1423,7 +1465,7 @@ fn stream_next_level(
     prepared: std::thread::ScopedJoinHandle<'_, Result<PreparedNext, String>>,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
-    fill_parts: bool,
+    opts: StreamOpts,
     early: Option<mpsc::SyncSender<WlfmPrebuild>>,
 ) -> Result<StreamedNext, String> {
     let (program, pre, marks) = prepared
@@ -1437,8 +1479,7 @@ fn stream_next_level(
         return Ok((program, pre, None));
     }
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let streamed =
-        stream_level_over_pieces_parts(&program, &marks, hasher, pieces, t0, fill_parts)?;
+    let streamed = stream_level_over_pieces_parts(&program, &marks, hasher, pieces, t0, opts)?;
     Ok((program, pre, Some(streamed)))
 }
 
@@ -1456,7 +1497,7 @@ fn stream_next_level_beside(
     last: LastLevel,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
-    fill_parts: bool,
+    opts: StreamOpts,
     early: Option<mpsc::SyncSender<WlfmPrebuild>>,
 ) -> Result<StreamedNext, String> {
     let (program, marks) = next_program(&child)?;
@@ -1466,8 +1507,7 @@ fn stream_next_level_beside(
             prepare_level_as(&program, levers, rounds)
         })
     };
-    let (pre, streamed) =
-        prepare_and_stream(&program, &marks, prepare, pieces, t0, fill_parts, early)?;
+    let (pre, streamed) = prepare_and_stream(&program, &marks, prepare, pieces, t0, opts, early)?;
     Ok((program, pre, streamed))
 }
 
@@ -1491,7 +1531,7 @@ pub(super) fn prepare_and_stream(
     prepare: impl FnOnce() -> Result<WlfmPrebuild, String> + Send,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
-    fill_parts: bool,
+    opts: StreamOpts,
     early: Option<mpsc::SyncSender<WlfmPrebuild>>,
 ) -> Result<PreparedBeside, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
@@ -1505,9 +1545,8 @@ pub(super) fn prepare_and_stream(
             };
             Ok((pre, at))
         });
-        let streamed = (marks.len() <= MAX_STREAM_PIECES).then(|| {
-            stream_level_over_pieces_parts(program, marks, hasher, pieces, t0, fill_parts)
-        });
+        let streamed = (marks.len() <= MAX_STREAM_PIECES)
+            .then(|| stream_level_over_pieces_parts(program, marks, hasher, pieces, t0, opts));
         let (pre, at) = prepare
             .join()
             .map_err(|_| "level 2's preparation panicked".to_string())??;
@@ -1532,18 +1571,18 @@ pub(super) fn stream_level_over_pieces(
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
 ) -> Result<(super::proof::LfmFilled, NextStream), String> {
-    stream_level_over_pieces_parts(program, marks, hasher, pieces, t0, false)
+    stream_level_over_pieces_parts(program, marks, hasher, pieces, t0, StreamOpts::default())
 }
 
-/// [`stream_level_over_pieces`] with its fill's parts at once under
-/// `fill_parts` ([`fill_parts`]).
+/// [`stream_level_over_pieces`] with its fill's parts at once and its waves
+/// in program order as `opts` says ([`fill_parts`], [`waves_in_order`]).
 fn stream_level_over_pieces_parts(
     program: &LfmProgram,
     marks: &[u32],
     hasher: super::HasherKind,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
-    fill_parts: bool,
+    opts: StreamOpts,
 ) -> Result<(super::proof::LfmFilled, NextStream), String> {
     use super::executor::{ArenaPiece, StreamedExecution};
     let now = || t0.elapsed().as_secs_f64();
@@ -1574,13 +1613,14 @@ fn stream_level_over_pieces_parts(
         ..NextStream::default()
     };
     let execution = {
-        let mut ex = StreamedExecution::new_pieced_setup(
+        let mut ex = StreamedExecution::new_pieced_in_order(
             program,
             arena_pieces,
             &hasher,
             false,
             bucket_waves(),
             setup_fast(),
+            opts.in_order,
         )
         .map_err(|e| format!("the streamed execution: {e:?}"))?;
         let mut landed = 0usize;
@@ -1622,7 +1662,7 @@ fn stream_level_over_pieces_parts(
         &Vec::new(),
         super::wlfm::chip_records(),
         None,
-        fill_parts,
+        opts.fill_parts,
     );
     times.fill = t.elapsed().as_secs_f64();
     Ok((filled, times))
@@ -2527,6 +2567,11 @@ pub fn prove_block_levels(
     let fill_parts_on = fill_parts();
     let commit_next_early_on = commit_next_early();
     let next_beside_on = next_beside();
+    let waves_in_order_on = waves_in_order();
+    let stream_opts = StreamOpts {
+        fill_parts: fill_parts_on,
+        in_order: waves_in_order_on,
+    };
     let late = settle_late() || super::wlfm_knobs::levels_untrimmed();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -2621,13 +2666,14 @@ pub fn prove_block_levels(
             }
             let mut placed = super::placement::Placement::default();
             let execute_from = now();
-            let mut ex = StreamedExecution::new_pieced_setup(
+            let mut ex = StreamedExecution::new_pieced_in_order(
                 program,
                 arena_pieces,
                 &hasher,
                 lean_beside,
                 bucket_waves(),
                 setup_fast(),
+                waves_in_order_on,
             )
             .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landing = Level1Landing {
@@ -3077,7 +3123,7 @@ pub fn prove_block_levels(
                     last,
                     rx,
                     t0,
-                    fill_parts_on,
+                    stream_opts,
                     early_tx,
                 )
             }));
@@ -3120,10 +3166,9 @@ pub fn prove_block_levels(
                 && let Some(rx) = piece_rx.take()
             {
                 let early_tx = early_channel();
-                streamed =
-                    Some(scope.spawn(move || {
-                        stream_next_level(prepared, rx, t0, fill_parts_on, early_tx)
-                    }));
+                streamed = Some(
+                    scope.spawn(move || stream_next_level(prepared, rx, t0, stream_opts, early_tx)),
+                );
             } else {
                 drop(piece_rx.take());
             }
