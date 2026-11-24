@@ -1381,6 +1381,55 @@ impl Instruction {
     }
 }
 
+/// The log an ECALL at `pc` writes when it succeeds on the registers `regs`
+/// (as they stand before it), and the value it writes to `x10` (the commit's
+/// byte count; no other ECALL writes a register): what the ECALL arm of
+/// [`Instruction::execute`] logs, from the registers alone. `None` for a
+/// number no ECALL accepts (and print's sibling panic), or DMA operands it
+/// refuses. Nothing is checked or run: a caller re-running a cycle the
+/// executor already ran (the lean stream's replay) knows it succeeded. A
+/// second statement of the arm's fields, pinned to it by the fast engine's
+/// tests on random programs over every ECALL.
+pub fn ecall_log(pc: u64, regs: &[u64; 32]) -> Option<(Log, Option<u64>)> {
+    let number = regs[17];
+    let r = |reg: usize| regs[reg];
+    let next_pc = pc.wrapping_add(REGULAR_PC_UPDATE);
+    let (src2_val, dst_val, x10) = match SyscallNumbers::try_from(number).ok()? {
+        SyscallNumbers::Print => (0, 0, None),
+        SyscallNumbers::Panic => return None,
+        SyscallNumbers::Halt => {
+            let log = Log {
+                current_pc: pc,
+                next_pc: 0,
+                src1_val: number,
+                src2_val: 0,
+                dst_val: 0,
+            };
+            return Some((log, None));
+        }
+        SyscallNumbers::Commit => (r(11), r(12), Some(r(12))),
+        SyscallNumbers::KeccakPermute | SyscallNumbers::Blake3Compress => (r(10), 0, None),
+        SyscallNumbers::Keccak256 => (keccak256_blocks(r(11)), r(10), None),
+        SyscallNumbers::Blake3Absorb => (r(10), r(11), None),
+        SyscallNumbers::Ecsm | SyscallNumbers::Ecrec | SyscallNumbers::Hint => (r(11), r(12), None),
+        SyscallNumbers::DmaMemcpy | SyscallNumbers::DmaMemset => {
+            let n = r(12);
+            if n > DMA_MEMCPY_MAX_BYTES {
+                return None;
+            }
+            (copy_trace_rows(r(11), r(10), n, false), n, None)
+        }
+    };
+    let log = Log {
+        current_pc: pc,
+        next_pc,
+        src1_val: number,
+        src2_val,
+        dst_val,
+    };
+    Some((log, x10))
+}
+
 impl ArithOp {
     /// 64-bit arithmetic operations (RV64I base)
     #[inline(always)]

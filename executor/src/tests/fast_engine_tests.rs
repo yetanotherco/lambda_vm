@@ -1210,3 +1210,403 @@ proptest! {
         }
     }
 }
+
+// --- The lean stream and its replay ------------------------------------------
+
+/// Runs `program` under the word history and under the lean stream, window by
+/// window (sizes cycling through `windows`, at most `cycles` in all), and
+/// checks every lean window: its history is the word history's less its
+/// per-cycle records, each ECALL placed at its cycle after the loads and
+/// stores before it; the replay of it from its starting cells, a few cycles
+/// at a time (`step`), writes the word history's logs, takes every record and
+/// ends at the engine's pc and registers. A run the lean stream refuses for an
+/// instruction fetched from memory must fetch one there. Returns the cycles
+/// replayed and the ECALL logs among them.
+pub(crate) fn same_lean(
+    program: &Elf,
+    input: Vec<u8>,
+    layout: FlatLayout,
+    windows: &[usize],
+    cycles: usize,
+    step: usize,
+) -> Result<(usize, usize), TestCaseError> {
+    use crate::vm::execution::InstructionCache;
+    use crate::vm::fast::Replay;
+    use crate::vm::history::ECALL;
+    let (Ok(mut full), Ok(mut lean)) = (
+        FastExecutor::with_layout(program, input.clone(), layout),
+        FastExecutor::with_layout(program, input, layout),
+    ) else {
+        return Ok((0, 0));
+    };
+    full.enable_word_history().unwrap();
+    prop_assert!(lean.enable_lean_stream().is_err(), "needs the word history");
+    lean.enable_word_history().unwrap();
+    lean.enable_lean_stream().unwrap();
+    let replay = Replay::new(program).expect("the replay");
+    // The replay's op table is the engine's, decoded the same way.
+    prop_assert!(
+        replay.same_table(&lean),
+        "the replay's op table is not the engine's"
+    );
+    let decoded = InstructionCache::new(&program.data).expect("the program decodes");
+    let (mut done, mut ecalls) = (0usize, 0usize);
+    for (n, &window) in windows.iter().cycle().enumerate() {
+        if done >= cycles {
+            break;
+        }
+        let want = full.resume_word_history(window);
+        let got = lean.resume_word_lean(window);
+        let (logs, h, cycles_run, l) = match (want, got) {
+            (Ok(Some((logs, h))), Ok(Some((cycles_run, l)))) => (logs, h, cycles_run, l),
+            (Ok(None), Ok(None)) => break,
+            (Err(w), Err(g)) if error(&w) == error(&g) => break,
+            (want, Err(g)) if error(&g).contains("outside the program's decoded segments") => {
+                // The full engine fetched (or failed to fetch) an instruction
+                // the program does not decode, in this window.
+                if let Ok(Some((logs, _))) = &want {
+                    prop_assert!(
+                        logs.iter().any(|log| decoded.get(log.current_pc).is_none()),
+                        "window {}: refused, but every pc decodes",
+                        n
+                    );
+                }
+                break;
+            }
+            (w, g) => {
+                return Err(TestCaseError::fail(format!(
+                    "window {n}: word history {:?}, lean stream {:?}",
+                    w.map(|o| o.map(|(l, _)| l.len())).map_err(|e| error(&e)),
+                    g.map(|o| o.map(|(c, _)| c)).map_err(|e| error(&e)),
+                )));
+            }
+        };
+        // The history: the word history's, less its extras.
+        prop_assert!(l.lean && l.words && l.extras.is_empty());
+        prop_assert_eq!(cycles_run, logs.len());
+        prop_assert_eq!(l.cycles, logs.len());
+        prop_assert_eq!(l.cycle_count(), h.cycle_count());
+        prop_assert_eq!(l.first, h.first);
+        prop_assert_eq!(&l.registers, &h.registers);
+        prop_assert_eq!(&l.word_accesses, &h.word_accesses);
+        prop_assert_eq!(&l.next_words, &h.next_words);
+        prop_assert_eq!(&l.groups, &h.groups);
+        prop_assert_eq!(&l.word_ranges, &h.word_ranges);
+        prop_assert_eq!(&l.word_values, &h.word_values);
+        prop_assert_eq!(&l.word_ts, &h.word_ts);
+        prop_assert_eq!(&l.reg_groups, &h.reg_groups);
+        prop_assert_eq!(&l.reg_cells, &h.reg_cells);
+        let (mut at, mut before) = (Vec::new(), Vec::new());
+        let mut accesses = 0u32;
+        for (i, extra) in h.extras.iter().enumerate() {
+            if extra.side == NO_ACCESS {
+                continue;
+            }
+            if extra.side & ECALL != 0 {
+                at.push(i as u32);
+                before.push(accesses);
+            } else {
+                accesses += 1;
+            }
+        }
+        prop_assert_eq!(&l.ecall_at, &at);
+        prop_assert_eq!(&l.accesses_before, &before);
+        prop_assert_eq!(l.first_touches(), h.first_touches());
+        // The replay: the engine's logs, every record taken.
+        let mut cursor = Replay::start(&l).expect("a lean window");
+        let mut out = Vec::new();
+        while cursor.cycle < l.cycles {
+            let k = step.min(l.cycles - cursor.cycle);
+            replay
+                .run(&l, &mut cursor, k, &mut out)
+                .map_err(|e| TestCaseError::fail(format!("window {n}: {e}")))?;
+        }
+        prop_assert!(Replay::finish(&l, &cursor).is_ok());
+        prop_assert_eq!(
+            out.iter().map(record).collect::<Vec<_>>(),
+            logs.iter().map(record).collect::<Vec<_>>(),
+            "window {}",
+            n
+        );
+        prop_assert_eq!(cursor.pc, full.pc());
+        prop_assert_eq!(cursor.regs, full.registers().to_array());
+        prop_assert_eq!(lean.pc(), full.pc());
+        prop_assert_eq!(lean.registers().to_array(), full.registers().to_array());
+        ecalls += at.len();
+        done += logs.len();
+    }
+    Ok((done, ecalls))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    // The lean stream on random programs: every op, loads and stores of every
+    // width on and across words and the flat regions' edges, jumps to
+    // undecoded addresses, windows of 1 to 63 cycles replayed a few cycles
+    // at a time.
+    #[test]
+    fn a_lean_window_replays_to_the_engines_logs(
+        regs in prop::collection::vec(value(), 31),
+        a7 in prop::sample::select(RANDOM_ECALLS.to_vec()),
+        extra in prop::collection::vec(any::<u8>(), 0..256),
+        body in prop::collection::vec(word(), 1..80).prop_map(|w| w.concat()),
+        code in prop::sample::select(vec![0x1000u64, 0x4_0000, (1 << 20) - 0x100, 0xFF00_0000]),
+        windows in prop::collection::vec(1usize..64, 1..4),
+        step in 1usize..9,
+    ) {
+        let mut regs = regs;
+        regs[16] = a7 as i64 as u64;
+        for layout in LAYOUTS {
+            let elf = program(code, &regs, &extra, &body);
+            same_lean(&elf, vec![], layout, &windows, 2_000, step)?;
+        }
+    }
+
+    // The lean stream over every ecall, operands where they are accepted and
+    // where they are refused (`ecalls_run_alike`'s): each ECALL's log made
+    // from the registers is the one its arm writes.
+    #[test]
+    fn a_lean_windows_ecalls_replay_to_their_logs(
+        calls in prop::collection::vec(
+            (
+                prop::sample::select(SYSCALLS.to_vec()),
+                prop::collection::vec(ecall_operand(), 4),
+            ),
+            1..5,
+        ),
+        extra in prop::collection::vec(any::<u8>(), 0..512),
+        input in prop::collection::vec(any::<u8>(), 0..64),
+        windows in prop::collection::vec(1usize..12, 1..3),
+    ) {
+        let mut regs = Vec::new();
+        let mut body = Vec::new();
+        for (number, operands) in &calls {
+            let mut operands = operands.clone();
+            if [1, 2, KECCAK256_SYSCALL_NUMBER].contains(number) {
+                operands[1] %= 4097;
+            }
+            let k = 31 + regs.len() as u64;
+            for (j, rd) in [10u32, 11, 12, 13].into_iter().enumerate() {
+                body.push(ld_data(rd, k + j as u64));
+            }
+            body.push(ld_data(17, k + 4));
+            body.push(0x73);
+            regs.extend_from_slice(&operands);
+            regs.push(*number);
+        }
+        let mut all: Vec<u64> = (1..32).map(|r| if r == 1 { 1 } else { r }).collect();
+        all.extend(regs);
+        for layout in LAYOUTS {
+            let elf = program(0x1000, &all, &extra, &body);
+            same_lean(&elf, input.clone(), layout, &windows, 1_000, 2)?;
+        }
+    }
+}
+
+/// A program making every ECALL the executor accepts once, each with
+/// operands it accepts, then a halt: (number, x10, x11, x12, x13) a call.
+fn every_ecall_program() -> Elf {
+    let calls: [(u64, [u64; 4]); 11] = [
+        (64, [1, 0x2000, 24, 0]),
+        (KECCAK_SYSCALL_NUMBER, [0x3000, 0, 0, 0]),
+        (KECCAK256_SYSCALL_NUMBER, [0x2003, 150, 0x4000, 0]),
+        (BLAKE3_SYSCALL_NUMBER, [0x5000, 0, 0, 0]),
+        (BLAKE3_ABSORB_SYSCALL_NUMBER, [0x6000, 0x6100, 2, 0]),
+        (DMA_MEMCPY_SYSCALL_NUMBER, [0x7005, 0x2001, 77, 0]),
+        (DMA_MEMSET_SYSCALL_NUMBER, [0x7108, 0x7100, 40, 0]),
+        (HINT_SYSCALL_NUMBER, [1, 0x2000, 0x8000, 0]),
+        (ECREC_SYSCALL_NUMBER, [0x9000, 0x9100, 0x9200, 1]),
+        (1, [0x2000, 0, 0, 0]),
+        (64, [1, 0x7005, 9, 0]),
+    ];
+    let mut regs: Vec<u64> = (1..32).map(|r| if r == 1 { 1 } else { r }).collect();
+    let mut body = Vec::new();
+    for (number, operands) in calls {
+        let k = regs.len() as u64;
+        for (j, rd) in [10u32, 11, 12, 13].into_iter().enumerate() {
+            body.push(ld_data(rd, k + j as u64));
+        }
+        body.push(ld_data(17, k + 4));
+        body.push(0x73);
+        // A load of x10 after each call: a commit's count must be in it.
+        body.push(r(0x33, 0, 10, 10, 0, 5)); // add x5, x10, x10
+        regs.extend_from_slice(&operands);
+        regs.push(number);
+    }
+    program(0x1000, &regs, &[0x41; 64], &body)
+}
+
+// Every ECALL the executor accepts, each once with accepted operands: the
+// run succeeds and every one of them is replayed to its arm's log, at windows
+// of 1, 2, 3 and 7 cycles.
+#[test]
+fn every_accepted_ecall_replays_to_its_log() {
+    let elf = every_ecall_program();
+    for windows in [[1usize], [2], [3], [7]] {
+        let (cycles, ecalls) = same_lean(&elf, vec![], FlatLayout::GUEST, &windows, 10_000, 3)
+            .unwrap_or_else(|e| panic!("windows {windows:?}: {e}"));
+        // The prologue, five loads, the call and the add a call, the halt.
+        assert_eq!(ecalls, 12, "windows {windows:?}: every call and the halt");
+        assert_eq!(cycles, 31 + 11 * 7 + 2, "windows {windows:?}");
+    }
+}
+
+// The replay decodes its own op table from the program; it is the engine's
+// (ops, base and register uses), and a table that differs is told apart.
+#[test]
+fn the_replays_op_table_is_the_engines() {
+    use crate::vm::fast::Replay;
+    for elf in [every_ecall_program(), looping_program()] {
+        let mut engine = FastExecutor::new(&elf, vec![]).unwrap();
+        engine.enable_word_history().unwrap();
+        let replay = Replay::new(&elf).unwrap();
+        assert!(replay.same_table(&engine));
+        // Without the history the engine has no register uses: told apart.
+        let plain = FastExecutor::new(&elf, vec![]).unwrap();
+        assert!(!replay.same_table(&plain));
+    }
+}
+
+/// The lean windows of `program` at `window` cycles, to the end.
+fn lean_windows(program: &Elf, window: usize) -> Vec<crate::vm::history::WindowHistory> {
+    let mut lean = FastExecutor::new(program, vec![]).unwrap();
+    lean.enable_word_history().unwrap();
+    lean.enable_lean_stream().unwrap();
+    let mut out = Vec::new();
+    while let Some((_, h)) = lean.resume_word_lean(window).unwrap() {
+        out.push(h);
+    }
+    out
+}
+
+/// The replay of a whole lean window: its logs, or the refusal.
+fn replay_window(
+    program: &Elf,
+    history: &crate::vm::history::WindowHistory,
+) -> Result<Vec<Log>, String> {
+    use crate::vm::fast::Replay;
+    let replay = Replay::new(program).map_err(|e| error(&e))?;
+    let mut at = Replay::start(history).map_err(|e| error(&e))?;
+    let mut out = Vec::new();
+    replay
+        .run(history, &mut at, history.cycles, &mut out)
+        .map_err(|e| error(&e))?;
+    Replay::finish(history, &at).map_err(|e| error(&e))?;
+    Ok(out)
+}
+
+// The replay refuses a window whose records are not the ones its cycles
+// make: an access record naming another address, one record too few, an
+// ECALL placed at another cycle or after another count of accesses, a
+// record or an ECALL left over; and a window that is not a lean one. A
+// changed word changes the loaded value it re-runs (the walker's end check
+// and the memory argument see it).
+#[test]
+fn a_replay_refuses_records_out_of_step() {
+    let elf = every_ecall_program();
+    let windows = lean_windows(&elf, 1 << 10);
+    assert_eq!(windows.len(), 1);
+    let h = &windows[0];
+    assert!(h.word_accesses.len() > 10 && h.groups.len() == 12);
+    replay_window(&elf, h).expect("the honest window replays");
+    let refused = |what: &str, h: &crate::vm::history::WindowHistory| {
+        let got = replay_window(&elf, h);
+        assert!(got.is_err(), "{what}: replayed {:?}", got.map(|l| l.len()));
+    };
+    let mut moved = h.clone();
+    moved.word_accesses[3].addr ^= 8;
+    refused("an access at another address", &moved);
+    let mut fewer = h.clone();
+    fewer.word_accesses.pop();
+    refused("one access record too few", &fewer);
+    let mut more = h.clone();
+    more.word_accesses.push(more.word_accesses[0]);
+    refused("an access record left over", &more);
+    let mut later = h.clone();
+    later.ecall_at[2] += 1;
+    refused("an ECALL at another cycle", &later);
+    let mut counted = h.clone();
+    counted.accesses_before[2] -= 1;
+    refused("an ECALL after another count of accesses", &counted);
+    let mut extra_call = h.clone();
+    extra_call.groups.push(extra_call.groups[0]);
+    refused("an ECALL left over", &extra_call);
+    let mut full = h.clone();
+    full.lean = false;
+    refused("a window that is not lean", &full);
+    // A changed word on a live load (record 3 is the prologue's `ld x4`, and
+    // no later cycle writes x4): the replay re-runs the load from it, so its
+    // log and the register it fills differ; the replay alone cannot tell. The walker refuses it only when the bent
+    // value reaches the window's end registers or a later address; otherwise
+    // the proof's memory argument rejects it (the old word is not the one
+    // stored): completeness only, never a wrong proof accepted.
+    let honest = replay_window(&elf, h).unwrap();
+    let mut changed = h.clone();
+    changed.word_accesses[3].word ^= 0xFF;
+    let bent = replay_window(&elf, &changed).expect("a changed word replays");
+    assert_ne!(
+        bent.iter().map(record).collect::<Vec<_>>(),
+        honest.iter().map(record).collect::<Vec<_>>()
+    );
+}
+
+// The lean stream refuses an instruction the engine would fetch from memory
+// (a jump into the data segment): the replay has no memory to fetch it from
+// and the prover's DECODE table, the program's decoded segments, holds none.
+// The word history runs it.
+#[test]
+fn the_lean_stream_refuses_an_instruction_fetched_from_memory() {
+    // x5 = DATA_BASE + 8 * 31 (the word after the registers); jalr there; the
+    // data holds `addi x6, x0, 7` then a halt.
+    let addi = i(0x13, 7, 0, 0, 6);
+    let a7 = i(0x13, 93, 0, 0, 17);
+    let target = DATA_BASE + 8 * 31;
+    let mut regs = vec![0u64; 31];
+    regs[4] = target;
+    let extra: Vec<u8> = [addi, a7, 0x73]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let body = [i(0x67, 0, 5, 0, 0)]; // jalr x0, 0(x5)
+    let elf = program(0x1000, &regs, &extra, &body);
+    let mut full = FastExecutor::new(&elf, vec![]).unwrap();
+    full.enable_word_history().unwrap();
+    let mut ran = 0;
+    while let Some((logs, _)) = full.resume_word_history(16).unwrap() {
+        ran += logs.len();
+    }
+    assert_eq!(full.registers().to_array()[6], 7, "the fetched addi ran");
+    assert!(ran > 31);
+    let mut lean = FastExecutor::new(&elf, vec![]).unwrap();
+    lean.enable_word_history().unwrap();
+    lean.enable_lean_stream().unwrap();
+    let refused = loop {
+        match lean.resume_word_lean(16) {
+            Ok(Some(_)) => continue,
+            other => break other.map(|o| o.map(|(c, _)| c)),
+        }
+    };
+    assert!(
+        matches!(&refused, Err(ExecutorError::History(m)) if m.contains("outside the program's decoded segments")),
+        "{refused:?}"
+    );
+}
+
+// The lean stream turns on once, over the word history, before the first
+// cycle; a window under the plain word history is no lean one.
+#[test]
+fn the_lean_stream_turns_on_over_the_word_history_before_the_first_cycle() {
+    let elf = looping_program();
+    let mut fast = FastExecutor::new(&elf, vec![]).unwrap();
+    assert!(fast.enable_lean_stream().is_err(), "no word history");
+    assert!(fast.resume_word_lean(4).is_err(), "not on");
+    fast.enable_word_history().unwrap();
+    assert!(fast.resume_word_lean(4).is_err(), "not on");
+    let (_, h) = fast.resume_word_history(4).unwrap().unwrap();
+    assert!(!h.lean && h.extras.len() == 4);
+    assert!(fast.enable_lean_stream().is_err(), "after the first cycle");
+    let mut engine = Engine::new(EngineKind::Reference, &elf, vec![]).unwrap();
+    assert!(engine.enable_lean_stream().is_err());
+    assert!(engine.resume_word_lean(4).is_err());
+}

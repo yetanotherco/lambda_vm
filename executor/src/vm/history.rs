@@ -250,6 +250,21 @@ pub struct WindowHistory {
     pub word_ranges: Vec<SideRange>,
     pub word_values: Vec<u64>,
     pub word_ts: Vec<u32>,
+    /// The lean stream ([`crate::vm::fast::FastExecutor::resume_word_lean`],
+    /// the word history only): the window holds no per-cycle record
+    /// (`extras` stays empty) and no logs go with it; a walker re-runs it
+    /// ([`crate::vm::fast::Replay`]). A cycle's record is then found by
+    /// counting: the loads and stores take `word_accesses` in order, the
+    /// ECALLs `groups` (and `reg_groups`) in order.
+    pub lean: bool,
+    /// Under the lean stream, the window's cycles.
+    pub cycles: usize,
+    /// Under the lean stream, each ECALL's cycle in the window (counted
+    /// from 0), one an ECALL.
+    pub ecall_at: Vec<u32>,
+    /// Under the lean stream, the loads and stores before each ECALL in the
+    /// window, one an ECALL.
+    pub accesses_before: Vec<u32>,
 }
 
 impl WindowHistory {
@@ -269,17 +284,81 @@ impl WindowHistory {
             + self.word_ranges.capacity() * std::mem::size_of::<SideRange>()
             + self.word_values.capacity() * 8
             + self.word_ts.capacity() * 4
+            + self.ecall_at.capacity() * 4
+            + self.accesses_before.capacity() * 4
     }
 
-    /// [`Self::cycle_cells`] under the word history: each byte of every word
-    /// cycle `i` touches, at the word's timestamp.
-    fn cycle_word_cells(&self, i: usize, mut cell: impl FnMut(u64, u8, u32)) {
+    /// The bytes the executor wrote for it (the lists' lengths, not their
+    /// room): what a walker reads back besides the logs. A measurement.
+    pub fn written_bytes(&self) -> usize {
+        self.extras.len() * std::mem::size_of::<HistExtra>()
+            + self.accesses.len() * std::mem::size_of::<MemAccess>()
+            + self.mixed.len() * std::mem::size_of::<[u32; 8]>()
+            + self.groups.len() * std::mem::size_of::<SideGroup>()
+            + self.ranges.len() * std::mem::size_of::<SideRange>()
+            + self.values.len()
+            + self.ts.len() * 4
+            + self.reg_groups.len() * std::mem::size_of::<SideGroup>()
+            + self.reg_cells.len() * std::mem::size_of::<RegAccess>()
+            + self.word_accesses.len() * std::mem::size_of::<WordAccess>()
+            + self.next_words.len() * std::mem::size_of::<WordCell>()
+            + self.word_ranges.len() * std::mem::size_of::<SideRange>()
+            + self.word_values.len() * 8
+            + self.word_ts.len() * 4
+            + self.ecall_at.len() * 4
+            + self.accesses_before.len() * 4
+    }
+
+    /// The window's cycles: its extras', or under the lean stream its count.
+    pub fn cycle_count(&self) -> usize {
+        if self.lean {
+            self.cycles
+        } else {
+            self.extras.len()
+        }
+    }
+
+    /// Cycle `i`'s record ([`HistExtra::side`]); [`NO_ACCESS`] past the
+    /// extras (and for every cycle under the lean stream, whose records are
+    /// found by counting).
+    pub fn side(&self, i: usize) -> u32 {
+        self.extras.get(i).map_or(NO_ACCESS, |extra| extra.side)
+    }
+
+    /// Every record of the window in cycle order (its loads' and stores'
+    /// and its ECALLs', as [`HistExtra::side`] names them): under the lean
+    /// stream from the accesses before each ECALL.
+    fn sides_in_order(&self) -> Vec<u32> {
+        if !self.lean {
+            return self
+                .extras
+                .iter()
+                .map(|extra| extra.side)
+                .filter(|&side| side != NO_ACCESS)
+                .collect();
+        }
+        let accesses = self.word_accesses.len() as u32;
+        let mut out = Vec::with_capacity(accesses as usize + self.groups.len());
+        let mut next = 0u32;
+        for (k, &before) in self.accesses_before.iter().enumerate() {
+            let before = before.min(accesses);
+            out.extend(next..before.max(next));
+            next = next.max(before);
+            out.push(ECALL | k as u32);
+        }
+        out.extend(next..accesses);
+        out
+    }
+
+    /// [`Self::side_cells`] under the word history: each byte of every word
+    /// the record `side` holds, at the word's timestamp.
+    fn side_word_cells(&self, side: u32, mut cell: impl FnMut(u64, u8, u32)) {
         let mut word = |address: u64, value: u64, ts: u32| {
             for (k, byte) in value.to_le_bytes().into_iter().enumerate() {
                 cell(address.wrapping_add(k as u64), byte, ts);
             }
         };
-        match self.extras[i].side {
+        match side {
             NO_ACCESS => {}
             side if side & ECALL == 0 => {
                 let a = self.word_accesses[side as usize];
@@ -308,12 +387,21 @@ impl WindowHistory {
 
     /// Cycle `i`'s ECALL register accesses (empty for any other cycle).
     pub fn cycle_registers(&self, i: usize) -> &[RegAccess] {
-        match self.extras[i].side {
+        self.side_registers(self.side(i))
+    }
+
+    /// The ECALL register accesses of the record `side` (empty for a record
+    /// that is no ECALL's).
+    pub fn side_registers(&self, side: u32) -> &[RegAccess] {
+        match side {
             NO_ACCESS => &[],
-            side if side & ECALL != 0 => {
-                let g = self.reg_groups[(side & !ECALL) as usize];
-                &self.reg_cells[g.first as usize..(g.first + g.count) as usize]
-            }
+            side if side & ECALL != 0 => match self.reg_groups.get((side & !ECALL) as usize) {
+                Some(g) => self
+                    .reg_cells
+                    .get(g.first as usize..(g.first + g.count) as usize)
+                    .unwrap_or(&[]),
+                None => &[],
+            },
             _ => &[],
         }
     }
@@ -321,12 +409,19 @@ impl WindowHistory {
     /// Calls `cell(address, value, timestamp)` for every byte cycle `i` of the
     /// window reads before the cycle, in order (a byte two ranges hold, once
     /// a range). Under the word history, every byte of each word the cycle
-    /// touches, at the word's timestamp ([`Self::words`]).
-    pub fn cycle_cells(&self, i: usize, mut cell: impl FnMut(u64, u8, u32)) {
+    /// touches, at the word's timestamp ([`Self::words`]). Under the lean
+    /// stream a cycle's record is found by counting, not by its index: see
+    /// [`Self::side_cells`].
+    pub fn cycle_cells(&self, i: usize, cell: impl FnMut(u64, u8, u32)) {
+        self.side_cells(self.side(i), cell)
+    }
+
+    /// [`Self::cycle_cells`] of the record `side` ([`HistExtra::side`]).
+    pub fn side_cells(&self, side: u32, mut cell: impl FnMut(u64, u8, u32)) {
         if self.words {
-            return self.cycle_word_cells(i, cell);
+            return self.side_word_cells(side, cell);
         }
-        match self.extras[i].side {
+        match side {
             NO_ACCESS => {}
             side if side & ECALL == 0 => {
                 let a = self.accesses[side as usize];
@@ -357,8 +452,8 @@ impl WindowHistory {
     pub fn first_touches(&self) -> Vec<(u64, u8, u64)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for i in 0..self.extras.len() {
-            self.cycle_cells(i, |address, value, ts| {
+        for side in self.sides_in_order() {
+            self.side_cells(side, |address, value, ts| {
                 if seen.insert(address) {
                     out.push((address, value, u64::from(ts)));
                 }
@@ -1229,6 +1324,9 @@ impl History {
 /// or the word one ([`WordHistory`]). One loop serves both
 /// ([`crate::vm::fast::FastExecutor`]), compiled apart for each.
 pub(crate) trait Keeper {
+    /// The lean stream's keeper ([`LeanWords`]): the run refuses an
+    /// instruction fetched from memory, which a walker's replay cannot fetch.
+    const LEAN: bool = false;
     /// The register cells as the walk holds them.
     fn cells(&mut self) -> &mut RegisterCells;
     /// Before a load or store of `width` bytes at `address`: its record.
@@ -1299,6 +1397,9 @@ pub(crate) struct WordHistory {
     /// `next_words`, `groups`, `word_ranges`, `word_values` (and `word_ts`),
     /// `reg_groups`, `reg_cells`.
     last_sides: [usize; 7],
+    /// The lean stream ([`WindowHistory::lean`]): windows with no extras,
+    /// their ECALLs placed by `ecall_at` and `accesses_before`.
+    pub(crate) lean: bool,
 }
 
 impl WordHistory {
@@ -1312,6 +1413,7 @@ impl WordHistory {
             },
             spare_extras: None,
             last_sides: [0; 7],
+            lean: false,
         })
     }
 
@@ -1319,6 +1421,7 @@ impl WordHistory {
     /// one.
     pub(crate) fn begin(&mut self, first: u64, capacity: usize) {
         let extras = match self.spare_extras.take() {
+            _ if self.lean => Vec::new(),
             Some(mut extras) if extras.capacity() == capacity => {
                 extras.clear();
                 extras
@@ -1347,6 +1450,9 @@ impl WordHistory {
             word_ranges: Vec::with_capacity(ranges),
             word_values: Vec::with_capacity(values),
             word_ts: Vec::with_capacity(values),
+            lean: self.lean,
+            ecall_at: Vec::with_capacity(if self.lean { groups } else { 0 }),
+            accesses_before: Vec::with_capacity(if self.lean { groups } else { 0 }),
             ..WindowHistory::default()
         };
     }
@@ -1458,4 +1564,53 @@ impl Keeper for WordHistory {
     fn push_extra(&mut self, extra: HistExtra) {
         self.window.extras.push(extra);
     }
+}
+
+/// The lean stream's keeper: the word history ([`WordHistory`]) with no
+/// per-cycle record kept, and each ECALL's place in its window noted instead
+/// ([`WindowHistory::ecall_at`], [`WindowHistory::accesses_before`]): what a
+/// walker's replay ([`crate::vm::fast::Replay`]) needs beside the access
+/// records to re-run the window.
+pub(crate) struct LeanWords<'a>(pub(crate) &'a mut WordHistory);
+
+impl Keeper for LeanWords<'_> {
+    const LEAN: bool = true;
+
+    #[inline(always)]
+    fn cells(&mut self) -> &mut RegisterCells {
+        &mut self.0.cells
+    }
+
+    #[inline(always)]
+    fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64, width: u8) -> u32 {
+        Keeper::before_access(self.0, memory, address, width)
+    }
+
+    #[inline(always)]
+    fn after_access(&mut self, address: u64, count: u8, ts: u64) {
+        Keeper::after_access(self.0, address, count, ts)
+    }
+
+    fn before_ecall<M: GuestMemory>(&mut self, memory: &M, log_before: &Log, ts: u64) -> u32 {
+        let side = Keeper::before_ecall(self.0, memory, log_before, ts);
+        let w = &mut self.0.window;
+        // Cycle `c` is at `4·c + 4`; its place in the window from `first`.
+        let at = (ts / 4).saturating_sub(1).saturating_sub(w.first);
+        w.ecall_at.push(at as u32);
+        w.accesses_before.push(w.word_accesses.len() as u32);
+        side
+    }
+
+    #[inline(always)]
+    fn after_ecall(&mut self, log: &Log, cells_before: &RegisterCells, ts: u64) {
+        Keeper::after_ecall(self.0, log, cells_before, ts)
+    }
+
+    #[inline(always)]
+    fn ecall_registers(&mut self, log: &Log, ts: u64) {
+        Keeper::ecall_registers(self.0, log, ts)
+    }
+
+    #[inline(always)]
+    fn push_extra(&mut self, _extra: HistExtra) {}
 }

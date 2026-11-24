@@ -21,16 +21,16 @@ use super::{
     execution::{ExecutorError, InstructionCache, ReturnValues, load_program, step},
     flat_memory::{FlatLayout, FlatMemory},
     history::{
-        HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, Keeper, NO_ACCESS, RegUse,
-        RegisterCells, WindowHistory, WordHistory, WordHistoryFinal, cycle_timestamp,
+        HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, Keeper, LeanWords, NO_ACCESS, RegUse,
+        RegisterCells, WORD_BYTES, WindowHistory, WordHistory, WordHistoryFinal, cycle_timestamp,
         step_registers,
     },
     instruction::execution::{BLAKE3_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER},
     instruction::{
         decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
         execution::{
-            auipc_value, effective_address, jalr_target, load_value, lui_value, pc_relative,
-            store_value,
+            auipc_value, ecall_log, effective_address, jalr_target, load_value, lui_value,
+            pc_relative, store_value,
         },
     },
     logs::Log,
@@ -135,7 +135,7 @@ enum Kind {
 
 /// One decoded instruction: its kind, registers and immediate (the offset of
 /// a load, store, branch or jump; the raw 32-bit value of LUI and AUIPC).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 struct Op {
     kind: Kind,
@@ -506,6 +506,58 @@ impl FastExecutor {
         Ok(Some((logs, history)))
     }
 
+    /// Turns the lean stream on, over the word history: from now on a window
+    /// is taken with [`FastExecutor::resume_word_lean`], which writes no logs
+    /// and no per-cycle record, only the access records, the ECALLs' cells
+    /// and places, and the window's starting cells; a walker re-runs the
+    /// window from them ([`Replay`]). Before the first cycle, after
+    /// [`FastExecutor::enable_word_history`].
+    pub fn enable_lean_stream(&mut self) -> Result<(), ExecutorError> {
+        match &mut self.word_history {
+            Some(history) if self.cycles == 0 => {
+                history.lean = true;
+                Ok(())
+            }
+            Some(_) => Err(ExecutorError::History(
+                "the lean stream starts before the first cycle".into(),
+            )),
+            None => Err(ExecutorError::History(
+                "the lean stream needs the word history".into(),
+            )),
+        }
+    }
+
+    /// [`FastExecutor::resume_word_history`] under the lean stream: the
+    /// window's cycle count and its [`WindowHistory`] (with
+    /// [`WindowHistory::lean`] set), no logs. A cycle whose instruction the
+    /// engine would fetch from memory (outside the program's decoded
+    /// segments, which the prover's DECODE table also is) is refused.
+    pub fn resume_word_lean(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<(usize, WindowHistory)>, ExecutorError> {
+        let window = log_window_capacity(limit);
+        if self.pc == 0 {
+            return Ok(None);
+        }
+        match &mut self.word_history {
+            Some(history) if history.lean => history.begin(self.cycles, window),
+            _ => return Err(ExecutorError::History("the lean stream is off".into())),
+        }
+        let first = self.cycles;
+        self.run_word_lean(limit)?;
+        let cycles = (self.cycles - first) as usize;
+        if cycles == 0 {
+            return Ok(None);
+        }
+        let mut history = match &mut self.word_history {
+            Some(h) => h.take_window(),
+            None => WindowHistory::default(),
+        };
+        history.cycles = cycles;
+        Ok(Some((cycles, history)))
+    }
+
     /// The log buffer cleared, with room for a `window` of logs.
     fn prepare_logs(&mut self, window: usize) {
         if self.logs.capacity() < window {
@@ -613,6 +665,31 @@ impl FastExecutor {
             &mut self.memory,
             &self.instructions,
             &mut self.logs,
+            (self.pc, self.cycles),
+            limit,
+        );
+        self.pc = pc;
+        self.cycles = cycle;
+        result
+    }
+
+    /// [`FastExecutor::run_word_history`] under the lean stream: the cycles
+    /// counted, no log written.
+    #[inline(never)]
+    fn run_word_lean(&mut self, limit: usize) -> Result<(), ExecutorError> {
+        let Some(history) = self.word_history.as_deref_mut() else {
+            return Err(ExecutorError::History("the word history is off".into()));
+        };
+        let mut count = CycleCount(0);
+        let (pc, cycle, result) = run_kept(
+            &mut LeanWords(history),
+            &self.ops,
+            &self.uses,
+            self.ops_base,
+            &mut self.regs,
+            &mut self.memory,
+            &self.instructions,
+            &mut count,
             (self.pc, self.cycles),
             limit,
         );
@@ -767,6 +844,21 @@ impl RecordSink for Vec<Log> {
     }
 }
 
+/// The lean stream's sink: the cycles counted, no log kept.
+struct CycleCount(usize);
+
+impl RecordSink for CycleCount {
+    #[inline(always)]
+    fn record(&mut self, _log: Log) {
+        self.0 += 1;
+    }
+
+    #[inline(always)]
+    fn cycles(&self) -> usize {
+        self.0
+    }
+}
+
 /// History mode's run loop over either history ([`Keeper`]): runs from
 /// `(pc, cycle)` until the program halts or `limit` logs are written, and
 /// returns where it stopped. Inlined into each history's own entry
@@ -774,7 +866,7 @@ impl RecordSink for Vec<Log> {
 /// each is compiled for its history alone.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn run_kept<K: Keeper>(
+fn run_kept<K: Keeper, S: RecordSink>(
     history: &mut K,
     ops: &[Op],
     uses: &[Option<RegUse>],
@@ -782,7 +874,7 @@ fn run_kept<K: Keeper>(
     regs: &mut [u64; 32],
     memory: &mut FlatMemory,
     instructions: &InstructionCache,
-    logs: &mut Vec<Log>,
+    logs: &mut S,
     (mut pc, mut cycle): (u64, u64),
     limit: usize,
 ) -> (u64, u64, Result<(), ExecutorError>) {
@@ -804,6 +896,14 @@ fn run_kept<K: Keeper>(
             let address = effective_address(regs[op.rs1 as usize & 31], op.imm);
             (op, u, address)
         } else {
+            // The lean stream's replay has no memory to fetch an instruction
+            // from; the prover's DECODE table holds no such instruction either.
+            if K::LEAN && pc.is_multiple_of(4) && instructions.get(pc).is_none() {
+                break Err(ExecutorError::History(format!(
+                    "lean stream: the instruction at {pc:#x} is outside the program's decoded \
+                     segments"
+                )));
+            }
             let (u, address) = fetched_use(pc, regs, memory, instructions);
             (STEP, u, address)
         };
@@ -895,10 +995,10 @@ fn fetched_use(
 /// memory.
 #[cold]
 #[inline(never)]
-fn reference_cycle(
+fn reference_cycle<M: GuestMemory>(
     pc: u64,
     regs: &mut [u64; 32],
-    memory: &mut FlatMemory,
+    memory: &mut M,
     instructions: &InstructionCache,
 ) -> Result<Log, ExecutorError> {
     let mut registers = Registers::from_array(regs);
@@ -911,7 +1011,12 @@ fn reference_cycle(
 /// One cycle of `op` at `pc`, or `None` for the reference cycle to run it
 /// (an op of kind [`Kind::Step`], or an access that fails).
 #[inline(always)]
-fn fast_cycle(op: Op, pc: u64, regs: &mut [u64; 32], memory: &mut FlatMemory) -> Option<Log> {
+fn fast_cycle<M: GuestMemory>(
+    op: Op,
+    pc: u64,
+    regs: &mut [u64; 32],
+    memory: &mut M,
+) -> Option<Log> {
     let rd = op.rd as usize & 31;
     let a = regs[op.rs1 as usize & 31];
     let b = regs[op.rs2 as usize & 31];
@@ -1054,4 +1159,307 @@ fn fast_cycle(op: Op, pc: u64, regs: &mut [u64; 32], memory: &mut FlatMemory) ->
         src2_val: s2,
         dst_val: d,
     })
+}
+
+/// A walker's re-run of a lean window ([`FastExecutor::resume_word_lean`]):
+/// the engine's own cycle ([`fast_cycle`], the reference's for anything
+/// else) on registers alone, each load answered from the window's access
+/// record and each ECALL's log made from the registers ([`ecall_log`]). The
+/// logs it writes are the ones the engine wrote, byte for byte: the same
+/// function of the same registers and the same loaded words. The op table is
+/// its own, decoded from the program as the engine decodes its.
+pub struct Replay {
+    ops: Box<[Op]>,
+    ops_base: u64,
+    uses: Box<[Option<RegUse>]>,
+    instructions: InstructionCache,
+}
+
+impl std::fmt::Debug for Replay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Replay")
+            .field("ops", &self.ops.len())
+            .field("ops_base", &self.ops_base)
+            .finish()
+    }
+}
+
+/// Where a replay of a window stands: the pc and registers after the cycles
+/// re-run so far, and how many of the window's cycles, access records and
+/// ECALLs they took.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayCursor {
+    pub pc: u64,
+    pub regs: [u64; 32],
+    /// The cycles re-run, from the window's first.
+    pub cycle: usize,
+    /// The access records ([`WindowHistory::word_accesses`]) taken.
+    pub access: usize,
+    /// The ECALLs ([`WindowHistory::groups`]) taken.
+    pub ecall: usize,
+}
+
+/// A replay that cannot go on: the window's records are not the ones its
+/// cycles make (or the window is not a lean one).
+fn replay_error(why: String) -> ExecutorError {
+    ExecutorError::History(format!("replay: {why}"))
+}
+
+impl Replay {
+    /// The replay of `program`'s windows.
+    pub fn new(program: &Elf) -> Result<Self, ExecutorError> {
+        let instructions = InstructionCache::new(&program.data)?;
+        let (ops_base, ops) = decode_ops(&instructions);
+        let uses = (0..ops.len() as u64)
+            .map(|i| instructions.get(ops_base + 4 * i).map(RegUse::of))
+            .collect();
+        Ok(Self {
+            ops,
+            ops_base,
+            uses,
+            instructions,
+        })
+    }
+
+    /// Whether its op table (ops, base, register uses) is `engine`'s, after
+    /// `engine`'s history is on: the replay decodes its own from the program
+    /// with the engine's [`decode_ops`], and a test pins the two equal.
+    #[cfg(test)]
+    pub(crate) fn same_table(&self, engine: &FastExecutor) -> bool {
+        self.ops_base == engine.ops_base && self.ops == engine.ops && self.uses == engine.uses
+    }
+
+    /// The cursor at the start of the lean window `history`: its starting
+    /// pc and register values.
+    pub fn start(history: &WindowHistory) -> Result<ReplayCursor, ExecutorError> {
+        if !(history.lean && history.words) {
+            return Err(replay_error("the window is not a lean one".into()));
+        }
+        let Some(cells) = &history.registers else {
+            return Err(replay_error("the window has no starting cells".into()));
+        };
+        Ok(ReplayCursor {
+            pc: cells.pc.0,
+            regs: std::array::from_fn(|r| if r == 0 { 0 } else { cells.regs[r].0 }),
+            cycle: 0,
+            access: 0,
+            ecall: 0,
+        })
+    }
+
+    /// The next `n` cycles of the lean window `history` from `at`, their
+    /// logs appended to `out`. Refuses a cycle past the window's end, a load
+    /// or store whose record is missing or names another address, a load
+    /// that reads a byte its record does not hold, and an ECALL that is not
+    /// the window's next at its cycle.
+    pub fn run(
+        &self,
+        history: &WindowHistory,
+        at: &mut ReplayCursor,
+        n: usize,
+        out: &mut Vec<Log>,
+    ) -> Result<(), ExecutorError> {
+        if at.cycle + n > history.cycles {
+            return Err(replay_error(format!(
+                "{} cycles asked from cycle {} of a window of {}",
+                n, at.cycle, history.cycles
+            )));
+        }
+        out.reserve(n);
+        for _ in 0..n {
+            let log = self.cycle(history, at)?;
+            at.pc = log.next_pc;
+            at.cycle += 1;
+            out.push(log);
+        }
+        Ok(())
+    }
+
+    /// The window's end: every cycle, access record and ECALL taken.
+    pub fn finish(history: &WindowHistory, at: &ReplayCursor) -> Result<(), ExecutorError> {
+        if at.cycle != history.cycles
+            || at.access != history.word_accesses.len()
+            || at.ecall != history.groups.len()
+        {
+            return Err(replay_error(format!(
+                "the window ends after {} of {} cycles, {} of {} access records, {} of {} ECALLs",
+                at.cycle,
+                history.cycles,
+                at.access,
+                history.word_accesses.len(),
+                at.ecall,
+                history.groups.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// One cycle, as [`run_kept`] runs it.
+    #[inline(always)]
+    fn cycle(&self, history: &WindowHistory, at: &mut ReplayCursor) -> Result<Log, ExecutorError> {
+        let pc = at.pc;
+        let index = pc.wrapping_sub(self.ops_base).rotate_right(2);
+        let (op, uses, address) = if index < self.ops.len() as u64
+            && let Some(u) = self.uses[index as usize]
+        {
+            let op = self.ops[index as usize];
+            let address = effective_address(at.regs[op.rs1 as usize & 31], op.imm);
+            (op, u, address)
+        } else {
+            match self.instructions.get(pc) {
+                Some(instruction) if pc.is_multiple_of(4) => {
+                    let address = match *instruction {
+                        Instruction::Load { base, offset, .. }
+                        | Instruction::Store { base, offset, .. } => {
+                            effective_address(at.regs[base as usize & 31], offset)
+                        }
+                        _ => 0,
+                    };
+                    (STEP, RegUse::of(instruction), address)
+                }
+                _ => {
+                    return Err(replay_error(format!(
+                        "cycle {}: no decoded instruction at {pc:#x}",
+                        at.cycle
+                    )));
+                }
+            }
+        };
+        if uses.ecall {
+            return self.ecall(history, at, pc);
+        }
+        let mut memory = ReplayMemory::default();
+        if uses.mem > 0 {
+            let Some(record) = history.word_accesses.get(at.access) else {
+                return Err(replay_error(format!(
+                    "cycle {}: a load or store past the window's {} access records",
+                    at.cycle,
+                    history.word_accesses.len()
+                )));
+            };
+            if record.addr != address {
+                return Err(replay_error(format!(
+                    "cycle {}: the access at {address:#x} finds the record of {:#x}",
+                    at.cycle, record.addr
+                )));
+            }
+            let next = match record.next {
+                NO_ACCESS => None,
+                k => match history.next_words.get(k as usize) {
+                    Some(cell) => Some(cell.word),
+                    None => {
+                        return Err(replay_error(format!(
+                            "cycle {}: its second word is missing",
+                            at.cycle
+                        )));
+                    }
+                },
+            };
+            memory = ReplayMemory {
+                base: record.addr & !(WORD_BYTES - 1),
+                word: record.word,
+                next,
+                held: if next.is_some() { 16 } else { 8 },
+                fault: std::cell::Cell::new(false),
+            };
+            at.access += 1;
+        }
+        let log = match fast_cycle(op, pc, &mut at.regs, &mut memory) {
+            Some(log) => log,
+            None => reference_cycle(pc, &mut at.regs, &mut memory, &self.instructions)?,
+        };
+        if memory.fault.get() {
+            return Err(replay_error(format!(
+                "cycle {}: a byte outside its access record",
+                at.cycle
+            )));
+        }
+        Ok(log)
+    }
+
+    /// An ECALL's cycle: the window's next ECALL must be at this cycle, after
+    /// as many access records as taken; its log from the registers, the
+    /// commit's `x10` written.
+    #[cold]
+    fn ecall(
+        &self,
+        history: &WindowHistory,
+        at: &mut ReplayCursor,
+        pc: u64,
+    ) -> Result<Log, ExecutorError> {
+        let k = at.ecall;
+        let placed = history.ecall_at.get(k).map(|&c| c as usize) == Some(at.cycle)
+            && history.accesses_before.get(k).map(|&a| a as usize) == Some(at.access)
+            && k < history.groups.len();
+        if !placed {
+            return Err(replay_error(format!(
+                "cycle {}: an ECALL the window does not place here (its ECALL {k})",
+                at.cycle
+            )));
+        }
+        let Some((log, x10)) = ecall_log(pc, &at.regs) else {
+            return Err(replay_error(format!(
+                "cycle {}: ECALL {:#x} has no log on these registers",
+                at.cycle, at.regs[17]
+            )));
+        };
+        if let Some(value) = x10 {
+            at.regs[10] = value;
+        }
+        at.ecall += 1;
+        Ok(log)
+    }
+}
+
+/// A replayed cycle's memory: the words of its access record (the word
+/// holding its first byte and, when it crosses, the next), read only. A write
+/// is dropped (a later load reads its own record); a read of any other byte
+/// is marked a fault and reads 0. The default holds no byte (a cycle with
+/// no access record).
+#[derive(Default)]
+struct ReplayMemory {
+    base: u64,
+    word: u64,
+    next: Option<u64>,
+    /// The bytes held from `base`: 0, 8 or 16.
+    held: u64,
+    fault: std::cell::Cell<bool>,
+}
+
+impl GuestMemory for ReplayMemory {
+    #[inline(always)]
+    fn read_n<const N: usize>(&self, address: u64) -> [u8; N] {
+        let mut out = [0u8; N];
+        let off = address.wrapping_sub(self.base);
+        let held = self.held;
+        if N as u64 > held || off > held - N as u64 {
+            self.fault.set(true);
+            return out;
+        }
+        let both = (u128::from(self.next.unwrap_or(0)) << 64) | u128::from(self.word);
+        let bytes = (both >> (8 * off)).to_le_bytes();
+        out.copy_from_slice(&bytes[..N]);
+        out
+    }
+
+    #[inline(always)]
+    fn write_n<const N: usize>(&mut self, _address: u64, _data: [u8; N]) {}
+
+    fn read_range(&self, _address: u64, out: &mut [u8]) {
+        if !out.is_empty() {
+            self.fault.set(true);
+        }
+    }
+
+    fn write_range(&mut self, _address: u64, _data: &[u8]) {}
+
+    fn public_output(&self) -> &[u8] {
+        &[]
+    }
+
+    fn extend_public_output(&mut self, _bytes: &[u8]) {}
+
+    fn dma_bulk(&self) -> bool {
+        false
+    }
 }
