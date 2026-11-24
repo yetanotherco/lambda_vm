@@ -887,6 +887,21 @@ pub struct TreeProgram {
 /// ([`WhirBlockPlan::closed_block_program_marked_timed`]).
 pub type TimedProgram = (LfmProgram, Vec<u32>, (f64, f64));
 
+std::thread_local! {
+    /// The last plan derivation's split on this thread ([`take_plan_split`]).
+    static LAST_PLAN_SPLIT: std::cell::Cell<Option<[f64; 6]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take the most recent plan derivation's split ON THIS THREAD, clearing it:
+/// the seconds of its frame, its local lookups' plan, its prepared tables, its
+/// groups' costs, its local receivers' check and its measuring probes
+/// ([`chip_loads_by_emission`]). `None` when no plan was derived here since
+/// the last take. A report: nothing reads it but the levels' stamps.
+pub fn take_plan_split() -> Option<[f64; 6]> {
+    LAST_PLAN_SPLIT.with(std::cell::Cell::take)
+}
+
 impl WhirBlockPlan {
     /// Derive the plan over `num_leaves` leaves (when `None`, the fewest that
     /// keep every chip of every leaf under [`P1_LEAF_HEIGHTS`], or under
@@ -1080,6 +1095,7 @@ impl WhirBlockPlan {
     }
 
     /// The derivation's body once the base and the wrap hash are settled.
+    /// Its split by part is left for [`take_plan_split`] on this thread.
     #[allow(clippy::too_many_arguments)]
     fn derive_under(
         elf_bytes: &[u8],
@@ -1095,8 +1111,17 @@ impl WhirBlockPlan {
         cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
         let base = &format.zf.base;
+        // The derivation's seconds by part, for the levels' stamps
+        // ([`take_plan_split`]).
+        let mut split = [0.0f64; 6];
+        let mut t = std::time::Instant::now();
+        let mut lap = |part: usize| {
+            split[part] = t.elapsed().as_secs_f64();
+            t = std::time::Instant::now();
+        };
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
+        lap(0);
         // Local lookups by the deriver's format: the static receiver check
         // (every receiver of a local bus reads fixed columns only), then every
         // table's digest from the deriver's own AIRs.
@@ -1105,6 +1130,7 @@ impl WhirBlockPlan {
         } else {
             None
         };
+        lap(1);
         let elf_digest = crate::statement::elf_digest(elf_bytes);
         let tag = crate::block_whir::block_format_tag(format);
         let statement_bytes =
@@ -1181,6 +1207,7 @@ impl WhirBlockPlan {
                 domain,
             });
         }
+        lap(2);
 
         // Each group's cost in socket rows: its tables' legs, its opening, its
         // prepared ones.
@@ -1320,6 +1347,7 @@ impl WhirBlockPlan {
             cost_parts.push([tables, opening, prepared_perms]);
         }
         drop(refs);
+        lap(3);
         if let Some(local) = &mut local {
             local.classes = group_classes;
         }
@@ -1384,10 +1412,13 @@ impl WhirBlockPlan {
                     .map_err(|e| format!("group {g}: {e}"))?;
             }
         }
+        lap(4);
         // Every chip's rows by group, emitted; the partition bounds them all,
         // at the format's leaf scale (a fixed leaf count, the tests', bounds
         // none).
         (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
+        lap(5);
+        LAST_PLAN_SPLIT.with(|c| c.set(Some(split)));
         plan.partition = match num_leaves {
             None => {
                 let heights = ChipRows {

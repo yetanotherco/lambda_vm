@@ -496,6 +496,9 @@ pub struct Level1Landing {
     pub arrivals: Vec<(usize, f64)>,
     /// When each piece landed, in landing order: `(piece, at, wave seconds)`.
     pub landed: Vec<(usize, f64, f64)>,
+    /// The groups whose arena words the landing thread made, and the seconds
+    /// it took ([`super::whir_block::group_arena_words`]).
+    pub words: (usize, f64),
     /// Where the execution ran, under `LAMBDA_VM_LEVELS_PLACEMENT`.
     pub placement: Option<super::placement::Placement>,
 }
@@ -739,6 +742,15 @@ pub struct NextStream {
     pub last: f64,
     pub executed: f64,
     pub fill: f64,
+}
+
+/// When level 2's stacks' commit started (the driver's clock), and when the
+/// driver joined level 2's streamed execution (`None` when it did not
+/// stream).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NextCommit {
+    pub from: f64,
+    pub joined: Option<f64>,
 }
 
 /// Starts this process's peak resident set again from its current resident
@@ -1727,6 +1739,15 @@ pub struct LevelsTimes {
     /// Level 1's program: its walk's, its compile's and (off the knob) its
     /// validation's seconds before its execution could start.
     pub emit_split: (f64, f64, f64),
+    /// Level 1's plan by part ([`super::whir_block::take_plan_split`]): frame,
+    /// local lookups, prepared tables, costs, receivers' check, probes.
+    pub plan_split: [f64; 6],
+    /// Level 1's parallel compile by part
+    /// ([`super::compiler::take_compile_split`]): multiplicities, rows, join.
+    pub compile_split: [f64; 3],
+    /// When the builder's thread ended, its prepare and packs done (the
+    /// driver's clock); `None` when level 1 was prepared after the base.
+    pub builder_end: Option<f64>,
     /// Level 1's lean round tables filled beside its execution
     /// (`LAMBDA_VM_WLFM_LEAN_BESIDE`): what the fill did, and the seconds
     /// level 1's thread waited for it once the execution had ended. `None`
@@ -1741,6 +1762,8 @@ pub struct LevelsTimes {
     /// Under [`STREAM_NEXT_ENV`], level 2's execution streamed over level 1's
     /// prove; `None` when it ran after it.
     pub next_stream: Option<NextStream>,
+    /// When level 2's stacks' commit started; `None` without a level 2.
+    pub next_commit: Option<NextCommit>,
     /// Under [`FILL_BESIDE_ENV`], level 1's fill on its own thread beside the
     /// stacks' commit: its seconds and when it ended (the driver's clock).
     /// `None` when the driver filled after the commit.
@@ -1988,6 +2011,7 @@ pub fn prove_block_levels(
         Option<(f64, f64)>,
         (f64, f64, f64),
         Level1Landing,
+        (Option<[f64; 6]>, Option<[f64; 3]>),
     );
     // Read on the driver's thread (a test's override is that thread's).
     let fill_beside_on = fill_beside();
@@ -1998,6 +2022,9 @@ pub fn prove_block_levels(
         && super::b3l_tables::fill_hold() == super::b3l_tables::B3lHold::Records;
     let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let base_end_ref = &base_end;
+    // When the builder's thread ended (the driver's clock), under `build_beside`.
+    let builder_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let builder_end_ref = &builder_end;
     // Level 1's program, emitted by its thread and read by the builder's.
     let program_cell: std::sync::OnceLock<LfmProgram> = std::sync::OnceLock::new();
     let program_ref = &program_cell;
@@ -2007,12 +2034,13 @@ pub fn prove_block_levels(
         // on the host, as soon as its program exists. The card is the base's
         // until it ends: nothing is committed here.
         let builder = build_beside.then(|| {
-            scope.spawn(move || -> Result<WlfmPrebuild, String> {
+            scope.spawn(move || -> Result<(WlfmPrebuild, f64), String> {
                 brx.recv()
                     .map_err(|_| "level 1's program was never emitted")?;
                 let program = program_ref.get().ok_or("the program is set")?;
                 let plan = plan_ref.get().ok_or("the plan is set")?;
-                prepare_level_beside(program, family, level_rounds(plan))
+                let pre = prepare_level_beside(program, family, level_rounds(plan))?;
+                Ok((pre, now()))
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
@@ -2028,9 +2056,11 @@ pub fn prove_block_levels(
                 Some(&roots),
             )?;
             let planned = now();
+            let plan_split = super::whir_block::take_plan_split();
             let beside_check = program_fast();
             let (program, marks, (walk, compiled)) =
                 plan.closed_block_program_marked_timed(beside_check)?;
+            let compile_split = super::compiler::take_compile_split();
             // Off the knob, validated before the execution, as always.
             let t = std::time::Instant::now();
             if !beside_check {
@@ -2135,6 +2165,7 @@ pub fn prove_block_levels(
                     hand_on_lean(&mut ex, lean_tx.as_ref());
                     landed[0] = true;
                 }
+                let t_words = std::time::Instant::now();
                 let words = super::whir_block::group_arena_words(
                     plan,
                     g,
@@ -2144,6 +2175,8 @@ pub fn prove_block_levels(
                     &opening,
                     prepared.as_ref(),
                 )?;
+                landing.words.0 += 1;
+                landing.words.1 += t_words.elapsed().as_secs_f64();
                 *by_group
                     .get_mut(g)
                     .ok_or("a group the plan does not hold")? = Some(words);
@@ -2254,6 +2287,7 @@ pub fn prove_block_levels(
                 validated,
                 emit_split,
                 landing,
+                (plan_split, compile_split),
             ))
         });
         // A format that argues local lookups proves a proof of its own kind
@@ -2310,7 +2344,8 @@ pub fn prove_block_levels(
                     .join()
                     .map_err(|_| "the builder's thread panicked".to_string());
                 Some(pre.and_then(|pre| {
-                    let pre = pre?;
+                    let (pre, builder_end) = pre?;
+                    let _ = builder_end_ref.set(builder_end);
                     let prepare = (pre.secs(), pre.prepare_split());
                     let cells = pre.prepared_cells();
                     if proved.is_err() {
@@ -2349,6 +2384,7 @@ pub fn prove_block_levels(
     }
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
+    times.builder_end = builder_end.get().copied();
     let (
         planned,
         emitted,
@@ -2361,8 +2397,11 @@ pub fn prove_block_levels(
         validated,
         emit_split,
         landing,
+        (plan_split, compile_split),
     ) = level1.map_err(|_| "level 1's thread panicked")??;
     times.landing = landing;
+    times.plan_split = plan_split.unwrap_or_default();
+    times.compile_split = compile_split.unwrap_or_default();
     times.validated_beside = validated;
     times.emit_split = emit_split;
     // A lean fill beside that was fed a compression twice, or missed one, is
@@ -2587,6 +2626,11 @@ pub fn prove_block_levels(
             ),
             None => None,
         };
+        if streaming {
+            let joined = now();
+            let next = times.next_commit.get_or_insert_with(NextCommit::default);
+            next.joined = Some(joined);
+        }
         times
             .stamps
             .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
@@ -2613,6 +2657,10 @@ pub fn prove_block_levels(
             let execute_from = done.as_ref().map_or_else(now, |(_, t)| t.from);
             let (prepare, prepare_split, cells) =
                 (pre.secs(), pre.prepare_split(), pre.prepared_cells());
+            if k == 1 {
+                let next = times.next_commit.get_or_insert_with(NextCommit::default);
+                next.from = now();
+            }
             // Its stacks on the card while its execution runs on the host.
             let committer = scope.spawn(move || {
                 commit_level(pre, k + 1).map(|build| {

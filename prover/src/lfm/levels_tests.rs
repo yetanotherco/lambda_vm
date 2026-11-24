@@ -1500,6 +1500,76 @@ fn rta_a_real_block_through_its_levels() {
     println!("RTA DONE");
 }
 
+/// Level 1's and level 2's host chains, on the driver's clock: what each
+/// waited for before its prove could start, so a lever on the chain reads as
+/// a moved stamp.
+fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
+    let p = t.plan_split;
+    println!(
+        "RTA LEVEL1 PLAN: frame {:.3}s · local {:.3}s · prepared {:.3}s · costs {:.3}s · receivers {:.3}s · \
+         probes {:.3}s",
+        p[0], p[1], p[2], p[3], p[4], p[5]
+    );
+    let c = t.compile_split;
+    println!(
+        "RTA LEVEL1 COMPILE: multiplicities {:.3}s · rows {:.3}s · join {:.3}s",
+        c[0], c[1], c[2]
+    );
+    let landing = &t.landing;
+    println!(
+        "RTA LEVEL1 WORDS: groups {} · {:.3}s",
+        landing.words.0, landing.words.1
+    );
+    let front = landing.front.0 + landing.front.1;
+    let last = landing
+        .landed
+        .iter()
+        .map(|&(_, at, secs)| at + secs)
+        .fold(front, f64::max);
+    // Every share at hand at the front: the pieces' words and waves back to
+    // back after it.
+    let busy: f64 = landing.landed.iter().map(|&(_, _, secs)| secs).sum::<f64>() + landing.words.1;
+    let could = front + busy;
+    let l1 = t.levels.first().copied().unwrap_or_default();
+    let commit = t.builds.first().map_or(0.0, |b| b.commit);
+    let fmt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.3}s"));
+    let floor = t.builder_end.map(|b| (could + l1.fill).max(b + commit));
+    println!(
+        "RTA LEVEL1 CHAIN: planned {:.3}s · emitted {:.3}s · front {front:.3}s · last piece {last:.3}s · \
+         last piece could land at {could:.3}s · fill {:.3}s · builder ended at {} · commit {commit:.3}s · \
+         base end {:.3}s · slack {} · chain floor {} · prove from {l1_prove_from:.3}s",
+        t.planned,
+        t.emitted,
+        l1.fill,
+        fmt(t.builder_end),
+        t.base,
+        fmt(t.builder_end.map(|b| t.base - b)),
+        fmt(floor),
+    );
+    let l2 = t.levels.get(1).copied().unwrap_or_default();
+    if let (Some(ns), Some(nc), Some(b)) = (t.next_stream, t.next_commit, t.builds.get(1)) {
+        let prove_from = l2.end - l2.prove;
+        println!(
+            "RTA LEVEL2 CHAIN: prepared {:.3}s · first piece {:.3}s · last piece {:.3}s · executed {:.3}s · \
+             fill {:.3}s · filled {:.3}s · commit from {:.3}s · joined {} · committed {:.3}s · \
+             level 1 proved {:.3}s · prove from {prove_from:.3}s · after level 1 {:.3}s",
+            ns.from,
+            ns.first,
+            ns.last,
+            ns.executed,
+            ns.fill,
+            ns.executed + ns.fill,
+            nc.from,
+            fmt(nc.joined),
+            b.committed,
+            l1.end,
+            prove_from - l1.end,
+        );
+    } else {
+        println!("RTA LEVEL2 CHAIN: not streamed");
+    }
+}
+
 /// This process's minor and major faults and its user and system seconds,
 /// from `/proc/self/stat` (Linux; `None` elsewhere or on a parse miss).
 fn self_usage() -> Option<(u64, u64, f64, f64)> {
@@ -1913,6 +1983,27 @@ fn rta_one_run(
     println!(
         "RTA RECURSION: {:.3}s after the base (end {end:.3}s)",
         end - t.base
+    );
+    print_level_chains(t, l1_prove_from);
+    // Each level's proof bytes, digested: equal across arms that only move
+    // when host work runs (under `LAMBDA_VM_DETERMINISTIC_GRIND=1`).
+    println!(
+        "RTA PROOF DIGEST: deterministic grind {} · {}",
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        run.proofs
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("serializes");
+                format!(
+                    "level {} {} B {}",
+                    k + 1,
+                    bytes.len(),
+                    &blake3::hash(&bytes).to_hex()[..16]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     );
     // Off the clock: the base (a BLAKE3 one under the test permit), every
     // level, and the block's verifier.
