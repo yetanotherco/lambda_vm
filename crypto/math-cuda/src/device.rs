@@ -3529,3 +3529,213 @@ mod two_card_openings_tests {
         assert_eq!(role, DeviceRole::Main);
     }
 }
+
+/// ★ The source scan (the per-card rule): device-bound state
+/// lives per backend, never one per process. Host-only: it reads this crate's
+/// sources, so a new cache of kernels or device buffers in a plain `static`,
+/// a function attribute set outside a backend's start, or a new process-wide
+/// `Once` / `OnceLock` fails here before any card run.
+#[cfg(test)]
+mod device_state_scan_tests {
+    /// Every `src/*.rs` of this crate: (file name, text).
+    fn sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("the crate's src")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (name, std::fs::read_to_string(&p).expect("a source file"))
+            })
+            .collect();
+        out.sort();
+        assert!(out.len() >= 30, "found only {} source files", out.len());
+        out
+    }
+
+    /// Every `static NAME: TYPE` line of `text` outside comments: (name, the
+    /// type up to its `=`).
+    fn statics(text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            let rest = ["pub static ", "pub(crate) static ", "static "]
+                .iter()
+                .find_map(|p| t.strip_prefix(p));
+            let Some(rest) = rest else { continue };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                continue;
+            }
+            let ty = ty.split('=').next().unwrap_or("").trim().to_string();
+            out.push((name.to_string(), ty));
+        }
+        out
+    }
+
+    /// Words that name a device-bound object (or a holder of one).
+    const DEVICE_TYPES: [&str; 10] = [
+        "CudaFunction",
+        "CudaModule",
+        "CudaSlice",
+        "CudaEvent",
+        "CUevent",
+        "Kernels",
+        "Module",
+        "RootTables",
+        "Staging",
+        "Place",
+    ];
+
+    fn names_a_word(ty: &str, word: &str) -> bool {
+        ty.match_indices(word).any(|(at, _)| {
+            let before = ty[..at].chars().next_back();
+            let after = ty[at + word.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// A process-wide static holding device objects keeps them per backend:
+    /// a `PerBackend` cell, an array of one per backend slot, or (listed here,
+    /// with why) a pool whose objects record their own context.
+    #[test]
+    fn no_device_object_in_a_process_wide_static() {
+        // The read-back staging pool: each buffer records the context it was
+        // made in, and a thread takes only its stream's context's.
+        const RECORD_THEIR_OWNER: [(&str, &str); 1] = [("readback.rs", "POOL")];
+        let mut breaches = Vec::new();
+        for (file, text) in sources() {
+            for (name, ty) in statics(&text) {
+                if !DEVICE_TYPES.iter().any(|w| names_a_word(&ty, w)) {
+                    continue;
+                }
+                let per_backend = ty.starts_with("crate::device::PerBackend<")
+                    || ty.starts_with("PerBackend<")
+                    || (ty.starts_with('[') && ty.ends_with("; 2]"));
+                if per_backend || RECORD_THEIR_OWNER.contains(&(file.as_str(), name.as_str())) {
+                    continue;
+                }
+                breaches.push(format!("{file}: static {name}: {ty}"));
+            }
+        }
+        assert!(
+            breaches.is_empty(),
+            "device objects in a process-wide static (make them per backend): {breaches:?}"
+        );
+    }
+
+    /// A function attribute is set once per card, as its backend starts: only
+    /// in `Backend::init_on`.
+    #[test]
+    fn a_function_attribute_is_set_only_in_init_on() {
+        let needle = [".set_", "attribute("].concat();
+        for (file, text) in sources() {
+            for (at, _) in text.match_indices(&needle) {
+                let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+                if text[line_start..at].trim_start().starts_with("//") {
+                    continue;
+                }
+                assert_eq!(
+                    file, "device.rs",
+                    "an attribute set outside the backend's start"
+                );
+                let start = text.find("fn init_on(").expect("init_on");
+                let end = text[start + 1..]
+                    .find("\n    fn ")
+                    .into_iter()
+                    .chain(text[start + 1..].find("\n    pub fn "))
+                    .min()
+                    .map_or(text.len(), |e| start + 1 + e);
+                assert!(
+                    (start..end).contains(&at),
+                    "device.rs sets an attribute outside init_on (byte {at})"
+                );
+            }
+        }
+    }
+
+    /// Every process-wide `Once`, `OnceLock` and `PerBackend` in the crate, by
+    /// file and name: none holds a device object (read when it was added:
+    /// knob readings, the card count, the backends themselves, pools of host
+    /// threads, host function pointers). A new one fails here until a person
+    /// has read it and added it, per the rule.
+    const ONCE_CELLS: [(&str, &str); 35] = [
+        ("argue_fused.rs", "ON"),
+        ("blake3_whir.rs", "KERNELS"),
+        ("card_rows.rs", "BYTES"),
+        ("card_rows.rs", "COUNTERS"),
+        ("card_rows.rs", "FROM_ENV"),
+        ("card_rows.rs", "MODULE"),
+        ("columns.rs", "ON"),
+        ("device.rs", "BACKEND"),
+        ("device.rs", "CACHED"),
+        ("device.rs", "COUNT"),
+        ("device.rs", "EVICTOR"),
+        ("device.rs", "OPENINGS_POOL"),
+        ("device.rs", "SECOND_BACKEND"),
+        ("device.rs", "SETTING"),
+        ("device.rs", "WARNED"),
+        ("fill.rs", "FROM_ENV"),
+        ("fill.rs", "FROM_ENV"),
+        ("fill.rs", "MODULE"),
+        ("gkr.rs", "ON"),
+        ("gkr.rs", "ON"),
+        ("grinding.rs", "GRID"),
+        ("grinding.rs", "KNOBS"),
+        ("lde_cm.rs", "L2"),
+        ("lde_cm.rs", "TABLES"),
+        ("nvtx.rs", "API"),
+        ("nvtx.rs", "API"),
+        ("p1_stark.rs", "KERNELS"),
+        ("p1w16.rs", "MODULE"),
+        ("pinned.rs", "ARENAS_MADE"),
+        ("pinned.rs", "ONCE"),
+        ("pinned.rs", "POOL_GIB"),
+        ("stream_class.rs", "SETTING"),
+        ("whir.rs", "ENABLED"),
+        ("whir.rs", "INSTALLED"),
+        ("whir_coset.rs", "MODULE"),
+    ];
+
+    #[test]
+    fn every_once_cell_is_on_the_pinned_list() {
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (file, text) in sources() {
+            for (name, ty) in statics(&text) {
+                if names_a_word(&ty, "Once")
+                    || ty.contains("OnceLock<")
+                    || ty.contains("PerBackend<")
+                {
+                    found.push((file.clone(), name));
+                }
+            }
+        }
+        found.sort();
+        let mut pinned: Vec<(String, String)> = ONCE_CELLS
+            .iter()
+            .map(|&(f, n)| (f.to_string(), n.to_string()))
+            .collect();
+        pinned.sort();
+        assert_eq!(
+            found, pinned,
+            "the crate's process-wide Once / OnceLock / PerBackend cells changed: read the new \
+             one against the per-card rule, then pin it"
+        );
+    }
+}
