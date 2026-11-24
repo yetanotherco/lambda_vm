@@ -600,6 +600,8 @@ struct PassEnd {
     busy: f64,
     /// Of `busy`, the finish's state.
     state_secs: f64,
+    /// The finish's state's parts in record mode ([`StateSplit`]).
+    state_split: Option<StateSplit>,
     entries: usize,
     most_entries: usize,
     /// The bytes the windows touched: their cells handed to the finish less
@@ -626,6 +628,22 @@ pub struct ParallelWalk {
     pub state_bytes: usize,
     /// Walked from the executor's history ([`walk_windows_from_history`]).
     pub from_history: bool,
+    /// The walkers' timed parts, summed, under `LAMBDA_VM_WALK_TIMES`.
+    pub walk_times: Option<super::WalkTimes>,
+    /// The finish's state's parts, in record mode.
+    pub state_split: Option<StateSplit>,
+}
+
+/// The finish's state built in record mode ([`finish_state`]), by part in
+/// seconds: each shadow page's cells stamped at the last window's start, the
+/// image mapped as the state's base, the touched pages added to it, and
+/// their cells filled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StateSplit {
+    pub stamps: f64,
+    pub base: f64,
+    pub pages: f64,
+    pub fill: f64,
 }
 
 impl ParallelWalk {
@@ -645,7 +663,19 @@ impl ParallelWalk {
             " · record mode: from the executor's history"
         } else {
             ""
-        }
+        } + &self
+            .state_split
+            .map(|s| {
+                format!(
+                    " · the finish's state by part stamps {:.3}s base {:.3}s pages {:.3}s fill {:.3}s",
+                    s.stamps, s.base, s.pages, s.fill
+                )
+            })
+            .unwrap_or_default()
+            + &self
+                .walk_times
+                .map(|t| format!(" · {}", t.line()))
+                .unwrap_or_default()
     }
 }
 
@@ -759,7 +789,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;
-    let (end, walk_secs, held_most, state_bytes, counts) = {
+    let (end, walk_secs, walk_times, held_most, state_bytes, counts) = {
         let (mut accumulator, image) = builder.accumulator_and_image();
         let (job_tx, job_rx) = sync_channel::<Ticket>(walkers);
         let job_rx = Mutex::new(job_rx);
@@ -852,6 +882,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             // Each walker's window state as of its last window, and the most
             // they took at once.
             let (mut walk_secs, mut states, mut state_bytes) = (0.0, vec![0usize; walkers], 0);
+            // The walkers' timed parts, summed (`LAMBDA_VM_WALK_TIMES`).
+            let mut walk_times: Option<super::WalkTimes> = None;
             // The walked windows' boundary sums, added as they come.
             let mut boundaries = 0u64;
             // The first error from a walker or from absorbing; an absorbing
@@ -866,6 +898,9 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     }
                 };
                 walk_secs += busy;
+                if let Some(times) = walked.times() {
+                    walk_times.get_or_insert_default().add(times);
+                }
                 boundaries = boundaries.wrapping_add(boundary);
                 states[w] = bytes;
                 state_bytes = state_bytes.max(states.iter().sum());
@@ -954,7 +989,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 }
                 (None, Ok(end)) => {
                     check_boundaries(boundaries, end.boundaries)?;
-                    Ok((end, walk_secs, held_most, state_bytes, counts))
+                    Ok((end, walk_secs, walk_times, held_most, state_bytes, counts))
                 }
             }
         })?
@@ -967,6 +1002,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         windows,
         busy,
         state_secs,
+        state_split,
         entries,
         most_entries,
         boundaries: _,
@@ -988,6 +1024,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         held_most,
         state_bytes,
         from_history: record.is_some(),
+        walk_times,
+        state_split,
     })
 }
 
@@ -1100,6 +1138,7 @@ fn pass_thread<W: Into<ExecWindow>>(
         windows: k as usize,
         busy,
         state_secs,
+        state_split: None,
         entries,
         most_entries: most,
         boundaries,
@@ -1132,6 +1171,7 @@ fn record_thread<W: Into<ExecWindow>>(
     // The previous job's follow-up.
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut state_secs) = (0u32, 0usize, 0.0, 0.0);
+    let mut state_split = None;
     let no_memory = Arc::new(executor::vm::memory::Memory::default().snapshot());
     let mut sent = false;
     for window in windows {
@@ -1205,10 +1245,12 @@ fn record_thread<W: Into<ExecWindow>>(
             let end = end.ok_or_else(|| {
                 Error::Prover("record mode: the run's last window came without its end".into())
             })?;
-            let state = Arc::new(match base.take() {
+            let (state, split) = match base.take() {
                 Some(base) => finish_state_hoisted(&end, &history, image, base, lean)?,
                 None => finish_state(&end, &history, image, lean),
-            });
+            };
+            let state = Arc::new(state);
+            state_split = Some(split);
             if let Some(after) = waiting.take() {
                 let _ = after.send(After::Finish {
                     registers: registers.clone(),
@@ -1258,6 +1300,7 @@ fn record_thread<W: Into<ExecWindow>>(
         windows: k as usize,
         busy,
         state_secs,
+        state_split,
         entries: 0,
         most_entries: 0,
         boundaries: 0,
@@ -1330,9 +1373,16 @@ fn finish_state_hoisted(
     image: &PagedMem<u8>,
     base: MemoryState,
     lean: bool,
-) -> Result<MemoryState, Error> {
+) -> Result<(MemoryState, StateSplit), Error> {
     use rayon::prelude::*;
     const PAGE: usize = 1 << 16;
+    let mut split = StateSplit::default();
+    let mut at = Instant::now();
+    let mut lap = |part: &mut f64| {
+        let now = Instant::now();
+        *part = (now - at).as_secs_f64();
+        at = now;
+    };
     if base.overlay.is_some()
         || !base.cells.page_bases().eq(image.page_bases())
         || base.cells.len() != image.len()
@@ -1382,6 +1432,7 @@ fn finish_state_hoisted(
         })
         .collect();
     pages.sort_unstable_by_key(|page| page.base);
+    lap(&mut split.stamps);
     let MemoryState { cells, .. } = base;
     let mut memory = MemoryState {
         cells,
@@ -1405,7 +1456,8 @@ fn finish_state_hoisted(
             page.for_each_stamped(|off, value, ts| state.set(at + off, (value, ts)));
         }
     });
-    Ok(memory)
+    lap(&mut split.fill);
+    Ok((memory, split))
 }
 
 #[cfg(test)]
@@ -1531,10 +1583,17 @@ fn finish_state(
     last: &WindowHistory,
     image: &PagedMem<u8>,
     lean: bool,
-) -> MemoryState {
+) -> (MemoryState, StateSplit) {
     use crate::paged_mem::PageMut;
     use rayon::prelude::*;
     const PAGE: usize = 1 << 16;
+    let mut split = StateSplit::default();
+    let mut at = Instant::now();
+    let mut lap = |part: &mut f64| {
+        let now = Instant::now();
+        *part = (now - at).as_secs_f64();
+        at = now;
+    };
     // The window's first cells, by 64 KiB page.
     let mut undo: BTreeMap<u64, Vec<(usize, u8, u64)>> = BTreeMap::new();
     for (address, value, ts) in last.first_touches() {
@@ -1562,13 +1621,16 @@ fn finish_state(
         })
         .collect();
     pages.sort_unstable_by_key(|(base, _, _)| *base);
+    lap(&mut split.stamps);
     let mut memory = MemoryState::from_pages(image);
     memory.lean = lean;
+    lap(&mut split.base);
     for (base, _, _) in &pages {
         memory
             .cells
             .page_index_or_insert(PagedMem::<(u8, u64)>::page_of(*base).0);
     }
+    lap(&mut split.pages);
     let fill = |mut state: PageMut<'_, (u8, u64)>| {
         let from = pages.partition_point(|(base, _, _)| *base < state.base());
         let to = from
@@ -1585,7 +1647,8 @@ fn finish_state(
     };
     let state_pages: Vec<_> = memory.cells.pages_mut().collect();
     state_pages.into_par_iter().for_each(fill);
-    memory
+    lap(&mut split.fill);
+    (memory, split)
 }
 
 #[cfg(test)]
@@ -1594,3 +1657,61 @@ mod history_tests;
 mod register_rows_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod walkers_line_tests {
+    use super::{ParallelWalk, StateSplit};
+    use crate::tables::trace_builder::windowed::WalkTimes;
+
+    fn walk(walk_times: Option<WalkTimes>, state_split: Option<StateSplit>) -> ParallelWalk {
+        ParallelWalk {
+            last: Vec::new(),
+            walkers: 4,
+            windows: 233,
+            pass_secs: 0.24,
+            finish_state_secs: 0.25,
+            walk_secs: 17.1,
+            entries: 0,
+            most_entries: 0,
+            held_most: 6,
+            state_bytes: 0,
+            from_history: true,
+            walk_times,
+            state_split,
+        }
+    }
+
+    /// Untimed, the line is today's; the finish's state's parts and the
+    /// walk's timed parts follow it, in that order, each once.
+    #[test]
+    fn the_walkers_line_ends_as_today_and_takes_the_parts_after_it() {
+        let today = walk(None, None).line();
+        assert!(
+            today.ends_with(
+                "the finish's state built in 0.25s · record mode: from the executor's history"
+            ),
+            "{today}"
+        );
+        let split = StateSplit {
+            stamps: 0.04,
+            base: 0.035,
+            pages: 0.1,
+            fill: 0.07,
+        };
+        let times = WalkTimes {
+            prescan: 0.8,
+            lists: 0.1,
+            collect: 2.0,
+            walk: 9.0,
+            count: 1.5,
+            route: 2.5,
+        };
+        let line = walk(Some(times), Some(split)).line();
+        assert!(line.starts_with(&today), "{line}");
+        assert_eq!(
+            &line[today.len()..],
+            " · the finish's state by part stamps 0.040s base 0.035s pages 0.100s fill 0.070s \
+             · walk times (summed) prescan 0.80s lists 0.10s collect 2.00s walk 9.00s count 1.50s route 2.50s"
+        );
+    }
+}

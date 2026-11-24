@@ -9584,10 +9584,11 @@ fn prove_streamed(
                 }
                 let setup = builder.setup_stamps();
                 eprintln!(
-                    "BLOCK BUILDER: ready at {:.2}s · image and memory state {:.2}s · decode table {:.2}s · DECODE's trace generated on a thread of its own",
+                    "BLOCK BUILDER: ready at {:.2}s · image and memory state {:.2}s · decode table {:.2}s · DECODE's trace generated on a thread of its own · of the image's, the memory state mapped in {:.3}s",
                     start.elapsed().as_secs_f64(),
                     setup.image,
                     setup.decode,
+                    setup.state,
                 );
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
