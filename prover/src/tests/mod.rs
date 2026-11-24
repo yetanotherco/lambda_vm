@@ -170,6 +170,9 @@ pub mod transcript_counts;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
 pub mod two_card_openings_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod two_card_split_tests;
 pub mod windowed_builder_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
