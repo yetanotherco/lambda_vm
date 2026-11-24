@@ -1976,6 +1976,20 @@ fn openings_backend() -> Result<&'static Backend> {
     }
 }
 
+/// The openings' own rayon pool, once made ([`on_openings_card`]); `None`
+/// inside when it could not be built.
+static OPENINGS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+/// Whether the openings' device work really runs on a backend of their own:
+/// the two-card openings on, their backend started (not fallen back to card
+/// 0's) and their pool built. A counter of groups opened there reads it after
+/// the openings ran, so a fallback to card 0 is not counted.
+pub fn openings_on_own_backend() -> bool {
+    two_card_openings()
+        && OPENINGS_BACKEND.get().is_some()
+        && OPENINGS_POOL.get().is_some_and(Option::is_some)
+}
+
 /// Runs `f` as the openings' device work. Without the two-card openings (or
 /// without a pool for them) it is `f()` on this thread, as before. With them, `f` runs under
 /// [`DeviceRole::Openings`] inside a rayon pool of its own whose workers are
@@ -1985,8 +1999,7 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if !two_card_openings() {
         return f();
     }
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| {
+    let pool = OPENINGS_POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(rayon::current_num_threads().max(1))
             .thread_name(|i| format!("openings-card-{i}"))
