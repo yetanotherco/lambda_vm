@@ -2506,19 +2506,60 @@ const MAX_WALKERS: usize = 8;
 /// whose memory was measured on the largest blocks.
 const DEFAULT_WALKERS: usize = 4;
 
-/// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty walks the run's windows on
-/// [`DEFAULT_WALKERS`] threads, each window from the bytes it touches as they
-/// stood before it ([`parallel::walk_windows`]); `1` to [`MAX_WALKERS`] on
-/// that many; `0` on one thread, the walk before the walkers (the rollback).
-/// The tables and their order are the same. Anything else refuses the prove.
-fn block_walkers() -> Result<usize, Error> {
-    parse_walkers(std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref())
+/// The hardware threads from which [`walkers_for_threads`] takes a fifth
+/// walker.
+const FIFTH_WALKER_THREADS: usize = 24;
+
+/// The walkers `LAMBDA_VM_BLOCK_WALKERS=auto` takes on a process that sees
+/// `threads` hardware threads: five from [`FIFTH_WALKER_THREADS`] on, else
+/// [`DEFAULT_WALKERS`]. Beside a fifth walker the executor paces the windows
+/// on a large box; below, the walkers would take the threads the rest of the
+/// build needs.
+fn walkers_for_threads(threads: usize) -> usize {
+    if threads >= FIFTH_WALKER_THREADS {
+        5
+    } else {
+        DEFAULT_WALKERS
+    }
 }
 
-/// [`block_walkers`] of the knob's value.
+/// The hardware threads this process sees (a container's quota honoured),
+/// one when unknown.
+fn hardware_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty walks the run's windows on
+/// [`DEFAULT_WALKERS`] threads, each window from the bytes it touches as they
+/// stood before it ([`parallel::walk_windows`]); `auto` on as many as
+/// [`walkers_for_threads`] gives the process; `1` to [`MAX_WALKERS`] on that
+/// many; `0` on one thread, the walk before the walkers (the rollback). The
+/// tables and their order are the same. Anything else refuses the prove.
+fn block_walkers() -> Result<usize, Error> {
+    let value = std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok();
+    let threads = hardware_threads();
+    let walkers = parse_walkers_on(value.as_deref(), threads)?;
+    if value.as_deref().map(str::trim) == Some("auto") {
+        eprintln!(
+            "★ BLOCK WALKERS RULE: auto: {walkers} walkers on {threads} hardware threads \
+             (5 from {FIFTH_WALKER_THREADS} on, else {DEFAULT_WALKERS}) (LAMBDA_VM_BLOCK_WALKERS)"
+        );
+    }
+    Ok(walkers)
+}
+
+/// [`block_walkers`] of the knob's value, on this process's threads.
+#[cfg(test)]
 fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
+    parse_walkers_on(value, hardware_threads())
+}
+
+/// [`block_walkers`] of the knob's value on a process that sees `threads`
+/// hardware threads.
+fn parse_walkers_on(value: Option<&str>, threads: usize) -> Result<usize, Error> {
     match value.map(str::trim) {
         None | Some("") => Ok(DEFAULT_WALKERS),
+        Some("auto") => Ok(walkers_for_threads(threads)),
         Some("0") => Ok(0),
         Some(v) => v
             .parse::<usize>()
@@ -2526,7 +2567,8 @@ fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
             .filter(|n| (1..=MAX_WALKERS).contains(n))
             .ok_or_else(|| {
                 Error::Prover(format!(
-                    "LAMBDA_VM_BLOCK_WALKERS={v}: 0 (one walker), or 1 to {MAX_WALKERS} walkers"
+                    "LAMBDA_VM_BLOCK_WALKERS={v}: 0 (one walker), 1 to {MAX_WALKERS} walkers, or \
+                     auto (by the hardware threads)"
                 ))
             }),
     }
@@ -13882,7 +13924,10 @@ mod packer_tests {
 
 #[cfg(test)]
 mod walkers_knob_tests {
-    use super::{CardFill, Error, parse_card_fill, parse_walkers, records_admission};
+    use super::{
+        CardFill, DEFAULT_WALKERS, Error, MAX_WALKERS, hardware_threads, parse_card_fill,
+        parse_walkers, parse_walkers_on, records_admission, walkers_for_threads,
+    };
 
     /// Streamed chunks are held as records only with live regeneration to drop
     /// them, or kept on purpose: never with a store or with regeneration off
@@ -13932,9 +13977,35 @@ mod walkers_knob_tests {
         ] {
             assert_eq!(parse_walkers(value).ok(), Some(walkers), "{value:?}");
         }
-        for value in ["9", "16", "17", "-1", "auto", "4x", "1.5"] {
+        for value in ["9", "16", "17", "-1", "Auto", "4x", "1.5"] {
             assert!(parse_walkers(Some(value)).is_err(), "{value}");
         }
+    }
+
+    /// `LAMBDA_VM_BLOCK_WALKERS=auto`: five walkers from 24 hardware threads
+    /// on, four below; unset stays four on any box, and a count overrides the
+    /// rule.
+    #[test]
+    fn the_walkers_rule_takes_5_from_24_threads_and_4_below() {
+        for (threads, walkers) in [(1, 4), (8, 4), (16, 4), (23, 4), (24, 5), (32, 5), (256, 5)] {
+            assert_eq!(
+                parse_walkers_on(Some("auto"), threads).ok(),
+                Some(walkers),
+                "auto on {threads}"
+            );
+            assert_eq!(
+                parse_walkers_on(Some(" auto "), threads).ok(),
+                Some(walkers),
+                "auto on {threads}, padded"
+            );
+            assert_eq!(
+                parse_walkers_on(None, threads).ok(),
+                Some(DEFAULT_WALKERS),
+                "unset on {threads}"
+            );
+            assert_eq!(parse_walkers_on(Some("6"), threads).ok(), Some(6));
+        }
+        assert!(walkers_for_threads(hardware_threads()) <= MAX_WALKERS);
     }
 
     /// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` has the card fill every family, `off`
