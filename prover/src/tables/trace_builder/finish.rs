@@ -1163,9 +1163,15 @@ impl<'a> FinishPlan<'a> {
         // computed once, here, from the image's whole pages, and both its
         // readers below take it: the same configs as computing it twice.
         let hoisted_pages: Option<Arc<Vec<PageConfig>>> = match initial_image {
-            Some(image) if skip.host_hoist.pages && !l2g_memory_bookend => Some(Arc::new(
-                super::page_configs_hoisted(image, memory_state, private_input),
-            )),
+            Some(image) if skip.host_hoist.pages && !l2g_memory_bookend => {
+                let layout_t = std::time::Instant::now();
+                let configs = super::page_configs_hoisted(image, memory_state, private_input);
+                build_stamps::mark(&format!(
+                    "p3 pages hoisted took {:.3}s",
+                    layout_t.elapsed().as_secs_f64()
+                ));
+                Some(Arc::new(configs))
+            }
             _ => None,
         };
         // PAGE's lookups, from the initial image (a continuation epoch's L2G
@@ -1186,11 +1192,17 @@ impl<'a> FinishPlan<'a> {
                     });
                 }
                 if words {
+                    // The first page layout, timed on the build marks.
+                    let layout_t = std::time::Instant::now();
                     let private: Vec<PageConfig> =
                         page_configs_of(image, memory_state, private_input)
                             .into_iter()
                             .filter(|config| config.is_private_input)
                             .collect();
+                    build_stamps::mark(&format!(
+                        "p3 pages call 1 took {:.3}s",
+                        layout_t.elapsed().as_secs_f64()
+                    ));
                     return Box::new(move |h: &mut bitwise::BitwiseHistogram| {
                         for config in &private {
                             for op in super::super::page_w::bitwise_ops(config) {
@@ -1283,6 +1295,9 @@ impl<'a> FinishPlan<'a> {
 
         // The PAGE layout: none in a continuation epoch (the L2G table owns every
         // touched cell's Memory init/fini there) or without an image.
+        // The second page layout, timed on the build marks (the hoisted
+        // layout's move or copy when `pages` is on).
+        let layout_t = std::time::Instant::now();
         let page_configs = match (hoisted_pages, initial_image) {
             // The hoisted layout: moved out if BITWISE's count no longer
             // holds it, else copied.
@@ -1292,6 +1307,10 @@ impl<'a> FinishPlan<'a> {
             }
             _ => Vec::new(),
         };
+        build_stamps::mark(&format!(
+            "p4 pages call 2 took {:.3}s",
+            layout_t.elapsed().as_secs_f64()
+        ));
         // The page tables the plan builds: refused here if the rule refuses
         // the pages.
         super::super::page_w::page_tables(&page_configs, skip.page_run_log2)
