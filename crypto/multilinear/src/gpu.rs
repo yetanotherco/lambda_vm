@@ -1368,6 +1368,19 @@ pub fn two_card_openings() -> bool {
     false
 }
 
+/// Whether phase B's openings really ran on a backend of their own, not
+/// fallen back to card 0's ([`math_cuda::device::openings_on_own_backend`]);
+/// `false` without a device build.
+#[cfg(feature = "cuda")]
+pub fn openings_on_own_backend() -> bool {
+    math_cuda::device::openings_on_own_backend()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn openings_on_own_backend() -> bool {
+    false
+}
+
 /// Runs `f` as phase B's openings' device work: on the openings' card, its
 /// parallel iterators too, under the two-card openings; `f()` here otherwise
 /// ([`math_cuda::device::on_openings_card`]).

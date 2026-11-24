@@ -5082,9 +5082,11 @@ where
     // through pinned staging; this thread, the argument's, does not.
     let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let mut prev: Option<Argued<F, E, T>> = None;
-    // Under the two-card openings: the groups opened on the openings' card,
-    // and those kept on card 0 (a held prepared stack).
+    // Under the two-card openings: the groups opened on the openings' card
+    // (counted after their openings ran there, a fallback to card 0 not), and
+    // those kept on card 0 (a held prepared stack).
     let mut two_card = (0usize, 0usize);
+    let opened_on_own = std::sync::atomic::AtomicUsize::new(0);
     let mut latched = false;
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
@@ -5183,8 +5185,6 @@ where
                 earlier.store_promise = None;
                 earlier.upload_once = false;
                 earlier.overlap_resident = false;
-                two_card.0 += 1;
-                TWO_CARD_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
             Some(_) if multilinear::gpu::two_card_openings() => {
@@ -5231,6 +5231,7 @@ where
             .map(|next| &all[starts[next]..starts[next] + sizes[next]]);
         let roots_ref = &roots;
         let answers_ref = &answers;
+        let opened_on_own_ref = &opened_on_own;
         let (argue_result, argue_end, next_store, joined, opened, open_paid) =
             std::thread::scope(|scope| {
                 let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
@@ -5249,11 +5250,17 @@ where
                         }
                         let fails = overlap_faults.open_fails == Some(earlier.place);
                         let (opened, stacked) = if prev_on_own_card {
-                            multilinear::gpu::on_openings_card(|| {
+                            let opened = multilinear::gpu::on_openings_card(|| {
                                 open_group::<F, E, T, H>(
                                     earlier, its_tables, prepared, deviations, config, false, fails,
                                 )
-                            })
+                            });
+                            if opened.is_ok() && multilinear::gpu::openings_on_own_backend() {
+                                opened_on_own_ref
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                TWO_CARD_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            opened
                         } else {
                             open_group::<F, E, T, H>(
                                 earlier, its_tables, prepared, deviations, config, false, fails,
@@ -5678,6 +5685,7 @@ where
     if sched && let (Some((then, h)), Some(now)) = (turn_sched, thread_schedstat()) {
         stamps[h].sched_b = Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
     }
+    two_card.0 = opened_on_own.into_inner();
     if multilinear::gpu::two_card_openings() {
         eprintln!(
             "BLOCK TWO-CARD OPENINGS: on (LAMBDA_VM_TWO_CARD_OPENINGS) · {} of {n} groups opened on the \
