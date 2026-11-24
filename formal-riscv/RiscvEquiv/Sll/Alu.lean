@@ -24,7 +24,7 @@ This theorem proves that, in the Clean model, an ALU message (`Alu.Msg`) with th
 theorem sll_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (hflags : m.flags.val = opselSHIFT)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
-    (hb : dword m.in2Lo m.in2Hi = b.toNat) :
+    (hb : dword m.in2Lo m.in2Hi % 64 = b.toNat % 64) :
     dword m.outLo m.outHi = (sllPure a b).toNat := by
   rw [sllPure_toNat]
   exact shift_alu m hg 0 0 (by norm_num) (by norm_num) (by simpa using hflags)

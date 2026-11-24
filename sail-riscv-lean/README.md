@@ -5,7 +5,8 @@ by the Lean backend of the Sail compiler ([rems-project/sail](https://github.com
 `formal-riscv` uses it to state what each RISC-V instruction does.
 
 Nothing here is written by hand. `LeanRV64D/`, `LeanRV64D.lean`, `lakefile.toml` and `lean-toolchain`
-are exactly what the Sail compiler outputs for the commits in [`PINS`](PINS). CI
+are exactly what the Sail compiler outputs for the commits in [`PINS`](PINS), and `LICENCE` is
+sail-riscv's (BSD-2-Clause), which covers the generated model. CI
 (`.github/workflows/sail-riscv-lean.yml`) checks it: it regenerates the model from those commits and
 fails if the result differs from what is committed.
 

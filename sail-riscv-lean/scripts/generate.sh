@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=../PINS
 source "$ROOT/PINS"
-WORK="${WORK:-$ROOT/_work}"
+WORK="${SAIL_RISCV_LEAN_WORK:-$ROOT/_work}"
 SWITCH="${OPAM_SWITCH:-sail-riscv-lean}"
 
 # 1. The Sail compiler at SAIL_COMMIT.
@@ -34,6 +34,8 @@ OUT="$WORK/sail-riscv/build/model/Lean_RV64D"
 rm -rf "$ROOT/LeanRV64D"
 cp -R "$OUT/LeanRV64D" "$ROOT/LeanRV64D"
 cp "$OUT/LeanRV64D.lean" "$OUT/lakefile.toml" "$OUT/lean-toolchain" "$ROOT/"
+# The model is BSD-2-Clause: its licence travels with it.
+cp "$WORK/sail-riscv/LICENCE" "$ROOT/LICENCE"
 
 echo "Generated from sail $SAIL_COMMIT and sail-riscv $SAIL_RISCV_COMMIT."
-echo "Run 'lake update' to refresh lake-manifest.json, then 'lake build'."
+echo "Next: step 3 of README.md (lake update here and in formal-riscv, then build formal-riscv)."
