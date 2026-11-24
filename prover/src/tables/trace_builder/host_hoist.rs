@@ -5,6 +5,9 @@
 //! - `pages`: the finish computes the page layout once, each initial page
 //!   copied whole from the image's pages instead of rebuilt a byte at a time
 //!   through a map, and reuses it for BITWISE's page lookups and the plan.
+//! - `image`: the builder writes the initial image a run of bytes at a time
+//!   (a copy a page) instead of a byte at a time, and maps the walk's memory
+//!   state from it on the pool, a page a job, so the walk starts sooner.
 
 use crate::Error;
 
@@ -14,24 +17,30 @@ use crate::Error;
 pub struct HostHoist {
     /// The page layout computed once, from the image's pages.
     pub pages: bool,
+    /// The builder's image written a run at a time, its memory state mapped
+    /// on the pool.
+    pub image: bool,
 }
 
 impl HostHoist {
     /// The knob's words.
-    pub(crate) const WORDS: &'static str = "pages";
+    pub(crate) const WORDS: &'static str = "pages, image";
 
     /// Every part on.
     pub fn all() -> Self {
-        Self { pages: true }
+        Self {
+            pages: true,
+            image: true,
+        }
     }
 
     /// Whether any part is on.
     pub fn any(self) -> bool {
-        self.pages
+        self.pages || self.image
     }
 
     /// The knob's reading: unset or empty, no part; else a comma-separated
-    /// list of parts (`pages`). A word it does not take refuses the prove.
+    /// list of parts (`pages`, `image`). A word it does not take refuses the prove.
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, Error> {
         let mut hoist = Self::default();
         let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
@@ -40,6 +49,7 @@ impl HostHoist {
         for word in value.split(',').map(str::trim) {
             match word {
                 "pages" => hoist.pages = true,
+                "image" => hoist.image = true,
                 _ => {
                     return Err(Error::Prover(format!(
                         "LAMBDA_VM_HOST_HOIST={value}: a comma-separated list of {} (unset: \
@@ -59,7 +69,7 @@ impl HostHoist {
 
     /// The parts on, as the knob names them, or `none`.
     pub fn describe(self) -> String {
-        let parts: Vec<&str> = [(self.pages, "pages")]
+        let parts: Vec<&str> = [(self.pages, "pages"), (self.image, "image")]
             .into_iter()
             .filter_map(|(on, word)| on.then_some(word))
             .collect();
@@ -71,8 +81,8 @@ impl HostHoist {
     }
 }
 
-/// How often this thread computed the page layout each way: a test's read of
-/// which path a build took.
+/// How often this thread computed the page layout each way, and wrote the
+/// image a run at a time: a test's read of which path a build took.
 #[cfg(test)]
 pub(crate) mod calls {
     use std::cell::Cell;
@@ -80,6 +90,17 @@ pub(crate) mod calls {
     thread_local! {
         static BY_BYTE: Cell<usize> = const { Cell::new(0) };
         static HOISTED: Cell<usize> = const { Cell::new(0) };
+        static RUNS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The image written a run at a time (`build_initial_image_by_runs`).
+    pub(crate) fn note_runs() {
+        RUNS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// The images written a run at a time since the last take; reset.
+    pub(crate) fn take_runs() -> usize {
+        RUNS.with(|n| n.replace(0))
     }
 
     /// The layout computed a byte at a time (`page_configs_of`).
@@ -117,10 +138,27 @@ mod tests {
     #[test]
     fn each_word_sets_its_part_alone() {
         let pages = HostHoist::parse(Some("pages")).unwrap();
-        assert_eq!(pages, HostHoist { pages: true });
+        assert_eq!(
+            pages,
+            HostHoist {
+                pages: true,
+                ..HostHoist::default()
+            }
+        );
         assert_eq!(pages.describe(), "pages");
         assert_eq!(HostHoist::parse(Some(" pages , pages ")).unwrap(), pages);
-        assert_eq!(HostHoist::all(), pages);
+        let image = HostHoist::parse(Some("image")).unwrap();
+        assert_eq!(
+            image,
+            HostHoist {
+                image: true,
+                ..HostHoist::default()
+            }
+        );
+        assert_eq!(image.describe(), "image");
+        let both = HostHoist::parse(Some("image,pages")).unwrap();
+        assert_eq!(both, HostHoist::all());
+        assert_eq!(both.describe(), "pages,image");
     }
 
     #[test]

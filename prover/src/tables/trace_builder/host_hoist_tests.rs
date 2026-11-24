@@ -1,9 +1,11 @@
 //! `LAMBDA_VM_HOST_HOIST` builds the tables it builds without it: the page
 //! layout computed once from the image's whole pages is the layout computed
 //! a byte at a time, page for page, on real runs with and without a private
-//! input, and a streamed finish with it on hands on the same header and the
+//! input; the image written a run at a time is the image written a byte at a
+//! time, and its memory state mapped on the pool the state mapped in turn;
+//! and a streamed finish with each part on hands on the same header and the
 //! same tables, word for word, under the word and the byte memory formats.
-//! With the knob off nothing takes the new path.
+//! With the knob off nothing takes a new path.
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
@@ -147,7 +149,7 @@ fn configs() -> Vec<(&'static str, Configure)> {
 /// The run's streamed finish under `configure` with `hoist`: the header's
 /// page configs, counts and public output, and every table handed on as
 /// (position, shape and words); and how often the layout was computed each
-/// way.
+/// way and the image written a run at a time.
 #[allow(clippy::type_complexity)]
 fn streamed(
     program: &Elf,
@@ -158,14 +160,14 @@ fn streamed(
 ) -> (
     (Vec<(u64, Option<Vec<u8>>, bool)>, String, Vec<u8>),
     Vec<(usize, Option<(usize, usize, Vec<u64>)>)>,
-    (usize, usize),
+    (usize, usize, usize),
 ) {
     let max_rows = MaxRowsConfig::small();
+    let _ = super::host_hoist::calls::take_runs();
     let builder = configure(
-        WindowedTraceBuilder::new(program, input, &max_rows)
-            .expect("the builder")
-            .host_hoist(hoist),
+        WindowedTraceBuilder::new_with(program, input, &max_rows, hoist).expect("the builder"),
     );
+    let runs = super::host_hoist::calls::take_runs();
     assert_eq!(builder.streamed().host_hoist, hoist);
     let window = 64;
     let body = logs.len() - 1;
@@ -195,7 +197,8 @@ fn streamed(
             }))
         })
         .expect("the streamed finish");
-    let calls = super::host_hoist::calls::take();
+    let (by_byte, hoisted) = super::host_hoist::calls::take();
+    let calls = (by_byte, hoisted, runs);
     let header = header.expect("the header came first");
     (
         (
@@ -208,13 +211,19 @@ fn streamed(
     )
 }
 
-/// ★ A streamed finish with the page layout hoisted hands on the header and
-/// the tables it hands on without, word for word, under every configuration
-/// and input; it computes the layout once from whole pages, and with the
-/// knob off it computes it a byte at a time as before, never from pages.
+/// ★ A streamed finish with each hoisted part on, alone and together, hands
+/// on the header and the tables it hands on with none, word for word, under
+/// every configuration and input. Under `pages` it computes the layout once
+/// from whole pages, and without it a byte at a time as before, never from
+/// pages; under `image` the builder writes its image a run at a time, and
+/// without it never.
 #[test]
-fn the_hoisted_pages_stream_the_same_tables() {
-    let on = HostHoist { pages: true };
+fn the_hoisted_parts_stream_the_same_tables() {
+    let parts = [
+        ("pages", HostHoist::parse(Some("pages")).expect("a part")),
+        ("image", HostHoist::parse(Some("image")).expect("a part")),
+        ("all", HostHoist::all()),
+    ];
     for name in PROGRAMS {
         for input in inputs() {
             let (program, logs) = run_on(name, &input);
@@ -222,33 +231,129 @@ fn the_hoisted_pages_stream_the_same_tables() {
                 let what = format!("{name}, {} input bytes, {config}", input.len());
                 let (header_off, tables_off, calls_off) =
                     streamed(&program, &logs, &input, &configure, HostHoist::default());
-                let (header_on, tables_on, calls_on) =
-                    streamed(&program, &logs, &input, &configure, on);
-                assert_eq!(header_on, header_off, "{what}: the header");
-                assert_eq!(tables_on.len(), tables_off.len(), "{what}: the tables");
-                for (k, (a, b)) in tables_on.iter().zip(&tables_off).enumerate() {
-                    assert_eq!(a, b, "{what}: table {k}");
-                }
-                assert!(
-                    tables_on.iter().filter(|(_, t)| t.is_some()).count() > 10,
-                    "{what}: tables built"
-                );
-                assert_eq!(calls_on, (0, 1), "{what}: hoisted once, never by byte");
                 assert_eq!(calls_off.1, 0, "{what}: off never hoists");
                 assert!(calls_off.0 >= 1, "{what}: off computes it by byte");
+                assert_eq!(calls_off.2, 0, "{what}: off writes no run");
+                assert!(
+                    tables_off.iter().filter(|(_, t)| t.is_some()).count() > 10,
+                    "{what}: tables built"
+                );
+                for (part, hoist) in parts {
+                    let what = format!("{what}, {part}");
+                    let (header_on, tables_on, calls_on) =
+                        streamed(&program, &logs, &input, &configure, hoist);
+                    assert_eq!(header_on, header_off, "{what}: the header");
+                    assert_eq!(tables_on.len(), tables_off.len(), "{what}: the tables");
+                    for (k, (a, b)) in tables_on.iter().zip(&tables_off).enumerate() {
+                        assert_eq!(a, b, "{what}: table {k}");
+                    }
+                    if hoist.pages {
+                        assert_eq!(
+                            (calls_on.0, calls_on.1),
+                            (0, 1),
+                            "{what}: hoisted once, never by byte"
+                        );
+                    } else {
+                        assert_eq!(calls_on.1, 0, "{what}: never hoisted");
+                    }
+                    assert_eq!(calls_on.2, usize::from(hoist.image), "{what}: runs");
+                }
             }
         }
     }
 }
 
+/// Equal stores: the same pages, each page's offsets, and the same `set`
+/// cells.
+fn same_store<T: Copy + PartialEq + std::fmt::Debug>(
+    what: &str,
+    a: &crate::paged_mem::PagedMem<T>,
+    b: &crate::paged_mem::PagedMem<T>,
+) {
+    let bases: Vec<u64> = a.page_bases().collect();
+    assert_eq!(bases, b.page_bases().collect::<Vec<_>>(), "{what}: pages");
+    for base in bases {
+        assert!(
+            a.page_data(base) == b.page_data(base),
+            "{what}: page {base:#x}"
+        );
+    }
+    assert!(a.iter().eq(b.iter()), "{what}: the set cells");
+}
+
+/// The image written a run at a time is the image written a byte at a time,
+/// and the memory state mapped on the pool is the state mapped page by page:
+/// on real programs with inputs that end inside a page, at a page's end and
+/// past it, and on hand-made segments that overlap (the later wins), cross
+/// a page end and wrap the address space.
+#[test]
+fn the_image_by_runs_is_the_image() {
+    let page = page::DEFAULT_PAGE_SIZE as u64;
+    let start_offset = page::offset_in_page(executor::vm::memory::PRIVATE_INPUT_START_INDEX);
+    let mut programs: Vec<Elf> = Vec::new();
+    let mut cases: Vec<(String, usize, Vec<u8>)> = Vec::new();
+    for name in [
+        "fused_mem_cases",
+        "test_keccak256",
+        "page_runs",
+        "all_instructions_64",
+    ] {
+        programs.push(Elf::load(&asm_elf_bytes(name)).expect("the ELF loads"));
+        let mut all = inputs();
+        // The length word and the bytes end exactly at a page's end.
+        all.push(vec![9u8; page::DEFAULT_PAGE_SIZE - start_offset - 4]);
+        for input in all {
+            let what = format!("{name}, {} bytes", input.len());
+            cases.push((what, programs.len() - 1, input));
+        }
+    }
+    let segment = |base_addr: u64, words: std::ops::Range<u32>| executor::elf::Segment {
+        base_addr,
+        values: words
+            .map(|w| w.wrapping_mul(0x0101_0101) ^ 0xa5a5_0000)
+            .collect(),
+        is_executable: false,
+    };
+    programs.push(Elf {
+        entry_point: 0x1000,
+        data: vec![
+            segment(0x1000, 0..10),
+            segment(0x1008, 100..103),
+            segment(page - 6, 7..12),
+            segment(5 * page, 0..(2 * page as u32 / 4 + 3)),
+            segment(u64::MAX - 5, 20..23),
+        ],
+    });
+    cases.push(("hand-made".into(), programs.len() - 1, Vec::new()));
+    cases.push((
+        "hand-made, input".into(),
+        programs.len() - 1,
+        (0..50u8).collect(),
+    ));
+    for (what, k, input) in cases {
+        let program = &programs[k];
+        let bytes = build_initial_image_paged(program, &input);
+        let runs = build_initial_image_by_runs(program, &input);
+        same_store(&what, &runs, &bytes);
+        assert!(!bytes.is_empty(), "{what}: an image");
+        same_store(
+            &format!("{what}: the state"),
+            &MemoryState::from_pages_on_pool(&runs).cells,
+            &MemoryState::from_pages(&bytes).cells,
+        );
+    }
+}
+
 /// With the knob unset no part is on: a builder's default and the stream's
-/// default hoist nothing.
+/// default hoist nothing, and `new` writes its image a byte at a time.
 #[test]
 fn the_knob_off_hoists_nothing() {
     assert_eq!(StreamSkip::default().host_hoist, HostHoist::default());
     assert_eq!(HostHoist::parse(None).expect("unset"), HostHoist::default());
     let program = Elf::load(&asm_elf_bytes("fused_mem_cases")).expect("the ELF loads");
+    let _ = super::host_hoist::calls::take_runs();
     let builder =
         WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small()).expect("the builder");
     assert_eq!(builder.streamed().host_hoist, HostHoist::default());
+    assert_eq!(super::host_hoist::calls::take_runs(), 0);
 }

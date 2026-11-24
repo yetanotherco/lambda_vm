@@ -1303,6 +1303,23 @@ impl MemoryState {
         }
     }
 
+    /// [`Self::from_pages`] with the pages mapped on the pool, a page a job
+    /// (`LAMBDA_VM_HOST_HOIST=image`): the same state. Without the
+    /// `parallel` feature, [`Self::from_pages`].
+    fn from_pages_on_pool(image: &PagedMem<u8>) -> Self {
+        #[cfg(feature = "parallel")]
+        let cells = image.par_map((0, 0), |value| (value, 0));
+        #[cfg(not(feature = "parallel"))]
+        let cells = image.map((0, 0), |value| (value, 0));
+        Self {
+            cells,
+            lean: false,
+            hot: NO_PAGE,
+            missing: AtomicBool::new(false),
+            overlay: None,
+        }
+    }
+
     /// The bytes its pages take on the heap.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.cells.heap_bytes()
@@ -6458,6 +6475,33 @@ pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> Page
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             image.set(PRIVATE_INPUT_START_INDEX + i as u64, b);
         }
+    }
+    image
+}
+
+/// [`build_initial_image_paged`] written a run at a time
+/// ([`PagedMem::set_slice`]): each segment's words as one run of bytes, then
+/// the private input's length and bytes, in that order, so a later write wins
+/// as there. The same image (`LAMBDA_VM_HOST_HOIST=image`).
+pub(crate) fn build_initial_image_by_runs(elf: &Elf, private_input: &[u8]) -> PagedMem<u8> {
+    #[cfg(test)]
+    host_hoist::calls::note_runs();
+    let mut image = PagedMem::new(0u8);
+    let mut bytes = Vec::new();
+    for segment in &elf.data {
+        bytes.clear();
+        bytes.extend(segment.values.iter().flat_map(|word| word.to_le_bytes()));
+        image.set_slice(segment.base_addr, &bytes);
+    }
+    if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        // `private_input_bytes`: the length, then the bytes.
+        let len_bytes = (private_input.len() as u32).to_le_bytes();
+        image.set_slice(PRIVATE_INPUT_START_INDEX, &len_bytes);
+        image.set_slice(
+            PRIVATE_INPUT_START_INDEX + len_bytes.len() as u64,
+            private_input,
+        );
     }
     image
 }
