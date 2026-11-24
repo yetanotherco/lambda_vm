@@ -1102,8 +1102,7 @@ pub static FAULT_CPU_SWAP: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 
 #[cfg(feature = "test-faults")]
 fn fault_cpu_swap() -> Option<(usize, usize)> {
-    static FROM_ENV: std::sync::OnceLock<Option<(usize, usize)>> =
-        std::sync::OnceLock::new();
+    static FROM_ENV: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
     let from_env = *FROM_ENV.get_or_init(|| {
         let value = std::env::var("LAMBDA_VM_TEST_FAULT_CARD_FILL_SWAP").ok()?;
         let (a, b) = value.trim().split_once(',')?;
