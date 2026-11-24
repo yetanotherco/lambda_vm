@@ -115,6 +115,9 @@ pub mod keccak_rnd_tests;
 pub mod keccak_tests;
 pub mod lean_program_census;
 #[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod lean_stream_block_tests;
+#[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
 pub mod local_to_global_bus_tests;
