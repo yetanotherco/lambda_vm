@@ -32,7 +32,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends opam libgmp-dev z3 pkg-config cmake
-          opam init -y --bare --disable-sandboxing
+
+      # The runner image (e.g. ubuntu24) goes in the cache key: the cached binaries link against
+      # its system libraries. $ImageOS is a runner variable, not readable from an expression.
+      - name: Runner image
+        id: image
+        run: echo "os=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
+
+      # The opam root with the `sail-riscv-lean` switch (OCaml and Sail at SAIL_COMMIT), so that
+      # they are not compiled on every run. The generated model depends on the Sail commit, which
+      # is in PINS, not on the versions of Sail's opam dependencies.
+      - name: Cache opam
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-${{ steps.image.outputs.os }}-${{ hashFiles('sail-riscv-lean/PINS', 'sail-riscv-lean/scripts/generate.sh') }}
+
+      - name: Initialize opam
+        run: '[ -d ~/.opam ] || opam init -y --bare --disable-sandboxing'
 
       - name: Regenerate the model
         run: scripts/generate.sh

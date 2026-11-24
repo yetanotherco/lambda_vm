@@ -23,7 +23,9 @@ The first build compiles Clean, the Clean model and the Sail model (the largest 
 `lake-manifest.json`: when `formal/` updates Mathlib or Clean, run `lake update` here too so both
 use the same versions. `lean-toolchain` must match `formal/lean-toolchain`; `lake update` may set
 it to the Sail model's version, so check it afterwards.
-This folder is not built by CI (`.github/workflows/formal.yml` only covers `formal/**`).
+CI (`.github/workflows/formal-riscv.yml`) builds it when `formal/`, `formal-riscv/` or
+`sail-riscv-lean/` change, and checks that its `lean-toolchain` and the revisions of the packages it
+shares with `formal/` match `formal/`'s.
 
 ## Structure
 
