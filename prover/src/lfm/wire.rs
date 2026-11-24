@@ -75,7 +75,24 @@ impl Out {
 pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
-    table: Option<Vec<Commitment>>,
+    /// Under [`WireFormat::Dedup`]: every distinct sibling read so far, by
+    /// index, and the same set for the "already held" check.
+    table: Option<(Vec<Commitment>, std::collections::BTreeSet<Commitment>)>,
+}
+
+/// The longest encoding a decoder reads: 256 MiB, twenty times the largest
+/// level proof (a block's level 1, ≈ 11 MB). Longer input is refused before
+/// any of it is read, so a hostile file costs no more than this.
+pub const MAX_WIRE_BYTES: usize = 256 << 20;
+
+fn check_wire_len(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_WIRE_BYTES {
+        return Err(format!(
+            "{} bytes, past the {MAX_WIRE_BYTES} an encoding may take",
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 impl<'a> Reader<'a> {
@@ -91,7 +108,7 @@ impl<'a> Reader<'a> {
         Self {
             bytes,
             at: 0,
-            table: Some(Vec::new()),
+            table: Some((Vec::new(), std::collections::BTreeSet::new())),
         }
     }
 
@@ -366,14 +383,14 @@ impl Wire for crypto::merkle_tree::proof::Proof<Commitment> {
             let t = get_varint(r)?;
             let d = if t == 0 {
                 let d = Commitment::get(r)?;
-                let table = r.table.as_mut().expect("dedup");
-                if table.contains(&d) {
+                let (table, held) = r.table.as_mut().expect("dedup");
+                if !held.insert(d) {
                     return Err("a sibling sent twice".into());
                 }
                 table.push(d);
                 d
             } else {
-                let table = r.table.as_ref().expect("dedup");
+                let (table, _) = r.table.as_ref().expect("dedup");
                 *usize::try_from(t - 1)
                     .ok()
                     .and_then(|i| table.get(i))
@@ -427,6 +444,7 @@ pub fn encode(proof: &WlfmProof) -> Vec<u8> {
 /// The proof `bytes` encode, refused unless they are exactly one proof's
 /// encoding.
 pub fn decode(bytes: &[u8]) -> Result<WlfmProof, String> {
+    check_wire_len(bytes)?;
     let mut r = Reader::new(bytes);
     let proof = WlfmProof::get(&mut r)?;
     r.finish()?;
@@ -443,6 +461,7 @@ pub fn encode_dedup(proof: &WlfmProof) -> Vec<u8> {
 
 /// [`decode`] for [`encode_dedup`]'s bytes.
 pub fn decode_dedup(bytes: &[u8]) -> Result<WlfmProof, String> {
+    check_wire_len(bytes)?;
     let mut r = Reader::dedup(bytes);
     let proof = WlfmProof::get(&mut r)?;
     r.finish()?;
@@ -703,6 +722,17 @@ mod tests {
         assert!(get::<Vec<FE>>(&trailing).is_err());
         let truncated = &put(&v)[..10];
         assert!(get::<Vec<FE>>(truncated).is_err());
+    }
+
+    /// An encoding past [`MAX_WIRE_BYTES`] is refused by both decoders
+    /// before any of it is read.
+    #[test]
+    fn an_encoding_past_the_cap_is_refused_unread() {
+        let long = vec![0u8; MAX_WIRE_BYTES + 1];
+        for e in [decode(&long).err(), decode_dedup(&long).err()] {
+            let e = e.expect("refused");
+            assert!(e.contains("past the"), "{e}");
+        }
     }
 
     fn path(ds: &[u8]) -> crypto::merkle_tree::proof::Proof<Commitment> {
