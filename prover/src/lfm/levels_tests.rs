@@ -1462,6 +1462,11 @@ fn rta_a_real_block_through_its_levels() {
         String::from_utf8_lossy(&crate::block_whir::block_format_tag(&cfg.format)),
         cfg.format.group_polys
     );
+    println!(
+        "RTA LAST LEVEL: {:?} · file {:?}",
+        super::last_level::last_level().unwrap_or_else(|e| panic!("{e}")),
+        super::last_level::last_wire().unwrap_or_else(|e| panic!("{e}"))
+    );
     if let Ok(list) = std::env::var("RTA_L1_GROUPS") {
         let ks: Vec<usize> = list
             .split(',')
@@ -1820,6 +1825,9 @@ fn rta_one_run(
             l.prove,
             l.end
         );
+        // The proof's bytes by component (printed after the run, off the
+        // clock): the compact encoding's parts, which sum to its total.
+        print_level_census(k + 1, level, p);
         if let Some(b) = t.builds.get(k) {
             println!(
                 "RTA LEVEL {} BUILD: stacks {} · prepared cells {} · prepare {:.3}s · commit {:.3}s \
@@ -1935,6 +1943,9 @@ fn rta_one_run(
     )
     .is_ok();
     println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
+    // The last level's file in the knob's encoding (`LAMBDA_VM_LAST_LEVEL_WIRE`),
+    // read back and verified by the block's verifier when it is compact.
+    let ok_file = rta_last_file(&elf, &opts, cfg, &run, family, levels);
     // A tampered last proof (one published word changed) is refused against
     // the last level's artifacts.
     let mut tampered = run.proofs.last().expect("a last level").clone();
@@ -1944,7 +1955,10 @@ fn rta_one_run(
     let top = &run.levels.last().expect("a last level").build.artifacts;
     let refused = verify_wlfm(top, &tampered, &tampered.public_words).is_err();
     println!("RTA TAMPER: a changed word of the last level refused {refused}");
-    assert!(ok_base && ok_levels && ok_last, "everything verifies");
+    assert!(
+        ok_base && ok_levels && ok_last && ok_file,
+        "everything verifies"
+    );
     assert!(refused, "a tampered last level is refused");
     // Off the clock, a box row (`RTA_IDENTITY=host`, with
     // `LAMBDA_VM_DETERMINISTIC_GRIND=1`): every level proved again over the
@@ -1980,6 +1994,80 @@ fn rta_one_run(
             );
         }
     }
+}
+
+/// `RTA LEVEL k CENSUS` and `RTA LEVEL k QUERIES` lines: level `k`'s proof
+/// by component ([`super::wire::census`]) and its chains' query counts by
+/// round, with its schedule and final round.
+fn print_level_census(k: usize, level: &super::levels::Level, p: &super::wlfm::WlfmProof) {
+    let c = super::wire::census(p);
+    let sum: usize = c.parts.iter().map(|(_, v)| v).sum();
+    println!(
+        "RTA LEVEL {k} CENSUS: rkyv {} B · compact {} B · dedup {} B · parts sum {sum} B · {}",
+        c.rkyv,
+        c.compact,
+        c.dedup,
+        c.line()
+    );
+    let a = &level.build.artifacts;
+    let (layouts, _) = crate::multilinear_prove::stacks(&a.shapes(&a.airs()), &a.sizes, &a.config)
+        .unwrap_or_default();
+    let tallest = layouts.iter().map(|l| l.n_stack()).max().unwrap_or(0);
+    println!(
+        "RTA LEVEL {k} QUERIES: prep {:?} · first fold {:?} · final {:?} · rounds {:?} · schedule at \
+         {tallest} {:?} · final round {:?} · Q a round {:?} · opened a chain {:?}",
+        a.prep,
+        a.first_fold,
+        a.final_poly,
+        a.rounds,
+        a.config.schedule(tallest),
+        a.config.final_round(tallest),
+        a.config.round_queries(tallest),
+        c.queries
+    );
+}
+
+/// The last level's proof as a file in [`super::last_level::last_wire`]'s
+/// encoding: its bytes printed, and, compact, read back and verified by the
+/// block's verifier (the decoded proof must be the one the prover made).
+/// `true` when there is nothing to read back or it verifies.
+fn rta_last_file(
+    elf: &[u8],
+    opts: &ProofOptions,
+    cfg: &super::whir_block_tree::WhirTreeConfig,
+    run: &super::levels::LevelsRun,
+    family: WlfmFamily,
+    levels: usize,
+) -> bool {
+    use super::last_level::{last_level_file, last_wire, read_last_level_file};
+    use super::wire::WireFormat;
+    let wire = last_wire().unwrap_or_else(|e| panic!("{e}"));
+    let last = run.proofs.last().expect("a last level");
+    let bytes = last_level_file(last, wire).unwrap_or_else(|e| panic!("{e}"));
+    let ok = match wire {
+        WireFormat::Rkyv => true,
+        _ => match read_last_level_file(&bytes, wire) {
+            Ok(back) => super::levels::verify_block_levels_under(
+                elf,
+                opts,
+                &cfg.format,
+                run.base_proof.statement(),
+                family,
+                LevelStop::Levels(levels),
+                &back,
+            )
+            .is_ok(),
+            Err(e) => {
+                println!("RTA LAST FILE REFUSED: {e}");
+                false
+            }
+        },
+    };
+    println!(
+        "RTA LAST FILE: wire {wire:?} · {} B · read back and verified {ok}",
+        bytes.len()
+    );
+    ok
 }
 
 /// One run of level 1 over a block's first `k` groups
