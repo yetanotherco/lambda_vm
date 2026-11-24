@@ -1187,12 +1187,12 @@ theorem completeness :
   -- a negative operand's absolute value is its two's complement. The `NEG` pulls are counted,
   -- so the hypothesis arrives as a count rather than as `sign = 1`; for a bit the two say the
   -- same thing.
-  have hnegR : Channel.CountUpTo muMax input_signR →
+  have hnegR : CountUpTo muMax input_signR →
       ZMod.val input_absR_lo + 2^32 * ZMod.val input_absR_hi = (2^64 - RV) % 2^64 := fun h1 => by
     rw [harv]
     exact har1 (by
       rw [← hsrv, eq_one_of_countUpTo (isBool_of_val_lt_two hsr2) h1]; exact val_one_eq)
-  have hnegD : Channel.CountUpTo muMax input_signD →
+  have hnegD : CountUpTo muMax input_signD →
       ZMod.val input_absD_lo + 2^32 * ZMod.val input_absD_hi = (2^64 - DV) % 2^64 := fun h1 => by
     rw [hadv]
     exact had1 (by

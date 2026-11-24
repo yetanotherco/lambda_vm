@@ -140,7 +140,7 @@ def circuit : FormalAssertion (F p) Inputs where
     obtain ⟨h_bool, h_p0, h_p1⟩ := h_holds
     refine ⟨?_, eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp h_bool)⟩
     intro hne
-    have hcount : Channel.CountUpTo muMax input_cond :=
+    have hcount : CountUpTo muMax input_cond :=
       (eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp h_bool)).resolve_left hne
     obtain ⟨-, hlo⟩ := h_p0 hcount
     obtain ⟨-, hhi⟩ := h_p1 hcount

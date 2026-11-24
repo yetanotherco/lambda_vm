@@ -154,15 +154,21 @@ def consumerComponent (channel : Channel (F p) Message) : Component (F p) where
 def finished : List (RawChannel (F p)) :=
   [Alu.channelC, Msb16C, IsHalfC, Bitwise.AreBytes.toRaw]
 
-/-- The LT ensemble: three providers, LT, and a consumer of the ALU bus. Without the consumer
-the bus carries only LT's pushes, a balanced witness forces every `μ` to zero, and `LT.RowSpec`
-— guarded by `μ ≠ 0` — holds vacuously on every row. -/
+/-- The LT ensemble: three providers and LT. It carries no consumer of the ALU bus, so that bus
+holds only LT's pushes, a balanced witness forces every `μ` to zero, and `LT.RowSpec` — guarded
+by `μ ≠ 0` — holds vacuously on every row.
+
+A consumer cannot be added here any more. Since every ALU interaction moved to `Alu.channelC`,
+it would have to pull there, and a counted pull owes the range obligation on that channel while
+also gaining its guarantee: ordering whole channels cannot place a component that both pulls and
+is finished by the same bus. That needs `tableSoundness_of_stagedRequirementsOn`, and the
+ensemble that has it is `DvrmStaged`, whose `lt_rows_correct` is what states LT's rows. -/
 def ensemble : Ensemble (F p) unit where
   tables := [providerComponent Bitwise.AreBytes, countedProviderComponent muMax Bitwise.IsHalf,
-    countedProviderComponent muMax Bitwise.Msb16, ltComponent, consumerComponent Alu.channel]
+    countedProviderComponent muMax Bitwise.Msb16, ltComponent]
   unique_names := by
-    simp [providerComponent, countedProviderComponent, ltComponent, consumerComponent, provider,
-      countedProvider, consumer, LT.circuit, Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16,
+    simp [providerComponent, countedProviderComponent, ltComponent, provider,
+      countedProvider, LT.circuit, Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16,
       Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table, Alu.channel,
       StaticLookupChannel.toChannel]
   channels := finished
@@ -172,8 +178,8 @@ def ensemble : Ensemble (F p) unit where
   tables_channels := by
     intro table h
     simp only [List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl <;>
-      simp only [GeneralFormalCircuit.channels, providerComponent_guarantees, providerComponent_requirements, countedProviderComponent_guarantees, countedProviderComponent_requirements, ltComponent_guarantees, ltComponent_requirements, consumerComponent_guarantees, consumerComponent_requirements] <;>
+    rcases h with rfl | rfl | rfl | rfl <;>
+      simp only [GeneralFormalCircuit.channels, providerComponent_guarantees, providerComponent_requirements, countedProviderComponent_guarantees, countedProviderComponent_requirements, ltComponent_guarantees, ltComponent_requirements] <;>
       simp [finished, IsHalfC, Msb16C]
   verifier_channels := by simp [circuit_norm]
 
@@ -211,9 +217,9 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
   apply Ensemble.tableSoundness_of_stagedRequirements finished rfl (List.Subset.refl _)
   · intro component h
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl <;>
+    rcases h with rfl | rfl | rfl | rfl <;>
       simp only [providerComponent_guarantees, countedProviderComponent_guarantees,
-        ltComponent_guarantees, consumerComponent_guarantees] <;>
+        ltComponent_guarantees] <;>
       simp [finished, IsHalfC, Msb16C]
   · intro c hc
     show c.ConsistentUpTo muMax
@@ -221,7 +227,7 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
     rcases hc with rfl | rfl | rfl | rfl <;> infer_instance
   · intro component h
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl
     -- the providers pull nothing
     iterate 3
       exact Component.stagedRequirements_of_forall fun _ _ _ =>
@@ -240,9 +246,5 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
         simp [circuit_norm, IsHalfC, Msb16C, Alu.channel, Bitwise.AreBytes, Bitwise.IsHalf,
           Bitwise.Msb16, Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table,
           StaticLookupChannel.toChannel] at this
-    -- the consumer owes nothing: it only pulls
-    exact Component.stagedRequirements_of_forall fun _ earlier _ =>
-      Component.requirementsAfter_of_not_mem earlier
-        (by simp [consumerComponent_requirements])
 
 end LambdaVM.Ensembles.LtStaged
