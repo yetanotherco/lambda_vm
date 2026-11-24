@@ -825,16 +825,19 @@ fn the_blake3_driver_with_level_2_streamed_proves_the_same_level_bytes() {
     }
 }
 
-/// Each level's fill with its three parts at once
-/// (`LAMBDA_VM_LEVELS_FILL_PARTS`) forced on this thread as given, the small
-/// BLAKE3 block driven under it, and each level's proof bytes against
+/// The levels' chain steps (`LAMBDA_VM_LEVELS_FILL_PARTS`,
+/// `LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY`) forced on this thread as given, the
+/// small BLAKE3 block driven under them, and each level's proof bytes against
 /// [`prove_levels`] over the same base. The run, for its stamps.
-fn driven_under_chain_steps(fill_parts: bool) -> super::levels::LevelsRun {
-    use super::levels::{prove_block_levels, set_fill_parts_for_test};
+fn driven_under_chain_steps(fill_parts: bool, commit_early: bool) -> super::levels::LevelsRun {
+    use super::levels::{
+        prove_block_levels, set_commit_next_early_for_test, set_fill_parts_for_test,
+    };
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
             set_fill_parts_for_test(None);
+            set_commit_next_early_for_test(None);
         }
     }
     assert!(
@@ -847,6 +850,7 @@ fn driven_under_chain_steps(fill_parts: bool) -> super::levels::LevelsRun {
     let run = {
         let _restore = Restore;
         set_fill_parts_for_test(Some(fill_parts));
+        set_commit_next_early_for_test(Some(commit_early));
         prove_block_levels(
             &elf,
             &[],
@@ -868,7 +872,8 @@ fn driven_under_chain_steps(fill_parts: bool) -> super::levels::LevelsRun {
         let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
         assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
         println!(
-            "LEVELS CHAIN STEPS (fill parts {fill_parts}) IDENTITY level {}: {} B equal",
+            "LEVELS CHAIN STEPS (fill parts {fill_parts}, commit early {commit_early}) IDENTITY \
+             level {}: {} B equal",
             k + 1,
             a.len()
         );
@@ -884,8 +889,41 @@ fn driven_under_chain_steps(fill_parts: bool) -> super::levels::LevelsRun {
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
 fn the_blake3_driver_with_its_fill_parts_at_once_proves_the_same_level_bytes() {
-    let run = driven_under_chain_steps(true);
+    let run = driven_under_chain_steps(true, false);
     assert!(run.proofs.len() >= 2, "level 2 filled too");
+}
+
+/// ★ Level 2's stacks committed as level 1's prove returns
+/// (`LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY`) are the same commit: a small BLAKE3
+/// block driven with the knob on proves each level's bytes as [`prove_levels`]
+/// does, and the driver started level 2's commit before it joined level 2's
+/// streamed execution; with the knob off, after. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels three times; box tier, deterministic grind"]
+fn the_blake3_driver_committing_level_2_early_proves_the_same_level_bytes() {
+    let run = driven_under_chain_steps(false, true);
+    assert!(run.proofs.len() >= 2, "a level 2 to commit");
+    assert!(run.times.next_stream.is_some(), "level 2 streamed");
+    let early = run.times.next_commit.expect("level 2 committed");
+    let joined = early.joined.expect("level 2's stream joined");
+    assert!(early.early, "committed early: {early:?}");
+    assert!(early.from <= joined, "committed before the join: {early:?}");
+    let off = driven_under_chain_steps(false, false);
+    let late = off.times.next_commit.expect("level 2 committed");
+    let joined = late.joined.expect("level 2's stream joined");
+    assert!(
+        !late.early && late.from >= joined,
+        "off: after the join: {late:?}"
+    );
+}
+
+/// Every chain step on at once: the same level bytes.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
+    let run = driven_under_chain_steps(true, true);
+    assert!(run.times.next_commit.is_some_and(|c| c.early));
 }
 
 /// The level-2 streaming knob's name; it is on by default, and only `0`
@@ -1628,7 +1666,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
         let prove_from = l2.end - l2.prove;
         println!(
             "RTA LEVEL2 CHAIN: prepared {:.3}s · first piece {:.3}s · last piece {:.3}s · executed {:.3}s · \
-             fill {:.3}s · filled {:.3}s · commit from {:.3}s · joined {} · committed {:.3}s · \
+             fill {:.3}s · filled {:.3}s · commit from {:.3}s · early {} · joined {} · committed {:.3}s · \
              level 1 proved {:.3}s · prove from {prove_from:.3}s · after level 1 {:.3}s",
             ns.from,
             ns.first,
@@ -1637,6 +1675,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
             ns.fill,
             ns.executed + ns.fill,
             nc.from,
+            nc.early,
             fmt(nc.joined),
             b.committed,
             l1.end,

@@ -544,6 +544,38 @@ pub fn fill_parts() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY=1`: when level 2 executes beside level
+/// 1's prove ([`stream_next`]), its prepared stacks are committed on the card
+/// the moment level 1's prove returns, beside the end of level 2's execution
+/// and its fill on the host, where they are otherwise committed after that
+/// fill. The same commit of the same columns, earlier: the same proofs. Off by
+/// default (and for any word but `1`). Read once a process, on the driver's
+/// thread.
+pub const COMMIT_NEXT_EARLY_ENV: &str = "LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY";
+
+std::thread_local! {
+    /// A test's [`commit_next_early`] on this thread.
+    static COMMIT_NEXT_EARLY_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`commit_next_early`] forced on this thread (`None` restores
+/// the knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_commit_next_early_for_test(on: Option<bool>) {
+    COMMIT_NEXT_EARLY_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`COMMIT_NEXT_EARLY_ENV`] is on (or this thread's test override).
+pub fn commit_next_early() -> bool {
+    if let Some(on) = COMMIT_NEXT_EARLY_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(COMMIT_NEXT_EARLY_ENV).ok().as_deref())
+    })
+}
+
 /// Level 1's execution as its thread hands it on: executed, for the driver to
 /// fill after the stacks' commit, or already filled beside it
 /// ([`fill_beside`]).
@@ -866,10 +898,11 @@ pub fn stream_next() -> bool {
 }
 
 /// Level 2's program and prebuild, and its execution filled beside level 1's
-/// prove when it streamed ([`stream_next`]).
+/// prove when it streamed ([`stream_next`]). No prebuild when it was handed
+/// on to be committed early ([`commit_next_early`]).
 type StreamedNext = (
     LfmProgram,
-    WlfmPrebuild,
+    Option<WlfmPrebuild>,
     Option<(super::proof::LfmFilled, NextStream)>,
 );
 
@@ -886,12 +919,13 @@ pub struct NextStream {
     pub fill: f64,
 }
 
-/// When level 2's stacks' commit started (the driver's clock), and when the
-/// driver joined level 2's streamed execution (`None` when it did not
-/// stream).
+/// When level 2's stacks' commit started (the driver's clock), whether early
+/// ([`commit_next_early`]: as level 1's prove returned), and when the driver
+/// joined level 2's streamed execution (`None` when it did not stream).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NextCommit {
     pub from: f64,
+    pub early: bool,
     pub joined: Option<f64>,
 }
 
@@ -1261,16 +1295,25 @@ const MAX_STREAM_PIECES: usize = 64;
 /// when its arena has more pieces than a streamed execution lands (level 2
 /// then executes after level 1's prove, as without the knob).
 ///
-/// Its fill runs its parts at once under `fill_parts` ([`fill_parts`]).
+/// With `early` ([`commit_next_early`]), the prebuild is handed on there the
+/// moment it is joined, before the execution streams, for the driver to
+/// commit as soon as level 1's prove returns; it comes back here only if the
+/// driver has stopped taking it. Its fill runs its parts at once under
+/// `fill_parts` ([`fill_parts`]).
 fn stream_next_level(
     prepared: std::thread::ScopedJoinHandle<'_, Result<PreparedNext, String>>,
     pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
     t0: std::time::Instant,
     fill_parts: bool,
+    early: Option<mpsc::SyncSender<WlfmPrebuild>>,
 ) -> Result<StreamedNext, String> {
     let (program, pre, marks) = prepared
         .join()
         .map_err(|_| "level 2's preparation panicked".to_string())??;
+    let pre = match early {
+        Some(tx) => tx.send(pre).err().map(|mpsc::SendError(pre)| pre),
+        None => Some(pre),
+    };
     if marks.len() > MAX_STREAM_PIECES {
         return Ok((program, pre, None));
     }
@@ -2025,7 +2068,8 @@ pub struct LevelsTimes {
     /// Under [`STREAM_NEXT_ENV`], level 2's execution streamed over level 1's
     /// prove; `None` when it ran after it.
     pub next_stream: Option<NextStream>,
-    /// When level 2's stacks' commit started; `None` without a level 2.
+    /// When level 2's stacks' commit started, early or not
+    /// ([`COMMIT_NEXT_EARLY_ENV`]); `None` without a level 2.
     pub next_commit: Option<NextCommit>,
     /// Under [`FILL_BESIDE_ENV`], level 1's fill on its own thread beside the
     /// stacks' commit: its seconds and when it ended (the driver's clock).
@@ -2285,6 +2329,7 @@ pub fn prove_block_levels(
     // Read on the driver's thread (a test's override is that thread's).
     let fill_beside_on = fill_beside();
     let fill_parts_on = fill_parts();
+    let commit_next_early_on = commit_next_early();
     let late = settle_late() || super::wlfm_knobs::levels_untrimmed();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -2788,6 +2833,19 @@ pub fn prove_block_levels(
             level_more(stop, count, build)
                 .then(|| scope.spawn(move || prepare_next(child, family, stop, count + 1, last)))
         };
+        // Level `k + 1`'s stacks committed on a thread of their own: the build,
+        // when the commit ended, and the card read after it.
+        let spawn_commit = |pre: WlfmPrebuild, k: usize| {
+            scope.spawn(move || {
+                commit_level(pre, k + 1).map(|build| {
+                    (
+                        build,
+                        now(),
+                        card_settle_levels(&format!("level {} committed", k + 1)),
+                    )
+                })
+            })
+        };
         let mut next = spawn_next(&levels[0].build, 1);
         let (filled, fill) = match execution {
             Level1Ready::Executed(execution, lean) => {
@@ -2823,9 +2881,20 @@ pub fn prove_block_levels(
         let mut streamed: Option<std::thread::ScopedJoinHandle<'_, Result<StreamedNext, String>>> =
             None;
         let (piece_tx, piece_rx) = mpsc::channel::<(usize, Vec<LfmWord>)>();
+        // Under [`commit_next_early`], level 2's prebuild comes back on its
+        // own as soon as it is joined, to be committed when level 1's prove
+        // returns rather than after level 2's fill.
+        let mut early_rx: Option<mpsc::Receiver<WlfmPrebuild>> = None;
         if stream_next_on && let Some(prepared) = next.take() {
+            let early_tx = commit_next_early_on.then(|| {
+                let (tx, rx) = mpsc::sync_channel::<WlfmPrebuild>(1);
+                early_rx = Some(rx);
+                tx
+            });
             streamed =
-                Some(scope.spawn(move || stream_next_level(prepared, piece_rx, t0, fill_parts_on)));
+                Some(scope.spawn(move || {
+                    stream_next_level(prepared, piece_rx, t0, fill_parts_on, early_tx)
+                }));
         } else {
             drop(piece_rx);
         }
@@ -2897,6 +2966,28 @@ pub fn prove_block_levels(
         {
             return Err(format!("level 2's arena from level 1's groups: {e}"));
         }
+        // Level 1's card is let go here, then level 2's stacks committed at
+        // once ([`commit_next_early`]), beside the end of its execution and
+        // its fill; or both after its execution, as without the knob.
+        let settled_early = early_rx.is_some();
+        let mut early_commit = None;
+        if let Some(rx) = early_rx.take() {
+            levels[0].build.release_prover_half();
+            if let Some(card) = card_settle_levels("level 1 proved") {
+                times.card.push(("level 1 proved".to_string(), card));
+            }
+            // A closed channel is the streamed thread gone without its
+            // prebuild: its join below says why.
+            if let Ok(pre) = rx.recv() {
+                let stats = (pre.secs(), pre.prepare_split(), pre.prepared_cells());
+                times.next_commit = Some(NextCommit {
+                    from: now(),
+                    early: true,
+                    joined: None,
+                });
+                early_commit = Some((spawn_commit(pre, 1), stats));
+            }
+        }
         let mut streamed_next = match streamed {
             Some(handle) => Some(
                 handle
@@ -2914,9 +3005,11 @@ pub fn prove_block_levels(
         times
             .stamps
             .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
-        levels[0].build.release_prover_half();
+        if !settled_early {
+            levels[0].build.release_prover_half();
+        }
         times.purges[2] = purge_filled.join().ok().flatten();
-        if let Some(card) = card_settle_levels("level 1 proved") {
+        if !settled_early && let Some(card) = card_settle_levels("level 1 proved") {
             times.card.push(("level 1 proved".to_string(), card));
         }
         if let Some(r) = resident_now() {
@@ -2930,27 +3023,30 @@ pub fn prove_block_levels(
                     let (program, pre, _marks) = handle
                         .join()
                         .map_err(|_| format!("level {}'s preparation panicked", k + 1))??;
-                    (program, pre, None)
+                    (program, Some(pre), None)
                 }
                 (None, None) => break,
             };
             let execute_from = done.as_ref().map_or_else(now, |(_, t)| t.from);
-            let (prepare, prepare_split, cells) =
-                (pre.secs(), pre.prepare_split(), pre.prepared_cells());
-            if k == 1 {
-                let next = times.next_commit.get_or_insert_with(NextCommit::default);
-                next.from = now();
-            }
-            // Its stacks on the card while its execution runs on the host.
-            let committer = scope.spawn(move || {
-                commit_level(pre, k + 1).map(|build| {
-                    (
-                        build,
-                        now(),
-                        card_settle_levels(&format!("level {} committed", k + 1)),
-                    )
-                })
-            });
+            // Its stacks on the card while its execution runs on the host:
+            // committed already ([`commit_next_early`]), or from here.
+            let (committer, (prepare, prepare_split, cells)) = match (early_commit.take(), pre) {
+                (Some(early), _) => early,
+                (None, Some(pre)) => {
+                    let stats = (pre.secs(), pre.prepare_split(), pre.prepared_cells());
+                    if k == 1 {
+                        let next = times.next_commit.get_or_insert_with(NextCommit::default);
+                        next.from = now();
+                    }
+                    (spawn_commit(pre, k), stats)
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "level {}'s prebuild was handed on and never committed",
+                        k + 1
+                    ));
+                }
+            };
             let (filled, executed, fill) = match done {
                 Some((filled, stream)) => {
                     times.next_stream = Some(stream);
