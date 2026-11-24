@@ -80,10 +80,20 @@ pub struct Reader<'a> {
     table: Option<(Vec<Commitment>, std::collections::BTreeSet<Commitment>)>,
 }
 
-/// The longest encoding a decoder reads: 256 MiB, twenty times the largest
+/// The longest encoding a decoder reads: 64 MiB, five times the largest
 /// level proof (a block's level 1, ≈ 11 MB). Longer input is refused before
-/// any of it is read, so a hostile file costs no more than this.
-pub const MAX_WIRE_BYTES: usize = 256 << 20;
+/// any of it is read. This bounds the bytes read; the memory a decoded value
+/// takes is a bounded multiple of them (a dedup reference of one byte
+/// decodes to a 32-byte digest, so about 32 times at worst, 2 GiB at the
+/// cap), and no length is allocated before the bytes it claims are present
+/// ([`MAX_PATH_SIBLINGS`] for a Merkle path).
+pub const MAX_WIRE_BYTES: usize = 64 << 20;
+
+/// The most siblings a Merkle path may carry: a path of a tree of `2^64`
+/// leaves under binary trees, and of `2^42` under 4-ary ones (3 siblings a
+/// level), past any tree a proof commits. A longer path is refused before
+/// anything is allocated for it.
+pub const MAX_PATH_SIBLINGS: usize = 64;
 
 pub(crate) fn check_wire_len(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() > MAX_WIRE_BYTES {
@@ -370,11 +380,19 @@ impl Wire for crypto::merkle_tree::proof::Proof<Commitment> {
     }
     fn get(r: &mut Reader<'_>) -> Result<Self, String> {
         if r.table.is_none() {
-            return Ok(Self {
-                merkle_path: Wire::get(r)?,
-            });
+            let merkle_path: Vec<Commitment> = Wire::get(r)?;
+            if merkle_path.len() > MAX_PATH_SIBLINGS {
+                return Err(format!(
+                    "a path of {} siblings, past {MAX_PATH_SIBLINGS}",
+                    merkle_path.len()
+                ));
+            }
+            return Ok(Self { merkle_path });
         }
         let n = usize::try_from(get_varint(r)?).map_err(|_| "a length out of range")?;
+        if n > MAX_PATH_SIBLINGS {
+            return Err(format!("a path of {n} siblings, past {MAX_PATH_SIBLINGS}"));
+        }
         if n > r.left() {
             return Err(format!("{n} siblings in {} bytes", r.left()));
         }
@@ -775,5 +793,44 @@ mod tests {
         // A reference past the table.
         let mut r = Reader::dedup(&[1, 1, 1]);
         assert!(Vec::<crypto::merkle_tree::proof::Proof<Commitment>>::get(&mut r).is_err());
+    }
+
+    /// A Merkle path longer than [`MAX_PATH_SIBLINGS`] is refused by both
+    /// decoders, under dedup before anything is allocated for it (the claimed
+    /// length alone, its siblings unsent); the longest allowed reads back.
+    #[test]
+    fn a_path_past_the_sibling_cap_is_refused() {
+        type P = crypto::merkle_tree::proof::Proof<Commitment>;
+        let ds: Vec<u8> = (0..=MAX_PATH_SIBLINGS as u8).collect();
+        let longest = path(&ds[..MAX_PATH_SIBLINGS]);
+        let long = path(&ds);
+        for dedup in [false, true] {
+            let mut out = Out::new(dedup);
+            longest.put(&mut out);
+            let mut r = if dedup {
+                Reader::dedup(&out.bytes)
+            } else {
+                Reader::new(&out.bytes)
+            };
+            assert_eq!(
+                P::get(&mut r).expect("the longest path").merkle_path,
+                longest.merkle_path
+            );
+            let mut out = Out::new(dedup);
+            long.put(&mut out);
+            let mut r = if dedup {
+                Reader::dedup(&out.bytes)
+            } else {
+                Reader::new(&out.bytes)
+            };
+            let e = P::get(&mut r).expect_err("a path past the cap");
+            assert!(e.contains("past 64"), "{e}");
+        }
+        // Under dedup the length is refused before any sibling is read.
+        let mut claim = Out::new(true);
+        put_varint(1 << 20, &mut claim);
+        let mut r = Reader::dedup(&claim.bytes);
+        let e = P::get(&mut r).expect_err("a claimed length past the cap");
+        assert!(e.contains("past 64"), "{e}");
     }
 }
