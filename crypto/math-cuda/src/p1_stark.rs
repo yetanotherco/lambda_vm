@@ -25,7 +25,7 @@
 //! sequence the host leaf hashes, in the read patterns of [`crate::rpx`]'s
 //! kernels.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg, sys,
@@ -79,12 +79,13 @@ pub struct Kernels {
 
 /// Load the kernels once.
 pub fn kernels() -> Result<&'static Kernels> {
-    static KERNELS: OnceLock<Kernels> = OnceLock::new();
-    if let Some(k) = KERNELS.get() {
+    static KERNELS: crate::device::PerBackend<Kernels> = crate::device::PerBackend::new();
+    let cell = KERNELS.current()?;
+    if let Some(k) = cell.get() {
         return Ok(k);
     }
     let k = load_kernels()?;
-    Ok(KERNELS.get_or_init(|| k))
+    Ok(cell.get_or_init(|| k))
 }
 
 /// The kernel set, loaded afresh. [`kernels`] caches one.

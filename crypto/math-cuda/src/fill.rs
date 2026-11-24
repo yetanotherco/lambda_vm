@@ -21,7 +21,7 @@
 //! [`crate::device::Backend::init`].
 
 use std::mem::{offset_of, size_of};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, DeviceRepr,
@@ -401,8 +401,9 @@ struct Module {
 }
 
 fn module() -> Result<&'static Module> {
-    static MODULE: OnceLock<Module> = OnceLock::new();
-    if let Some(m) = MODULE.get() {
+    static MODULE: crate::device::PerBackend<Module> = crate::device::PerBackend::new();
+    let cell = MODULE.current()?;
+    if let Some(m) = cell.get() {
         return Ok(m);
     }
     let be = backend()?;
@@ -425,7 +426,7 @@ fn module() -> Result<&'static Module> {
         lfm_bitdec: module.load_function("fill_lfm_bitdec")?,
         _module: module,
     };
-    Ok(MODULE.get_or_init(|| m))
+    Ok(cell.get_or_init(|| m))
 }
 
 /// Three timing events on a stream: queued, uploaded, done.
@@ -1080,7 +1081,7 @@ pub static FAULT_RECORDS_SKIP: std::sync::atomic::AtomicUsize =
 
 #[cfg(feature = "test-faults")]
 fn fault_records_skip() -> usize {
-    static FROM_ENV: OnceLock<usize> = OnceLock::new();
+    static FROM_ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let from_env = *FROM_ENV.get_or_init(|| {
         std::env::var("LAMBDA_VM_TEST_FAULT_CARD_FILL_SKIP")
             .ok()
@@ -1101,7 +1102,8 @@ pub static FAULT_CPU_SWAP: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 
 #[cfg(feature = "test-faults")]
 fn fault_cpu_swap() -> Option<(usize, usize)> {
-    static FROM_ENV: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    static FROM_ENV: std::sync::OnceLock<Option<(usize, usize)>> =
+        std::sync::OnceLock::new();
     let from_env = *FROM_ENV.get_or_init(|| {
         let value = std::env::var("LAMBDA_VM_TEST_FAULT_CARD_FILL_SWAP").ok()?;
         let (a, b) = value.trim().split_once(',')?;

@@ -1928,6 +1928,37 @@ impl BackendSlot {
     }
 }
 
+impl BackendSlot {
+    fn index(self) -> usize {
+        match self {
+            Self::Main => 0,
+            Self::Openings => 1,
+        }
+    }
+}
+
+/// A value made once per backend (card 0's, the second's): kernels loaded in
+/// a backend's context and tables in its memory belong to that backend
+/// alone, so a cache of them is one per backend, never one per process.
+/// With one backend it is a single cell, as before.
+pub(crate) struct PerBackend<T>([OnceLock<T>; 2]);
+
+impl<T> PerBackend<T> {
+    pub(crate) const fn new() -> Self {
+        Self([OnceLock::new(), OnceLock::new()])
+    }
+
+    /// The cell of `be`.
+    pub(crate) fn of(&self, be: &Backend) -> &OnceLock<T> {
+        &self.0[BackendSlot::of(be).index()]
+    }
+
+    /// The cell of this thread's backend ([`backend`]).
+    pub(crate) fn current(&self) -> Result<&OnceLock<T>> {
+        Ok(self.of(backend()?))
+    }
+}
+
 /// The openings' backend: card 0's under [`MAIN_PLACEMENT`], else the second
 /// slot's, made on first use. A second backend that fails to start is said
 /// once and the openings fall back to card 0's for the call (bytes are the
