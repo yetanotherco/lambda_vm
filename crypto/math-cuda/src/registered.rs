@@ -119,7 +119,7 @@ pub fn pieces_of(ptr: usize, len: usize) -> Vec<(usize, usize)> {
 }
 
 fn driver_lock(at: usize, len: usize) -> bool {
-    let Ok(be) = crate::device::backend() else {
+    let Ok(be) = crate::device::main_backend() else {
         return false;
     };
     if be.ctx.bind_to_thread().is_err() {
@@ -134,7 +134,7 @@ fn driver_lock(at: usize, len: usize) -> bool {
 }
 
 fn driver_unlock(at: usize) {
-    if let Ok(be) = crate::device::backend() {
+    if let Ok(be) = crate::device::main_backend() {
         let _ = be.ctx.bind_to_thread();
     }
     // SAFETY: `at` is the start of a piece this module registered.

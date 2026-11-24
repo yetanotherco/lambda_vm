@@ -153,6 +153,7 @@ impl Staging {
     /// read-back returned.
     fn free(&mut self) {
         if !self.ptr.is_null() {
+            bind_own_context(self.ctx);
             // SAFETY: the buffer is idle and ours.
             unsafe {
                 let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut _);
@@ -164,9 +165,21 @@ impl Staging {
     }
 }
 
+/// Makes `ctx` (a backend's context, alive for the process) current on this
+/// thread: a raw call on a buffer or event of that context binds it first
+/// (the staging may be dropped on a thread whose last call was another card's).
+fn bind_own_context(ctx: usize) {
+    if ctx != 0 {
+        // SAFETY: `ctx` is a context a backend made and never destroys.
+        let _ =
+            unsafe { cudarc::driver::sys::cuCtxSetCurrent(ctx as cudarc::driver::sys::CUcontext) };
+    }
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         self.free();
+        bind_own_context(self.ctx);
         // SAFETY: the event is idle and ours.
         unsafe {
             let _ = cudarc::driver::sys::cuEventDestroy_v2(self.event);

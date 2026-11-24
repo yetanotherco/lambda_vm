@@ -162,24 +162,29 @@ fn next_seq() -> u64 {
     NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A slot's host and device addresses.
+/// A slot's host and device addresses, and the backend slot whose context
+/// mapped it.
 #[derive(Clone, Copy)]
 struct Place {
     host: usize,
     dev: u64,
+    card: usize,
 }
 
 /// Slots no session holds, from 64 KiB pages of pinned, card-mapped memory
-/// that are never given back (at most [`MAX_PAGES`]).
-static FREE: Mutex<Vec<Place>> = Mutex::new(Vec::new());
-static PAGES: AtomicU64 = AtomicU64::new(0);
+/// that are never given back (at most [`MAX_PAGES`] a card): one list a card,
+/// since a page's device address is its mapping card's.
+static FREE: [Mutex<Vec<Place>>; 2] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
+static PAGES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 const PAGE_BYTES: usize = 64 * 1024;
 const MAX_PAGES: u64 = 16;
 
-fn new_page() -> Option<Vec<Place>> {
+/// A new page mapped by this thread's card (`card`, its backend slot).
+fn new_page(card: usize) -> Option<Vec<Place>> {
     use cudarc::driver::sys;
-    if PAGES.fetch_add(1, Ordering::Relaxed) >= MAX_PAGES {
-        PAGES.fetch_sub(1, Ordering::Relaxed);
+    let pages = &PAGES[card];
+    if pages.fetch_add(1, Ordering::Relaxed) >= MAX_PAGES {
+        pages.fetch_sub(1, Ordering::Relaxed);
         return None;
     }
     let be = crate::device::backend().ok()?;
@@ -198,7 +203,7 @@ fn new_page() -> Option<Vec<Place>> {
             .is_err()
         {
             let _ = sys::cuMemFreeHost(host as *mut _);
-            PAGES.fetch_sub(1, Ordering::Relaxed);
+            pages.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         std::ptr::write_bytes(host, 0, PAGE_BYTES / 8);
@@ -208,6 +213,7 @@ fn new_page() -> Option<Vec<Place>> {
                 .map(|i| Place {
                     host: host as usize + i * stride,
                     dev: dev + (i * stride) as u64,
+                    card,
                 })
                 .collect(),
         )
@@ -230,12 +236,13 @@ impl MappedSlot {
     /// A slot for launches on `stream`, or `None` when the pool is spent or
     /// the card will not map host memory.
     pub fn take(stream: &Arc<CudaStream>) -> Option<Self> {
+        let card = crate::device::current_slot().min(FREE.len() - 1);
         let place = {
-            let mut free = FREE.lock().ok()?;
+            let mut free = FREE[card].lock().ok()?;
             match free.pop() {
                 Some(place) => place,
                 None => {
-                    let mut page = new_page()?;
+                    let mut page = new_page(card)?;
                     let place = page.pop()?;
                     free.extend(page);
                     place
@@ -289,7 +296,7 @@ impl Drop for MappedSlot {
     fn drop(&mut self) {
         // Every launch that writes this slot is on this stream.
         let _ = self.stream.synchronize();
-        if let Ok(mut free) = FREE.lock() {
+        if let Ok(mut free) = FREE[self.place.card].lock() {
             free.push(self.place);
         }
     }

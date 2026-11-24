@@ -48,8 +48,8 @@
 //! [`spread_supports`]) — and, whole, under a test's [`with_engine`].
 
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
@@ -281,7 +281,7 @@ pub(crate) fn root_tables(be: &Backend) -> Result<&'static RootTables> {
     stream.synchronize()?;
     // A racing initialiser's tables are dropped; either set is the same bytes.
     let _ = cell.set(RootTables { fwd, inv });
-    Ok(cell.get().expect("root tables just set"))
+    cell.get().ok_or_else(crate::invalid_value)
 }
 
 /// Columns per chunk: as many whole columns (trace scratch plus LDE) as fit
@@ -289,8 +289,9 @@ pub(crate) fn root_tables(be: &Backend) -> Result<&'static RootTables> {
 /// room for the tables and the stream's other traffic. The scratch is one
 /// chunk of trace columns, so it too stays within 60% of L2.
 fn chunk_cols(be: &Backend, n: usize, lde: usize, m: usize) -> usize {
-    static L2: OnceLock<usize> = OnceLock::new();
-    let l2 = *L2.get_or_init(|| {
+    // A value read from a card: one per card.
+    static L2: crate::device::PerBackend<usize> = crate::device::PerBackend::new();
+    let l2 = *L2.of(be).get_or_init(|| {
         be.ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
             .ok()
@@ -503,6 +504,8 @@ pub(crate) fn lde_columns(
                 }
             }
             Input::Coeffs => {
+                // A raw driver call: bind the stream's context first.
+                stream.context().bind_to_thread()?;
                 for i in 0..cols {
                     // SAFETY: both ranges are `n` elements inside live
                     // allocations (the caller's source column, the scratch),

@@ -306,13 +306,15 @@ const _: () = {
 
 /// A program's DECODE rows as CPU's fill reads them, shared by every CPU
 /// table of a prove: the entries in pc order and the runs of pcs 4 apart. On
-/// a card it is uploaded once, at the first fill that reads it, and freed with
-/// it.
+/// a card it is uploaded once a card, at that card's first fill that reads
+/// it, and freed with it.
 pub struct DecodeRecords {
     entries: Vec<DecodeRow>,
     runs: Vec<DecodeRun>,
+    /// The rows on each card (by backend slot): a card's fill reads only its
+    /// own card's copy.
     #[cfg(feature = "cuda")]
-    card: std::sync::Mutex<Option<Arc<math_cuda::fill::CardDecode>>>,
+    card: std::sync::Mutex<[Option<Arc<math_cuda::fill::CardDecode>>; 2]>,
 }
 
 impl DecodeRecords {
@@ -338,7 +340,7 @@ impl DecodeRecords {
             entries,
             runs,
             #[cfg(feature = "cuda")]
-            card: std::sync::Mutex::new(None),
+            card: std::sync::Mutex::new([None, None]),
         })
     }
 
@@ -360,8 +362,9 @@ impl DecodeRecords {
             .then(|| run.row + (offset / 4) as u32)
     }
 
-    /// The rows on the card: uploaded at the first call, under a promise of
-    /// their bytes, and kept until this goes. `None` when the card declines.
+    /// The rows on this thread's card: uploaded at that card's first call,
+    /// under a promise of its bytes, and kept until this goes. `None` when
+    /// the card declines.
     #[cfg(feature = "cuda")]
     pub(crate) fn on_card(&self) -> Option<Arc<math_cuda::fill::CardDecode>> {
         use math_cuda::fill::{CardDecode, DecodeEntryC, DecodeRunC};
@@ -377,7 +380,9 @@ impl DecodeRecords {
             assert!(align_of::<DecodeRun>() == align_of::<DecodeRunC>());
             assert!(std::mem::offset_of!(DecodeRun, len) == std::mem::offset_of!(DecodeRunC, len));
         };
-        let mut held = self.card.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = math_cuda::device::current_slot();
+        let mut cards = self.card.lock().unwrap_or_else(|e| e.into_inner());
+        let held = cards.get_mut(slot)?;
         if let Some(card) = held.as_ref() {
             return Some(Arc::clone(card));
         }
@@ -1006,6 +1011,37 @@ mod tests {
             assert_ne!(base, other, "{what}");
             assert_ne!(base.digest(), other.digest(), "{what}");
         }
+    }
+
+    /// ★ Card, run alone. The decode table on the card is one a backend:
+    /// asked from card 0's thread and from the openings' role (a second
+    /// backend: forced on one card, card 1 with two), it is two objects, and
+    /// each thread gets its own backend's every time.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "card: run alone"]
+    fn the_decode_table_on_the_card_is_one_a_backend() {
+        use math_cuda::device::{
+            DeviceRole, TwoCardOpenings, card_count, enter_role, set_two_card_openings_for_test,
+        };
+        set_two_card_openings_for_test(Some(if card_count() >= 2 {
+            TwoCardOpenings::Auto
+        } else {
+            TwoCardOpenings::Forced
+        }));
+        let table = decode();
+        let main = table.on_card().expect("card 0's copy");
+        let second = {
+            let _role = enter_role(DeviceRole::Openings);
+            table.on_card().expect("the second's copy")
+        };
+        assert!(
+            !Arc::ptr_eq(&main, &second),
+            "one decode table for two backends"
+        );
+        let again = table.on_card().expect("card 0's copy again");
+        assert!(Arc::ptr_eq(&main, &again), "card 0 keeps its own");
+        set_two_card_openings_for_test(None);
     }
 
     fn decode() -> DecodeRecords {

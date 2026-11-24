@@ -623,6 +623,8 @@ impl RunCopier for DeviceRunCopier<'_> {
         if copies.is_empty() {
             return Ok(());
         }
+        // Raw driver calls: bind the stream's context first.
+        self.stream.context().bind_to_thread()?;
         if copies.len() == 1 {
             for &(dst, src) in copies {
                 // SAFETY: both addresses lie inside allocations the caller

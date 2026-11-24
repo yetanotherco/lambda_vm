@@ -311,7 +311,7 @@ pub fn lock_pool() -> Option<PoolLocked> {
         return None;
     }
     if LOCK.load(Ordering::Acquire) == 0 {
-        let backend = crate::device::backend().ok()?;
+        let backend = crate::device::main_backend().ok()?;
         let context = backend.ctx.cu_ctx();
         // SAFETY: the context is the backend's, alive for the process.
         if unsafe { sys::cuCtxSetCurrent(context) } != sys::CUresult::CUDA_SUCCESS {

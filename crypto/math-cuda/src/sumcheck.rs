@@ -533,6 +533,8 @@ impl SumcheckSession {
     /// whatever wrote them.
     pub fn values(&self) -> Result<Vec<Vec<u64>>> {
         self.stream.synchronize()?;
+        // Raw driver calls: bind the stream's context first.
+        self.stream.context().bind_to_thread()?;
         let mut out = Vec::with_capacity(self.addresses.len());
         for address in &self.addresses {
             let mut values = vec![0u64; self.len * 3];
@@ -592,6 +594,8 @@ impl SumcheckSession {
     /// card built reads that table and not the trace beside it.
     pub fn factor(&self, k: usize) -> Result<Vec<u64>> {
         self.stream.synchronize()?;
+        // Raw driver calls: bind the stream's context first.
+        self.stream.context().bind_to_thread()?;
         let mut values = vec![0u64; self.len * 3];
         // SAFETY: as in `values`: the address is factor `k`'s base, it spans
         // `len` elements, and the stream is idle.
@@ -612,6 +616,8 @@ impl SumcheckSession {
     pub fn set_cell(&self, k: usize, index: usize, value: &[u64; 3]) -> Result<()> {
         assert!(index < self.len, "the cell is inside the cube");
         self.stream.synchronize()?;
+        // A raw driver call: bind the stream's context first.
+        self.stream.context().bind_to_thread()?;
         // SAFETY: the cell is inside factor `k`'s `len` elements, and the
         // stream is idle, so nothing reads or writes it meanwhile.
         unsafe {
@@ -1689,6 +1695,8 @@ pub fn reduce_session(
         if bytes == 0 {
             return Ok(());
         }
+        // A raw driver call: bind the stream's context first.
+        stream.context().bind_to_thread()?;
         // SAFETY: both ranges lie inside allocations this call holds, they do
         // not overlap — a shift slab is never the table it is copied from —
         // and the copy is ordered on `stream` behind whatever wrote the source.

@@ -156,6 +156,11 @@ impl RetainedLeaves {
         self.nodes.bytes
     }
 
+    /// The backend slot whose ledger holds the promise (its card).
+    fn card(&self) -> usize {
+        self.nodes.room.slot_index()
+    }
+
     /// Whether an opening holds this right now: the slot's handle is not the
     /// only one.
     ///
@@ -513,7 +518,7 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
 /// - `shrink` frees the BUDGET, not the bytes: never-purge keeps the raw device
 ///   allocation pooled for reuse, and the budget is exactly what argue's
 ///   `reserve` is gated on ([[gpu-two-vramgates-overlap]]).
-fn evict_retained_layers(target: u64) -> u64 {
+fn evict_retained_layers(target: u64, card: usize) -> u64 {
     let mut freed = 0u64;
     let mut reg = match RETENTION_REGISTRY.lock() {
         Ok(reg) => reg,
@@ -531,6 +536,8 @@ fn evict_retained_layers(target: u64) -> u64 {
             Err(poisoned) => poisoned.into_inner(),
         };
         match slot.as_ref() {
+            // Another card's layer gives no room on this one.
+            Some(layer) if layer.card() != card => {}
             Some(layer) if layer.read_by_an_opening() => being_read += 1,
             Some(layer) => reclaimable += layer.bytes(),
             None => {}
@@ -577,7 +584,7 @@ fn evict_retained_layers(target: u64) -> u64 {
             };
             if slot
                 .as_ref()
-                .is_some_and(RetainedLeaves::read_by_an_opening)
+                .is_some_and(|layer| layer.card() != card || layer.read_by_an_opening())
             {
                 passed += 1;
                 None
@@ -1877,6 +1884,8 @@ pub(crate) fn copy_slices(
             .all(|&(at, len, offset)| at + len <= buffer.len() && offset + len <= coeffs.len())
     );
     stream.memset_zeros(coeffs)?;
+    // Raw driver calls: bind the stream's context first.
+    stream.context().bind_to_thread()?;
     let (src, _src_guard) = buffer.device_ptr(stream);
     let (dst, _dst_guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
     for &(at, len, offset) in parts {
@@ -2497,7 +2506,7 @@ const MOBIUS_WIDE_LOW: u32 = 11;
 /// Levels a strided wide tile takes: 2^8 rows × 33 words of 8 bytes.
 const MOBIUS_WIDE_TILE: u32 = 8;
 /// The strided tile's shared memory at [`MOBIUS_WIDE_TILE`] levels.
-const MOBIUS_WIDE_TILE_BYTES: u32 = (1 << MOBIUS_WIDE_TILE) * (MOBIUS_TILE_COLS + 1) * 8;
+pub(crate) const MOBIUS_WIDE_TILE_BYTES: u32 = (1 << MOBIUS_WIDE_TILE) * (MOBIUS_TILE_COLS + 1) * 8;
 
 thread_local! {
     /// Per-thread override of the wide transform, for parity tests that run
@@ -2639,17 +2648,8 @@ fn mobius_wide_tiles(
     parts: Option<(cudarc::driver::sys::CUdeviceptr, u32)>,
 ) -> Result<()> {
     debug_assert!(len == 1usize << log_evals && (1u32 << from) >= MOBIUS_TILE_COLS);
-    static TILE_ATTR: Once = Once::new();
-    let mut attr = Ok(());
-    TILE_ATTR.call_once(|| {
-        attr = be.ctx.bind_to_thread().and_then(|()| {
-            be.mobius_wide_tile.set_attribute(
-                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                MOBIUS_WIDE_TILE_BYTES as i32,
-            )
-        });
-    });
-    attr?;
+    // The tile's dynamic shared memory is set on each card's own function as
+    // its backend starts (`Backend::init_on`).
     let mut gather = parts;
     let mut level = from as u64;
     while level < log_evals {

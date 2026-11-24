@@ -574,6 +574,8 @@ impl DeviceColumns {
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
         let (src, len) = self.at(k);
+        // A raw driver call: bind the stream's context first.
+        stream.context().bind_to_thread()?;
         let (base, _guard) = dst.device_ptr_mut(stream);
         // SAFETY: both ranges are inside allocations this call holds a handle
         // to, and the caller checked `offset + len` against `dst`.
