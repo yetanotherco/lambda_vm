@@ -7529,7 +7529,13 @@ fn page_configs_of<I: ImageSource>(
     host_hoist::calls::note_by_byte();
 
     // Per-page init bytes from the initial-memory image.
+    // Its seconds on the build marks (a no-op unless a build records them).
+    let pass_t = std::time::Instant::now();
     let init_page_data = build_init_page_data(image);
+    build_stamps::mark(&format!(
+        "p3 pages init data took {:.3}s",
+        pass_t.elapsed().as_secs_f64()
+    ));
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
