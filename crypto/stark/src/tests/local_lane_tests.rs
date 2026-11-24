@@ -510,3 +510,50 @@ fn the_local_lane_lines_add_up() {
     );
     assert_eq!(local_lane_lines(&[GroupStamps::default()]), "");
 }
+
+/// Phase B split over two drivers on the host (the two-card split's schedule
+/// without a card): a group whose local argue began on the lane in phase A is
+/// host data, so it is not kept on card 0; a group of it finishes its argue on
+/// the second driver, and the proof is the one-driver proof, byte for byte,
+/// and verifies.
+#[test]
+fn a_lanes_begun_argue_finishes_on_the_second_driver() {
+    let airs = Airs::new(None);
+    let block = Block::honest();
+    let config = production();
+    let order: Vec<usize> = (0..SIZES.len()).collect();
+    let prove_with = |split: bool| -> BlockProved<Fp, Ext> {
+        let mut committed =
+            commit(tables(&airs, &block), &config, lane(LaneLimits::default())).expect("phase A");
+        if split {
+            committed.set_two_card_split(Some(vec![false; SIZES.len()]), true);
+        }
+        let mut transcript = H::sponge();
+        multilinear_block::block_prove_in_order::<Fp, Ext, _, H>(
+            committed,
+            &config,
+            &mut transcript,
+            &[],
+            &[],
+            &|g| g,
+            &honest(),
+            &|_| {},
+            &order,
+            None,
+        )
+        .expect("phase B")
+    };
+    let one = prove_with(false);
+    let two = prove_with(true);
+    let cards: Vec<u8> = two.3.iter().map(|s| s.card).collect();
+    let began_on_card_1 = two
+        .3
+        .iter()
+        .any(|s| s.card == 1 && s.zc_lane.local && s.zc_lane.state == LaneState::Ran);
+    assert!(
+        began_on_card_1,
+        "no group whose argue began on the lane finished on the second driver: cards {cards:?}"
+    );
+    assert_eq!(bytes(&two), bytes(&one), "two drivers moved a byte");
+    verify_local(&airs, &block, &config, &two).expect("two drivers verify");
+}
