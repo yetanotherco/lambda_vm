@@ -1281,3 +1281,437 @@ fn a_dropped_or_swapped_word_chunk_reds_the_parity() {
         assert!(differs(&got), "{drop_ops}: swapped chunks passed");
     }
 }
+
+// --- The executor's lean stream ----------------------------------------------
+
+/// A window's history edited before it is sent (a forger's executor).
+type Tamper<'a> = &'a (dyn Fn(&mut executor::vm::history::WindowHistory) + Sync);
+
+/// How [`word_stream_build`] runs the executor and the walk.
+#[derive(Clone, Copy, Default)]
+struct StreamRun<'a> {
+    /// The executor's stream lean ([`executor::vm::fast::FastExecutor::resume_word_lean`]).
+    lean: bool,
+    /// The builder given the lean stream's replay
+    /// ([`super::windowed::WindowedTraceBuilder::lean_stream`]).
+    replay: bool,
+    /// Window `.0`'s history edited by `.1` before it is sent.
+    tamper: Option<(usize, Tamper<'a>)>,
+    /// A lean window sent with a log a cycle (a mismatched pair).
+    logs_with_lean: bool,
+}
+
+/// One streamed chunk as phase A hands it out: its table, index and records
+/// digest (`None` for a chunk not held as records).
+type HandedChunk = (String, usize, Option<[u64; 2]>);
+
+/// `program`'s run in record mode under the word memory format, by windows of
+/// `window` cycles on `walkers` threads at light walk `level`, its streamed
+/// ops dropped and its CPU chunks held as their records (their logs kept, as
+/// the card fills them): the tables, and each streamed chunk with its records'
+/// digest (the one regeneration checks).
+fn word_stream_build(
+    program: &Elf,
+    window: usize,
+    walkers: usize,
+    level: u8,
+    run: StreamRun<'_>,
+) -> Result<(Traces, Vec<HandedChunk>), crate::Error> {
+    use super::windowed::WindowedTraceBuilder;
+    use super::windowed::parallel::{ExecWindow, RunEnd, walk_windows_from_history};
+    use executor::vm::fast::{FastExecutor, Replay};
+    let mut builder = WindowedTraceBuilder::new(program, &[], &MaxRowsConfig::small())?
+        .register_format(RegisterFormat::InRow)?
+        .memw_aligned_order(MemwAlignedOrder::Limbs)?
+        .keccak_rnd_form(crate::block_whir::BlockFormat::production().keccak_rnd)
+        .ecdas_form(crate::block_whir::BlockFormat::production().ecdas)
+        .memory_format(MemoryFormat::Words)?
+        .drop_streamed_ops()?
+        .card_fill_streamed(std::sync::Arc::new(|_| true), true, false)?
+        .light_walk(level)?;
+    assert!(builder.keeps_logs(), "the CPU chunks keep their logs");
+    if run.replay {
+        let replay = Replay::new(program).map_err(|e| crate::Error::Execution(format!("{e}")))?;
+        builder = builder.lean_stream(std::sync::Arc::new(replay), false)?;
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let mut chunks = Vec::new();
+    let mut handed = Vec::new();
+    let report = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
+            fast.enable_word_history().expect("the word history");
+            if run.lean {
+                fast.enable_lean_stream().expect("the lean stream");
+            }
+            let mut k = 0usize;
+            loop {
+                let window = if run.lean {
+                    fast.resume_word_lean(window)
+                        .expect("the run")
+                        .map(|(cycles, h)| {
+                            let logs = if run.logs_with_lean {
+                                let log = executor::vm::logs::Log {
+                                    current_pc: 0,
+                                    next_pc: 0,
+                                    src1_val: 0,
+                                    src2_val: 0,
+                                    dst_val: 0,
+                                };
+                                vec![log; cycles]
+                            } else {
+                                Vec::new()
+                            };
+                            (logs, h)
+                        })
+                } else {
+                    fast.resume_word_history(window).expect("the run")
+                };
+                let Some((logs, mut history)) = window else {
+                    break;
+                };
+                assert_eq!(history.lean, run.lean);
+                if let Some((at, tamper)) = run.tamper
+                    && at == k
+                {
+                    tamper(&mut history);
+                }
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_word_history_final().map(RunEnd::boxed_words))
+                    .flatten();
+                let sent = tx.send(ExecWindow {
+                    logs: std::sync::Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                });
+                if sent.is_err() {
+                    break;
+                }
+                k += 1;
+            }
+        });
+        walk_windows_from_history(&mut builder, rx, walkers, 0, |accumulator, walked, _| {
+            for job in accumulator.absorb(walked) {
+                let mut chunk = job.generate();
+                // A chunk held as records: their digest, then the host's
+                // fill of them (the card's fill, on the host).
+                let digest = chunk.trace.take_records_main().map(|records| {
+                    let digest = records.digest();
+                    let packed = records.host_fill().expect("the host fills its records");
+                    let columns = packed
+                        .widen::<GoldilocksField>()
+                        .expect("the packed columns widen");
+                    let (rows, cols) = (records.rows(), records.cols());
+                    let mut data = Vec::with_capacity(rows * cols);
+                    for r in 0..rows {
+                        data.extend(columns.iter().map(|column| column.evals()[r]));
+                    }
+                    chunk.trace = Table::new_main(data, cols, 1);
+                    digest
+                });
+                handed.push((format!("{:?}", chunk.table), chunk.index, digest));
+                chunks.push(chunk);
+            }
+            Ok(())
+        })
+    })?;
+    let mut traces = builder.finish(&report.last)?;
+    traces.insert_streamed(chunks)?;
+    Ok((traces, handed))
+}
+
+/// The fixtures the lean stream is checked on: every width, sign and
+/// alignment of loads and stores and across `2^32`, every instruction, the
+/// misaligned ones, a loop, and the ECALLs the word format takes (copy,
+/// commit, Keccak, signature recovery; the executor's tests replay every
+/// ECALL, BLAKE3's among them).
+const LEAN_PROGRAMS: [&str; 11] = [
+    "fused_mem_cases",
+    "cross_4gib",
+    "all_loadstore_32",
+    "misalign_sw",
+    "loop_4096",
+    "test_copy_ecalls",
+    "copy_4gib",
+    "test_copy_overlaps",
+    "test_commit_split",
+    "test_keccak256",
+    "test_ecrec",
+];
+
+/// ★ The executor's lean stream: each window sent as its access records,
+/// ECALLs and starting cells only, re-run by its walker from them, a batch at
+/// a time. On every fixture, at windows of 7 and 33 cycles (every run's last
+/// window halts inside it), on one walker and on three, at light walk 1 and
+/// 2: the tables are the full stream's, every streamed chunk is handed out
+/// alike with the same records digest (the CPU chunks' kept logs byte for
+/// byte, as regeneration checks them), and every bus balances.
+#[test]
+fn the_lean_stream_builds_the_full_streams_tables_and_records() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let lean = StreamRun {
+        lean: true,
+        replay: true,
+        ..StreamRun::default()
+    };
+    // The chunks held as records (a CPU chunk is when it is cut full).
+    let mut held = 0usize;
+    for name in LEAN_PROGRAMS {
+        let (program, _) = run(name);
+        for window in [7, 33] {
+            for (walkers, level) in [(1, 1u8), (3, 2)] {
+                let what = format!("{name}/{window}/{walkers}/{level}");
+                eprintln!("{what}: full");
+                let (want, want_chunks) =
+                    word_stream_build(&program, window, walkers, level, StreamRun::default())
+                        .unwrap_or_else(|e| panic!("{what}: full: {e:?}"));
+                eprintln!("{what}: lean");
+                let (mut got, got_chunks) =
+                    word_stream_build(&program, window, walkers, level, lean)
+                        .unwrap_or_else(|e| panic!("{what}: lean: {e:?}"));
+                crate::tests::windowed_builder_tests::same_traces(&want, &got);
+                assert_eq!(got_chunks, want_chunks, "{what}");
+                held += got_chunks.iter().filter(|(_, _, d)| d.is_some()).count();
+                if window == 7 && walkers == 3 {
+                    let left = left(&program, &mut got, RegisterFormat::InRow);
+                    assert!(
+                        left.is_empty(),
+                        "{what}: {}",
+                        super::bus_net_tests::named(&left)
+                    );
+                }
+            }
+        }
+    }
+    assert!(held > 0, "a chunk held as records, its logs kept");
+}
+
+/// ★ The lean stream is refused, never run as another mode: a lean window
+/// sent to a walk with no replay, or with a log a cycle beside it.
+#[test]
+fn a_lean_window_without_its_replay_or_with_logs_is_refused() {
+    let (program, _) = run("loop_4096");
+    let no_replay = StreamRun {
+        lean: true,
+        ..StreamRun::default()
+    };
+    let err = word_stream_build(&program, 33, 2, 2, no_replay).map(|_| ());
+    assert!(
+        matches!(&err, Err(crate::Error::Prover(m)) if m.contains("needs the lean stream's replay")),
+        "{err:?}"
+    );
+    let paired = StreamRun {
+        lean: true,
+        replay: true,
+        logs_with_lean: true,
+        ..StreamRun::default()
+    };
+    let err = word_stream_build(&program, 33, 2, 2, paired).map(|_| ());
+    assert!(
+        matches!(&err, Err(crate::Error::Prover(m)) if m.contains("record mode: window 0's history")),
+        "{err:?}"
+    );
+    // At light walk 0 a cycle's record is found by its index, which a lean
+    // window has none of.
+    let lean = StreamRun {
+        lean: true,
+        replay: true,
+        ..StreamRun::default()
+    };
+    let err = word_stream_build(&program, 33, 2, 0, lean).map(|_| ());
+    assert!(
+        matches!(&err, Err(crate::Error::Prover(m)) if m.contains("the light walk")),
+        "{err:?}"
+    );
+}
+
+/// `program`'s lean windows at `window` cycles, to the end.
+fn lean_windows(program: &Elf, window: usize) -> Vec<executor::vm::history::WindowHistory> {
+    use executor::vm::fast::FastExecutor;
+    let mut fast = FastExecutor::new(program, Vec::new()).unwrap();
+    fast.enable_word_history().unwrap();
+    fast.enable_lean_stream().unwrap();
+    let mut out = Vec::new();
+    while let Some((_, h)) = fast.resume_word_lean(window).unwrap() {
+        out.push(h);
+    }
+    out
+}
+
+/// The access indices of the lean window `h`'s loads and stores whose word,
+/// changed, changes the replay's registers at the window's end (`reaches`)
+/// or leaves them (and the replay runs to its end).
+fn bent_accesses(
+    program: &Elf,
+    h: &executor::vm::history::WindowHistory,
+    reaches: bool,
+) -> Vec<usize> {
+    use executor::vm::fast::Replay;
+    let replay = Replay::new(program).unwrap();
+    let end = |h: &executor::vm::history::WindowHistory| {
+        let mut at = Replay::start(h).ok()?;
+        let mut out = Vec::new();
+        replay.run(h, &mut at, h.cycles, &mut out).ok()?;
+        Replay::finish(h, &at).ok()?;
+        Some(at.regs)
+    };
+    let honest = end(h).expect("the honest window replays");
+    (0..h.word_accesses.len())
+        .filter(|&a| {
+            let mut bent = h.clone();
+            bent.word_accesses[a].word ^= 0x0101_0101_0101_0101;
+            end(&bent).is_some_and(|regs| (regs != honest) == reaches)
+        })
+        .collect()
+}
+
+/// ★ Mutants of a lean window's records (a window that is not the run's
+/// last), each refused by its walker: an access record at another address,
+/// an access record dropped, an ECALL placed a cycle later or after another
+/// count of accesses; and a changed word on a live load, one whose bent value
+/// reaches the window's end registers (the walk's end is checked against the
+/// next window's start). Known limit, completeness only: a changed word whose
+/// value never reaches the window's end or a later address is not seen by
+/// the walker; the tables it builds then leave the memory argument
+/// unbalanced (the word read is not the one stored), so the verifier rejects
+/// the proof (the last case).
+#[test]
+fn a_lean_windows_tampered_records_are_refused() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    const WINDOW: usize = 33;
+    for name in ["fused_mem_cases", "test_copy_ecalls"] {
+        let (program, _) = run(name);
+        let windows = lean_windows(&program, WINDOW);
+        let body = &windows[..windows.len() - 1];
+        let walk = |k: usize, tamper: Tamper<'_>| {
+            let run = StreamRun {
+                lean: true,
+                replay: true,
+                tamper: Some((k, tamper)),
+                ..StreamRun::default()
+            };
+            word_stream_build(&program, WINDOW, 2, 2, run).map(|_| ())
+        };
+        // A window with a live load (the loads and stores fixture has one).
+        let live = body
+            .iter()
+            .enumerate()
+            .find_map(|(k, h)| bent_accesses(&program, h, true).first().map(|&a| (k, a)));
+        assert!(
+            live.is_some() || name != "fused_mem_cases",
+            "{name}: a live load"
+        );
+        if let Some((k, live)) = live {
+            assert!(
+                walk(k, &|h| h.word_accesses[0].addr ^= 8).is_err(),
+                "{name}: an access at another address"
+            );
+            assert!(
+                walk(k, &|h| {
+                    h.word_accesses.pop();
+                })
+                .is_err(),
+                "{name}: an access record dropped"
+            );
+            assert!(
+                walk(k, &move |h| h.word_accesses[live].word ^=
+                    0x0101_0101_0101_0101)
+                .is_err(),
+                "{name}: a changed word on a live load"
+            );
+        }
+        // The known limit: a changed word whose value dies in its window.
+        if let Some((k, dead)) = body
+            .iter()
+            .enumerate()
+            .find_map(|(k, h)| bent_accesses(&program, h, false).first().map(|&a| (k, a)))
+        {
+            let run = StreamRun {
+                lean: true,
+                replay: true,
+                tamper: Some((k, &move |h| {
+                    h.word_accesses[dead].word ^= 0x0101_0101_0101_0101
+                })),
+                ..StreamRun::default()
+            };
+            if let Ok((mut traces, _)) = word_stream_build(&program, WINDOW, 2, 2, run) {
+                let left = left(&program, &mut traces, RegisterFormat::InRow);
+                assert!(
+                    !left.is_empty(),
+                    "{name}: a dead load's changed word balanced every bus"
+                );
+            }
+        }
+        // A window with an ECALL.
+        if let Some(k) = body.iter().position(|h| !h.ecall_at.is_empty()) {
+            assert!(
+                walk(k, &|h| h.ecall_at[0] += 1).is_err(),
+                "{name}: an ECALL a cycle later"
+            );
+            assert!(
+                walk(k, &|h| h.accesses_before[0] += 1).is_err(),
+                "{name}: an ECALL after another count of accesses"
+            );
+        } else {
+            assert_ne!(name, "test_copy_ecalls", "a window with an ECALL");
+        }
+    }
+}
+
+/// ★ A run that fetches an instruction from memory (a jump into a data
+/// segment): today's record mode refuses its window (the prover's DECODE
+/// table holds no instruction there: `MissingInstruction`), and the lean
+/// stream refuses it at the executor, with an error, not a panic.
+#[test]
+fn a_window_fetching_an_instruction_from_memory_is_refused_by_both_streams() {
+    use executor::elf::Segment;
+    use executor::vm::fast::FastExecutor;
+    // I-type: imm[11:0] rs1 funct3 rd opcode.
+    let i = |opcode: u32, imm: i32, rs1: u32, funct3: u32, rd: u32| {
+        ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    };
+    let data = 0x200u64;
+    let program = Elf {
+        entry_point: 0x1000,
+        data: vec![
+            Segment {
+                base_addr: data,
+                // addi x6, x0, 7; addi x17, x0, 93; ecall (halt)
+                values: vec![i(0x13, 7, 0, 0, 6), i(0x13, 93, 0, 0, 17), 0x73],
+                is_executable: false,
+            },
+            Segment {
+                base_addr: 0x1000,
+                // addi x5, x0, 0x200; jalr x0, 0(x5)
+                values: vec![i(0x13, data as i32, 0, 0, 5), i(0x67, 0, 5, 0, 0)],
+                is_executable: true,
+            },
+        ],
+    };
+    // The engine runs it.
+    let mut fast = FastExecutor::new(&program, Vec::new()).unwrap();
+    fast.enable_word_history().unwrap();
+    while fast.resume_word_history(4).unwrap().is_some() {}
+    assert_eq!(fast.registers().read(6).unwrap(), 7, "the fetched addi ran");
+    // Today's record mode: refused at the walk.
+    let full = word_stream_build(&program, 4, 1, 2, StreamRun::default()).map(|_| ());
+    assert!(
+        matches!(&full, Err(crate::Error::MissingInstruction(pc)) if (data..data + 12).contains(pc)),
+        "{full:?}"
+    );
+    // The lean stream: refused at the executor.
+    let mut lean = FastExecutor::new(&program, Vec::new()).unwrap();
+    lean.enable_word_history().unwrap();
+    lean.enable_lean_stream().unwrap();
+    let refused = loop {
+        match lean.resume_word_lean(4) {
+            Ok(Some(_)) => continue,
+            other => break other.map(|o| o.map(|(c, _)| c)),
+        }
+    };
+    assert!(
+        matches!(&refused, Err(e) if format!("{e}").contains("outside the program's decoded segments")),
+        "{refused:?}"
+    );
+}

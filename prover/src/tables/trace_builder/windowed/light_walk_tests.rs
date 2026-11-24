@@ -127,7 +127,7 @@ fn walked(
         &mut record,
         &mut registers,
         first,
-        logs,
+        &mut super::LogSource::Logs(logs),
         None,
     )
     .expect("the walk");

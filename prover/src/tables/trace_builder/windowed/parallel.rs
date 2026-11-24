@@ -47,7 +47,9 @@ use executor::vm::memory::MemorySnapshot;
 use super::super::{ABSENT, HistoryOverlay, MemoryState, NO_PAGE, RegisterState, WalkSizes};
 use super::head_log;
 use super::lean_pass::LeanPass;
-use super::{Accumulator, WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window};
+use super::{
+    Accumulator, LeanStream, LogSource, WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window,
+};
 use crate::Error;
 use crate::paged_mem::PagedMem;
 use crate::tables::decode::DecodeTable;
@@ -137,6 +139,13 @@ impl<L: Into<Arc<Vec<Log>>>> From<(L, Option<MemorySnapshot>)> for ExecWindow {
 /// history mode (`HISTORY_MAX_CYCLES`).
 pub(super) fn ecall_cycles(history: &WindowHistory) -> Vec<u32> {
     use executor::vm::history::{ECALL, NO_ACCESS};
+    if history.lean {
+        return history
+            .ecall_at
+            .iter()
+            .map(|&at| (history.first + u64::from(at)) as u32)
+            .collect();
+    }
     history
         .extras
         .iter()
@@ -212,6 +221,9 @@ struct WalkSettings {
     route: bool,
     /// The walk's cuts ([`WindowedTraceBuilder::walk_cuts`]).
     cuts: crate::tables::trace_builder::WalkCuts,
+    /// The lean stream ([`WindowedTraceBuilder::lean_stream`]): each lean
+    /// window re-run by its walker.
+    lean: Option<LeanStream>,
 }
 
 impl WalkSettings {
@@ -222,6 +234,44 @@ impl WalkSettings {
             count: self.ecdas_count.as_ref(),
         }
     }
+}
+
+/// A walker's buffer for a lean window's `cycles` logs, kept with the window:
+/// from the page-locked pool when `pooled` (as the executor's own buffers
+/// are, `LAMBDA_VM_POOL_EXEC_LOGS`), pageable otherwise.
+fn lean_window_buffer(cycles: usize, pooled: bool) -> Vec<Log> {
+    if pooled {
+        crate::block_whir::pooled_log_buffer(cycles)
+    } else {
+        Vec::with_capacity(cycles)
+    }
+}
+
+/// The run's last window, lean, re-run whole on the record thread: the
+/// finish walks its logs. Its last cycle, and no other, must halt.
+fn replay_last(lean: Option<&LeanStream>, history: &WindowHistory) -> Result<Vec<Log>, Error> {
+    let failed = |e: executor::vm::execution::ExecutorError| Error::Prover(format!("{e}"));
+    let Some(lean) = lean else {
+        return Err(Error::Prover(
+            "record mode: a lean window, and no replay to re-run it".into(),
+        ));
+    };
+    let mut at = executor::vm::fast::Replay::start(history).map_err(failed)?;
+    let mut logs = Vec::with_capacity(history.cycles);
+    lean.replay
+        .run(history, &mut at, history.cycles, &mut logs)
+        .map_err(failed)?;
+    executor::vm::fast::Replay::finish(history, &at).map_err(failed)?;
+    let halts_last = logs.last().is_some_and(|log| log.next_pc == 0);
+    let halts_before = logs
+        .split_last()
+        .is_some_and(|(_, before)| before.iter().any(|log| log.next_pc == 0));
+    if !halts_last || halts_before {
+        return Err(Error::Prover(
+            "record mode: the run's last window, re-run, does not halt on its last cycle".into(),
+        ));
+    }
+    Ok(logs)
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -329,16 +379,53 @@ impl WindowWalker {
         ));
         let settings = Arc::clone(&self.settings);
         let s = &*settings;
+        let cycles = history.cycle_count();
         // Words mode: the window's ECALL cycles, from its history, before the
         // walk (its walker marks the rows the card cannot build).
         let words = s.words.map(|table| {
             super::super::register_words::WordWindow::new(
                 job.first as u64,
-                job.logs.len(),
+                cycles,
                 table,
                 ecall_cycles(history).into_iter().map(u64::from),
             )
         });
+        // A lean window: re-run here, a batch at a time, into a buffer of the
+        // window's (kept for the card) or of a batch.
+        let lean = match (history.lean, &s.lean) {
+            (false, _) => None,
+            (true, Some(lean)) if s.light && job.logs.is_empty() => Some(lean),
+            (true, _) => {
+                self.record.overlay = None;
+                return Err(Error::Prover(format!(
+                    "window {}: a lean window needs the lean stream's replay and the light walk",
+                    job.window
+                )));
+            }
+        };
+        let mut buffer = match lean {
+            Some(lean) if s.keep_logs => lean_window_buffer(cycles, lean.pooled),
+            Some(_) => Vec::with_capacity(s.batch.max(1).min(cycles.max(1))),
+            None => Vec::new(),
+        };
+        let started = match lean {
+            Some(_) => Some(
+                executor::vm::fast::Replay::start(history)
+                    .map(Box::new)
+                    .map_err(|e| Error::Prover(format!("window {}: {e}", job.window)))?,
+            ),
+            None => None,
+        };
+        let mut source = match (lean, started) {
+            (Some(lean), Some(cursor)) => LogSource::Replay {
+                replay: &lean.replay,
+                history,
+                cursor,
+                out: &mut buffer,
+                keep: s.keep_logs,
+            },
+            _ => LogSource::Logs(&job.logs),
+        };
         let walked = walk_window(
             &s.decode,
             s.order,
@@ -355,13 +442,40 @@ impl WindowWalker {
             &mut self.record,
             &mut self.registers,
             job.first,
-            &job.logs,
+            &mut source,
             words,
         );
+        let replayed = match source {
+            LogSource::Replay { cursor, .. } => Some(cursor),
+            LogSource::Logs(_) => None,
+        };
+        let took_every_record = self
+            .record
+            .overlay
+            .as_deref()
+            .is_none_or(HistoryOverlay::took_every_record);
         self.record.overlay = None;
         let mut walked = walked?;
+        if let Some(cursor) = &replayed {
+            // The re-run took every record and ends where the walk does: its
+            // pc and register values are the walk's, whose cells (stamps
+            // too) are checked against the next window's start.
+            executor::vm::fast::Replay::finish(history, cursor)
+                .map_err(|e| Error::Prover(format!("window {}: {e}", job.window)))?;
+            let r = &self.registers;
+            let values: [u64; 32] = std::array::from_fn(|k| r.regs[k].0);
+            if !took_every_record || values != cursor.regs || r.pc_register.0 != cursor.pc {
+                return Err(Error::Prover(format!(
+                    "window {}: re-run from its records, it does not end where its walk does",
+                    job.window
+                )));
+            }
+        }
         if s.keep_logs {
-            walked.keep_logs(Arc::clone(&job.logs));
+            walked.keep_logs(match replayed {
+                Some(_) => Arc::new(buffer),
+                None => Arc::clone(&job.logs),
+            });
         }
         if self.record.take_missing() {
             return Err(Error::Prover(format!(
@@ -414,7 +528,7 @@ impl WindowWalker {
             &mut self.memory,
             &mut self.registers,
             job.first,
-            &job.logs,
+            &mut LogSource::Logs(&job.logs),
             None,
         )?;
         if s.keep_logs {
@@ -781,7 +895,9 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         light: builder.light_walks().0,
         route: builder.light_walks().1,
         cuts: builder.walk_cuts_on(),
+        lean: builder.lean_streams(),
     });
+    let lean_stream = settings.lean.clone();
     // Record mode with the final state hoisted (`LAMBDA_VM_HOST_HOIST=state`):
     // the builder's setup state, the image mapped, is the finish's state's
     // base instead of mapping the image again. Untouched before the run's
@@ -832,6 +948,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     &start_registers,
                     image,
                     lean,
+                    lean_stream.as_ref(),
                     windows,
                     number,
                     recheck,
@@ -1184,6 +1301,7 @@ fn record_thread<W: Into<ExecWindow>>(
     start_registers: &RegisterState,
     image: &PagedMem<u8>,
     lean: bool,
+    lean_stream: Option<&LeanStream>,
     windows: Receiver<W>,
     number: fn(u32) -> u32,
     recheck: usize,
@@ -1218,11 +1336,20 @@ fn record_thread<W: Into<ExecWindow>>(
         let history: Arc<WindowHistory> = Arc::from(history.ok_or_else(|| {
             Error::Prover("record mode: the executor sent a window without its history".into())
         })?);
-        if history.first != first as u64 || history.extras.len() != logs.len() {
+        // A lean window comes with no logs (its walker re-runs it); any
+        // other with a log a cycle of its history.
+        let cycles = history.cycle_count();
+        let paired = if history.lean {
+            logs.is_empty() && cycles > 0
+        } else {
+            history.extras.len() == logs.len()
+        };
+        if history.first != first as u64 || !paired {
             return Err(Error::Prover(format!(
-                "record mode: window {k}'s history covers {} cycles from {}, its logs {} from {first}",
-                history.extras.len(),
+                "record mode: window {k}'s history covers {cycles} cycles from {} (lean: {}), its \
+                 logs {} from {first}",
                 history.first,
+                history.lean,
                 logs.len()
             )));
         }
@@ -1241,8 +1368,19 @@ fn record_thread<W: Into<ExecWindow>>(
             ));
         }
         let t = Instant::now();
-        let halts = logs.last().is_some_and(|log| log.next_pc == 0);
+        // A lean window has no log to read: the run's end comes with the one
+        // that halts (a halt in any other is refused where it is re-run).
+        let halts = if history.lean {
+            end.is_some()
+        } else {
+            logs.last().is_some_and(|log| log.next_pc == 0)
+        };
         let rechecked = recheck > 0 && !halts && (k as usize).is_multiple_of(recheck);
+        if check.is_some() && history.lean {
+            return Err(Error::Prover(format!(
+                "record mode: window {k} is lean, and the history check re-walks logs"
+            )));
+        }
         if let Some(check) = &check {
             let start = match (rechecked, start) {
                 (true, Some(start)) => Some(Arc::new(start)),
@@ -1285,6 +1423,11 @@ fn record_thread<W: Into<ExecWindow>>(
                     state: Arc::clone(&state),
                 });
             }
+            let logs = if history.lean {
+                Arc::new(replay_last(lean_stream, &history)?)
+            } else {
+                logs
+            };
             state_secs = t.elapsed().as_secs_f64();
             busy += state_secs;
             last = Some((logs, state, registers));
@@ -1293,7 +1436,6 @@ fn record_thread<W: Into<ExecWindow>>(
         busy += t.elapsed().as_secs_f64();
         let (after_tx, after_rx) = sync_channel(1);
         permits.send(()).map_err(stopped)?;
-        let cycles = logs.len();
         jobs.send(Ticket {
             job: WindowJob {
                 window: number(k),

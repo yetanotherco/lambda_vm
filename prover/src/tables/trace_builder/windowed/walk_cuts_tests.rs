@@ -17,7 +17,7 @@ use super::super::{HistoryOverlay, MemoryState, RegisterState, WalkCuts, WalkSiz
 use super::light_walk_tests::{
     PROGRAMS, RUST_GUESTS, WORD_PROGRAMS, built, counted, dbg, lists, rust_elf,
 };
-use super::{WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window};
+use super::{LogSource, WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window};
 use crate::Error;
 use crate::tables::MaxRowsConfig;
 use crate::tables::decode::DecodeTable;
@@ -77,7 +77,7 @@ fn walked(
         &mut record,
         &mut registers,
         first,
-        logs,
+        &mut LogSource::Logs(logs),
         None,
     )?;
     let refused = record.take_missing();
