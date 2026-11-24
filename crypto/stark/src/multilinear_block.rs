@@ -4607,11 +4607,11 @@ where
     }
     let before_revive = own_window.then(multilinear::gpu::ledger_reserved);
     // ★ THE TWO-CARD OPENINGS' SECOND UPLOAD (r4). Under the two-card openings
-    // `store` is `None` here (dropped with the group's card-0 state before its
-    // openings started), so this revive uploads the group's columns from the
-    // host a second time, to the openings' card: the host link's extra bytes
-    // a measurement prices (`stamps.encode` below holds its time with the
-    // re-encode).
+    // `store` is the group's second, compact upload on the openings' card
+    // (the first went with the group's card-0 state before its openings
+    // started): the host link's extra bytes a measurement prices. When that
+    // card declined it, `store` is `None` and this revive reads the host's
+    // columns.
     let stacked = retired.revive::<H, _>(
         &columns,
         store.map(|store| (&**store, ColumnsAt::From(0))),
@@ -5087,6 +5087,9 @@ where
     // those kept on card 0 (a held prepared stack).
     let mut two_card = (0usize, 0usize);
     let opened_on_own = std::sync::atomic::AtomicUsize::new(0);
+    // Of those, the groups whose compact upload on the openings' card was
+    // declined (opened over the host's columns).
+    let second_declined = std::sync::atomic::AtomicUsize::new(0);
     let mut latched = false;
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
@@ -5232,6 +5235,7 @@ where
         let roots_ref = &roots;
         let answers_ref = &answers;
         let opened_on_own_ref = &opened_on_own;
+        let second_declined_ref = &second_declined;
         let (argue_result, argue_end, next_store, joined, opened, open_paid) =
             std::thread::scope(|scope| {
                 let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
@@ -5251,6 +5255,17 @@ where
                         let fails = overlap_faults.open_fails == Some(earlier.place);
                         let (opened, stacked) = if prev_on_own_card {
                             let opened = multilinear::gpu::on_openings_card(|| {
+                                // The group's columns once more, compact (records
+                                // filled and narrow columns widened on the
+                                // openings' card, into its ledger), so its
+                                // openings open from the stack as on card 0. A
+                                // card that declines leaves the host's columns:
+                                // the same bytes, slower, and counted.
+                                earlier.store = upload_group(its_tables);
+                                if earlier.store.is_none() {
+                                    second_declined_ref
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 open_group::<F, E, T, H>(
                                     earlier, its_tables, prepared, deviations, config, false, fails,
                                 )
@@ -5690,8 +5705,10 @@ where
         eprintln!(
             "BLOCK TWO-CARD OPENINGS: on (LAMBDA_VM_TWO_CARD_OPENINGS) · {} of {n} groups opened on the \
              openings' card beside an argue · {} kept on card 0 (a held prepared stack) · the rest \
-             opened alone on card 0",
-            two_card.0, two_card.1
+             opened alone on card 0 · {} opened there over the host's columns (their upload declined)",
+            two_card.0,
+            two_card.1,
+            second_declined.into_inner()
         );
     }
     // Every finished group's records handed back before phase B returns.

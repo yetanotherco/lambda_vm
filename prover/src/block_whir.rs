@@ -10764,6 +10764,18 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        // The process's counts of the paths a card refusal (or a store read
+        // from another card) takes, as the base's phase B ends: a two-card arm
+        // must show the one-card arm's counts, and no cross-card decline.
+        eprintln!(
+            "BLOCK HOST PATHS: host fallbacks {} · openings staged from the host {} · host widens {} tables \
+             · host fills {} tables · cross-card declines {}",
+            multilinear::gpu::host_fallbacks(),
+            multilinear::gpu::openings_staged_from_host(),
+            multilinear::narrow::host_widens().0,
+            multilinear::records::fills().1,
+            multilinear::gpu::cross_card_declines(),
+        );
         // The order as phase B took it, when the lead moved groups.
         let order = match lead.and_then(PhaseBLead::taken) {
             Some(taken) if taken.order.len() == order.len() => taken.order,

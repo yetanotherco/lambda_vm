@@ -3516,6 +3516,67 @@ mod two_card_openings_tests {
         assert_eq!(current_role(), DeviceRole::Main);
     }
 
+    /// ★ Card, run alone. Two backends keep their own per-card state: the
+    /// BLAKE3 WHIR kernels and the root tables are each backend's own objects;
+    /// a reservation made in the openings' role is the second backend's (its
+    /// ledger and its peak, not card 0's) and goes back there when dropped on
+    /// a card-0 thread. Forced on one card, or on card 1 with two. On one card
+    /// the two backends share the device's primary context, so this shows the
+    /// caches are per backend, not that card 1's launches work: only a
+    /// two-card run shows that.
+    #[test]
+    #[ignore = "card: run alone"]
+    fn each_backend_keeps_its_own_kernels_tables_and_ledger() {
+        use super::{BackendSlot, backend, main_backend, reserve};
+        let setting = if super::card_count() >= 2 {
+            TwoCardOpenings::Auto
+        } else {
+            TwoCardOpenings::Forced
+        };
+        set_two_card_openings_for_test(Some(setting));
+        let main = main_backend().expect("card 0");
+        let second = {
+            let _role = enter_role(DeviceRole::Openings);
+            backend().expect("the second backend")
+        };
+        assert!(!std::ptr::eq(main, second), "two backends");
+        assert_eq!(BackendSlot::of(second), BackendSlot::Second);
+        let k0 = crate::blake3_whir::kernels().expect("card 0's kernels") as *const _;
+        let k1 = {
+            let _role = enter_role(DeviceRole::Openings);
+            crate::blake3_whir::kernels().expect("the second's kernels") as *const _
+        };
+        assert_ne!(k0, k1, "one set of kernels for two backends");
+        let t0 = crate::lde_cm::root_tables(main).expect("card 0's tables") as *const _;
+        let t1 = crate::lde_cm::root_tables(second).expect("the second's tables") as *const _;
+        assert_ne!(t0, t1, "one set of root tables for two backends");
+        const MIB: u64 = 1 << 20;
+        let (m0, s0) = (main.reserved_bytes(), second.reserved_bytes());
+        let r = std::thread::spawn(|| {
+            let _role = enter_role(DeviceRole::Openings);
+            super::reset_window_high_water();
+            reserve(MIB)
+        })
+        .join()
+        .expect("thread")
+        .expect("the second backend has a MiB");
+        assert_eq!(
+            (main.reserved_bytes(), second.reserved_bytes()),
+            (m0, s0 + MIB)
+        );
+        assert!(
+            second
+                .peaks
+                .window
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= s0 + MIB,
+            "the second backend's own peak"
+        );
+        drop(r);
+        assert_eq!((main.reserved_bytes(), second.reserved_bytes()), (m0, s0));
+        set_two_card_openings_for_test(None);
+    }
+
     /// Off, the openings' work runs as before: on the caller's thread, in its
     /// role, and no rayon pool of their own is made.
     #[test]
