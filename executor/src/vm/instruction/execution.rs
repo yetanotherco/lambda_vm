@@ -894,8 +894,10 @@ impl Instruction {
                 let syscall_number_raw = registers.read(17)?; // a7
                 let syscall_number = SyscallNumbers::try_from(syscall_number_raw)
                     .map_err(|_| ExecutionError::UnknownSyscall(syscall_number_raw))?;
-                let mut src2_val = 0u64;
-                let mut dst_val = 0u64;
+                // The log and the `x10` write-back, from the registers before
+                // the call: one statement of them, the lean stream's replay's
+                // too (`ecall_log`). The arms below run the call and its checks.
+                let made = ecall_log(pc, &registers.to_array());
                 match syscall_number {
                     SyscallNumbers::Print => {
                         // print
@@ -936,9 +938,7 @@ impl Instruction {
                         // the next instruction to read A0 without first writing it
                         // emits a register token COPY never produced — an honest
                         // program that the prover cannot prove.
-                        registers.write(10, count)?;
-                        src2_val = buf_addr;
-                        dst_val = count;
+                        // (`ecall_log` gives x10 = count, written below.)
                     }
                     SyscallNumbers::KeccakPermute => {
                         // keccak-f[1600] permutation on 200 bytes (25 × u64) at address in x10
@@ -964,7 +964,6 @@ impl Instruction {
                                 .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
                             memory.store_doubleword(lane_addr, lane)?;
                         }
-                        src2_val = state_addr;
                     }
                     SyscallNumbers::Keccak256 => {
                         // Keccak-256 of [x10, x10 + x11) written to [x12, x12 + 32).
@@ -987,8 +986,6 @@ impl Instruction {
                         // `EcallEbreak` writes no register, and the trace builder
                         // recovers x10..x12 from the register state, like ECSM and
                         // HINT.
-                        src2_val = keccak256_blocks(len);
-                        dst_val = ptr;
                     }
                     SyscallNumbers::Blake3Compress => {
                         // BLAKE3 6-round compression on a 176-byte region at the
@@ -1023,7 +1020,6 @@ impl Instruction {
                                 dw,
                             )?;
                         }
-                        src2_val = state_addr;
                     }
                     SyscallNumbers::Blake3Absorb => {
                         // Chained absorb: fold `num_blocks` consecutive 64-byte
@@ -1122,8 +1118,6 @@ impl Instruction {
                         // They are here for the absorb classification the chip
                         // will add, which — like ECSM and HINT — will recover
                         // x10..x13 from the register state rather than the log.
-                        src2_val = ctrl_addr;
-                        dst_val = msg_addr;
                     }
                     SyscallNumbers::Ecsm => {
                         // ECSM(-11): k×G on secp256k1.
@@ -1155,8 +1149,6 @@ impl Instruction {
                         store_u256_le(memory, addr_xr, &xr)?;
                         // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
                         // by the ECSM register-read path in the trace builder.
-                        src2_val = addr_xg;
-                        dst_val = addr_k;
                     }
                     SyscallNumbers::Ecrec => {
                         // ECREC(-12): ECDSA public-key recovery on secp256k1.
@@ -1223,8 +1215,6 @@ impl Instruction {
                             dw.copy_from_slice(&out[8 * i as usize..8 * i as usize + 8]);
                             memory.store_doubleword(addr_out + 8 * i, u64::from_le_bytes(dw))?;
                         }
-                        src2_val = addr_sig;
-                        dst_val = addr_msg;
                     }
                     SyscallNumbers::DmaMemcpy => {
                         // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
@@ -1258,8 +1248,6 @@ impl Instruction {
                                 memory.store_byte(dst + i as u64, byte);
                             }
                         }
-                        src2_val = copy_trace_rows(src, dst, n, false);
-                        dst_val = n;
                     }
                     SyscallNumbers::DmaMemset => {
                         // memset(dst = x10, src = x11, n = x12) — a *propagating* copy,
@@ -1309,8 +1297,6 @@ impl Instruction {
                                 memory.store_byte(dst + i, byte);
                             }
                         }
-                        src2_val = copy_trace_rows(src, dst, n, false);
-                        dst_val = n;
                     }
                     SyscallNumbers::Hint => {
                         // Non-constraining hint: host computes a modular inverse/sqrt
@@ -1345,27 +1331,20 @@ impl Instruction {
                         let input = load_u256_le(memory, in_addr)?;
                         let output = compute_hint(hint_id, &input);
                         store_u256_le(memory, out_addr, &output)?;
-                        src2_val = in_addr;
-                        dst_val = out_addr;
                     }
                     SyscallNumbers::Halt => {
-                        // halt
-                        return Ok(Log {
-                            current_pc: pc,
-                            next_pc: 0,                   // We halt by setting pc to 0
-                            src1_val: syscall_number_raw, // actual a7 value for rv1
-                            src2_val: 0,
-                            dst_val: 0,
-                        });
+                        // halt: `ecall_log` sets the next pc to 0 and logs a7.
                     }
                 }
-                Log {
-                    current_pc: pc,
-                    next_pc: pc + REGULAR_PC_UPDATE,
-                    src1_val: syscall_number_raw,
-                    src2_val,
-                    dst_val,
+                // Every call `ecall_log` gives no log for has returned its
+                // error above.
+                let Some((log, x10)) = made else {
+                    return Err(ExecutionError::UnknownSyscall(syscall_number_raw));
+                };
+                if let Some(value) = x10 {
+                    registers.write(10, value)?;
                 }
+                log
             }
             Instruction::Fence => {
                 // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
@@ -1383,13 +1362,12 @@ impl Instruction {
 
 /// The log an ECALL at `pc` writes when it succeeds on the registers `regs`
 /// (as they stand before it), and the value it writes to `x10` (the commit's
-/// byte count; no other ECALL writes a register): what the ECALL arm of
-/// [`Instruction::execute`] logs, from the registers alone. `None` for a
-/// number no ECALL accepts (and print's sibling panic), or DMA operands it
-/// refuses. Nothing is checked or run: a caller re-running a cycle the
-/// executor already ran (the lean stream's replay) knows it succeeded. A
-/// second statement of the arm's fields, pinned to it by the fast engine's
-/// tests on random programs over every ECALL.
+/// byte count; no other ECALL writes a register), from the registers alone:
+/// the ECALL arm of [`Instruction::execute`] logs and writes back exactly
+/// this, and the lean stream's replay re-makes it. `None` for a number no
+/// ECALL accepts (and print's sibling panic), or DMA operands it refuses.
+/// Nothing is checked or run: the arm runs the call and its checks, and a
+/// replay re-runs a cycle the executor already ran.
 pub fn ecall_log(pc: u64, regs: &[u64; 32]) -> Option<(Log, Option<u64>)> {
     let number = regs[17];
     let r = |reg: usize| regs[reg];
