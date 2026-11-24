@@ -330,6 +330,8 @@ pub struct WindowedTraceBuilder<'a> {
     light_walk: u8,
     /// [`Self::walk_cuts`].
     walk_cuts: super::WalkCuts,
+    /// [`Self::lean_stream`].
+    lean_stream: Option<LeanStream>,
     /// The split walker's counts ([`Self::count_where_made`]).
     own_counts: WalkCounts,
     /// The counts of the walkers of a run walked from its entries or its
@@ -652,6 +654,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             cpu_listless: true,
             light_walk: 0,
             walk_cuts: super::WalkCuts::default(),
+            lean_stream: None,
             own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
@@ -901,6 +904,34 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// The walk's cuts in effect ([`Self::walk_cuts`]).
     pub(crate) fn walk_cuts_on(&self) -> super::WalkCuts {
         self.walk_cuts
+    }
+
+    /// The lean stream: the executor sends each window as its access records
+    /// and ECALLs only ([`executor::vm::fast::FastExecutor::resume_word_lean`])
+    /// and each walker re-runs its window with `replay`, a batch at a time,
+    /// rebuilding the executor's logs byte for byte; with
+    /// [`Self::keeps_logs`] it writes them into a buffer of the window's
+    /// (from the page-locked pool when `pooled`), which the card fills from.
+    /// Needs record mode under the word memory format and the light walk
+    /// ([`Self::light_walk`] ≥ 1), checked as the windows come. Before the
+    /// first window only. The tables are the same.
+    pub fn lean_stream(
+        mut self,
+        replay: Arc<executor::vm::fast::Replay>,
+        pooled: bool,
+    ) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "lean_stream after a window was walked".to_string(),
+            ));
+        }
+        self.lean_stream = Some(LeanStream { replay, pooled });
+        Ok(self)
+    }
+
+    /// [`Self::lean_stream`]'s replay and buffer source, when it is on.
+    pub(crate) fn lean_streams(&self) -> Option<LeanStream> {
+        self.lean_stream.clone()
     }
 
     /// The walkers' light walk in effect ([`Self::light_walk`]): its cells
@@ -2499,7 +2530,7 @@ impl Walker<'_> {
             self.memory_state,
             self.register_state,
             *self.cycles,
-            logs,
+            &mut LogSource::Logs(logs),
             None,
         )?;
         *self.cycles += logs.len();
@@ -2537,6 +2568,71 @@ fn routes_stores(format: MemoryFormat) -> bool {
     }
 }
 
+/// The lean stream's replay and where a walker's window buffer comes from
+/// ([`WindowedTraceBuilder::lean_stream`]).
+#[derive(Clone)]
+pub(crate) struct LeanStream {
+    pub(crate) replay: Arc<executor::vm::fast::Replay>,
+    pub(crate) pooled: bool,
+}
+
+/// Where a walked window's logs come from: the executor's, or a lean window
+/// ([`executor::vm::history::WindowHistory::lean`]) re-run by its walker a
+/// batch at a time ([`executor::vm::fast::Replay`]), each batch walked while
+/// it is in cache.
+pub(crate) enum LogSource<'a> {
+    Logs(&'a [Log]),
+    Replay {
+        replay: &'a executor::vm::fast::Replay,
+        history: &'a executor::vm::history::WindowHistory,
+        /// Where the re-run stands (boxed: the registers are its bulk).
+        cursor: Box<executor::vm::fast::ReplayCursor>,
+        /// The logs re-run: the whole window's when `keep`, else the batch
+        /// being walked.
+        out: &'a mut Vec<Log>,
+        keep: bool,
+    },
+}
+
+impl LogSource<'_> {
+    /// The window's cycles.
+    fn cycles(&self) -> usize {
+        match self {
+            Self::Logs(logs) => logs.len(),
+            Self::Replay { history, .. } => history.cycles,
+        }
+    }
+
+    /// The `n` cycles from cycle `from`'s logs: the executor's, or re-run
+    /// (refusing a halt: only the run's last window, which no walker walks,
+    /// may halt).
+    fn batch(&mut self, from: usize, n: usize) -> Result<&[Log], Error> {
+        match self {
+            Self::Logs(logs) => Ok(&logs[from..from + n]),
+            Self::Replay {
+                replay,
+                history,
+                cursor,
+                out,
+                keep,
+            } => {
+                if !*keep {
+                    out.clear();
+                }
+                let start = out.len();
+                replay
+                    .run(history, cursor, n, out)
+                    .map_err(|e| Error::Prover(format!("{e}")))?;
+                let part = &out[start..];
+                if part.iter().any(|log| log.next_pc == 0) {
+                    return Err(Error::HaltInNonFinalEpoch);
+                }
+                Ok(part)
+            }
+        }
+    }
+}
+
 /// One window (not the run's last) walked from `memory` and `registers` into
 /// fresh lists, its cycles numbered from `first`: [`Walker::walk`]'s body, and
 /// what a window walked from its entries runs.
@@ -2557,7 +2653,7 @@ fn walk_window(
     memory: &mut MemoryState,
     registers: &mut RegisterState,
     first: usize,
-    logs: &[Log],
+    source: &mut LogSource<'_>,
     words: Option<super::register_words::WordWindow>,
 ) -> Result<WalkedWindow, Error> {
     // Each part's seconds added to `times` when the walk is timed.
@@ -2571,33 +2667,38 @@ fn walk_window(
         }
     };
     // As a whole-run build: only the last cycle may halt. Under the cut
-    // `prescan` the collect refuses a halting cycle as it reads its log.
-    if !cuts.prescan && logs.iter().any(|log| log.next_pc == 0) {
+    // `prescan` the collect refuses a halting cycle as it reads its log; a
+    // re-run window is checked a batch at a time either way.
+    if !cuts.prescan
+        && let LogSource::Logs(logs) = source
+        && logs.iter().any(|log| log.next_pc == 0)
+    {
         return Err(Error::HaltInNonFinalEpoch);
     }
     lap(|t| &mut t.prescan, &mut times);
+    let cycles = source.cycles();
     let mut cpu_ops = Vec::with_capacity(if list {
-        logs.len()
+        cycles
     } else {
-        batch_len(batch, logs.len())
+        batch_len(batch, cycles)
     });
     // Without `lookups`, the accumulator counts them (`absorb`).
-    let mut walk = WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order);
+    let mut walk = WalkOutputs::for_walk_sized(cycles, lookups, sizes, order);
     walk.memw.registers = register_format;
     walk.memw.memory = memory_format;
     if register_format == crate::tables::register::RegisterFormat::InRow
         && super::inrow_sides_pinned()
     {
-        walk.side_records_for_the_card(logs.len());
+        walk.side_records_for_the_card(cycles);
     }
     if let Some(window) = words {
-        walk.memw.set_words(window, logs.len() * 3);
+        walk.memw.set_words(window, cycles * 3);
     }
     // The walk is a left fold over the CPU ops: walking each batch right
     // after collecting it gives the window's lists, with the batch's ops
     // still in cache instead of read back from the whole window's list.
     let batch = match batch {
-        0 => logs.len().max(1),
+        0 => cycles.max(1),
         n => n,
     };
     // Counting where the rows are made: the window's last ECALL.
@@ -2606,7 +2707,7 @@ fn walk_window(
     // routed and their own lookups counted while in cache, into segments
     // sized from the walker's last window.
     let mut router = (route && counts.is_some()).then(|| {
-        super::CpuRouter::with_capacities(sizes.routed_for(logs.len()))
+        super::CpuRouter::with_capacities(sizes.routed_for(cycles))
             .routing_stores(routes_stores(memory_format))
     });
     lap(|t| &mut t.lists, &mut times);
@@ -2616,7 +2717,8 @@ fn walk_window(
     let pad_bytes = pad.walker;
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
-    for part in logs.chunks(batch) {
+    while from < cycles {
+        let part = source.batch(from, batch.min(cycles - from))?;
         let start = if list { cpu_ops.len() } else { 0 };
         if !list {
             cpu_ops.clear();
@@ -2698,7 +2800,7 @@ fn walk_window(
     }
     let routed = router.map(|router| router.finish(&walk.cpu32_ops));
     let last_routed = sizes.routed;
-    *sizes = WalkSizes::of(&walk, logs.len());
+    *sizes = WalkSizes::of(&walk, cycles);
     match routed.as_ref() {
         Some(segments) => sizes.set_routed(segments),
         None => sizes.routed = last_routed,
@@ -2713,7 +2815,7 @@ fn walk_window(
     Ok(WalkedWindow {
         cpu_ops,
         first,
-        cycles: logs.len(),
+        cycles,
         walk,
         logs: None,
         made,

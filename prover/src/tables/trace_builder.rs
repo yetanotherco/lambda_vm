@@ -1079,10 +1079,19 @@ pub(crate) struct HistoryOverlay {
     timestamps: Vec<u64>,
     /// The cycle being walked, its index in the window.
     cycle: Option<usize>,
+    /// The cycle's record ([`executor::vm::history::HistExtra::side`]).
+    side: u32,
     /// The light record walk ([`Self::light`]): a cycle that is no ECALL is
     /// walked without its cells, its load or store read from its access
     /// record.
     light: bool,
+    /// Under the lean stream ([`executor::vm::history::WindowHistory::lean`])
+    /// the records are found by counting: the access records and the ECALLs
+    /// taken so far, and whether an ECALL came where the window does not
+    /// place one.
+    access: usize,
+    ecall: usize,
+    out_of_step: bool,
 }
 
 impl HistoryOverlay {
@@ -1093,8 +1102,63 @@ impl HistoryOverlay {
             values: Vec::new(),
             timestamps: Vec::new(),
             cycle: None,
+            side: executor::vm::history::NO_ACCESS,
             light: false,
+            access: 0,
+            ecall: 0,
+            out_of_step: false,
         }
+    }
+
+    /// The window's cycle at `timestamp`, if it is one of its cycles.
+    fn cycle_at(&self, timestamp: u64) -> Option<usize> {
+        (timestamp / 4)
+            .checked_sub(1 + self.history.first)
+            .map(|i| i as usize)
+            .filter(|&i| i < self.history.cycle_count() && timestamp.is_multiple_of(4))
+    }
+
+    /// Cycle `cycle`'s record: its history's, or under the lean stream the
+    /// next by count — the next access record for a load or store
+    /// (`memory`), the next ECALL's for an ECALL, which the window must place
+    /// at this cycle after the access records taken.
+    fn take_side(&mut self, cycle: Option<usize>, memory: bool, ecall: bool) -> u32 {
+        use executor::vm::history::{ECALL, NO_ACCESS};
+        let Some(i) = cycle else {
+            return NO_ACCESS;
+        };
+        if !self.history.lean {
+            return self.history.side(i);
+        }
+        if ecall {
+            let k = self.ecall;
+            let placed = self.history.ecall_at.get(k).map(|&c| c as usize) == Some(i)
+                && self.history.accesses_before.get(k).map(|&a| a as usize) == Some(self.access)
+                && k < self.history.groups.len();
+            if !placed {
+                self.out_of_step = true;
+                return NO_ACCESS;
+            }
+            self.ecall += 1;
+            return ECALL | k as u32;
+        }
+        if memory {
+            let a = self.access;
+            self.access += 1;
+            if a < self.history.word_accesses.len() {
+                return a as u32;
+            }
+        }
+        NO_ACCESS
+    }
+
+    /// Under the lean stream, whether the walk took every record of its
+    /// window, each where the window places it; always for any other window.
+    pub(crate) fn took_every_record(&self) -> bool {
+        !self.history.lean
+            || (!self.out_of_step
+                && self.access == self.history.word_accesses.len()
+                && self.ecall == self.history.groups.len())
     }
 
     /// The light record walk: each cycle that is no ECALL is walked without
@@ -1110,14 +1174,14 @@ impl HistoryOverlay {
 
     /// [`Self::begin`] with no cell made: the cycle at `timestamp` for
     /// [`Self::registers_match`] and [`Self::access`]; a byte read finds none.
-    fn begin_light(&mut self, timestamp: u64) {
+    /// `memory`: the cycle is a load or store (an ECALL is never walked
+    /// light).
+    fn begin_light(&mut self, timestamp: u64, memory: bool) {
         self.ranges.clear();
         self.values.clear();
         self.timestamps.clear();
-        self.cycle = (timestamp / 4)
-            .checked_sub(1 + self.history.first)
-            .map(|i| i as usize)
-            .filter(|&i| i < self.history.extras.len() && timestamp.is_multiple_of(4));
+        self.cycle = self.cycle_at(timestamp);
+        self.side = self.take_side(self.cycle, memory, false);
     }
 
     /// The cycle's load or store as its access record holds it: the address,
@@ -1125,7 +1189,8 @@ impl HistoryOverlay {
     /// the cycle has no record or none of a load or store.
     fn access(&self) -> Option<(u64, u64, [u64; 8])> {
         use executor::vm::history::{ECALL, NO_ACCESS};
-        let side = self.history.extras.get(self.cycle?)?.side;
+        self.cycle?;
+        let side = self.side;
         if side == NO_ACCESS || side & ECALL != 0 {
             return None;
         }
@@ -1148,7 +1213,8 @@ impl HistoryOverlay {
         if !self.history.words {
             return None;
         }
-        let side = self.history.extras.get(self.cycle?)?.side;
+        self.cycle?;
+        let side = self.side;
         if side == NO_ACCESS || side & ECALL != 0 {
             return None;
         }
@@ -1172,6 +1238,12 @@ impl HistoryOverlay {
         let Some(i) = self.cycle else {
             return false;
         };
+        // Under the lean stream there is no per-cycle record: the walk's
+        // register stamps are checked at the window's end against the next
+        // window's starting cells; an ECALL's chip cells still here.
+        if self.history.lean {
+            return !self.out_of_step && self.ecall_cells_match(registers);
+        }
         let extra = self.history.extras[i];
         let f = &op.decode.fields;
         let ts = op.timestamp;
@@ -1202,7 +1274,13 @@ impl HistoryOverlay {
         {
             return false;
         }
-        self.history.cycle_registers(i).iter().all(|c| {
+        self.ecall_cells_match(registers)
+    }
+
+    /// Whether the cycle's ECALL chip cells (x10 to x13, the commit index)
+    /// are the walk's, values and stamps.
+    fn ecall_cells_match(&self, registers: &RegisterState) -> bool {
+        self.history.side_registers(self.side).iter().all(|c| {
             let (value, at) = if c.reg == 254 {
                 (
                     u64::from(registers.index_register.0),
@@ -1216,24 +1294,21 @@ impl HistoryOverlay {
     }
 
     /// The cells of the cycle at `timestamp`: none for a timestamp outside
-    /// the window.
-    fn begin(&mut self, timestamp: u64) {
+    /// the window. `memory`, `ecall`: the cycle is a load or store, an ECALL
+    /// (how the lean stream finds its record).
+    fn begin(&mut self, timestamp: u64, memory: bool, ecall: bool) {
         self.ranges.clear();
         self.values.clear();
         self.timestamps.clear();
-        self.cycle = None;
-        let Some(i) = (timestamp / 4)
-            .checked_sub(1 + self.history.first)
-            .map(|i| i as usize)
-            .filter(|&i| i < self.history.extras.len() && timestamp.is_multiple_of(4))
-        else {
+        self.cycle = self.cycle_at(timestamp);
+        self.side = self.take_side(self.cycle, memory, ecall);
+        if self.cycle.is_none() {
             return;
-        };
-        self.cycle = Some(i);
+        }
         let (ranges, values, timestamps) =
             (&mut self.ranges, &mut self.values, &mut self.timestamps);
         let mut last: Option<u64> = None;
-        self.history.cycle_cells(i, |address, value, ts| {
+        self.history.side_cells(self.side, |address, value, ts| {
             // Consecutive bytes extend the range; a jump starts one.
             if last.is_some_and(|a| a.wrapping_add(1) == address)
                 && let Some(r) = ranges.last_mut()
@@ -2653,11 +2728,13 @@ fn walk_cpu_ops<const REST: bool>(
             word_walk::refuse_syscall(op)?;
         }
         if let Some(overlay) = memory_state.overlay.as_deref_mut() {
-            light = overlay.light && !op.decode.fields.ecall;
+            let f = &op.decode.fields;
+            let memory = f.is_load() || f.is_store();
+            light = overlay.light && !f.ecall;
             if light {
-                overlay.begin_light(op.timestamp);
+                overlay.begin_light(op.timestamp, memory);
             } else {
-                overlay.begin(op.timestamp);
+                overlay.begin(op.timestamp, memory, f.ecall);
             }
             // Under the probe a light cycle's check is skipped (short-circuit).
             if !(light && skip_reg_check || overlay.registers_match(&op, register_state)) {
