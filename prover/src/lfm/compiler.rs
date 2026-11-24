@@ -551,10 +551,26 @@ pub fn compile_parallel(source: LfmProgramSource) -> LfmProgram {
     compile_parallel_sliced(source, 1 << 20)
 }
 
+std::thread_local! {
+    /// The last parallel compile's split on this thread ([`take_compile_split`]).
+    static LAST_COMPILE_SPLIT: std::cell::Cell<Option<[f64; 3]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take the most recent [`compile_parallel`]'s split ON THIS THREAD, clearing
+/// it: the seconds of its multiplicity pass, of its rows (each slice's), and
+/// of the join (the slices' rows into each chip's group). `None` when nothing
+/// compiled in parallel here since the last take. A report: nothing reads it
+/// but the levels' stamps.
+pub fn take_compile_split() -> Option<[f64; 3]> {
+    LAST_COMPILE_SPLIT.with(std::cell::Cell::take)
+}
+
 /// [`compile_parallel`] at `slice` instructions a slice.
 #[cfg(feature = "parallel")]
 pub(crate) fn compile_parallel_sliced(source: LfmProgramSource, slice: usize) -> LfmProgram {
     use rayon::prelude::*;
+    let t = std::time::Instant::now();
     let LfmProgramSource {
         mut instrs,
         num_addrs,
@@ -571,6 +587,8 @@ pub(crate) fn compile_parallel_sliced(source: LfmProgramSource, slice: usize) ->
         }
     });
     drop(read_counts);
+    let multiplicities = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
     // Pass 2: each slice's rows from where its ordinal-bound groups start.
     let counts: Vec<(usize, usize)> = instrs
         .par_chunks(slice)
@@ -599,6 +617,8 @@ pub(crate) fn compile_parallel_sliced(source: LfmProgramSource, slice: usize) ->
     if parts.is_empty() {
         parts.push(emit_rows(&[], 0, 0).into_array());
     }
+    let rows = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
     // Chip by chip, the slices' rows in order, padded: each cell copied once,
     // in parallel, into the group's one buffer.
     let mut by_chip: Vec<Vec<ColumnGroupBuilder>> = (0..15).map(|_| Vec::new()).collect();
@@ -610,6 +630,7 @@ pub(crate) fn compile_parallel_sliced(source: LfmProgramSource, slice: usize) ->
     let joined: Vec<ColumnGroup> = by_chip.into_iter().map(join_slices).collect();
     let groups = GroupBuilders::groups_from(joined);
     let hash16 = instrs.par_iter().any(|i| matches!(i, Instr::Hash16(_)));
+    LAST_COMPILE_SPLIT.with(|c| c.set(Some([multiplicities, rows, t.elapsed().as_secs_f64()])));
     LfmProgram {
         hash16,
         instrs,
