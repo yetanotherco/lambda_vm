@@ -47,9 +47,12 @@ The [Field VM module](/prover/src/field_vm/mod.rs) contains some toy tests in
 
 [horner_field_vm_vs_lfm()](/prover/src/field_vm/lfm_compare.rs#L219) reports on
 the performance of both VMs for Horner polynomial evaluation.
-The FVM Program is constructed in the Rust code using the Field VM's native
-`Asm` builder; it's written in two different forms: one with a loop, the other
-unrolled.
+The LFM guest program is [constructed in the Rust code](#lfm-guest) using that
+machine's builder; it calls an existing implementation of the Horner evaluation
+algorithm.
+The FVM program is constructed also in the Rust code but using the Field VM's
+native `Asm` builder; it is written in two different forms: 
+[one with a loop](#fvm-guestlooped), the other unrolled.
 
 Initially, running this Horner test appears to show that the FVM suffers in
 comparison with the LFM; the following table reports on trace cell count:
@@ -136,3 +139,34 @@ This source is then compiled with
 This compilation step backfills reading multiplicities for each address,
 checking for invariant satisfaction, and then emits per-chip preprocessed column
 groups that become the program's identity.
+
+#### FVM Guest---Looped
+
+In [`fvm_loop()`](/prover/src/field_vm/lfm_compare.rs#L59), the FVM's
+[`Asm`](/prover/src/field_vm/asm.rs#L20) is used to build a loop-based guest
+program for Horner evaluation.
+
+1. The accumulator `acc` and the loop index `i` are assigned to GP registers `0`
+   and `1` respectively.
+1. With a [`MOV` pseudo-instruction](/prover/src/field_vm/asm.rs#L90) each, `acc`
+   is given the value `0`, and `i` is given the value `len`.
+1. A "`top`" label is then placed at the start of the loop.
+1. The loop computes one iteration of the Horner evaluation by multiplying the
+   current value of `acc` with a [`mem_abs`](/prover/src/field_vm/isa.rs#L85)
+   read of the value stored at absolute address `0` (i.e., the evaluation
+   point), and adding the next coefficient of the polynomial, taken from a
+   [`mem`](/prover/src/field_vm/isa.rs#L90) at address `i`.
+   This assumes that the coefficients were placed in memory in the expected order
+   and positions.
+1. In each iteration, a [`sub`](/prover/src/field_vm/asm.rs#L82) pseudo-instruction
+   decreases the value of `i` by `1` in place in its corresponding GP register.
+1. After these two instructions, a
+   [`jump_not_zero`](/prover/src/field_vm/asm.rs#L130) jumps either to "`top`" to
+   continue the loop, or to the next PC value.
+1. The final value of `acc` is written with
+   [`store`](/prover/src/field_vm/asm.rs#L95) into address `len + 1`, and the
+   program halts.
+
+This results in a program with only 9 pseudo-instructions, but that costs three
+trace rows per loop iteration during execution: one for the accumulation FMA,
+one for the loop index decrement FMA, and one for the jump FMA.
