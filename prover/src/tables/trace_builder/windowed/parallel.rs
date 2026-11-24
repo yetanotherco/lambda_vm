@@ -1705,13 +1705,18 @@ mod walkers_line_tests {
             walk: 9.0,
             count: 1.5,
             route: 2.5,
+            count_loop: 0.3,
+            count_rows: 0.7,
+            count_shift: 0.2,
+            count_listed: 0.25,
         };
         let line = walk(Some(times), Some(split)).line();
         assert!(line.starts_with(&today), "{line}");
         assert_eq!(
             &line[today.len()..],
             " · the finish's state by part stamps 0.040s base 0.035s pages 0.100s fill 0.070s \
-             · walk times (summed) prescan 0.80s lists 0.10s collect 2.00s walk 9.00s count 1.50s route 2.50s"
+             · walk times (summed) prescan 0.80s lists 0.10s collect 2.00s walk 9.00s count 1.50s route 2.50s \
+             · count by part loop 0.30s rows 0.70s shift 0.20s listed 0.25s"
         );
     }
 }

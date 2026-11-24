@@ -2162,6 +2162,10 @@ mod walk_times_tests {
             walk: 4.0,
             count: 5.0,
             route: 6.0,
+            count_loop: 0.5,
+            count_rows: 1.5,
+            count_shift: 2.5,
+            count_listed: 0.25,
         };
         let mut sum = WalkTimes::default();
         sum.add(&one);
@@ -2175,6 +2179,10 @@ mod walk_times_tests {
                 walk: 8.0,
                 count: 10.0,
                 route: 12.0,
+                count_loop: 1.0,
+                count_rows: 3.0,
+                count_shift: 5.0,
+                count_listed: 0.5,
             }
         );
     }
@@ -2191,6 +2199,13 @@ pub struct WalkTimes {
     pub walk: f64,
     pub count: f64,
     pub route: f64,
+    /// Of `count`: its first loop (DECODE rows and the last ECALL), the new
+    /// rows' lookups but SHIFT's, SHIFT's rows' lookups, and the in-row
+    /// slots' listed lookups.
+    pub count_loop: f64,
+    pub count_rows: f64,
+    pub count_shift: f64,
+    pub count_listed: f64,
 }
 
 impl WalkTimes {
@@ -2202,13 +2217,27 @@ impl WalkTimes {
         self.walk += other.walk;
         self.count += other.count;
         self.route += other.route;
+        self.count_loop += other.count_loop;
+        self.count_rows += other.count_rows;
+        self.count_shift += other.count_shift;
+        self.count_listed += other.count_listed;
     }
 
     /// The parts as the `BLOCK WALKERS` line prints them.
     pub fn line(&self) -> String {
         format!(
-            "walk times (summed) prescan {:.2}s lists {:.2}s collect {:.2}s walk {:.2}s count {:.2}s route {:.2}s",
-            self.prescan, self.lists, self.collect, self.walk, self.count, self.route
+            "walk times (summed) prescan {:.2}s lists {:.2}s collect {:.2}s walk {:.2}s count {:.2}s route {:.2}s \
+             · count by part loop {:.2}s rows {:.2}s shift {:.2}s listed {:.2}s",
+            self.prescan,
+            self.lists,
+            self.collect,
+            self.walk,
+            self.count,
+            self.route,
+            self.count_loop,
+            self.count_rows,
+            self.count_shift,
+            self.count_listed
         )
     }
 }
@@ -2488,13 +2517,24 @@ fn walk_window(
         }
         lap(|t| &mut t.walk, &mut times);
         if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
-            counts.count_batch(decode, &cpu_ops[start..], &walk, marks, last_ecall);
+            counts.count_batch(
+                decode,
+                &cpu_ops[start..],
+                &walk,
+                marks,
+                last_ecall,
+                times.as_mut(),
+            );
             // A walk that lists no lookup of its own still lists each in-row
             // CPU slot's step: counted here, on the walker's thread, and none
             // left for the accumulator to count.
             if !lookups {
+                let listed = times.map(|_| std::time::Instant::now());
                 counts.count_listed(&walk.bitwise_ops[marks.bitwise..]);
                 walk.bitwise_ops.truncate(marks.bitwise);
+                if let (Some(t), Some(listed)) = (times.as_mut(), listed) {
+                    t.count_listed += listed.elapsed().as_secs_f64();
+                }
             }
             lap(|t| &mut t.count, &mut times);
             if let Some(router) = router.as_mut() {
@@ -2601,7 +2641,10 @@ impl WalkCounts {
         walk: &WalkOutputs,
         marks: BatchMarks,
         last_ecall: &mut Option<(u64, u64)>,
+        times: Option<&mut WalkTimes>,
     ) {
+        // Its parts timed into `times` when the walk is timed.
+        let t0 = times.as_ref().map(|_| std::time::Instant::now());
         let histogram = self
             .histogram
             .get_or_insert_with(bitwise::BitwiseHistogram::new);
@@ -2616,6 +2659,7 @@ impl WalkCounts {
                 *last_ecall = Some((raw.timestamp, raw.next_pc));
             }
         }
+        let t1 = t0.map(|_| std::time::Instant::now());
         for op in &walk.load_ops[marks.load..] {
             op.count_bitwise_into(histogram);
         }
@@ -2639,9 +2683,15 @@ impl WalkCounts {
         histogram.add_ops(&super::collect_bitwise_from_memw_aligned(
             &walk.memw.aligned[marks.aligned..],
         ));
+        let t2 = t0.map(|_| std::time::Instant::now());
         histogram.add_ops(&shift::collect_bitwise_from_shift(
             &walk.shift_ops[marks.shift..],
         ));
+        if let (Some(t), Some(t0), Some(t1), Some(t2)) = (times, t0, t1, t2) {
+            t.count_loop += (t1 - t0).as_secs_f64();
+            t.count_rows += (t2 - t1).as_secs_f64();
+            t.count_shift += t2.elapsed().as_secs_f64();
+        }
     }
 
     /// One batch's CPU ops routed into `router` and their own lookups (the
