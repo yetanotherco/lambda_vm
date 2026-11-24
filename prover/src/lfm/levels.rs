@@ -691,8 +691,40 @@ pub(crate) fn prepare_level(
     family: WlfmFamily,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
+    prepare_level_packs(program, family, rounds, packs_beside())
+}
+
+/// [`prepare_level`] with its two packs made at once under `beside`
+/// ([`PACKS_BESIDE_ENV`]): the chip prefixes on this thread, the narrow packs
+/// on their pool from a thread of their own, both read the stacks' columns
+/// and write nothing the other reads; then both installed. The same
+/// prebuild. Only when both are made; otherwise as today.
+pub(crate) fn prepare_level_packs(
+    program: &LfmProgram,
+    family: WlfmFamily,
+    rounds: Option<u8>,
+    beside: bool,
+) -> Result<WlfmPrebuild, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, level_levers(family), rounds)?;
+    if beside && super::wlfm::chip_records() && super::wlfm::narrow_commit() {
+        let (prefixes, packs) = std::thread::scope(|scope| {
+            let pre = &pre;
+            let packs = scope.spawn(move || match narrow_pack_pool() {
+                Some(pool) => pool.install(|| pre.narrow_packs_made()),
+                None => pre.narrow_packs_made(),
+            });
+            let prefixes = pre.chip_prefixes_made();
+            // A pack that panics panics here, as it would in series.
+            let packs = packs
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (prefixes, packs)
+        });
+        pre.install_chip_prefixes(prefixes?);
+        pre.install_narrow_packs(packs);
+        return Ok(pre);
+    }
     if super::wlfm::chip_records() {
         pre.hold_chip_prefixes()?;
     }
@@ -703,6 +735,41 @@ pub(crate) fn prepare_level(
         }
     }
     Ok(pre)
+}
+
+/// `LAMBDA_VM_LEVELS_PACKS_BESIDE=1`: a level's host part makes its chip
+/// prefixes and its stacks' narrow packs at once ([`prepare_level_packs`]),
+/// where it otherwise makes the prefixes, then the packs. The same packs. Off
+/// by default (and for any word but `1`); read once a process.
+pub const PACKS_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_PACKS_BESIDE";
+
+/// A test's [`packs_beside`], process wide (0 the knob, 1 off, 2 on).
+static PACKS_BESIDE_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`packs_beside`] forced for the whole process (`None` restores
+/// the knob): a level's prepare runs on threads of the driver's own. A test
+/// that sets it runs alone.
+#[doc(hidden)]
+pub fn set_packs_beside_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    PACKS_BESIDE_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`PACKS_BESIDE_ENV`] is on (or a test's override).
+pub fn packs_beside() -> bool {
+    match PACKS_BESIDE_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(PACKS_BESIDE_ENV).ok().as_deref())
+    })
 }
 
 /// The threads a level's host part packs its prepared stacks narrow on
