@@ -8548,15 +8548,22 @@ fn lay_out_rest_streamed<'a>(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
+    // The constraint set's parts in seconds (its inputs, its tables' AIRs,
+    // the memory format's AIRs), for the BLOCK REST AIRS SPLIT line.
+    let air_split: std::sync::Mutex<Option<[f64; 3]>> = std::sync::Mutex::new(None);
     let build_airs = || -> Result<&'a VmAirs, Error> {
+        let t = Instant::now();
         let inputs = BlockAirInputs::new(
             opts,
             program,
             header.cpu_heights.clone(),
             &header.public_output_bytes,
         )?;
+        let inputs_secs = t.elapsed().as_secs_f64();
+        let mut parts = None;
         let mut built = Ok(());
         let airs = run_airs.get_or_init(|| {
+            let t = Instant::now();
             let mut airs = block_airs(
                 program,
                 opts,
@@ -8568,12 +8575,18 @@ fn lay_out_rest_streamed<'a>(
                 registers,
                 ecdas,
             );
+            let tables_secs = t.elapsed().as_secs_f64();
+            let t = Instant::now();
             airs.with_fused_memory(opts, fused);
             if memory == crate::tables::fused_memory::MemoryFormat::Words {
                 built = airs.with_word_memory_at(opts, words, &header.page_configs, page_run_log2);
             }
+            parts = Some((tables_secs, t.elapsed().as_secs_f64()));
             airs
         });
+        if let (Some((tables_secs, memory_secs)), Ok(mut split)) = (parts, air_split.lock()) {
+            *split = Some([inputs_secs, tables_secs, memory_secs]);
+        }
         built?;
         check_table_count(airs.air_refs().len())?;
         Ok(airs)
@@ -8697,6 +8710,12 @@ fn lay_out_rest_streamed<'a>(
         None => build_airs()?,
     };
     marks.push(("airs", at()));
+    if let Some([inputs, tables, memory]) = air_split.lock().ok().and_then(|split| *split) {
+        eprintln!(
+            "BLOCK REST AIRS SPLIT: the constraint set by part · inputs {inputs:.3}s · tables' AIRs {tables:.3}s · \
+             the memory format's AIRs {memory:.3}s"
+        );
+    }
     let refs = airs.air_refs();
     let mut first = if header.keccak_rnd_first {
         let names: Vec<&str> = refs.iter().map(|air| air.name()).collect();
