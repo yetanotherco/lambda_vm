@@ -32,6 +32,7 @@ pub mod multilinear_table;
 pub mod narrow;
 pub mod ood;
 pub(crate) mod par;
+pub mod phase_b_split;
 pub mod profile_markers;
 pub mod proof;
 pub mod prove_split;
