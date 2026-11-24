@@ -2162,10 +2162,12 @@ pub fn main_backend() -> Result<&'static Backend> {
 pub fn current_slot() -> usize {
     match current_role() {
         DeviceRole::Main => 0,
-        _ => SECOND_BACKEND
-            .get()
-            .zip(backend().ok())
-            .map_or(0, |(second, be)| usize::from(std::ptr::eq(second, be))),
+        // This thread's backend first: on a thread's first device call in the
+        // second role it is what makes the second backend.
+        _ => match backend() {
+            Ok(be) => usize::from(BackendSlot::of(be) == BackendSlot::Second),
+            Err(_) => 0,
+        },
     }
 }
 
