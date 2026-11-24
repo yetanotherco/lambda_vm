@@ -2147,13 +2147,16 @@ pub(crate) fn phase_b_sched_from(value: Option<&str>) -> bool {
 
 /// The card set up (its context, its modules and its staging pools) on a
 /// thread of its own as the streamed prove starts, so the first group's upload
-/// does not wait for it; nothing without the card's kernels. The proof is the
-/// same.
+/// does not wait for it; nothing without the card's kernels. Under the
+/// two-card split (`LAMBDA_VM_TWO_CARD_SPLIT`) the second card's backend and
+/// pools are made there too, after card 0's, so phase B does not wait for
+/// them; off, that asks nothing of the driver. The proof is the same.
 fn set_up_card() {
     if cfg!(feature = "cuda") {
         std::thread::spawn(|| {
             multilinear::gpu::set_up_device();
             head_log::card_ready();
+            let _ = multilinear::gpu::two_card_split_ready();
         });
     }
 }
