@@ -24,7 +24,7 @@ limbs, the absolute values of `r` and `d` as words, `n - r` as limbs, five sign 
 The chip is the first here that **pulls and pushes the same bus**. It pulls three `ALU` messages
 to borrow work from other chips — one `LT` for `|r| < |d|`, two `MUL` for `d * q = n - r` — and
 pushes two `DIVREM` messages with its own results. Ordering by whole channels cannot place that;
-ordering the `ALU` messages in classes can, which is what `Ensemble.tableSoundness_of_stagedOn`
+ordering the `ALU` messages in classes can, which is what `Ensemble.tableSoundness_of_stagedRequirementsOn`
 is for. That is an ensemble concern: the chip's own soundness only receives on its pulls and owes
 on its pushes.
 
@@ -415,9 +415,9 @@ lemma lt_of_guarantees {a0 a1 b0 b1 o : F p} (ha0 : a0.val < 2^32) (ha1 : a1.val
     (h : Alu.Guarantees (⟨a0, a1, b0, b1, 4, o, 0⟩ : Alu.Msg (F p))) :
     o = ((if dword a0 a1 < dword b0 b1 then 1 else 0 : ℕ) : F p) := by
   simp only [Alu.Guarantees] at h
-  obtain ⟨hlt, -, -, -, -, -, -, -⟩ := h ha0 ha1 hb0 hb1
+  obtain ⟨hlt, -, -, -, -, -, -, -⟩ := h
   obtain ⟨-, ho⟩ := hlt 0 0 (by norm_num) (by norm_num)
-    (by rw [val_ofNat 4 (by norm_num)]; simp [opselLT])
+    (by rw [val_ofNat 4 (by norm_num)]; simp [opselLT]) ha0 hb0
   have hL : dword a0 a1 < 2^64 := by simp only [dword]; omega
   have hR : dword b0 b1 < 2^64 := by simp only [dword]; omega
   have hu := Alu.ult_ofNat_iff hL hR
@@ -439,7 +439,7 @@ lemma mul_of_guarantees {a0 a1 b0 b1 o0 o1 f : F p} {ls rs hi : ℕ}
     (h : Alu.Guarantees (⟨a0, a1, b0, b1, f, o0, o1⟩ : Alu.Msg (F p))) :
     dword o0 o1 = Alu.mulResult ls rs hi (dword a0 a1) (dword b0 b1) := by
   simp only [Alu.Guarantees] at h
-  obtain ⟨-, -, -, -, -, -, hmul, -⟩ := h ha0 ha1 hb0 hb1
+  obtain ⟨-, -, -, -, -, -, hmul, -⟩ := h
   exact (hmul ls rs hi hls hrs hhi (by rw [hf]; simp only [opselMUL])).2.2
 
 /-- What a `DIVREM` pusher owes: at `opsel(DIVREM) + 32·signed + 128·rem` no other clause of the
@@ -449,7 +449,6 @@ lemma divrem_guarantees {a0 a1 b0 b1 o0 o1 f : F p} {s rm : ℕ} (hs : s < 2) (h
     (hout : dword o0 o1 = Alu.divremResult s rm (dword a0 a1) (dword b0 b1)) :
     Alu.Guarantees (⟨a0, a1, b0, b1, f, o0, o1⟩ : Alu.Msg (F p)) := by
   simp only [Alu.Guarantees]
-  intro _ _ _ _
   refine ⟨fun s' i hs' hi hfl => by
       exfalso; rw [hf] at hfl; simp only [opselLT] at hfl; omega,
     fun i hi hfl => by exfalso; rw [hf] at hfl; simp only [opselEQ] at hfl; omega,
@@ -514,8 +513,8 @@ theorem soundness :
       | exact fun h => absurd hzq h
       | exact fun h => absurd hzr h
   -- an active row: the sum is a count of at most `muMax`, so every range check delivers
-  have hcount : Channel.CountUpTo muMax (input_muQ + input_muR) :=
-    Channel.countUpTo_of_val hmu (by simp only [hsumval, muMax]; omega)
+  have hcount : CountUpTo muMax (input_muQ + input_muR) :=
+    countUpTo_of_ne_zero_of_val_le hmu (by simp only [hsumval, muMax]; omega)
   have hn0 := h_n0 hcount
   have hn1 := h_n1 hcount
   have hn2 := h_n2 hcount
@@ -972,9 +971,8 @@ lemma alu_lt_message {rlo rhi dlo dhi dz : F p} {data : ProverData (F p)}
       simp [Alu.ltBit, Alu.ltRaw, hf, h]
   simp only [Alu.channel, Alu.Guarantees, dword, opselLT, opselEQ, opselSHIFT, opselAND, opselOR,
     opselXOR, opselMUL, opselDIVREM]
-  intro _ _ _ _
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  · intro a b ha hb heq
+  · intro a b ha hb heq _ _
     rw [hflags] at heq
     obtain ⟨rfl, rfl⟩ : a = 0 ∧ b = 0 := by omega
     refine ⟨trivial, ?_⟩
@@ -999,7 +997,6 @@ lemma alu_mul_message {dlo dhi qlo qhi olo ohi flags : F p} {data : ProverData (
     Alu.channel.Guarantees ⟨dlo, dhi, qlo, qhi, flags, olo, ohi⟩ data := by
   simp only [Alu.channel, Alu.Guarantees, dword, opselLT, opselEQ, opselSHIFT, opselAND, opselOR,
     opselXOR, opselMUL, opselDIVREM]
-  intro _ _ _ _
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro a b ha hb heq; rw [hflags] at heq; exact absurd heq (by omega)
   · intro a ha heq; rw [hflags] at heq; exact absurd heq (by omega)
@@ -1133,7 +1130,7 @@ theorem completeness :
       pr0, pr1, pr2, pr3, pdz, pov, parlo, parhi, padlo, padhi, pm0, pm1, pm2, pm3,
       psm, psn, psd, psq, psr, pmq, pmr, circuit_norm]
     -- a zero multiplicity is not a count, so every counted pull's obligation is vacuous
-    have hnc : ¬ Channel.CountUpTo muMax (0 : F p) := by
+    have hnc : ¬ CountUpTo muMax (0 : F p) := by
       rintro ⟨k, hk1, hk2, hk⟩
       have hv : ((k : ℕ) : F p).val = k :=
         val_natCast_of_lt_two_pow_40 (by simp only [muMax] at hk2; omega)

@@ -316,8 +316,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     by_cases h0 : input_mu = 0
     · simp [h0]
     -- IS_BYTE[μ] bounds μ, so every BYTE_ALU pull is a counted pull and delivers
-    have hcount : Channel.CountUpTo muMax input_mu :=
-      Channel.countUpTo_of_val h0 (by simp only [muMax]; omega)
+    have hcount : CountUpTo muMax input_mu :=
+      countUpTo_of_ne_zero_of_val_le h0 (by simp only [muMax]; omega)
     obtain ⟨ha0, hb0, hd0⟩ := g0 hcount
     obtain ⟨ha1, hb1, hd1⟩ := g1 hcount
     obtain ⟨ha2, hb2, hd2⟩ := g2 hcount
@@ -376,7 +376,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       rcases hop with h | h | h <;> rw [h] <;> simp [opselAND, opselOR, opselXOR]
     refine ⟨fun _ => hspec, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
       .inr hcount, .inr hcount, .inr hcount, ?_⟩
-    intro _ _ _ _ _
+    intro _
     -- `op` is 0, 1 or 2, so only the three BYTEWISE clauses can fire
     refine ⟨fun s i hs hi h => by have : opselLT = 4 := rfl; omega,
       fun i hi h => by have : opselEQ = 3 := rfl; omega,

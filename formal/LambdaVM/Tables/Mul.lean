@@ -262,8 +262,8 @@ theorem soundness :
       | exact fun h => absurd hmu0 h
       | exact fun h => absurd hmu1 h
   -- an active row: the sum is a count of at most `muMax`, so every range check delivers
-  have hcount : Channel.CountUpTo muMax (input_muLo + input_muHi) :=
-    Channel.countUpTo_of_val h0 (by simp only [hsumval, muMax]; omega)
+  have hcount : CountUpTo muMax (input_muLo + input_muHi) :=
+    countUpTo_of_ne_zero_of_val_le h0 (by simp only [hsumval, muMax]; omega)
   have hl0 := h_l0 hcount
   have hl1 := h_l1 hcount
   have hl2 := h_l2 hcount
@@ -435,7 +435,7 @@ theorem soundness :
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, ?_, ?_⟩
   · -- the `high = 0` message: the low 64 bits of the product
-    intro _ _ _ _ _
+    intro _
     have hflags : (7 + 32 * input_lhsSigned + 64 * input_rhsSigned : F p).val
         = 7 + 32 * input_lhsSigned.val + 64 * input_rhsSigned.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -459,7 +459,7 @@ theorem soundness :
     simp only [MulCore.ofHalves4]
     ring
   · -- the `high = 1` message: the high 64 bits of the product
-    intro _ _ _ _ _
+    intro _
     have hflags : (7 + 32 * input_lhsSigned + 64 * input_rhsSigned + 128 : F p).val
         = 7 + 32 * input_lhsSigned.val + 64 * input_rhsSigned.val + 128 :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -627,10 +627,10 @@ theorem completeness :
       rw [(ZMod.val_eq_zero _).mp hz, mul_zero]
     · rw [h]; ring
   · -- IS_B20 on the four carries
-    intro _; rw [hc0, Bitwise.val_natCast_of_lt_two_pow_20 hk0]; exact hk0
-  · intro _; rw [hc1, Bitwise.val_natCast_of_lt_two_pow_20 hk1]; exact hk1
-  · intro _; rw [hc2, Bitwise.val_natCast_of_lt_two_pow_20 hk2]; exact hk2
-  · intro _; rw [hc3, Bitwise.val_natCast_of_lt_two_pow_20 hk3]; exact hk3
+    intro _; rw [hc0, val_natCast_of_lt_two_pow_40 (by omega)]; exact hk0
+  · intro _; rw [hc1, val_natCast_of_lt_two_pow_40 (by omega)]; exact hk1
+  · intro _; rw [hc2, val_natCast_of_lt_two_pow_40 (by omega)]; exact hk2
+  · intro _; rw [hc3, val_natCast_of_lt_two_pow_40 (by omega)]; exact hk3
   -- the four `raw_product` constraints
   · rw [hn0]; simp only [MulCore.raw]; push_cast; simp only [ZMod.natCast_zmod_val]; ring
   · rw [hn1]; simp only [MulCore.raw]; push_cast; simp only [ZMod.natCast_zmod_val]; ring

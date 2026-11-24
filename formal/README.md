@@ -244,7 +244,7 @@ After PR #1016 a deduplicated row pulls its range checks with multiplicity `μ`,
 `1` only, and requires every pull to carry `0` or `1`; any other nonzero
 multiplicity is a requirement the row cannot meet.
 `LambdaVM/Channels/Counted.lean` is this model's own generalisation. It is **not**
-the channel LT and CMIN pull on — those use the fork's `Channel.counted`, whose
+the channel LT pulls on — that one is the fork's `Channel.counted`, whose
 semantics differ; see the comparison at the end of this section.
 
 - `counted N channel` grants the guarantee to a pull of `1, …, N` and charges
@@ -287,7 +287,7 @@ The model takes both from the `yetanotherco/clean` fork, pinned in
 deleted once the upstream PRs land. That is Clean main `f3abad7c` plus three
 commits, and four review fixes answering the audit of them: `Balance.logUpUpTo N` with
 `RawChannel.ConsistentUpTo N`, the typed `Channel.counted N`, and
-`Ensemble.tableSoundness_of_staged` / `_stagedOn` (soundness by finishing
+`Ensemble.tableSoundness_of_stagedRequirements` / `_stagedRequirementsOn` (soundness by finishing
 order of channels, and of message classes within a channel). On top of it:
 
 - `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ`, bounded by
@@ -301,7 +301,7 @@ order of channels, and of message classes within a channel). On top of it:
 - `Tables/Dvrm.lean` pulls `IS_HALF` twenty times with `μ_q + μ_r`, bounded by
   its own `ARE_BYTES[μ_q, μ_r]`, and is the one chip that pulls the `ALU` bus.
 - `Ensembles/LtStaged.lean` proves `tableSoundness`, that is
-  `Ensemble.TableSoundness (Balance.logUpUpTo 255)` for the LT ensemble,
+  `Ensemble.TableSoundness (Balance.logUpUpTo muMax)` for the LT ensemble,
   finishing `ARE_BYTES` before the counted `IS_HALF` and `MSB16` and those
   before ALU.
 
@@ -311,7 +311,7 @@ being designed, and were removed once BYTEWISE exercised the mechanism on a real
 chip; DVRM replaces them with the real thing. The table proof is unaffected,
 since the chip receives on its pulls and owes on its pushes, so ordering the
 `ALU` messages is an ensemble concern:
-`Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes of
+`Ensemble.tableSoundness_of_stagedRequirementsOn` finishes one bus in two classes of
 messages, which is how a puller and a pusher of one bus are ordered.
 
 That ensemble is not written yet, and it needs the two names for the `ALU` bus
@@ -323,12 +323,10 @@ another ALU chip at once. Moving the five pushers to the counted channel leaves
 `export/` byte-identical — the channel is a choice in the Lean model, invisible
 in the AIR — but it does change proofs.
 
-What the MIN halves conclude about rows: `MinToy.RowSpec`, that a MIN row with
-range-checked operand limbs carries `out = min(a, b)` as a 64-bit unsigned
-value — on every row, since MIN pulls its LT answer unconditionally; and
-`CountedMin.RowSpec`, the same for a CMIN row, guarded by `μ ≠ 0` because that
-row pulls its LT answer `μ` times and a `μ = 0` row pulls nothing. The provider
-and consumer stand-ins conclude `True`, which is what the next paragraphs are about.
+The toy MIN table and the `CountedSameBus` ensemble that stood in for DVRM are gone
+from this PR: the real DVRM is here, so the stand-ins have nothing left to stand in for.
+The provider and consumer stand-ins of `LtStaged.lean` conclude `True`, which is what the
+next paragraphs are about.
 
 That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
 sound ensemble, not the conclusion: it reads `witness.Assumptions →
@@ -342,16 +340,15 @@ discharge. In `LtStaged` that premise is not free, because the `ARE_BYTES`,
 into the ensemble. Each provider assumes its own answers are correct; nothing
 in the file derives that from a row of BITWISE.
 
-Both ensembles also carry a consumer of the ALU bus (`consumer` and
-`countedConsumer` in `LtStaged.lean`), and that stand-in is not a concession. A
+The LT ensemble also carries a consumer of the ALU bus (`consumer` in
+`LtStaged.lean`), and that stand-in is not a concession. A
 pull gains the channel's guarantee instead of owing it, so a consumer assumes
 nothing on the soundness side; what the honest prover must know — that it pulls
 a message the bus really answers — is a `ProverAssumptions`, which only
 completeness may use. Without a consumer the bus would carry pushes and no
 pulls at all, a balanced witness would have to send every `μ` on it to zero, and
-every row spec guarded by `μ ≠ 0` would hold vacuously: `LT.RowSpec` in
-`LtStaged.tableSoundness`, `CountedMin.RowSpec` in `CountedMin.tableSoundness`.
-`MinToy.RowSpec` carries no such guard, so it does not depend on this.
+every row spec guarded by `μ ≠ 0` would hold vacuously, starting with `LT.RowSpec` in
+`LtStaged.tableSoundness`.
 
 `EqLookup`, already in the model (PR #1027), is the contrast. Its `pushStatic` emits the
 entries of a real `StaticLookupChannel` and proves the guarantee from
@@ -372,14 +369,14 @@ multiplicity costs:
 | this file | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
 | the fork (`Channel.counted`) | `mult = 0 ∨ CountUpTo N mult` — forbidden: a range obligation the row must discharge |
 
-LT, MIN and CMIN are all on the fork's. This file's channel has one consumer,
+LT is on the fork's. This file's channel has one consumer,
 `Demo.circuit`, and keeping it is deliberate: its `not_consistent` is the reason
 the fork's balance carries the `N * count` bound, and its `consistentUpTo` shows
 the channel is consistent under the fork's `BalancedUpTo N`. Nothing else uses it.
 
 Moving LT onto the counted channel has one structural cost: **LT cannot share an
 ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
-(`name := channel.name`), so `Bitwise.IsHalf.counted 255`, which `Tables/Lt.lean`
+(`name := channel.name`), so `Bitwise.IsHalf.counted muMax`, which `Tables/Lt.lean`
 pulls, and `Bitwise.IsHalf.toRaw`, which `Tables/Eq.lean` and `Tables/Shift.lean`
 pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, and
 `Ensemble.unique_channel_names` rejects a `tables` list holding both. `MSB16` is

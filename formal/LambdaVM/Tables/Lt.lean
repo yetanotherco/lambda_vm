@@ -78,8 +78,8 @@ abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
 abbrev Msb16C : RawChannel (F p) := Bitwise.Msb16.counted muMax
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
-  -- μ : Byte, as in lt.rs: ARE_BYTES[μ, 0]. `spec/src/lt.toml` still declares μ as a Bit and
-  -- has no such pull; the model follows the Rust, and the spec is the one that needs updating.
+  -- μ : Byte, as in lt.rs: ARE_BYTES[μ, 0]. `spec/src/lt.toml` agrees since this PR, which
+  -- types μ as a Byte and adds its IS_BYTE range check.
   Bitwise.AreBytes.pull (r.mu, 0)
   -- range: IS_HALF[lhs[1]], IS_HALF[rhs[1]], IS_BIT<signed>, IS_BIT<invert>
   Bitwise.IsHalf.pullUpTo muMax r.mu r.lhs1

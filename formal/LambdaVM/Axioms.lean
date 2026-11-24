@@ -39,9 +39,13 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.Add.circuit
 #print axioms LambdaVM.IsByteCheck.circuit
 #print axioms LambdaVM.AreBytesCheck.circuit
+#print axioms LambdaVM.SignCheck.circuit
+#print axioms LambdaVM.NegCheck.circuit
 
--- The two static tables no modelled chip pulls; only `Export.lean` reads them. Printing the
--- table covers its `guarantees_iff`.
+-- The static tables. `msb8Table` is the one no modelled chip pulls, so without this line a
+-- `sorry` in it would pass the check; `isB20Table` is pulled by MUL and reached anyway, and is
+-- printed next to it so the pair reads as one list. Printing the table covers its
+-- `guarantees_iff`.
 #print axioms LambdaVM.Bitwise.isB20Table
 #print axioms LambdaVM.Bitwise.msb8Table
 

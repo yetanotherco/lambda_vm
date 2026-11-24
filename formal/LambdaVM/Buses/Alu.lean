@@ -79,6 +79,12 @@ def mulResult (lhsSigned rhsSigned high x y : ℕ) : ℕ :=
   if high = 1 then (ext128 lhsSigned x * ext128 rhsSigned y) % 2^128 / 2^64
   else (ext128 lhsSigned x * ext128 rhsSigned y) % 2^128 % 2^64
 
+/-- Two's-complement reading of a 64-bit value. -/
+def toSigned64 (x : ℕ) : ℤ := if x < 2^63 then x else (x : ℤ) - 2^64
+
+/-- A 64-bit value read as signed (`signed = 1`) or unsigned. -/
+def sgn64 (signed x : ℕ) : ℤ := if signed = 1 then toSigned64 x else x
+
 /-- `DIVREM` (`spec/src/dvrm.toml`): the quotient (`rem = 0`) or the remainder (`rem = 1`) of `a` by
 `b`, rounding towards zero, which is `DIV`, `DIVU`, `REM` and `REMU`. Division by zero gives the
 quotient `2^64 - 1` and the remainder `a`. The signed overflow `-2^63 / -1` needs no case of its
