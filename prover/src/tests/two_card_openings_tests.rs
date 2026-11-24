@@ -53,6 +53,32 @@ fn proved() -> Vec<u8> {
     bytes(&proof)
 }
 
+/// The counters of the paths a card refusal or a wrong card takes: host
+/// fallbacks, openings staged from host columns, narrow tables widened on the
+/// host, records tables filled on the host, and stores declined because the
+/// thread worked for another card. With the openings on another card they
+/// must move exactly as with the knob off (the second upload keeps every
+/// opening on the stack), and the last must not move at all.
+#[cfg(feature = "cuda")]
+fn host_path_counters() -> [u64; 5] {
+    [
+        multilinear::gpu::host_fallbacks(),
+        multilinear::gpu::openings_staged_from_host(),
+        multilinear::narrow::host_widens().0,
+        multilinear::records::fills().1,
+        multilinear::gpu::cross_card_declines(),
+    ]
+}
+
+/// `proved()`'s bytes and how far it moved [`host_path_counters`].
+#[cfg(feature = "cuda")]
+fn proved_counted() -> (Vec<u8>, [u64; 5]) {
+    let before = host_path_counters();
+    let bytes = proved();
+    let after = host_path_counters();
+    (bytes, std::array::from_fn(|k| after[k] - before[k]))
+}
+
 /// Without a device build, or with the knob off, no group's openings leave
 /// card 0's path: `two_card_openings` reads false and none is counted.
 #[test]
@@ -89,17 +115,23 @@ fn forced_two_card_openings_prove_the_same_bytes_on_one_card() {
     );
     assert!(multilinear::gpu::reserve_budget() > 0, "needs a card");
     set_two_card_openings_for_test(Some(TwoCardOpenings::Off));
-    let off = proved();
+    let (off, off_counts) = proved_counted();
     set_two_card_openings_for_test(Some(TwoCardOpenings::Forced));
     assert!(multilinear::gpu::two_card_openings(), "forced on");
     let before = stark::multilinear_block::two_card_opened();
-    let forced = proved();
+    let (forced, forced_counts) = proved_counted();
     let opened = stark::multilinear_block::two_card_opened() - before;
     println!(
-        "TWO-CARD OPENINGS forced on one card: {opened} group(s) opened on the openings' backend"
+        "TWO-CARD OPENINGS forced on one card: {opened} group(s) opened on the openings' backend · \
+         host paths off {off_counts:?} · forced {forced_counts:?}"
     );
     assert!(opened > 0, "no group opened on the openings' backend");
     assert_eq!(forced, off, "the openings' backend moved a byte");
+    assert_eq!(forced_counts, off_counts, "the openings took another path");
+    assert_eq!(
+        forced_counts[4], 0,
+        "a store was read from the other backend"
+    );
 }
 
 /// ★ Two-card box, one process: run alone, deterministic grind. With two cards
@@ -119,13 +151,21 @@ fn two_card_openings_prove_the_same_bytes_on_card_1() {
     );
     assert!(card_count() >= 2, "needs two cards, saw {}", card_count());
     set_two_card_openings_for_test(Some(TwoCardOpenings::Off));
-    let off = proved();
+    let (off, off_counts) = proved_counted();
     set_two_card_openings_for_test(Some(TwoCardOpenings::Auto));
     assert_eq!(openings_placement().ordinal, 1, "the openings on card 1");
     let before = stark::multilinear_block::two_card_opened();
-    let two = proved();
+    let (two, two_counts) = proved_counted();
     let opened = stark::multilinear_block::two_card_opened() - before;
-    println!("TWO-CARD OPENINGS on card 1: {opened} group(s) opened there");
+    println!(
+        "TWO-CARD OPENINGS on card 1: {opened} group(s) opened there · host paths off \
+         {off_counts:?} · card 1 {two_counts:?}"
+    );
     assert!(opened > 0, "no group opened on card 1");
     assert_eq!(two, off, "card 1 moved a byte");
+    assert_eq!(
+        two_counts, off_counts,
+        "the openings on card 1 took another path"
+    );
+    assert_eq!(two_counts[4], 0, "a store was read from the other card");
 }
