@@ -49,7 +49,7 @@ use crate::tables::gpack::{self, TraceForm};
 use crate::tables::local_bytes::{self, LocalCounts};
 use crate::tables::trace_builder::{
     ChunkJob, CutPadding, HostHoist, RowFamilies, StreamTable, Traces, WindowStamps,
-    WindowedTraceBuilder, head_log, parallel,
+    WindowedTraceBuilder, exec_pad_probe, head_log, pad_write, parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -3352,6 +3352,9 @@ pub struct ExecutorStamps {
     /// The executor thread's page faults and CPU seconds over its windows
     /// (`getrusage(RUSAGE_THREAD)`; Linux only).
     pub usage: Option<ThreadUsage>,
+    /// The pad probe's dead bytes a cycle and the seconds writing them
+    /// (`LAMBDA_VM_EXEC_PAD_PROBE`'s executor part; `None` when 0).
+    pub pad: Option<(usize, f64)>,
 }
 
 /// A thread's page faults and CPU seconds, as `getrusage(RUSAGE_THREAD)`
@@ -3451,6 +3454,12 @@ impl ExecutorStamps {
                     )
                 })
                 .unwrap_or_default()
+                + &self
+                    .pad
+                    .map(|(bytes, secs)| {
+                        format!(" · pad probe {bytes} bytes a cycle in {secs:.2}s")
+                    })
+                    .unwrap_or_default()
                 + "\n"),
         )
     }
@@ -9425,6 +9434,16 @@ fn prove_streamed(
                 own.logs_pooled = pool_exec_logs()
                     && kind == EngineKind::Fast
                     && multilinear::pinned::ready();
+                // The pad probe's executor part: dead bytes a cycle into a
+                // buffer reused window after window (0: none).
+                let (pad_bytes, walker_pad) = exec_pad_probe().map_err(Error::Prover)?;
+                if pad_bytes > 0 || walker_pad > 0 {
+                    eprintln!(
+                        "★ BLOCK PAD PROBE: executor {pad_bytes} · each walker {walker_pad} dead bytes a cycle (LAMBDA_VM_EXEC_PAD_PROBE)"
+                    );
+                }
+                let mut pad_buf: Vec<u8> = Vec::new();
+                let mut pad_secs = 0.0;
                 let usage_before = ThreadUsage::now();
                 loop {
                     let t = Instant::now();
@@ -9470,6 +9489,11 @@ fn prove_streamed(
                     let Some((logs, window_history)) = logs else {
                         break;
                     };
+                    if pad_bytes > 0 {
+                        let t = Instant::now();
+                        pad_write(&mut pad_buf, 0, logs.len(), pad_bytes, cycles);
+                        pad_secs += t.elapsed().as_secs_f64();
+                    }
                     cycles += logs.len() as u64;
                     own.note_logs(&logs, logs.capacity());
                     if let Some(check) = &mut shadow {
@@ -9521,6 +9545,7 @@ fn prove_streamed(
                 own.usage = usage_before
                     .zip(ThreadUsage::now())
                     .map(|(before, after)| after.since(before));
+                own.pad = (pad_bytes > 0).then_some((pad_bytes, pad_secs));
                 drop(executor);
                 if let Some(check) = shadow {
                     let counts = check.finish().map_err(Error::Execution)?;
@@ -13468,19 +13493,20 @@ mod producer_report_tests {
                  (134 windows, logs moved) · send-blocked 3.50s · own 2.55s"
             )
         );
-        // The thread's faults and seconds after it.
+        // The thread's faults and seconds, then the pad probe, after it.
         stamps.executor.usage = Some(ThreadUsage {
             minor_faults: 3400,
             major_faults: 0,
             system: 0.21,
             user: 3.1,
         });
+        stamps.executor.pad = Some((16, 0.42));
         assert_eq!(
             line(&stamps).as_deref(),
             Some(
                 "BLOCK EXECUTOR: started at 0.02s · setup 0.01s · execute 2.50s · hand-off 0.04s \
                  (134 windows, logs moved) · send-blocked 3.50s · own 2.55s · faults minor 3400 major 0 \
-                 · system 0.21s · user 3.10s"
+                 · system 0.21s · user 3.10s · pad probe 16 bytes a cycle in 0.42s"
             )
         );
         stamps.executor = ExecutorStamps::default();
