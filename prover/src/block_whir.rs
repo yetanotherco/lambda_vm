@@ -48,7 +48,7 @@ use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::local_bytes::{self, LocalCounts};
 use crate::tables::trace_builder::{
-    ChunkJob, CutPadding, HostHoist, RowFamilies, StreamTable, Traces, WindowStamps,
+    ChunkJob, CutPadding, HostHoist, RowFamilies, StreamTable, Traces, WalkCuts, WindowStamps,
     WindowedTraceBuilder, exec_pad_probe, head_log, pad_write, parallel,
 };
 use crate::test_utils::{E, F};
@@ -5545,6 +5545,9 @@ pub(crate) struct Deviations {
     /// The serial host work hoisted, instead of the knob
     /// (`LAMBDA_VM_HOST_HOIST`, [`HostHoist`]).
     pub host_hoist: Option<HostHoist>,
+    /// The walk's cuts, instead of the knob (`LAMBDA_VM_WALK_CUTS`,
+    /// [`WalkCuts`]).
+    pub walk_cuts: Option<WalkCuts>,
     /// The run's AIR set built on a thread of its own while the first
     /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
     /// first table (`Some(false)`), instead of the knob
@@ -8988,6 +8991,16 @@ fn prove_streamed(
         "★ BLOCK HOST HOIST: {} (LAMBDA_VM_HOST_HOIST)",
         host_hoist.describe()
     );
+    // The walk's cuts: a word it does not take refuses the prove. The
+    // tables are the same with any part on.
+    let walk_cuts = match deviations.walk_cuts {
+        Some(cuts) => cuts,
+        None => WalkCuts::from_env()?,
+    };
+    eprintln!(
+        "★ BLOCK WALK CUTS: {} (LAMBDA_VM_WALK_CUTS)",
+        walk_cuts.describe()
+    );
     // The walkers' light walk: a word it does not take refuses the prove.
     let light_walk = parse_light_walk(std::env::var("LAMBDA_VM_LIGHT_WALK").ok().as_deref())?;
     eprintln!(
@@ -9671,7 +9684,7 @@ fn prove_streamed(
                             builder.card_fill_streamed_fault(deviations.card_fill_streamed_fault);
                     }
                 }
-                builder = builder.light_walk(light_walk)?;
+                builder = builder.light_walk(light_walk)?.walk_cuts(walk_cuts)?;
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);
                     ledger.line("builder created");

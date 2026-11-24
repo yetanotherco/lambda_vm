@@ -208,6 +208,8 @@ struct WalkSettings {
     /// cycles walked without their cells, and each window routed by its walker.
     light: bool,
     route: bool,
+    /// The walk's cuts ([`WindowedTraceBuilder::walk_cuts`]).
+    cuts: crate::tables::trace_builder::WalkCuts,
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -333,6 +335,7 @@ impl WindowWalker {
             s.lookups,
             s.batch,
             s.defer_ecrec,
+            s.cuts,
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
             s.route,
@@ -391,6 +394,7 @@ impl WindowWalker {
             s.lookups,
             s.batch,
             s.defer_ecrec,
+            s.cuts,
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
             s.route,
@@ -763,6 +767,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
         light: builder.light_walks().0,
         route: builder.light_walks().1,
+        cuts: builder.walk_cuts_on(),
     });
     // Record mode with the final state hoisted (`LAMBDA_VM_HOST_HOIST=state`):
     // the builder's setup state, the image mapped, is the finish's state's

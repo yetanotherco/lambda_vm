@@ -31,7 +31,7 @@ use crate::tests::windowed_builder_tests::{run, same_traces};
 /// The asm programs of the record-mode tests: every ECALL the walk handles
 /// but HINT (the Rust guests have it), misaligned and page-crossing accesses,
 /// and a register idle past the in-row slot's reach.
-const PROGRAMS: [&str; 15] = [
+pub(super) const PROGRAMS: [&str; 15] = [
     "all_instructions_64",
     "all_loadstore_32",
     "test_keccak_multi",
@@ -50,7 +50,7 @@ const PROGRAMS: [&str; 15] = [
 ];
 
 /// The Rust guests with HINT, DMA and Keccak calls.
-const RUST_GUESTS: [&str; 5] = [
+pub(super) const RUST_GUESTS: [&str; 5] = [
     "hint_min",
     "hint_multi",
     "dma_memset_cases",
@@ -59,7 +59,7 @@ const RUST_GUESTS: [&str; 5] = [
 ];
 
 /// A Rust guest's ELF from `program_artifacts/rust`.
-fn rust_elf(name: &str) -> Elf {
+pub(super) fn rust_elf(name: &str) -> Elf {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../executor/program_artifacts/rust")
         .join(format!("{name}.elf"));
@@ -67,12 +67,12 @@ fn rust_elf(name: &str) -> Elf {
     Elf::load(&bytes).expect("the ELF loads")
 }
 
-fn dbg<T: Debug + ?Sized>(x: &T) -> String {
+pub(super) fn dbg<T: Debug + ?Sized>(x: &T) -> String {
     format!("{x:?}")
 }
 
 /// A walker's counts as one histogram and DECODE's rows, for comparing.
-fn counted(counts: &WalkCounts) -> (BitwiseHistogram, Vec<u64>) {
+pub(super) fn counted(counts: &WalkCounts) -> (BitwiseHistogram, Vec<u64>) {
     let mut histogram = BitwiseHistogram::new();
     if let Some(h) = counts.histogram.as_ref() {
         histogram.merge(h);
@@ -119,6 +119,7 @@ fn walked(
         false,
         batch,
         false,
+        crate::tables::trace_builder::WalkCuts::default(),
         Some(counts),
         true,
         route,
@@ -135,7 +136,7 @@ fn walked(
 }
 
 /// Every list a walked window emits, as text.
-fn lists(w: &WalkedWindow) -> [(&'static str, String); 18] {
+pub(super) fn lists(w: &WalkedWindow) -> [(&'static str, String); 18] {
     let l = &w.walk;
     [
         ("CPU", dbg(&w.cpu_ops)),
@@ -434,7 +435,7 @@ fn the_light_walk_refuses_a_history_without_the_access() {
 /// The programs the word memory format walks: the CPU's loads and stores of
 /// every width and alignment (across `2^32` too), and the chips it takes
 /// (COPY, keccak256, ECREC).
-const WORD_PROGRAMS: [&str; 10] = [
+pub(super) const WORD_PROGRAMS: [&str; 10] = [
     "all_instructions_64",
     "all_loadstore_32",
     "cross_4gib",
@@ -578,15 +579,16 @@ fn unheld(mut chunk: StreamedChunk) -> StreamedChunk {
 }
 
 /// The run of `program` by windows of `window` cycles under `format`, walked
-/// from the fast engine's history on `walkers` threads at light walk `level`,
-/// its CPU chunks held as their logs, counted where made, no CPU list: its
-/// traces (every chunk filled on the host) and the chunks in hand-out order.
-fn built(
+/// from the fast engine's history on `walkers` threads at light walk `level`
+/// with the walk's `cuts`, its CPU chunks held as their logs, counted where
+/// made, no CPU list: its traces (every chunk filled on the host) and the
+/// chunks in hand-out order.
+pub(super) fn built(
     program: &Elf,
     max_rows: &MaxRowsConfig,
     window: usize,
     walkers: usize,
-    level: u8,
+    (level, cuts): (u8, crate::tables::trace_builder::WalkCuts),
     format: RegisterFormat,
 ) -> (Traces, Vec<(StreamTable, usize)>) {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
@@ -596,6 +598,7 @@ fn built(
         .and_then(|b| b.card_fill_streamed(always(), true, format != RegisterFormat::InRow))
         .map(|b| b.count_where_made(true).drop_cpu_list(true))
         .and_then(|b| b.light_walk(level))
+        .and_then(|b| b.walk_cuts(cuts))
         .expect("the builder");
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
     let mut jobs: Vec<ChunkJob> = Vec::new();
@@ -650,11 +653,13 @@ fn the_light_walk_builds_today_s_tables() {
         let (program, _) = run(name);
         for format in [RegisterFormat::InRow, RegisterFormat::Tokens32] {
             for window in [7, 33, 4096] {
-                let (want, want_order) = built(&program, &max_rows, window, 2, 0, format);
+                let none = crate::tables::trace_builder::WalkCuts::default();
+                let (want, want_order) = built(&program, &max_rows, window, 2, (0, none), format);
                 chunks += want_order.len();
                 for (level, walkers) in [(1, 3), (2, 1), (2, 3)] {
                     let what = format!("{name}/{format:?}/{window}/level {level}/{walkers}");
-                    let (got, order) = built(&program, &max_rows, window, walkers, level, format);
+                    let (got, order) =
+                        built(&program, &max_rows, window, walkers, (level, none), format);
                     assert_eq!(order, want_order, "{what}: the hand-out");
                     same_traces(&want, &got);
                 }
