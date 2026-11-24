@@ -1576,6 +1576,13 @@ pub fn build_wlfm_placed(
     prepare_wlfm(program, hasher, rate, levers)?.commit(place)
 }
 
+/// A prebuild's chip prefixes by table position and the seconds they took
+/// ([`WlfmPrebuild::chip_prefixes_made`]).
+pub type ChipPrefixes = (
+    Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
+    f64,
+);
+
 /// A build's host part: the artifacts but the prepared roots, and the
 /// prepared stacks' columns, uncommitted ([`prepare_wlfm`]).
 pub struct WlfmPrebuild {
@@ -1636,10 +1643,56 @@ impl WlfmPrebuild {
         }
     }
 
+    /// [`Self::hold_narrow_packs`]' packs made without installing them: each
+    /// stack's columns packed narrow ([`GroupStack::pack_narrow`]'s words), by
+    /// stack; `None` for a build with no stacks. For a caller that makes them
+    /// beside [`Self::chip_prefixes_made`] and installs both
+    /// ([`Self::install_narrow_packs`]).
+    pub fn narrow_packs_made(&self) -> Option<Vec<Option<multilinear::gpu::PackedStore>>> {
+        self.stacks.as_ref().map(|stacks| {
+            stacks
+                .iter()
+                .map(|stack| {
+                    let raw: Vec<&[FieldElement<F>]> =
+                        stack.columns.iter().map(Vec::as_slice).collect();
+                    multilinear::gpu::pack_store_fields(&raw)
+                })
+                .collect()
+        })
+    }
+
+    /// [`Self::narrow_packs_made`]' packs installed, each on its stack: what
+    /// [`Self::hold_narrow_packs`] leaves.
+    pub fn install_narrow_packs(
+        &mut self,
+        packs: Option<Vec<Option<multilinear::gpu::PackedStore>>>,
+    ) {
+        if let (Some(stacks), Some(packs)) = (self.stacks.as_mut(), packs) {
+            for (stack, packed) in stacks.iter_mut().zip(packs) {
+                stack.packed = packed;
+            }
+        }
+    }
+
     /// [`WlfmBuild::hold_chip_prefixes`] before the commit, from the columns
     /// the stacks will commit (the same words, so the same prefixes): a
     /// host's work that need not wait for the card.
     pub fn hold_chip_prefixes(&mut self) -> Result<(), String> {
+        let made = self.chip_prefixes_made()?;
+        self.install_chip_prefixes(made);
+        Ok(())
+    }
+
+    /// [`Self::chip_prefixes_made`]' prefixes and seconds installed: what
+    /// [`Self::hold_chip_prefixes`] leaves.
+    pub fn install_chip_prefixes(&mut self, made: ChipPrefixes) {
+        (self.chip_prefixes, self.chip_prefix_secs) = made;
+    }
+
+    /// [`Self::hold_chip_prefixes`]' prefixes made without installing them,
+    /// with their seconds: from `&self`, so beside
+    /// [`Self::narrow_packs_made`].
+    pub fn chip_prefixes_made(&self) -> Result<ChipPrefixes, String> {
         let t = std::time::Instant::now();
         let airs = self.artifacts.airs();
         let refs = airs.air_refs();
@@ -1680,9 +1733,7 @@ impl WlfmPrebuild {
             prefixes[table] = Some(std::sync::Arc::new(packed));
         }
         drop(refs);
-        self.chip_prefixes = prefixes;
-        self.chip_prefix_secs = t.elapsed().as_secs_f64();
-        Ok(())
+        Ok((prefixes, t.elapsed().as_secs_f64()))
     }
 
     /// Each stack's columns, for a test that compares two prebuilds.
@@ -1691,6 +1742,36 @@ impl WlfmPrebuild {
         self.stacks
             .as_ref()
             .map(|stacks| stacks.iter().map(|s| s.columns.as_slice()).collect())
+    }
+
+    /// The installed chip prefixes, for a test that compares two prebuilds.
+    #[cfg(test)]
+    pub(crate) fn chip_prefixes_for_test(
+        &self,
+    ) -> &[Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>] {
+        &self.chip_prefixes
+    }
+
+    /// Each stack's narrow pack, as its packed bytes and its words (its
+    /// debug form less its own seconds), for a test that compares two
+    /// prebuilds; `None` where a stack holds none.
+    #[cfg(test)]
+    pub(crate) fn narrow_packs_for_test(&self) -> Vec<Option<(u64, String)>> {
+        self.stacks
+            .iter()
+            .flatten()
+            .map(|s| {
+                s.packed.as_ref().map(|p| {
+                    let debug = format!("{p:?}");
+                    let words = debug
+                        .split(", pack_secs:")
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    (p.packed_bytes(), words)
+                })
+            })
+            .collect()
     }
 
     /// The build: every prepared stack committed where `place` says, the

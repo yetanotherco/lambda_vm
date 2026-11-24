@@ -8,7 +8,9 @@
 //! (`levels_tests::the_blake3_driver_committing_level_2_early_proves_the_same_level_bytes`).
 //! Step 3 (`LAMBDA_VM_LEVELS_COLUMNS_TILED`): the tiled columns are today's
 //! cell for cell, and a build's host part made by tiles, its chips' chunks
-//! read in place, is today's stack for stack.
+//! read in place, is today's stack for stack. Step 4
+//! (`LAMBDA_VM_LEVELS_PACKS_BESIDE`): a level's chip prefixes and narrow packs
+//! made at once are the ones made in turn.
 
 use crate::tables::types::FE;
 
@@ -472,6 +474,59 @@ fn a_tiled_prepare_is_the_prepare() {
         assert_eq!(
             today.artifacts.program_id, tiled.artifacts.program_id,
             "{family:?}: the same committed identity"
+        );
+    }
+}
+
+// =============================================================================
+// Step 4: the two packs at once
+// =============================================================================
+
+/// ★ PIN: a level's two packs made at once are the packs made in turn: the
+/// same chip prefixes table for table and the same narrow pack stack for
+/// stack, under both families, and the knob's words.
+#[test]
+fn the_packs_at_once_are_the_packs_in_turn() {
+    use super::levels::{PACKS_BESIDE_ENV, packs_beside, prepare_level_packs};
+    use super::wlfm::{WlfmFamily, set_narrow_commit_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_narrow_commit_for_test(None);
+        }
+    }
+    assert_eq!(PACKS_BESIDE_ENV, "LAMBDA_VM_LEVELS_PACKS_BESIDE");
+    if std::env::var_os(PACKS_BESIDE_ENV).is_none() {
+        assert!(!packs_beside(), "off by default");
+    }
+    let _restore = Restore;
+    let _records = test_format::set_chip_records(true);
+    set_narrow_commit_for_test(Some(true));
+    for (program, family) in [
+        (super::wlfm_tests::honest(), WlfmFamily::P1),
+        (super::b3l_wlfm_tests::honest(), WlfmFamily::B3),
+    ] {
+        let [in_turn, at_once] = [false, true].map(|beside| {
+            prepare_level_packs(&program, family, None, beside)
+                .unwrap_or_else(|e| panic!("{family:?} beside {beside}: prepares: {e}"))
+        });
+        assert!(
+            in_turn.chip_prefixes_for_test().iter().any(Option::is_some),
+            "{family:?}: chip prefixes made"
+        );
+        assert!(
+            in_turn.chip_prefixes_for_test() == at_once.chip_prefixes_for_test(),
+            "{family:?}: the same prefixes"
+        );
+        let packs = in_turn.narrow_packs_for_test();
+        assert!(
+            !packs.is_empty() && packs.iter().all(Option::is_some),
+            "{family:?}: every stack packed"
+        );
+        assert_eq!(
+            packs,
+            at_once.narrow_packs_for_test(),
+            "{family:?}: the same packs"
         );
     }
 }

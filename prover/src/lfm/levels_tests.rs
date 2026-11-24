@@ -834,15 +834,18 @@ struct ChainSteps {
     commit_early: bool,
     /// `LAMBDA_VM_LEVELS_COLUMNS_TILED`.
     tiled: bool,
+    /// `LAMBDA_VM_LEVELS_PACKS_BESIDE`.
+    packs: bool,
 }
 
 /// The levels' chain steps forced as given (the first two on this thread,
-/// the prepare's for the process), the small BLAKE3 block driven under
+/// the prepare's two for the process), the small BLAKE3 block driven under
 /// them, and each level's proof bytes against [`prove_levels`] over the same
 /// base with every step off (today's derivation). The run, for its stamps.
 fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     use super::levels::{
         prove_block_levels, set_commit_next_early_for_test, set_fill_parts_for_test,
+        set_packs_beside_for_test,
     };
     use super::wlfm::set_columns_tiled_for_test;
     struct Restore;
@@ -851,12 +854,14 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             set_fill_parts_for_test(None);
             set_commit_next_early_for_test(None);
             set_columns_tiled_for_test(None);
+            set_packs_beside_for_test(None);
         }
     }
     let ChainSteps {
         fill_parts,
         commit_early,
         tiled,
+        packs,
     } = steps;
 
     assert!(
@@ -869,6 +874,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     let run = {
         let _restore = Restore;
         set_columns_tiled_for_test(Some(tiled));
+        set_packs_beside_for_test(Some(packs));
         set_fill_parts_for_test(Some(fill_parts));
         set_commit_next_early_for_test(Some(commit_early));
         prove_block_levels(
@@ -958,6 +964,21 @@ fn the_blake3_driver_with_its_columns_tiled_proves_the_same_level_bytes() {
     assert!(run.proofs.len() >= 2, "level 2 prepared too");
 }
 
+/// ★ Every level's chip prefixes and narrow packs made at once
+/// (`LAMBDA_VM_LEVELS_PACKS_BESIDE`) are the same packs: a small BLAKE3 block
+/// driven with the knob on proves each level's bytes as [`prove_levels`]
+/// does over the same base. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an
+/// untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_its_packs_at_once_proves_the_same_level_bytes() {
+    let run = driven_under_chain_steps(ChainSteps {
+        packs: true,
+        ..ChainSteps::default()
+    });
+    assert!(run.proofs.len() >= 2, "level 2 prepared too");
+}
+
 /// Every chain step on at once: the same level bytes.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
@@ -966,6 +987,7 @@ fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
         fill_parts: true,
         commit_early: true,
         tiled: true,
+        packs: true,
     });
     assert!(run.times.next_commit.is_some_and(|c| c.early));
 }
@@ -1696,7 +1718,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
         "RTA LEVEL1 CHAIN: planned {:.3}s · emitted {:.3}s · front {front:.3}s · last piece {last:.3}s · \
          last piece could land at {could:.3}s · fill {:.3}s · builder ended at {} · commit {commit:.3}s · \
          base end {:.3}s · slack {} · chain floor {} · prove from {l1_prove_from:.3}s · fill parts {} · \
-         columns tiled {}",
+         columns tiled {} · packs beside {}",
         t.planned,
         t.emitted,
         l1.fill,
@@ -1706,6 +1728,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
         fmt(floor),
         super::levels::fill_parts(),
         super::wlfm::columns_tiled(),
+        super::levels::packs_beside(),
     );
     let l2 = t.levels.get(1).copied().unwrap_or_default();
     if let (Some(ns), Some(nc), Some(b)) = (t.next_stream, t.next_commit, t.builds.get(1)) {
