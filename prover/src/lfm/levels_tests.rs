@@ -1013,6 +1013,113 @@ fn the_blake3_driver_with_its_waves_in_order_proves_the_same_level_bytes() {
     assert!(run.proofs.len() >= 2, "level 2 streamed in order too");
 }
 
+/// The small BLAKE3 block driven with the levels' two-card split at `setting`
+/// (`LAMBDA_VM_TWO_CARD_LEVELS`; the base's split off, so the base proves on
+/// one card), each level's proof bytes against [`prove_levels`] over the same
+/// base (one card, its stacks held, never split), and the host paths the run
+/// took. The level groups the second driver proved.
+#[cfg(feature = "cuda")]
+fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
+    use super::levels::prove_block_levels;
+    use math_cuda::device::{
+        TwoCardSplit, set_two_card_levels_for_test, set_two_card_split_for_test,
+    };
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_two_card_levels_for_test(None);
+            set_two_card_split_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let _restore = Restore;
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    set_two_card_split_for_test(Some(TwoCardSplit::Off));
+    set_two_card_levels_for_test(Some(setting));
+    assert!(
+        multilinear::gpu::two_card_levels_on(),
+        "the levels' split is on"
+    );
+    assert!(
+        !multilinear::gpu::two_card_split_on(),
+        "the base's split is off"
+    );
+    assert!(
+        multilinear::gpu::two_card_split_ready(),
+        "the levels' second driver is ready"
+    );
+    let declines = multilinear::gpu::cross_card_declines();
+    let before = stark::multilinear_block::split_second_groups();
+    let run = prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &streamed_options(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
+    .expect("the BLAKE3 block proves to its last level with the levels split");
+    let second = stark::multilinear_block::split_second_groups() - before;
+    let declined = multilinear::gpu::cross_card_declines() - declines;
+    set_two_card_levels_for_test(Some(TwoCardSplit::Off));
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS TWO-CARD ({setting:?}) IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+    println!(
+        "LEVELS TWO-CARD ({setting:?}): {second} level group(s) proved by the second driver · cross-card \
+         declines {declined}"
+    );
+    assert_eq!(declined, 0, "a store was read from the other card");
+    second
+}
+
+/// ★ Card, run alone, deterministic grind. The levels' phase B split over two
+/// drivers forced on one card (a second backend of card 0 drives the second
+/// share: its own streams, staging, ledger and pools) proves each level's
+/// bytes as one card does, and the second driver proved level groups.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: proves a small BLAKE3 block and its levels twice; run alone, deterministic grind"]
+fn the_blake3_driver_with_its_levels_split_forced_on_one_card_proves_the_same_level_bytes() {
+    let second = driven_under_levels_split(math_cuda::device::TwoCardSplit::Forced);
+    assert!(second > 0, "no level group proved by the second driver");
+}
+
+/// ★ Two cards, run alone, deterministic grind. With two cards seen and the
+/// levels' knob at `auto`, the levels' second driver runs on card 1 and each
+/// level proves the bytes of one card.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "two cards: proves a small BLAKE3 block and its levels twice; run alone, deterministic grind"]
+fn the_blake3_driver_with_its_levels_split_on_card_1_proves_the_same_level_bytes() {
+    use math_cuda::device::{TwoCardSplit, card_count, split_placement};
+    assert!(card_count() >= 2, "needs two cards, saw {}", card_count());
+    let second = {
+        math_cuda::device::set_two_card_levels_for_test(Some(TwoCardSplit::Auto));
+        assert_eq!(split_placement().ordinal, 1, "the second driver on card 1");
+        driven_under_levels_split(TwoCardSplit::Auto)
+    };
+    assert!(second > 0, "no level group proved on card 1");
+}
+
 /// ★ Level 2 executed beside its own preparation
 /// (`LAMBDA_VM_LEVELS_NEXT_BESIDE`), alone and with its stacks committed
 /// early, is the same level: a small BLAKE3 block driven with the knob on

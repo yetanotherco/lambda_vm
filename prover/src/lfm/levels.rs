@@ -1093,6 +1093,10 @@ fn card_budget_pct() -> Result<Option<u64>, String> {
 /// The base's budget while the levels' own is in force ([`CARD_BUDGET_ENV`]).
 static BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
+/// Under the levels' split (`LAMBDA_VM_TWO_CARD_LEVELS`): the second card's
+/// budget before the levels' was put in force there too.
+static SECOND_BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
 /// Puts the levels' budget in force ([`CARD_BUDGET_ENV`], 85 % by default) on
 /// a card of `total` bytes: the budget now (unchanged without a card, or when
 /// the process set its own card budget and the knob says nothing).
@@ -1100,11 +1104,35 @@ fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
     let (Some(pct), Some(total)) = (card_budget_pct()?, total) else {
         return Ok(multilinear::gpu::reserve_budget());
     };
-    let bytes = total / 100 * pct;
+    // The levels' split (`LAMBDA_VM_TWO_CARD_LEVELS`) argues and opens on the
+    // second card as well: the same share there (the cards are alike), its own
+    // budget back at the return; two backends on one card (forced, one card)
+    // get half each, as at the second backend's start. Asked only with the
+    // levels' knob on; ready makes the second backend if the prove's set-up
+    // has not yet.
+    let split = multilinear::gpu::two_card_levels_on() && multilinear::gpu::two_card_split_ready();
+    let bytes = match split && multilinear::gpu::second_shares_card_0() {
+        true => total / 100 * pct / 2,
+        false => total / 100 * pct,
+    };
     let base = multilinear::gpu::set_reserve_budget(bytes);
     let mut held = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
     if held.is_none() {
         *held = Some(base);
+    }
+    if split {
+        if let Some(second) = multilinear::gpu::set_second_reserve_budget(bytes) {
+            let mut held2 = SECOND_BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+            if held2.is_none() {
+                *held2 = Some(second);
+            }
+            eprintln!(
+                "LEVELS CARD budget on the second card: {:.2} GiB (LAMBDA_VM_TWO_CARD_LEVELS), its {:.2} GiB \
+                 back at the driver's return",
+                bytes as f64 / (1u64 << 30) as f64,
+                held2.unwrap_or(second) as f64 / (1u64 << 30) as f64
+            );
+        }
     }
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     eprintln!(
@@ -1121,6 +1149,13 @@ fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
 fn release_levels_budget() {
     if let Some(base) = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).take() {
         multilinear::gpu::set_reserve_budget(base);
+    }
+    if let Some(second) = SECOND_BASE_BUDGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        multilinear::gpu::set_second_reserve_budget(second);
     }
 }
 

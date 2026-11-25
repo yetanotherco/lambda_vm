@@ -1346,6 +1346,33 @@ pub fn set_reserve_budget(_bytes: u64) -> u64 {
     0
 }
 
+/// Moves the second driver's ledger budget to `bytes` (the two-card split's
+/// second backend, when it was made and started), and returns the one it
+/// replaces; `None`, and nothing moved, without one. Promises already made
+/// stay made.
+#[cfg(feature = "cuda")]
+pub fn set_second_reserve_budget(bytes: u64) -> Option<u64> {
+    math_cuda::device::second_backend_started().map(|be| be.set_vram_budget_bytes(bytes))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn set_second_reserve_budget(_bytes: u64) -> Option<u64> {
+    None
+}
+
+/// Whether the second driver's backend shares card 0 (forced with one card):
+/// two ledgers on one card ([`math_cuda::device::second_backend_on_card_0`]);
+/// `false` without a device build.
+#[cfg(feature = "cuda")]
+pub fn second_shares_card_0() -> bool {
+    math_cuda::device::second_backend_on_card_0()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn second_shares_card_0() -> bool {
+    false
+}
+
 /// While it lives, this thread's device calls draw their streams from the
 /// background pool ([`math_cuda::stream_class`]), when one exists; nothing
 /// without a device. It belongs to the thread that took it.
@@ -1414,6 +1441,19 @@ pub fn two_card_split_on() -> bool {
 
 #[cfg(not(feature = "cuda"))]
 pub fn two_card_split_on() -> bool {
+    false
+}
+
+/// Whether the recursion levels' split is on in this process
+/// ([`math_cuda::device::two_card_levels`], `LAMBDA_VM_TWO_CARD_LEVELS`),
+/// ready or not; `false` without a device build.
+#[cfg(feature = "cuda")]
+pub fn two_card_levels_on() -> bool {
+    math_cuda::device::two_card_levels()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn two_card_levels_on() -> bool {
     false
 }
 

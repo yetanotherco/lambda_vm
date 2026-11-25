@@ -2024,6 +2024,7 @@ fn openings_backend() -> Result<&'static Backend> {
 enum Asker {
     Openings,
     Split,
+    Levels,
 }
 
 /// Set once the second slot's backend failed to start, or a prove marked it
@@ -2066,6 +2067,12 @@ fn second_backend(placement: RolePlacement, asker: Asker) -> Result<&'static Bac
                     two_card_split_setting(),
                     card_count()
                 ),
+                Asker::Levels => eprintln!(
+                    "[gpu] two-card levels: the levels' second driver on card {} ({TWO_CARD_LEVELS_ENV}={:?}, {} card(s) seen)",
+                    placement.ordinal,
+                    two_card_levels_setting(),
+                    card_count()
+                ),
             }
             // Two backends on one card (forced, one card): two full ledgers
             // would promise the card twice, so each gets half.
@@ -2094,6 +2101,10 @@ fn second_backend(placement: RolePlacement, asker: Asker) -> Result<&'static Bac
                 ),
                 Asker::Split => eprintln!(
                     "[gpu] two-card split: card {}'s backend did not start ({e}); phase B stays on one card",
+                    placement.ordinal
+                ),
+                Asker::Levels => eprintln!(
+                    "[gpu] two-card levels: card {}'s backend did not start ({e}); the levels stay on one card",
                     placement.ordinal
                 ),
             }
@@ -2238,18 +2249,97 @@ pub fn split_placement_for(setting: TwoCardSplit, cards: usize) -> RolePlacement
     placement_for(DeviceRole::Openings, as_openings, cards)
 }
 
-/// Where the split's second driver runs in this process. Off, the driver is
-/// not asked for its cards.
+/// `LAMBDA_VM_TWO_CARD_LEVELS`: the recursion levels' phase B split over two
+/// cards, as [`TWO_CARD_SPLIT_ENV`] splits the base's: each card drives its
+/// own groups on its own backend. The same words (unset or `0` off, the
+/// default; `auto`; `1` forced); the two knobs share one second backend and
+/// its pools, each says only whether its own proves split.
+pub const TWO_CARD_LEVELS_ENV: &str = "LAMBDA_VM_TWO_CARD_LEVELS";
+
+/// Test only: the levels' setting in place of the environment's (0 none,
+/// 1 auto, 2 off, 3 forced).
+static TWO_CARD_LEVELS_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test only, not for production callers: the levels' split setting in place
+/// of [`TWO_CARD_LEVELS_ENV`] (`None`: the environment's). Process-wide; a
+/// second backend already made stays made.
+#[doc(hidden)]
+pub fn set_two_card_levels_for_test(setting: Option<TwoCardSplit>) {
+    let v = match setting {
+        None => 0,
+        Some(TwoCardSplit::Auto) => 1,
+        Some(TwoCardSplit::Off) => 2,
+        Some(TwoCardSplit::Forced) => 3,
+    };
+    TWO_CARD_LEVELS_FORCED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process's levels' split setting: a test's, else the environment's,
+/// read once (an unrecognised word is said once and read as off).
+pub fn two_card_levels_setting() -> TwoCardSplit {
+    match TWO_CARD_LEVELS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return TwoCardSplit::Auto,
+        2 => return TwoCardSplit::Off,
+        3 => return TwoCardSplit::Forced,
+        _ => {}
+    }
+    static SETTING: OnceLock<TwoCardSplit> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        TwoCardSplit::parse(std::env::var(TWO_CARD_LEVELS_ENV).ok().as_deref())
+            .map_err(|e| e.replace(TWO_CARD_SPLIT_ENV, TWO_CARD_LEVELS_ENV))
+            .unwrap_or_else(|e| {
+                eprintln!("{e} — read as off");
+                TwoCardSplit::Off
+            })
+    })
+}
+
+/// The setting the second driver's backend is placed by, from the base's
+/// split and the levels' split: forced when either is, else `auto` when
+/// either is, else off. Each knob still decides alone whether its own proves
+/// split ([`split_knob_places`]).
+pub fn second_driver_setting_for(split: TwoCardSplit, levels: TwoCardSplit) -> TwoCardSplit {
+    match (split, levels) {
+        (TwoCardSplit::Forced, _) | (_, TwoCardSplit::Forced) => TwoCardSplit::Forced,
+        (TwoCardSplit::Auto, _) | (_, TwoCardSplit::Auto) => TwoCardSplit::Auto,
+        _ => TwoCardSplit::Off,
+    }
+}
+
+/// Whether a knob at `setting` splits its proves with `cards` cards: it
+/// places a second driver of its own ([`split_placement_for`]). `auto` with
+/// one card does not, even when the other knob, forced, made a second
+/// backend of card 0.
+pub fn split_knob_places(setting: TwoCardSplit, cards: usize) -> bool {
+    split_placement_for(setting, cards).slot != 0
+}
+
+/// Where the second driver runs in this process, under the base's split and
+/// the levels' ([`second_driver_setting_for`]). Both off, the driver is not
+/// asked for its cards.
 pub fn split_placement() -> RolePlacement {
-    match two_card_split_setting() {
+    match second_driver_setting_for(two_card_split_setting(), two_card_levels_setting()) {
         TwoCardSplit::Off => MAIN_PLACEMENT,
         setting => split_placement_for(setting, card_count()),
     }
 }
 
-/// Whether the split is on in this process (a second backend placed).
+/// Whether the base's split is on in this process (its knob places a second
+/// driver). Off, the driver is not asked for its cards.
 pub fn two_card_split() -> bool {
-    split_placement().slot != 0
+    match two_card_split_setting() {
+        TwoCardSplit::Off => false,
+        setting => split_knob_places(setting, card_count()),
+    }
+}
+
+/// Whether the levels' split is on in this process ([`TWO_CARD_LEVELS_ENV`]
+/// places a second driver). Off, the driver is not asked for its cards.
+pub fn two_card_levels() -> bool {
+    match two_card_levels_setting() {
+        TwoCardSplit::Off => false,
+        setting => split_knob_places(setting, card_count()),
+    }
 }
 
 /// The backend of [`DeviceRole::Second`]: the second slot's under the split.
@@ -2261,7 +2351,12 @@ fn split_backend() -> Result<&'static Backend> {
     if placement.slot == 0 {
         return Err(crate::invalid_value());
     }
-    let be = second_backend(placement, Asker::Split)?;
+    // Said in the words of the knob that made it: the base's when it is on.
+    let asker = match two_card_split_setting() {
+        TwoCardSplit::Off => Asker::Levels,
+        _ => Asker::Split,
+    };
+    let be = second_backend(placement, asker)?;
     if BackendSlot::of(be) == BackendSlot::Second {
         Ok(be)
     } else {
@@ -2326,12 +2421,14 @@ pub fn mark_second_failed(why: &str) {
     }
 }
 
-/// Whether phase B may split its groups over two cards: the split on, the
+/// Whether phase B may split its groups over two cards: a second driver
+/// placed (by the base's split or the levels', [`split_placement`]), the
 /// second backend started on its own (not fallen back to card 0's) and the
 /// second driver's pool built. Makes both on its first call; the caller asks
-/// before it splits, so a split never runs half on card 0.
+/// its own knob ([`two_card_split`], [`two_card_levels`]) and then this before
+/// it splits, so a split never runs half on card 0.
 pub fn two_card_split_ready() -> bool {
-    if !two_card_split() {
+    if split_placement().slot == 0 {
         return false;
     }
     let Ok(be) = split_backend() else {
@@ -2340,6 +2437,29 @@ pub fn two_card_split_ready() -> bool {
     BackendSlot::of(be) == BackendSlot::Second
         && second_pool().is_some()
         && second_openings_pool().is_some()
+}
+
+/// The second driver's backend when it was made and started on its own (not
+/// fallen back to card 0's, not marked failed): what a caller moves the
+/// budget of beside card 0's ([`Backend::set_vram_budget_bytes`]). Never
+/// makes it.
+pub fn second_backend_started() -> Option<&'static Backend> {
+    if SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    SECOND_BACKEND.get()
+}
+
+/// Whether the second driver's backend shares card 0 with the main one
+/// (forced with one card): two ledgers on one card, each given half.
+pub fn second_backend_on_card_0() -> bool {
+    match (
+        second_backend_started(),
+        SECOND_BACKEND.get().and(backend_once().ok()),
+    ) {
+        (Some(second), Some(main)) => second.ordinal() == main.ordinal(),
+        _ => false,
+    }
 }
 
 /// Runs `f` as the split's second driver's work: inside its pool, in
@@ -4055,6 +4175,115 @@ mod device_state_scan_tests {
             "the crate's process-wide Once / OnceLock / PerBackend cells changed: read the new \
              one against the per-card rule, then pin it"
         );
+    }
+}
+
+#[cfg(test)]
+mod two_card_levels_tests {
+    use super::{
+        MAIN_PLACEMENT, RolePlacement, TwoCardSplit, second_driver_setting_for,
+        set_two_card_levels_for_test, set_two_card_split_for_test, split_knob_places,
+        split_placement_for, two_card_levels, two_card_levels_setting, two_card_split,
+    };
+
+    const SETTINGS: [TwoCardSplit; 3] =
+        [TwoCardSplit::Off, TwoCardSplit::Auto, TwoCardSplit::Forced];
+
+    /// The levels' knob has its own name, reads the split's words and is off
+    /// by default; a test's setting is read back.
+    #[test]
+    fn the_levels_knob_is_named_and_off_by_default() {
+        assert_eq!(super::TWO_CARD_LEVELS_ENV, "LAMBDA_VM_TWO_CARD_LEVELS");
+        set_two_card_levels_for_test(None);
+        if std::env::var_os(super::TWO_CARD_LEVELS_ENV).is_none() {
+            assert_eq!(
+                two_card_levels_setting(),
+                TwoCardSplit::Off,
+                "off by default"
+            );
+        }
+        for setting in SETTINGS {
+            set_two_card_levels_for_test(Some(setting));
+            assert_eq!(two_card_levels_setting(), setting);
+        }
+        set_two_card_levels_for_test(None);
+    }
+
+    /// The second backend is placed by the stronger of the two knobs: forced
+    /// when either is, `auto` when either is, off only when both are.
+    #[test]
+    fn the_second_driver_is_placed_by_the_stronger_knob() {
+        for split in SETTINGS {
+            for levels in SETTINGS {
+                let want = if split == TwoCardSplit::Forced || levels == TwoCardSplit::Forced {
+                    TwoCardSplit::Forced
+                } else if split == TwoCardSplit::Auto || levels == TwoCardSplit::Auto {
+                    TwoCardSplit::Auto
+                } else {
+                    TwoCardSplit::Off
+                };
+                assert_eq!(
+                    second_driver_setting_for(split, levels),
+                    want,
+                    "{split:?} {levels:?}"
+                );
+                assert_eq!(second_driver_setting_for(levels, split), want, "symmetric");
+            }
+        }
+    }
+
+    /// Each knob splits its own proves only where it would place a second
+    /// driver itself: `auto` with one card does not, although the other knob,
+    /// forced, made a second backend of card 0; off never does; nothing
+    /// without a card.
+    #[test]
+    fn each_knob_splits_only_where_it_places_a_driver_itself() {
+        for cards in 0..5 {
+            for setting in SETTINGS {
+                assert_eq!(
+                    split_knob_places(setting, cards),
+                    split_placement_for(setting, cards).slot != 0,
+                    "{setting:?} with {cards} card(s)"
+                );
+            }
+        }
+        assert!(!split_knob_places(TwoCardSplit::Auto, 1));
+        assert!(split_knob_places(TwoCardSplit::Forced, 1));
+        assert!(!split_knob_places(TwoCardSplit::Off, 2));
+        assert!(split_knob_places(TwoCardSplit::Auto, 2));
+        for setting in SETTINGS {
+            assert!(!split_knob_places(setting, 0), "nothing without a card");
+        }
+        // Forced + auto with one card: the backend is card 0's second; only the
+        // forced knob's proves split.
+        let placed = split_placement_for(
+            second_driver_setting_for(TwoCardSplit::Forced, TwoCardSplit::Auto),
+            1,
+        );
+        assert_eq!(
+            placed,
+            RolePlacement {
+                slot: 1,
+                ordinal: 0
+            }
+        );
+        assert_ne!(placed, MAIN_PLACEMENT);
+    }
+
+    /// The levels' knob alone never turns the base's split on, nor the base's
+    /// the levels'; both off, neither is on (and the driver is not asked).
+    #[test]
+    fn the_levels_knob_does_not_split_the_base() {
+        set_two_card_split_for_test(Some(TwoCardSplit::Off));
+        set_two_card_levels_for_test(Some(TwoCardSplit::Off));
+        assert!(!two_card_split() && !two_card_levels());
+        set_two_card_levels_for_test(Some(TwoCardSplit::Forced));
+        assert!(!two_card_split(), "the levels' knob split the base");
+        set_two_card_levels_for_test(Some(TwoCardSplit::Off));
+        set_two_card_split_for_test(Some(TwoCardSplit::Forced));
+        assert!(!two_card_levels(), "the base's knob split the levels");
+        set_two_card_split_for_test(None);
+        set_two_card_levels_for_test(None);
     }
 }
 
