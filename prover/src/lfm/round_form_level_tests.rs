@@ -1546,7 +1546,9 @@ fn round_form_level_pins() {
     const LEVEL_2_OFF: &str = "fold word 0x8041eb0180070006 · Q 229 · rounds at 27 [229, 57, 46, \
                                39, 33, 29, 26] · id \
                                4e902bb869c8bbbf7d0e18a4d97eb0603540907ab1d366f77bb5ea50d6f3231e";
-    const LEVEL_2_PINNED: &str = "UNPINNED";
+    const LEVEL_2_PINNED: &str = "fold word 0x8000fb9180070004 · Q 229 · rounds at 27 [229, 114, 76, \
+                                  57, 46, 39, 33] · id \
+                                  7216f38da29382f478f6fa839638fde64f62632f1c9915a5acf937cc4692b183";
     let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
     let (elf, proof) = base("test_commit_4", &format);
     let plan = plan(&elf, &proof, &format);
