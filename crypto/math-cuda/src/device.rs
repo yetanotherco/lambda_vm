@@ -4300,8 +4300,8 @@ mod two_card_levels_tests {
 mod two_card_split_tests {
     use super::{
         DeviceRole, MAIN_PLACEMENT, RolePlacement, TwoCardOpenings, TwoCardSplit, current_role,
-        on_second_card, on_second_card_openings, placement_for, set_two_card_split_for_test,
-        split_placement_for, two_card_split, two_card_split_ready,
+        on_second_card, on_second_card_openings, placement_for, set_two_card_levels_for_test,
+        set_two_card_split_for_test, split_placement_for, two_card_split, two_card_split_ready,
     };
 
     #[test]
@@ -4380,11 +4380,15 @@ mod two_card_split_tests {
 
     /// Off, or without a card (forced on a host with none): no split is ready,
     /// and the second driver's work runs on the caller's thread in its role.
+    /// Off is both knobs at `0`: the levels' knob, `auto` when unset, places
+    /// the same second driver on a box with two cards.
     #[test]
     fn off_or_without_a_card_the_split_is_not_ready() {
         set_two_card_split_for_test(Some(TwoCardSplit::Off));
+        set_two_card_levels_for_test(Some(TwoCardSplit::Off));
         assert!(!two_card_split());
         assert!(!two_card_split_ready());
+        set_two_card_levels_for_test(None);
         if super::card_count() == 0 {
             set_two_card_split_for_test(Some(TwoCardSplit::Forced));
             assert!(!two_card_split(), "forced without a card places nothing");
