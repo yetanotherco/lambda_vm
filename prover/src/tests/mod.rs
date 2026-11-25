@@ -120,6 +120,9 @@ pub mod lean_stream_block_tests;
 #[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod local_lane_second_card_tests;
+#[cfg(test)]
 pub mod local_to_global_bus_tests;
 #[cfg(test)]
 pub mod lt_bus_tests;
