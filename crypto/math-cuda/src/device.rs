@@ -2171,15 +2171,17 @@ pub fn on_openings_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 
 /// `LAMBDA_VM_TWO_CARD_SPLIT`: phase B's groups split over two cards, each
 /// card driving its own groups (argue and openings) on its own backend.
+/// Unset (or empty), `auto`, the default: on when the process sees two cards
+/// or more, one card as before otherwise; `0` off; `1` forced.
 pub const TWO_CARD_SPLIT_ENV: &str = "LAMBDA_VM_TWO_CARD_SPLIT";
 
 /// The two-card split's setting ([`TWO_CARD_SPLIT_ENV`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TwoCardSplit {
-    /// `auto`: on when the process sees two cards or more. Not the default
-    /// until a two-card box has measured it (bytes and time).
+    /// Unset, empty or `auto`: on when the process sees two cards or more;
+    /// with one card, one driver on card 0 as with the knob off. The default.
     Auto,
-    /// Unset or `0`: off, one driver on card 0 (today's). The default.
+    /// `0`: off, one driver on card 0 whatever the cards.
     Off,
     /// `1`: on. With one card, the second driver gets a backend of its own on
     /// card 0 (its own streams, staging and ledger, the same context): the
@@ -2188,14 +2190,16 @@ pub enum TwoCardSplit {
 }
 
 impl TwoCardSplit {
-    /// The knob's reading: unset or `0` off (the default), `auto`
-    /// [`Self::Auto`], `1` forced; anything else is refused.
+    /// The knob's reading: unset, empty or `auto` [`Self::Auto`] (the
+    /// default), `0` off, `1` forced; anything else is refused.
     pub fn parse(word: Option<&str>) -> std::result::Result<Self, String> {
         match word.map(str::trim) {
-            None | Some("0") => Ok(Self::Off),
-            Some("auto") => Ok(Self::Auto),
+            None | Some("" | "auto") => Ok(Self::Auto),
+            Some("0") => Ok(Self::Off),
             Some("1") => Ok(Self::Forced),
-            Some(other) => Err(format!("{TWO_CARD_SPLIT_ENV}={other}: auto, 0 or 1")),
+            Some(other) => Err(format!(
+                "{TWO_CARD_SPLIT_ENV}={other}: auto (the default), 0 or 1"
+            )),
         }
     }
 }
@@ -2251,9 +2255,10 @@ pub fn split_placement_for(setting: TwoCardSplit, cards: usize) -> RolePlacement
 
 /// `LAMBDA_VM_TWO_CARD_LEVELS`: the recursion levels' phase B split over two
 /// cards, as [`TWO_CARD_SPLIT_ENV`] splits the base's: each card drives its
-/// own groups on its own backend. The same words (unset or `0` off, the
-/// default; `auto`; `1` forced); the two knobs share one second backend and
-/// its pools, each says only whether its own proves split.
+/// own groups on its own backend. The same words (unset, empty or `auto`, the
+/// default: on with two cards or more; `0` off; `1` forced); the two knobs
+/// share one second backend and its pools, each says only whether its own
+/// proves split.
 pub const TWO_CARD_LEVELS_ENV: &str = "LAMBDA_VM_TWO_CARD_LEVELS";
 
 /// Test only: the levels' setting in place of the environment's (0 none,
@@ -4192,17 +4197,18 @@ mod two_card_levels_tests {
     const SETTINGS: [TwoCardSplit; 3] =
         [TwoCardSplit::Off, TwoCardSplit::Auto, TwoCardSplit::Forced];
 
-    /// The levels' knob has its own name, reads the split's words and is off
-    /// by default; a test's setting is read back.
+    /// The levels' knob has its own name, reads the split's words and is
+    /// `auto` by default (one card as before with one card); a test's setting
+    /// is read back.
     #[test]
-    fn the_levels_knob_is_named_and_off_by_default() {
+    fn the_levels_knob_is_named_and_auto_by_default() {
         assert_eq!(super::TWO_CARD_LEVELS_ENV, "LAMBDA_VM_TWO_CARD_LEVELS");
         set_two_card_levels_for_test(None);
         if std::env::var_os(super::TWO_CARD_LEVELS_ENV).is_none() {
             assert_eq!(
                 two_card_levels_setting(),
-                TwoCardSplit::Off,
-                "off by default"
+                TwoCardSplit::Auto,
+                "auto by default"
             );
         }
         for setting in SETTINGS {
@@ -4300,15 +4306,23 @@ mod two_card_split_tests {
 
     #[test]
     fn the_split_knob_reads_its_words_and_refuses_the_rest() {
-        assert_eq!(
-            TwoCardSplit::parse(None),
-            Ok(TwoCardSplit::Off),
-            "off by default"
-        );
+        for default in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                TwoCardSplit::parse(default),
+                Ok(TwoCardSplit::Auto),
+                "{default:?}: auto by default"
+            );
+        }
         assert_eq!(TwoCardSplit::parse(Some("0")), Ok(TwoCardSplit::Off));
+        assert_eq!(TwoCardSplit::parse(Some(" 0 ")), Ok(TwoCardSplit::Off));
         assert_eq!(TwoCardSplit::parse(Some(" auto ")), Ok(TwoCardSplit::Auto));
         assert_eq!(TwoCardSplit::parse(Some("1")), Ok(TwoCardSplit::Forced));
-        for bad in ["", "on", "2", "base"] {
+        // The default places no second driver with one card or none: one card
+        // proves as with the knob off.
+        for cards in [0, 1] {
+            assert!(!super::split_knob_places(TwoCardSplit::Auto, cards));
+        }
+        for bad in ["on", "off", "2", "base", "none"] {
             let err = TwoCardSplit::parse(Some(bad)).expect_err(bad);
             assert!(err.contains("LAMBDA_VM_TWO_CARD_SPLIT"), "{err}");
         }

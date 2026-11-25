@@ -178,31 +178,52 @@ fn lean_shape(filled: &mut LfmFilled) -> Vec<(usize, usize, bool)> {
 // The knobs
 // =============================================================================
 
-/// The driver-read knobs are named, off by default, and on only for `1`; a
-/// test's override is this thread's alone.
+/// The driver-read knobs are named; unset, each is on exactly where the
+/// process proves over two cards (`two_cards`, the default: off with one card
+/// and without a device build); `1` turns one on and `0` off; a test's
+/// override is this thread's alone.
 #[test]
-fn the_chain_knobs_are_named_and_off_by_default() {
+fn the_chain_knobs_are_named_and_on_with_two_cards_by_default() {
     use super::levels::{
         COMMIT_NEXT_EARLY_ENV, FILL_PARTS_ENV, NEXT_BESIDE_ENV, WAVES_IN_ORDER_ENV,
         commit_next_early, fill_parts, next_beside, set_commit_next_early_for_test,
         set_fill_parts_for_test, set_next_beside_for_test, set_waves_in_order_for_test,
         waves_in_order,
     };
+    use super::wlfm::COLUMNS_TILED_ENV;
+    use super::wlfm_knobs::{knob_word_two_card, two_cards};
+    let two = two_cards();
+    if !cfg!(feature = "cuda") {
+        assert!(!two, "two cards without a device build");
+    }
     assert_eq!(FILL_PARTS_ENV, "LAMBDA_VM_LEVELS_FILL_PARTS");
     assert_eq!(COMMIT_NEXT_EARLY_ENV, "LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY");
+    assert_eq!(COLUMNS_TILED_ENV, "LAMBDA_VM_LEVELS_COLUMNS_TILED");
     assert_eq!(NEXT_BESIDE_ENV, "LAMBDA_VM_LEVELS_NEXT_BESIDE");
     if std::env::var_os(NEXT_BESIDE_ENV).is_none() {
-        assert!(!next_beside(), "off by default");
+        assert_eq!(next_beside(), two, "two cards by default");
     }
     assert_eq!(WAVES_IN_ORDER_ENV, "LAMBDA_VM_LEVELS_WAVES_IN_ORDER");
     if std::env::var_os(WAVES_IN_ORDER_ENV).is_none() {
-        assert!(!waves_in_order(), "off by default");
+        assert_eq!(waves_in_order(), two, "two cards by default");
     }
     if std::env::var_os(FILL_PARTS_ENV).is_none() {
-        assert!(!fill_parts(), "off by default");
+        assert_eq!(fill_parts(), two, "two cards by default");
     }
     if std::env::var_os(COMMIT_NEXT_EARLY_ENV).is_none() {
-        assert!(!commit_next_early(), "off by default");
+        assert_eq!(commit_next_early(), two, "two cards by default");
+    }
+    for (word, on) in [
+        (None, None),
+        (Some(""), None),
+        (Some("on"), None),
+        (Some("true"), None),
+        (Some("0"), Some(false)),
+        (Some(" 0 "), Some(false)),
+        (Some("1"), Some(true)),
+        (Some(" 1 "), Some(true)),
+    ] {
+        assert_eq!(knob_word_two_card(word), on, "{word:?}");
     }
     for (word, on) in [
         (None, false),
@@ -248,7 +269,7 @@ fn the_chain_knobs_are_named_and_off_by_default() {
     {
         assert_eq!(
             other,
-            (false, false, false, false),
+            (two, two, two, two),
             "another thread reads the knobs"
         );
     }

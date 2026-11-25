@@ -48,6 +48,28 @@ pub fn knob_word_off(word: Option<&str>) -> bool {
     word.is_some_and(|v| v.trim() == "0")
 }
 
+/// A two-card chain knob's word: `Some(true)` for `1`, `Some(false)` for
+/// `0` (spaces around either ignored); unset, empty or any other word `None`,
+/// the default, on exactly where the process proves over two cards
+/// ([`two_cards`]).
+pub fn knob_word_two_card(word: Option<&str>) -> Option<bool> {
+    match word.map(str::trim) {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether this process proves over two cards: the base's two-card split
+/// (`LAMBDA_VM_TWO_CARD_SPLIT`) or the levels' (`LAMBDA_VM_TWO_CARD_LEVELS`)
+/// places a second driver. Both default to `auto`, so this is true on a box
+/// with two cards or more; false with one card and without a device build.
+/// The levels' chain knobs default to it: they pay where the base's phase B
+/// and the levels' split over two cards, and one card proves as before.
+pub fn two_cards() -> bool {
+    multilinear::gpu::two_card_split_on() || multilinear::gpu::two_card_levels_on()
+}
+
 /// Whether the W-LFM prover holds the chips as their records:
 /// [`CHIP_RECORDS_ENV`], or a test's override.
 pub fn chip_records() -> bool {

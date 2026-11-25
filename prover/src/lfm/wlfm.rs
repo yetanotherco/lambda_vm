@@ -3523,8 +3523,10 @@ pub fn prepare_par() -> bool {
 /// columns, where it otherwise reads the whole table once a column; and a chip
 /// cut at the chunk cap is read in place, by its chunks' row ranges, where it
 /// is otherwise copied chunk by chunk first. One thread, as today. The same
-/// columns, cell for cell. Off by default (and for any word but `1`); read
-/// once a process.
+/// columns, cell for cell. `0` off; unset (or any other word), on exactly
+/// where the process proves over two cards
+/// ([`super::wlfm_knobs::two_cards`]), the default. The word is read once a
+/// process.
 pub const COLUMNS_TILED_ENV: &str = "LAMBDA_VM_LEVELS_COLUMNS_TILED";
 
 /// A test's [`columns_tiled`], process wide (0 the knob, 1 off, 2 on).
@@ -3550,10 +3552,13 @@ pub fn columns_tiled() -> bool {
         2 => return true,
         _ => {}
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(super::wlfm_knobs::env_word(COLUMNS_TILED_ENV).as_deref())
+    static WORD: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        super::wlfm_knobs::knob_word_two_card(
+            super::wlfm_knobs::env_word(COLUMNS_TILED_ENV).as_deref(),
+        )
     })
+    .unwrap_or_else(super::wlfm_knobs::two_cards)
 }
 
 /// `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL=1`: level 1's builder, which makes

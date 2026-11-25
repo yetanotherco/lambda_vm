@@ -517,8 +517,10 @@ pub fn fill_beside() -> bool {
 /// once (the chips' traces, the lean BLAKE3 tables, the one-output selects'
 /// and cap tables), each on a thread of its own, where they otherwise run one
 /// after another ([`super::proof::lfm_fill_executed_parts`]). The same tables
-/// from the same records, so the same proofs. Off by default (and for any
-/// word but `1`). Read once a process, on the driver's thread.
+/// from the same records, so the same proofs. `0` off; unset (or any other
+/// word), on exactly where the process proves over two cards
+/// ([`super::wlfm_knobs::two_cards`]), the default. The word is read once a
+/// process, on the driver's thread.
 pub const FILL_PARTS_ENV: &str = "LAMBDA_VM_LEVELS_FILL_PARTS";
 
 std::thread_local! {
@@ -538,19 +540,21 @@ pub fn fill_parts() -> bool {
     if let Some(on) = FILL_PARTS_FOR_TEST.with(std::cell::Cell::get) {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(FILL_PARTS_ENV).ok().as_deref())
+    static WORD: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        super::wlfm_knobs::knob_word_two_card(std::env::var(FILL_PARTS_ENV).ok().as_deref())
     })
+    .unwrap_or_else(super::wlfm_knobs::two_cards)
 }
 
 /// `LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY=1`: when level 2 executes beside level
 /// 1's prove ([`stream_next`]), its prepared stacks are committed on the card
 /// the moment level 1's prove returns, beside the end of level 2's execution
 /// and its fill on the host, where they are otherwise committed after that
-/// fill. The same commit of the same columns, earlier: the same proofs. Off by
-/// default (and for any word but `1`). Read once a process, on the driver's
-/// thread.
+/// fill. The same commit of the same columns, earlier: the same proofs. `0`
+/// off; unset (or any other word), on exactly where the process proves over
+/// two cards ([`super::wlfm_knobs::two_cards`]), the default. The word is read
+/// once a process, on the driver's thread.
 pub const COMMIT_NEXT_EARLY_ENV: &str = "LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY";
 
 std::thread_local! {
@@ -570,10 +574,11 @@ pub fn commit_next_early() -> bool {
     if let Some(on) = COMMIT_NEXT_EARLY_FOR_TEST.with(std::cell::Cell::get) {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(COMMIT_NEXT_EARLY_ENV).ok().as_deref())
+    static WORD: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        super::wlfm_knobs::knob_word_two_card(std::env::var(COMMIT_NEXT_EARLY_ENV).ok().as_deref())
     })
+    .unwrap_or_else(super::wlfm_knobs::two_cards)
 }
 
 /// `LAMBDA_VM_LEVELS_WAVES_IN_ORDER=1`: level 1's and level 2's streamed
@@ -582,8 +587,10 @@ pub fn commit_next_early() -> bool {
 /// where each wave otherwise walks the whole program's level schedule with its
 /// hashes on the shared pool. The same instructions a wave, in an order that
 /// respects every dependency, so the same executions and proofs. Acts only on
-/// bucketed waves ([`bucket_waves`], on by default). Off by default (and for
-/// any word but `1`). Read once a process, on the driver's thread.
+/// bucketed waves ([`bucket_waves`], on by default). `0` off; unset (or any
+/// other word), on exactly where the process proves over two cards
+/// ([`super::wlfm_knobs::two_cards`]), the default. The word is read once a
+/// process, on the driver's thread.
 pub const WAVES_IN_ORDER_ENV: &str = "LAMBDA_VM_LEVELS_WAVES_IN_ORDER";
 
 std::thread_local! {
@@ -603,10 +610,11 @@ pub fn waves_in_order() -> bool {
     if let Some(on) = WAVES_IN_ORDER_FOR_TEST.with(std::cell::Cell::get) {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(WAVES_IN_ORDER_ENV).ok().as_deref())
+    static WORD: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        super::wlfm_knobs::knob_word_two_card(std::env::var(WAVES_IN_ORDER_ENV).ok().as_deref())
     })
+    .unwrap_or_else(super::wlfm_knobs::two_cards)
 }
 
 /// How level 2's streamed execution runs, as the driver read its knobs: its
@@ -1135,8 +1143,10 @@ fn next_program(child: &WlfmChild) -> Result<(LfmProgram, Vec<u32>), String> {
 /// its program exists, its host preparation (columns, stacks, packs) on a
 /// thread of its own beside it ([`stream_next_level_beside`]), where today the
 /// execution waits for that preparation. The same program, prebuild and
-/// execution: the same proofs. Off by default (and for any word but `1`).
-/// Read once a process, on the driver's thread.
+/// execution: the same proofs. `0` off; unset (or any other word), on exactly
+/// where the process proves over two cards
+/// ([`super::wlfm_knobs::two_cards`]), the default. The word is read once a
+/// process, on the driver's thread.
 pub const NEXT_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_NEXT_BESIDE";
 
 std::thread_local! {
@@ -1156,10 +1166,11 @@ pub fn next_beside() -> bool {
     if let Some(on) = NEXT_BESIDE_FOR_TEST.with(std::cell::Cell::get) {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(NEXT_BESIDE_ENV).ok().as_deref())
+    static WORD: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        super::wlfm_knobs::knob_word_two_card(std::env::var(NEXT_BESIDE_ENV).ok().as_deref())
     })
+    .unwrap_or_else(super::wlfm_knobs::two_cards)
 }
 
 /// [`prepare_next`]'s level: its program, its prebuild and its arena's marks.
