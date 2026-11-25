@@ -22,6 +22,7 @@ use super::super::gate::ByteGate;
 use super::super::*;
 use super::{
     Emitted, FAMILIES, Job, Unit, emit_streamed_units, hand_on_order, hand_on_order_first,
+    take_rows_missed_here,
 };
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
@@ -328,14 +329,17 @@ fn streamed_keeping(
     let mut placed = 0usize;
     let regen = builder
         .finish_streamed_keeping(last, &gate, keep, |_| {
-            Ok(Box::new(|emitted: Emitted| {
-                if emitted.table.is_some() {
-                    gate.release(placed);
-                    placed += 1;
-                }
-                out.push(emitted);
-                Ok(())
-            }))
+            Ok((
+                Box::new(|emitted: Emitted| {
+                    if emitted.table.is_some() {
+                        gate.release(placed);
+                        placed += 1;
+                    }
+                    out.push(emitted);
+                    Ok(())
+                }),
+                None,
+            ))
         })
         .expect("the streamed finish");
     (out, regen)
@@ -1150,6 +1154,7 @@ fn tables_handed_on_first_stream_under_a_one_byte_budget() {
                 Some(0),
                 None,
                 crate::tables::ecdas::EcdasForm::Bytes,
+                None,
             );
             result.map(|()| (order, most.into_inner()))
         });
@@ -2297,4 +2302,209 @@ fn a_broken_ecdas_step_fails_its_own_tables_job_under_the_limb_form() {
             "rows {rows}: the byte form"
         );
     }
+}
+
+/// What a streamed finish handed on, and everything its rows sink was told.
+fn streamed_rows(
+    builder: WindowedTraceBuilder<'_>,
+    last: &[Log],
+    budget: usize,
+) -> (Vec<Emitted>, Vec<super::RowsNote>) {
+    let gate = ByteGate::new(budget);
+    let mut out = Vec::new();
+    let notes = std::cell::RefCell::new(Vec::new());
+    let mut placed = 0usize;
+    builder
+        .finish_streamed_keeping(last, &gate, false, |_| {
+            Ok((
+                Box::new(|emitted: Emitted| {
+                    if emitted.table.is_some() {
+                        gate.release(placed);
+                        placed += 1;
+                    }
+                    out.push(emitted);
+                    Ok(())
+                }),
+                Some(Box::new(|note: super::RowsNote| {
+                    notes.borrow_mut().push(note);
+                })),
+            ))
+        })
+        .expect("the streamed finish");
+    (out, notes.into_inner())
+}
+
+/// The block's builder flags over `b` (as `block_whir` sets them, KECCAK_RND
+/// filled on the card as records), under the word format's (`words`).
+fn block_like(b: WindowedTraceBuilder<'_>, words: bool) -> WindowedTraceBuilder<'_> {
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    use crate::tables::register::RegisterFormat;
+    let b = cut(b, CutPadding::LastTable)
+        .lt_merge()
+        .p4_rows_on_pool()
+        .p4_lookups_direct()
+        .rest_bitwise_last()
+        .bitwise_from_tables()
+        .keccak_rnd_first()
+        .pages_first()
+        .card_fill_keccak_rnd();
+    if !words {
+        return b;
+    }
+    b.register_format(RegisterFormat::InRow)
+        .expect("before any window")
+        .memw_aligned_order(MemwAlignedOrder::Limbs)
+        .expect("before any window")
+        .memory_format(MemoryFormat::Words)
+        .expect("before any window")
+}
+
+/// ★ Before any table is built the streamed finish states every unit's rows
+/// (what the early statement reads): each table it states exactly is built at
+/// exactly those rows, and each table of a family it states late (one whose
+/// generator pads its deduplicated or merged rows) has its height told once,
+/// after it is built and before it is handed on. Every stream configuration,
+/// the word format's and the block's, both row configurations, windows of 7
+/// and 1000 cycles, in waves and sliding. A miss names its family.
+#[test]
+fn every_unit_states_its_tables_height() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let programs = [
+        ("all_instructions_64", false),
+        ("misalign_sd", false),
+        ("test_keccak_multi", false),
+        ("test_ecsm_multi", false),
+        ("test_commit_split", false),
+        ("test_blake3_absorb", false),
+        ("test_dense_pages", false),
+        ("fused_mem_cases", true),
+        ("all_loadstore_32", true),
+        ("misalign_lw", true),
+        ("test_copy_ecalls", true),
+        ("test_commit_split", true),
+        ("test_keccak256", true),
+        ("test_ecrec", true),
+    ];
+    let pairs: Vec<(MaxRowsConfig, &str, bool)> =
+        [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)]
+            .into_iter()
+            .flat_map(|max_rows| programs.map(|(name, words)| (max_rows.clone(), name, words)))
+            .collect();
+    let found: Vec<([usize; 2], Vec<String>)> = std::thread::scope(|scope| {
+        let runs: Vec<_> = pairs
+            .iter()
+            .map(|(max_rows, name, words)| {
+                scope.spawn(move || states_its_height_for(max_rows, name, *words))
+            })
+            .collect();
+        runs.into_iter()
+            .map(|run| run.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    let exact: usize = found.iter().map(|(n, _)| n[0]).sum();
+    let late: usize = found.iter().map(|(n, _)| n[1]).sum();
+    let misses: Vec<&String> = found.iter().flat_map(|(_, m)| m).collect();
+    let mut by_family: std::collections::BTreeMap<String, (usize, &String)> = Default::default();
+    for m in &misses {
+        let key = m.split(" @ ").next().unwrap_or("").to_string();
+        by_family.entry(key).or_insert((0, m)).0 += 1;
+    }
+    let summary: Vec<String> = by_family
+        .iter()
+        .map(|(k, (n, first))| format!("{k}: {n} (first: {first})"))
+        .collect();
+    println!("ROWS STATED: {exact} tables exact, {late} late");
+    assert!(exact > 0 && late > 0, "both kinds were checked");
+    assert!(
+        misses.is_empty(),
+        "{} tables built at other rows than stated:\n{}",
+        misses.len(),
+        summary.join("\n")
+    );
+}
+
+/// [`every_unit_states_its_tables_height`] for one row configuration and one
+/// program (`words`: under the word format's configurations): the tables
+/// checked, exact and late, and the misses, each `"FAMILY stated s built b
+/// @ what"`; the stream's own comparison and the finish's count must agree.
+fn states_its_height_for(
+    max_rows: &MaxRowsConfig,
+    name: &str,
+    words: bool,
+) -> ([usize; 2], Vec<String>) {
+    use super::{RowsNote, UnitRows};
+    let (program, logs) = run(name);
+    let configs = if words { word_configs() } else { configs() };
+    let mut checked = [0usize; 2];
+    let mut misses = Vec::new();
+    for window in [7, 1000] {
+        for slide in [false, true] {
+            let block: Configure = Box::new(move |b| block_like(b, words));
+            let plain: Vec<(String, &Configure)> = configs
+                .iter()
+                .map(|(c, f)| (c.to_string(), f))
+                .chain(std::iter::once(("the block's".to_string(), &block)))
+                .collect();
+            for (config, configure) in plain {
+                let what = format!("{name} window {window} {config} slide {slide}");
+                let (builder, last) = pushed(&program, &logs, max_rows, window, &|b| {
+                    let b = configure(b);
+                    if slide { b.slide_rest() } else { b }
+                });
+                let _ = take_rows_missed_here();
+                let (got, notes) = streamed_rows(builder, last, usize::MAX);
+                let named = take_rows_missed_here();
+                let mut notes = notes.into_iter();
+                let Some(RowsNote::Stated(rows)) = notes.next() else {
+                    panic!("{what}: the rows were not stated first");
+                };
+                assert_eq!(rows.len(), got.len(), "{what}: a row a unit");
+                let mut told: Vec<Option<usize>> = vec![None; rows.len()];
+                for note in notes {
+                    let RowsNote::Built { position, rows: r } = note else {
+                        panic!("{what}: the rows stated twice");
+                    };
+                    assert_eq!(rows[position], UnitRows::Late, "{what}: {position} told");
+                    assert!(told[position].replace(r).is_none(), "{what}: told twice");
+                }
+                let mut by_position = 0usize;
+                for e in &got {
+                    match (&e.table, rows[e.position]) {
+                        (None, UnitRows::Slot) => {}
+                        (Some(t), UnitRows::Exact(r)) => {
+                            checked[0] += 1;
+                            if t.main_table.height != r {
+                                by_position += 1;
+                            }
+                        }
+                        (Some(t), UnitRows::Late) => {
+                            checked[1] += 1;
+                            assert_eq!(
+                                told[e.position],
+                                Some(t.main_table.height),
+                                "{what}: position {}'s height told",
+                                e.position
+                            );
+                        }
+                        (t, r) => panic!(
+                            "{what}: position {} a table {} but rows {r:?}",
+                            e.position,
+                            t.is_some()
+                        ),
+                    }
+                }
+                assert_eq!(
+                    by_position,
+                    named.len(),
+                    "{what}: the stream's misses and the finish's count"
+                );
+                for (family, stated, built) in named {
+                    misses.push(format!("{family} stated {stated} built {built} @ {what}"));
+                }
+            }
+        }
+    }
+    (checked, misses)
 }

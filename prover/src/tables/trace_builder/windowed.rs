@@ -96,6 +96,14 @@ use card_records::{
 };
 
 mod handout_count;
+
+/// The streamed finish's table sink ([`WindowedTraceBuilder::finish_streamed_keeping`]).
+pub(crate) type RestSink<'s> = Box<dyn FnMut(super::Emitted) -> Result<(), Error> + 's>;
+
+/// The streamed finish's rows sink: each unit's rows in AIR order before any
+/// table is built, then each late table's height ([`super::RowsNote`]).
+pub(crate) type RowsSink<'s> = Box<dyn FnMut(super::RowsNote) + 's>;
+
 pub use handout_count::CountThreadStamps;
 use handout_count::{CountWork, HandoutCounter};
 
@@ -1599,12 +1607,17 @@ impl<'a> WindowedTraceBuilder<'a> {
             Error,
         >,
     ) -> Result<(), Error> {
-        self.finish_streamed_keeping(logs, gate, false, on_header)
-            .map(|_| ())
+        self.finish_streamed_keeping(logs, gate, false, |header| {
+            on_header(header).map(|send| (send, None))
+        })
+        .map(|_| ())
     }
 
     /// [`Self::finish_streamed`], and with `keep` what phase B needs to build
-    /// KECCAK_RND's and LT's tables again ([`super::RestRegen`]).
+    /// KECCAK_RND's and LT's tables again ([`super::RestRegen`]). Beside the
+    /// table sink, `on_header` may return a rows sink: it is handed each
+    /// unit's rows in AIR order once, before any table is built
+    /// ([`super::finish::FinishPlan::emit_streamed_keeping`]'s `on_rows`).
     pub(crate) fn finish_streamed_keeping<'s>(
         self,
         logs: &[Log],
@@ -1612,10 +1625,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         keep: bool,
         on_header: impl FnOnce(
             super::RestHeader,
-        ) -> Result<
-            Box<dyn FnMut(super::Emitted) -> Result<(), Error> + 's>,
-            Error,
-        >,
+        ) -> Result<(RestSink<'s>, Option<RowsSink<'s>>), Error>,
     ) -> Result<Option<super::RestRegen>, Error> {
         let slide = self.slide_rest;
         let Finishing {
@@ -1670,14 +1680,20 @@ impl<'a> WindowedTraceBuilder<'a> {
         if skip.pages_first && slide && cfg!(feature = "parallel") {
             plan.hand_pages_first();
         }
-        let mut send = match on_header(plan.header().clone()) {
-            Ok(send) => send,
+        let (mut send, mut rows) = match on_header(plan.header().clone()) {
+            Ok(sinks) => sinks,
             Err(e) => {
                 gate.stop("the header found no taker");
                 return Err(e);
             }
         };
-        plan.emit_streamed_keeping(gate, &mut *send, keep, slide)
+        plan.emit_streamed_keeping(
+            gate,
+            &mut *send,
+            keep,
+            slide,
+            rows.as_mut().map(|r| &mut **r as &mut dyn FnMut(super::RowsNote)),
+        )
     }
 
     /// The run's last window collected and walked, and the run's lists

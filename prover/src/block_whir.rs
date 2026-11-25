@@ -10224,7 +10224,7 @@ fn prove_streamed(
                             tables: rx,
                         })))
                         .map_err(|_| Error::Prover("the layout thread stopped".into()))?;
-                        Ok(Box::new(
+                        let send: crate::tables::trace_builder::RestSink<'_> = Box::new(
                             move |emitted: crate::tables::trace_builder::Emitted| {
                                 if let (Some(ledger), Some(table)) = (ledger, &emitted.table) {
                                     ledger.rest.fetch_add(memlog::rows_bytes(table), Relaxed);
@@ -10235,7 +10235,8 @@ fn prove_streamed(
                                     )
                                 })
                             },
-                        ))
+                        );
+                        Ok((send, None))
                     });
                     if let Some(ledger) = ledger {
                         crate::tables::trace_builder::build_stamps::set_hook(None);
