@@ -1164,22 +1164,31 @@ fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
     );
     let declines = multilinear::gpu::cross_card_declines();
     let before = stark::multilinear_block::split_second_groups();
-    let run = prove_block_levels(
-        &elf,
-        &[],
-        &opts,
-        &format,
-        &streamed_options(),
-        WlfmFamily::B3,
-        LevelStop::DEFAULT,
-        true,
-        true,
-    )
-    .expect("the BLAKE3 block proves to its last level with the levels split");
+    // Every level's stacks retired: a held stack pins its group to card 0, and
+    // a small block's levels would hold theirs (the same bytes either way).
+    let run = {
+        let _retired =
+            super::levels::set_stacks_for_test(Some(super::wlfm::StackPlace::CardRetired));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level with the levels split")
+    };
     let second = stark::multilinear_block::split_second_groups() - before;
     let declined = multilinear::gpu::cross_card_declines() - declines;
     set_two_card_levels_for_test(Some(TwoCardSplit::Off));
-    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let held = {
+        let _held = super::levels::set_stacks_for_test(Some(super::wlfm::StackPlace::Card));
+        derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+    };
     let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
     assert_eq!(proofs.len(), run.proofs.len());
     for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
@@ -2296,7 +2305,8 @@ fn rta_one_run(
     }
     match t.builder_whole_pool {
         Some(note) => println!(
-            "RTA LEVEL1 BUILDER POOL: watched · {} of {} tables' columns on one thread · the base seen at {}              into the columns · packs on the whole pool {}",
+            "RTA LEVEL1 BUILDER POOL: watched · {} of {} tables' columns on one thread · the base seen at {} \
+             into the columns · packs on the whole pool {}",
             note.tables_before,
             note.tables,
             note.seen_at
