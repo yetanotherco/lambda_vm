@@ -2831,8 +2831,21 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         !body("level_plan_with").contains("derive_blake3("),
         "level_plan_with derives through the share-reading derive_blake3"
     );
-    // A knob is read by a bare call; `plan.cap_mux()` reads the plan's.
-    let reads = |b: &str, knob: &str| b.match_indices(knob).any(|(at, _)| !b[..at].ends_with('.'));
+    // A knob is read by a bare call; `plan.cap_mux()` reads the plan's, and
+    // `is_last_level(` is another function: a match counts only where no `.`
+    // and no identifier character comes before it.
+    let reads = |b: &str, knob: &str| {
+        b.match_indices(knob).any(|(at, _)| {
+            !b[..at].ends_with(|c: char| c == '.' || c == '_' || c.is_ascii_alphanumeric())
+        })
+    };
+    assert!(
+        reads("x = last_level(family)", "last_level(")
+            && reads("super::last_level(family)", "last_level(")
+            && !reads("is_last_level(stop)", "last_level(")
+            && !reads("plan.cap_mux()", "cap_mux()"),
+        "the scan tells a knob's call from a method and from a longer name"
+    );
     for function in [
         "verify_block_levels",
         "verify_block_levels_at",
