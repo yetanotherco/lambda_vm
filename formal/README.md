@@ -149,10 +149,14 @@ multiplicity is a requirement the row cannot meet.
 the channel LT and CMIN pull on — those use the fork's `Channel.counted`, whose
 semantics differ; see the comparison at the end of this section.
 
-- `counted N channel` grants the guarantee to a pull of `1, …, N` and charges
-  every other nonzero interaction, mirroring `Channel.toRaw`. `pullIf`/`emit`
-  are the circuit operations, with `ExplicitCircuits` instances so elaboration
-  works.
+- `countedCharged N channel` grants the guarantee to a pull of `1, …, N` and
+  charges every other nonzero interaction, mirroring `Channel.toRaw`.
+  `Counted.pullIf`/`Counted.emit` are its circuit operations, with
+  `ExplicitCircuits` instances so elaboration works. The name keeps it apart from
+  the fork's `Channel.counted`, which this model also pulls on and which treats an
+  out-of-range pull differently; the table at the end of this section is the
+  comparison. Clean has its own `Channel.pullIf`, named below, and they are not
+  the same function.
 - `exists_push_of_pull` and `consistent` are Clean's lemmas for this channel.
   Their balance premise is `N · length < char F`. Clean's `BalancedInteractions`
   carries no length bound of its own: the bound is the `fits` of the `Balance`
@@ -248,13 +252,13 @@ has neither. What `LtStaged` and `CountedSameBus` do establish is that the
 staged finishing order admits counted pulls, which is what they were written
 for.
 
-`Channels/Counted.lean` above predates the fork, and its `counted` is a different
-channel from the fork's, not a copy. They part on what a pull of an out-of-range
-multiplicity costs:
+`Channels/Counted.lean` above predates the fork, and its `countedCharged` is a
+different channel from the fork's, not a copy. They part on what a pull of an
+out-of-range multiplicity costs:
 
 | | out-of-range pull |
 |---|---|
-| this file | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
+| this file (`countedCharged`) | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
 | the fork (`Channel.counted`) | `mult = 0 ∨ CountUpTo N mult` — forbidden: a range obligation the row must discharge |
 
 LT, MIN and CMIN are all on the fork's. This file's channel has one consumer,
@@ -266,14 +270,16 @@ Moving LT onto the counted channel has one structural cost: **LT cannot share an
 ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
 (`name := channel.name`), so `Bitwise.IsHalf.counted 255`, which `Tables/Lt.lean`
 pulls, and `Bitwise.IsHalf.toRaw`, which `Tables/Eq.lean` and `Tables/Shift.lean`
-pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, and
-`Ensemble.unique_channel_names` rejects a `tables` list holding both. `MSB16` is
+pull through Clean's `Channel.pullIf`, are two different `RawChannel`s both
+called `IS_HALF`, and `Ensemble.unique_channel_names` rejects a `tables` list
+holding both. `MSB16` is
 the same. A combined ensemble would have to put EQ and SHIFT on the *same*
 counted channel LT uses, at `N = 255`. Dropping them onto `Channel.counted 1`
 would not do: it keeps the base name too, so it collides with `Channel.counted
 255` for exactly the reason above, and the pinned fork has no lemma collapsing it
-to the plain channel either. EQ and SHIFT reach the channel through `pullIf`, so
-moving them is a proof obligation about their rows, not a rename. No ensemble
+to the plain channel either. EQ and SHIFT reach the channel through Clean's
+`Channel.pullIf`, so moving them is a proof obligation about their rows, not a
+rename. No ensemble
 here needs it yet: `LtStaged` and `CountedSameBus` hold LT and its toy MIN only.
 
 ## What is intentionally not proven
@@ -335,7 +341,8 @@ Clean itself is compiled from source; only the modules we import are built.
 - Clean's circuit inference does not unfold user-defined `Circuit` helpers. A
   helper used inside a `main` needs an `ExplicitCircuit` instance, bridged to
   its body with `ExplicitCircuit.of_eq rfl (by infer_explicit_circuit)`.
-- A conditional interaction (`pullIf cond`) is only lawful when the same circuit
-  constrains `cond` to be boolean: Clean requires every pull to carry
+- A conditional interaction (Clean's `Channel.pullIf cond`) is only lawful when
+  the same circuit constrains `cond` to be boolean: Clean requires every pull to
+  carry
   multiplicity `0` or `1`, and a pull outside `{0, 1}` is a requirement the
   circuit cannot discharge at lawfulness.
