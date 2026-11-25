@@ -580,7 +580,7 @@ mod zc_lane;
 #[doc(hidden)]
 pub use zc_lane::{
     LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, local_lane_lines, merge_probe_lines,
-    zc_lane_lines,
+    second_lane_shells_off_own_store, zc_lane_lines,
 };
 
 /// The label that opens a group's probe transcript ([`CsProbe`]): no proof's

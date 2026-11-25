@@ -44,6 +44,16 @@ use multilinear::whir_chain::GkrPack;
 use super::*;
 use crate::multilinear_table::LaneColumns;
 
+/// Tables of a second-lane job whose shell did not point at the store the job
+/// had just uploaded ([`ZcLane::upload_own`]): 0 in every run that is right.
+static SHELLS_OFF_OWN_STORE: AtomicU64 = AtomicU64::new(0);
+
+/// See [`SHELLS_OFF_OWN_STORE`]: process-wide, never reset.
+#[doc(hidden)]
+pub fn second_lane_shells_off_own_store() -> u64 {
+    SHELLS_OFF_OWN_STORE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The most cells a table not held as records may have and still be copied
 /// to a second-card job (a group's byte table is 2^16 rows of 7 columns).
 pub(crate) const LANE_COPY_MAX_CELLS: usize = 1 << 20;
@@ -716,6 +726,26 @@ where
                 for table in tables.iter_mut() {
                     table.set_resident(store.clone(), first);
                     first += table.num_committed_columns();
+                }
+                // Every shell must read the store just uploaded on this card,
+                // never another (card 0's would be a read across cards). One
+                // that does not is counted and the job goes to phase B, the
+                // same bytes, before any bin reads it.
+                let off_store = tables
+                    .iter()
+                    .filter(|t| {
+                        !t.trace()
+                            .resident()
+                            .is_some_and(|(held, _)| std::ptr::eq(held, &*store))
+                    })
+                    .count();
+                if off_store > 0 {
+                    SHELLS_OFF_OWN_STORE
+                        .fetch_add(off_store as u64, std::sync::atomic::Ordering::SeqCst);
+                    for table in tables.iter_mut() {
+                        table.clear_resident();
+                    }
+                    return Err(LaneDefer::NoStore);
                 }
                 Ok(true)
             }

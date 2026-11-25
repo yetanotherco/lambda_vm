@@ -141,11 +141,19 @@ fn same_bytes_with_the_second_lane(what: &str) {
         on_second(&off_stamps).is_empty(),
         "{what}: knob off, no job"
     );
+    let off_store_before = stark::multilinear_block::second_lane_shells_off_own_store();
     let (on, on_stamps, on_counts) = proved(true);
+    let off_store = stark::multilinear_block::second_lane_shells_off_own_store() - off_store_before;
     let taken = on_second(&on_stamps);
     println!(
         "LOCAL LANE SECOND CARD {what}: groups on the second lane {taken:?} · host paths off \
-         {off_counts:?} · on {on_counts:?}"
+         {off_counts:?} · on {on_counts:?} · shells off their job's own store {off_store}"
+    );
+    // First: a job whose shells kept card 0's store (or none) is sent to phase
+    // B with the same bytes, so only this count tells it apart on one card.
+    assert_eq!(
+        off_store, 0,
+        "{what}: a second-lane shell not on its job's own store"
     );
     assert!(
         taken.iter().any(|(_, state)| *state == LaneState::Ran),
@@ -165,8 +173,9 @@ fn same_bytes_with_the_second_lane(what: &str) {
 /// ★ C1. Card, one process: run alone, deterministic grind. Forced on one
 /// card (a second backend of card 0, its own context, streams and ledger),
 /// the second lane proves the same bytes as card 0's lane alone, with the
-/// same host paths and no store read across backends (a shell still pointed
-/// at card 0's store would be one).
+/// same host paths, no store read across backends, and every job's shells
+/// on the store it uploaded (a shell still pointed at card 0's store reads
+/// the same bytes on one card; only that count sees it).
 #[test]
 #[ignore = "card: run alone with LAMBDA_VM_DETERMINISTIC_GRIND=1"]
 fn the_second_lane_proves_the_same_bytes_forced_on_one_card() {
