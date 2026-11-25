@@ -939,7 +939,10 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     match (statement_early, run.times.early) {
         (false, early) => assert!(early.is_none(), "off: no early statement came"),
         (true, Some(note)) => {
-            println!("LEVELS EARLY STATEMENT NOTE: {note:?} · level 1 emitted at {:.3}", run.times.emitted);
+            println!(
+                "LEVELS EARLY STATEMENT NOTE: {note:?} · level 1 emitted at {:.3}",
+                run.times.emitted
+            );
             // Nothing of level 1 published before the final statement came.
             assert!(
                 run.times.emitted >= note.confirmed_at,
@@ -1200,7 +1203,10 @@ fn the_blake3_driver_with_its_statement_early_proves_the_same_level_bytes() {
             ..ChainSteps::default()
         });
         let note = run.times.early.expect("an early statement came");
-        assert!(note.used, "plan lean {plan_lean}: the early program was used");
+        assert!(
+            note.used,
+            "plan lean {plan_lean}: the early program was used"
+        );
         assert_eq!(super::levels::early_mismatches(), before, "no mismatch");
         assert!(run.proofs.len() >= 2, "level 2 over level 1");
     }
@@ -1254,7 +1260,8 @@ fn a_wrong_early_statement_falls_back_to_the_final_ones_bytes() {
 #[test]
 #[ignore = "proves three small BLAKE3 blocks' bases; box tier"]
 fn the_early_statement_is_the_final_one() {
-    type Seen = std::sync::Mutex<Vec<(&'static str, String, Vec<crate::block_whir::PreparedRoots>)>>;
+    type Seen =
+        std::sync::Mutex<Vec<(&'static str, String, Vec<crate::block_whir::PreparedRoots>)>>;
     let format = b3_format();
     let opts = ProofOptions::default_test_options();
     let misses = crate::tables::trace_builder::rows_misses();
@@ -1263,10 +1270,13 @@ fn the_early_statement_is_the_final_one() {
         let seen: Seen = std::sync::Mutex::new(Vec::new());
         let note = |kind: &'static str| {
             let seen = &seen;
-            move |s: crate::block_whir::BlockStatement<'_>, roots: &[crate::block_whir::PreparedRoots]| {
-                seen.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((kind, format!("{:?}", s.to_owned()), roots.to_vec()));
+            move |s: crate::block_whir::BlockStatement<'_>,
+                  roots: &[crate::block_whir::PreparedRoots]| {
+                seen.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    kind,
+                    format!("{:?}", s.to_owned()),
+                    roots.to_vec(),
+                ));
             }
         };
         let (fin, early) = (note("final"), note("early"));
@@ -1287,7 +1297,10 @@ fn the_early_statement_is_the_final_one() {
         let seen = seen.into_inner().unwrap_or_else(|e| e.into_inner());
         let kinds: Vec<&str> = seen.iter().map(|s| s.0).collect();
         assert_eq!(kinds, ["early", "final"], "{name}: early first, then final");
-        assert_eq!(seen[0].1, seen[1].1, "{name}: the statement, field for field");
+        assert_eq!(
+            seen[0].1, seen[1].1,
+            "{name}: the statement, field for field"
+        );
         assert_eq!(seen[0].2, seen[1].2, "{name}: the prepared roots");
         println!("EARLY STATEMENT {name}: confirmed");
     }
@@ -1333,7 +1346,10 @@ fn the_finish_starting_its_late_tables_first_proves_the_same_base_bytes() {
                 .to_vec()
         };
         let (off, on) = (prove(false), prove(true));
-        assert!(off == on, "{name}: the late families started first moved a byte");
+        assert!(
+            off == on,
+            "{name}: the late families started first moved a byte"
+        );
         println!("FINISH LATE FIRST IDENTITY {name}: {} B equal", on.len());
     }
 }
@@ -1609,8 +1625,7 @@ fn the_blake3_driver_with_its_levels_split_on_card_1_proves_the_same_level_bytes
 #[test]
 #[ignore = "card: proves a small BLAKE3 block and its levels twice; run alone, deterministic grind"]
 fn the_blake3_driver_with_its_stacks_by_card_forced_on_one_card_proves_the_same_level_bytes() {
-    let second =
-        driven_under_levels_split_stacks(math_cuda::device::TwoCardSplit::Forced, true);
+    let second = driven_under_levels_split_stacks(math_cuda::device::TwoCardSplit::Forced, true);
     assert!(second > 0, "no level group proved by the second driver");
 }
 

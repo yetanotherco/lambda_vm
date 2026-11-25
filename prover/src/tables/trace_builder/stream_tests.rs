@@ -1201,7 +1201,12 @@ fn noting_units(n: usize, started: Arc<std::sync::Mutex<Vec<usize>>>) -> Vec<Uni
 #[cfg(feature = "parallel")]
 fn tables_started_first_are_handed_on_in_the_same_order() {
     for (start, budget, build, started_want) in [
-        (vec![4, 5], usize::MAX, Some(1), Some(vec![0, 4, 5, 1, 2, 3])),
+        (
+            vec![4, 5],
+            usize::MAX,
+            Some(1),
+            Some(vec![0, 4, 5, 1, 2, 3]),
+        ),
         (vec![2], usize::MAX, Some(1), Some(vec![0, 2, 1, 3, 4, 5])),
         (vec![4, 5], 1, None, None),
         (vec![0, 3], 1, None, None),
@@ -2525,7 +2530,10 @@ fn states_its_height_for(
                 .iter()
                 .map(|(c, f)| (c.to_string(), f))
                 .chain(std::iter::once(("the block's".to_string(), &block)))
-                .chain(std::iter::once(("the block's, late first".to_string(), &late)))
+                .chain(std::iter::once((
+                    "the block's, late first".to_string(),
+                    &late,
+                )))
                 .collect();
             for (config, configure) in plain {
                 let what = format!("{name} window {window} {config} slide {slide}");

@@ -7313,7 +7313,11 @@ const FINISH_LATE_FIRST_ENV: &str = "LAMBDA_VM_FINISH_LATE_FIRST";
 fn finish_late_first(deviation: Option<bool>) -> Result<bool, Error> {
     match deviation {
         Some(on) => Ok(on),
-        None => match std::env::var(FINISH_LATE_FIRST_ENV).ok().as_deref().map(str::trim) {
+        None => match std::env::var(FINISH_LATE_FIRST_ENV)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
             None | Some("" | "0") => Ok(false),
             Some("1") => Ok(true),
             Some(v) => Err(Error::Prover(format!(
@@ -7865,9 +7869,10 @@ impl PackPlan {
                 if self.polys(&shapes)? > self.max_polys && open {
                     self.close_own()?;
                 }
-                let own = self.own.as_mut().ok_or_else(|| {
-                    Error::Prover("the plan lost KECCAK_RND's own group".into())
-                })?;
+                let own = self
+                    .own
+                    .as_mut()
+                    .ok_or_else(|| Error::Prover("the plan lost KECCAK_RND's own group".into()))?;
                 if own.shapes.is_empty() {
                     own.shapes.push(shape);
                 }
@@ -15557,7 +15562,10 @@ mod pack_plan_tests {
                     })
                     .collect();
                 assert_eq!(locals, (0..locals.len()).collect::<Vec<_>>());
-                assert!(local || locals.is_empty(), "no local lookups, no LOCAL_BYTES");
+                assert!(
+                    local || locals.is_empty(),
+                    "no local lookups, no LOCAL_BYTES"
+                );
                 if own {
                     for g in &want {
                         let own_keys = g
@@ -15567,10 +15575,17 @@ mod pack_plan_tests {
                         let others = g
                             .iter()
                             .filter(|k| {
-                                !matches!(k, Key::Streamed(StreamTable::KeccakRnd, _) | Key::Local(_))
+                                !matches!(
+                                    k,
+                                    Key::Streamed(StreamTable::KeccakRnd, _) | Key::Local(_)
+                                )
                             })
                             .count();
-                        assert!(own_keys == 0 || others == 0, "seed {seed}: {:?}", groups(&[g.clone()]));
+                        assert!(
+                            own_keys == 0 || others == 0,
+                            "seed {seed}: {:?}",
+                            groups(std::slice::from_ref(g))
+                        );
                     }
                 }
                 if want.len() > 1 {
