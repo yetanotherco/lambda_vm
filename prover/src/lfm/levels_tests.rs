@@ -896,6 +896,9 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = ProofOptions::default_test_options();
+    // The plan's measuring probes, counted over the driver's run alone (the
+    // reference plan below measures). Run alone: the count is the process's.
+    let probes = super::whir_block::plan_probes_for_test();
     let run = {
         let _restore = Restore;
         set_columns_tiled_for_test(Some(tiled));
@@ -923,6 +926,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         )
         .expect("the BLAKE3 block proves to its last level")
     };
+    let probes = super::whir_block::plan_probes_for_test() - probes;
     // Under a lean plan the reference is today's: a plan that measures, from
     // the base's statement and the roots committed on the host.
     let measured = plan_lean.then(|| {
@@ -942,6 +946,9 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             run.plan.chip_loads().0.is_empty(),
             "the driver's plan measured nothing"
         );
+        assert_eq!(probes, 0, "no probe ran in the driver's plan");
+    } else {
+        assert!(probes > 0, "the driver's plan measured");
     }
     match (statement_early, run.times.early) {
         (false, early) => assert!(early.is_none(), "off: no early statement came"),
@@ -1189,7 +1196,13 @@ fn the_blake3_driver_with_its_plan_lean_proves_the_same_level_bytes() {
         ..ChainSteps::default()
     });
     assert!(run.proofs.len() >= 2, "level 2 over the lean level 1");
-    assert_eq!(run.times.plan_split[5], 0.0, "no probe ran");
+    // No probe call (counted in the driver); the probes' lap is only the
+    // clock's own read, never exactly zero.
+    println!(
+        "LEVELS PLAN LEAN: the probes' lap {:.9} s",
+        run.times.plan_split[5]
+    );
+    assert!(run.times.plan_split[5] < 1e-3, "the probes' lap is empty");
 }
 
 /// ★ Level 1's program made from the base's early statement

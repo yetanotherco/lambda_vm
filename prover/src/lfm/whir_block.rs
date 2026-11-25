@@ -902,6 +902,20 @@ pub fn take_plan_split() -> Option<[f64; 6]> {
     LAST_PLAN_SPLIT.with(std::cell::Cell::take)
 }
 
+/// Tests only: plan derivations that measured their groups' chip rows
+/// ([`chip_loads_by_emission`]), since the process started. A lap of the
+/// probes' stamp is never exactly zero (the clock's own read), so a test asks
+/// this count whether the probes ran.
+#[cfg(test)]
+static PLAN_PROBES_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Tests only: [`PLAN_PROBES_FOR_TEST`]'s count.
+#[cfg(test)]
+pub(crate) fn plan_probes_for_test() -> usize {
+    PLAN_PROBES_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl WhirBlockPlan {
     /// Derive the plan over `num_leaves` leaves (when `None`, the fewest that
     /// keep every chip of every leaf under [`P1_LEAF_HEIGHTS`], or under
@@ -1432,6 +1446,8 @@ impl WhirBlockPlan {
         // at the format's leaf scale (a fixed leaf count, the tests', bounds
         // none, and reads them only when `measure` asks).
         if measure || num_leaves.is_none() {
+            #[cfg(test)]
+            PLAN_PROBES_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
         }
         lap(5);
