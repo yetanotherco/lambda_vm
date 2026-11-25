@@ -1,0 +1,6 @@
+# Generated files the AI review skips: they are left out of the diff and file context.
+# One git glob per line, relative to the repo root.
+
+# Sail's Lean translation of the RISC-V spec; CI regenerates it and checks it matches.
+sail-riscv-lean/LeanRV64D/**
+sail-riscv-lean/LeanRV64D.lean

@@ -85,6 +85,12 @@ def main() -> int:
     context.add_argument("--out-dir", required=True)
     context.add_argument("--max-diff-chars", type=int, default=350000)
     context.add_argument("--max-file-chars", type=int, default=220000)
+    # Generated code to keep out of the review (one git glob per line). Read from the
+    # runner checkout, next to the prompts, so it is the trusted copy on the default branch.
+    context.add_argument(
+        "--exclude-file",
+        default=str(pathlib.Path(__file__).resolve().parent.parent / "ai-review" / "exclude.txt"),
+    )
 
     lane_error = sub.add_parser("lane-error")
     lane_error.add_argument("--lane-json", required=True)
@@ -226,8 +232,11 @@ def cmd_context(args: argparse.Namespace) -> int:
     base = args.base_sha
     head = args.head_ref
     pr_range = f"{base}...{head}"
-    diff = git_text(repo, "diff", "--find-renames", "--find-copies", "--unified=80", pr_range)
-    name_status = git_text(repo, "diff", "--name-status", "--find-renames", "--find-copies", pr_range)
+    pathspec = ["--", ".", *exclude_pathspecs(pathlib.Path(args.exclude_file))]
+    diff = git_text(repo, "diff", "--find-renames", "--find-copies", "--unified=80", pr_range, *pathspec)
+    name_status = git_text(
+        repo, "diff", "--name-status", "--find-renames", "--find-copies", pr_range, *pathspec
+    )
     changed_files = parse_name_status(name_status)
 
     diff_truncated = len(diff) > args.max_diff_chars
@@ -1356,6 +1365,18 @@ def normalize_verification(item: dict[str, Any], lane: dict[str, Any]) -> dict[s
         "lane_id": lane["id"],
         "model": lane["model"],
     }
+
+
+def exclude_pathspecs(path: pathlib.Path) -> list[str]:
+    """Git pathspecs that drop the globs listed in `path` (blank lines and # comments skipped)."""
+    if not path.is_file():
+        return []
+    patterns = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(f":(glob,exclude){line}")
+    return patterns
 
 
 def parse_name_status(text: str) -> list[dict[str, Any]]:

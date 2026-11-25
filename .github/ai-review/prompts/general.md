@@ -20,6 +20,8 @@ Guidelines:
 - Do NOT suggest micro-optimizations, churn, or premature abstractions
 - Always prefer simplicity over complexity when performance gains are marginal
 - Focus on real issues, not hypothetical improvements
+- Do not review generated files: the paths listed in `.github/ai-review/exclude.txt`
+  (e.g. the Sail-generated `sail-riscv-lean/LeanRV64D/`). CI checks them.
 - Be concise and actionable
 
 Environment — review statically with the tools you have:
