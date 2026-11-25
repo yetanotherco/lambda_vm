@@ -122,6 +122,38 @@ pub fn validate(program: &LfmProgram) -> Result<(), LfmViolation> {
     Ok(())
 }
 
+/// [`validate`]'s five checks at once, each on a thread of its own: the same
+/// checks over the same program, so the same verdict. Of several failures,
+/// the one [`validate`] reports, the earliest check's in its order, is the
+/// answer (every check runs to its end; none is skipped).
+pub fn validate_at_once(program: &LfmProgram) -> Result<(), LfmViolation> {
+    type Check = fn(&LfmProgram) -> Result<(), LfmViolation>;
+    const CHECKS: [Check; 5] = [
+        check_writes_and_reads,
+        check_multiplicities,
+        check_arenas,
+        check_groups,
+        |p: &LfmProgram| check_keccak_tags(&p.groups.keccak),
+    ];
+    let verdicts: Vec<Result<(), LfmViolation>> = std::thread::scope(|scope| {
+        let others: Vec<_> = CHECKS[1..]
+            .iter()
+            .map(|&check| scope.spawn(move || check(program)))
+            .collect();
+        let mut out = vec![CHECKS[0](program)];
+        for handle in others {
+            // A check's panic is the panic it would be in series.
+            out.push(
+                handle
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            );
+        }
+        out
+    });
+    verdicts.into_iter().collect()
+}
+
 /// [`validate`]'s checks one by one, each with its seconds — an instrument
 /// (`node_emit_timing_tests`), test-only.
 #[cfg(test)]
@@ -936,6 +968,55 @@ mod dense_count_tests {
                 "tamper {k}: {map:?}"
             );
             assert_eq!(validate_with(bad, true), map, "tamper {k}");
+        }
+    }
+
+    /// The checks at once give [`validate`]'s verdict: each valid program
+    /// admitted; each tampered one refused with the same first violation, also
+    /// when an earlier check and a later one both fail (the earlier answers).
+    #[test]
+    fn the_checks_at_once_give_the_verdict_in_series() {
+        for program in programs() {
+            assert_eq!(validate_at_once(&program), Ok(()));
+        }
+        // A constant's count raised: the multiplicity check fails.
+        let raise = |p: &mut LfmProgram| {
+            for i in &mut p.instrs {
+                if let Instr::Const { mult, .. } = i {
+                    *mult += 1;
+                    break;
+                }
+            }
+        };
+        // A read moved past the last address: the first check fails.
+        let read_past = |p: &mut LfmProgram| {
+            let past = Addr(p.num_addrs + 7);
+            for i in p.instrs.iter_mut().rev() {
+                if let Instr::BaseAlu { a, .. } = i {
+                    *a = past;
+                    break;
+                }
+            }
+        };
+        let mut only_mult = small_node();
+        raise(&mut only_mult);
+        let mut only_read = small_node();
+        read_past(&mut only_read);
+        let mut both = small_node();
+        raise(&mut both);
+        read_past(&mut both);
+        assert!(matches!(
+            validate(&only_mult),
+            Err(LfmViolation::MultMismatch { .. })
+        ));
+        assert!(
+            !matches!(validate(&only_read), Err(LfmViolation::MultMismatch { .. })),
+            "the out-of-range read is the first check's"
+        );
+        for (k, bad) in [only_mult, only_read, both].iter().enumerate() {
+            let series = validate(bad);
+            assert!(series.is_err(), "tamper {k} admitted");
+            assert_eq!(validate_at_once(bad), series, "tamper {k}");
         }
     }
 }
