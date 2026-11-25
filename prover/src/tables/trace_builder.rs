@@ -2516,15 +2516,16 @@ fn collect_ops_from_cpu_into(
         register_state,
         out,
         lookups,
-        false,
+        ecrec::EcrecDefer::default(),
         None,
     )
 }
 
 /// [`collect_ops_from_cpu_into`] for a window of a windowed build: with
-/// `defer_ecrec` each ECREC call's witness is computed off the walk
+/// `defer_ecrec` on each ECREC call's witness is computed off the walk
 /// ([`collect_ecrec_ops`]), and the run's lists hold it pending until the
-/// finish ([`resolve_deferred_ecrec`]). With `slot_counts` (the walk's cut
+/// finish ([`resolve_deferred_ecrec`]); its ECDAS rows' lookups counted
+/// there too with its `count`. With `slot_counts` (the walk's cut
 /// `slots`) each in-row register slot's lookup is counted there instead of
 /// listed.
 #[inline]
@@ -2536,7 +2537,7 @@ fn collect_window_ops_into(
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
     lookups: bool,
-    defer_ecrec: bool,
+    defer_ecrec: ecrec::EcrecDefer<'_>,
     slot_counts: Option<&mut bitwise::BitwiseHistogram>,
 ) -> Result<(), Error> {
     walk_cpu_ops::<true>(
@@ -2571,7 +2572,7 @@ fn collect_streamed_ops_from_cpu_into(
         register_state,
         out,
         false,
-        false,
+        ecrec::EcrecDefer::default(),
         None,
     )
 }
@@ -2588,7 +2589,7 @@ fn walk_cpu_ops<const REST: bool>(
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
     lookups: bool,
-    defer_ecrec: bool,
+    defer_ecrec: ecrec::EcrecDefer<'_>,
     mut slot_counts: Option<&mut bitwise::BitwiseHistogram>,
 ) -> Result<(), Error> {
     let WalkOutputs {
@@ -3062,8 +3063,16 @@ fn walk_cpu_ops<const REST: bool>(
         // Under the word memory format its memory is word rows (an ECREC_W
         // row's), its register accesses as before.
         if op.ecall_ecrec()
-            && let Some((ecrec_memw, mut ecrec_op, ecrec_ecdas)) =
-                collect_ecrec_ops(op, memory_state, register_state, REST && defer_ecrec)
+            && let Some((ecrec_memw, mut ecrec_op, ecrec_ecdas)) = collect_ecrec_ops(
+                op,
+                memory_state,
+                register_state,
+                if REST {
+                    defer_ecrec
+                } else {
+                    ecrec::EcrecDefer::default()
+                },
+            )
         {
             if words {
                 let (registers, ram): (Vec<_>, Vec<_>) =
@@ -3633,7 +3642,7 @@ fn collect_ecrec_ops(
     op: CpuOp<'_>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-    defer: bool,
+    defer: ecrec::EcrecDefer<'_>,
 ) -> Option<(
     Vec<MemwOperation>,
     ecrec::EcrecOperation,
@@ -3732,11 +3741,13 @@ fn ecrec_witness_or_deferred(
     msg: &[u8; 32],
     parity: u8,
     t: u64,
-    defer: bool,
+    defer: ecrec::EcrecDefer<'_>,
 ) -> (
     ::ecsm::EcrecWitness,
     Option<std::sync::Arc<ecrec::DeferredEcrec>>,
 ) {
+    let count = defer.count;
+    let defer = defer.on;
     #[cfg(test)]
     let defer = defer && !forges_ecrec(sig);
     #[cfg(feature = "parallel")]
@@ -3747,11 +3758,11 @@ fn ecrec_witness_or_deferred(
         witness.ok = true;
         witness.x_q = le(&x_be);
         witness.y_q = le(&y_be);
-        let pending = ecrec::DeferredEcrec::spawn(*sig, *msg, parity, t);
+        let pending = ecrec::DeferredEcrec::spawn(*sig, *msg, parity, t, count.cloned());
         return (witness, Some(pending));
     }
     #[cfg(not(feature = "parallel"))]
-    let _ = (defer, t);
+    let _ = (defer, t, count);
     let witness = ::ecsm::compute_ecrec_witness(sig, msg, parity);
     #[cfg(test)]
     let witness = {
@@ -3770,16 +3781,24 @@ fn ecrec_witness_or_deferred(
 /// or one block when it was built whole). Refuses lists whose standing rows and
 /// pending ops do not pair up one for one in order (by timestamp), and a
 /// witness whose key or status is not the one the walk wrote. Lists with no
-/// pending op are left as they are, unread past the ECREC ops.
+/// pending op are left as they are, unread past the ECREC ops. Returns which
+/// calls had their ECDAS rows' lookups counted where they were computed
+/// ([`ecrec::EcdasCount`]); with `count_plain`, the lookups of the rows that
+/// are no deferred call's counted here under that form.
 fn resolve_deferred_ecrec(
     ecdas_ops: &mut BlockVec<ecdas::CompactEcdasOp>,
     ecrec_ops: &mut BlockVec<ecrec::EcrecOperation>,
-) -> Result<(), Error> {
+    count_plain: Option<ecdas::EcdasForm>,
+) -> Result<DeferredJoin, Error> {
     if !ecrec_ops.iter().any(|op| op.pending.is_some()) {
-        return Ok(());
+        return Ok(DeferredJoin::default());
     }
     let t = std::time::Instant::now();
     let (mut calls, mut waited, mut busy) = (0usize, 0.0f64, 0.0f64);
+    let mut join = DeferredJoin {
+        joined: true,
+        ..DeferredJoin::default()
+    };
     let mut rows_by_call = std::collections::VecDeque::new();
     for op in ecrec_ops.iter_mut() {
         let Some(pending) = op.pending.take() else {
@@ -3793,6 +3812,11 @@ fn resolve_deferred_ecrec(
             )));
         }
         let (resolved, wait) = pending.take()?;
+        if resolved.counted {
+            join.counted.push(pending.id());
+        } else {
+            join.uncounted += 1;
+        }
         let w = &resolved.witness;
         if w.status() != op.witness.status() || w.x_q != op.witness.x_q || w.y_q != op.witness.y_q {
             return Err(Error::Prover(format!(
@@ -3810,6 +3834,13 @@ fn resolve_deferred_ecrec(
     let list = std::mem::replace(ecdas_ops, BlockVec::new(1));
     *ecdas_ops = list.rebuilt(|row, out| {
         let Some(at) = row.deferred_ecrec() else {
+            join.plain_rows += 1;
+            if let Some(form) = count_plain {
+                let (_, plane) = join
+                    .plain
+                    .get_or_insert_with(|| (form, bitwise::BitwisePlane::new()));
+                ecrec::count_ecdas_rows(plane, std::slice::from_ref(&row), form);
+            }
             out.push(row);
             return Ok(());
         };
@@ -3837,7 +3868,50 @@ fn resolve_deferred_ecrec(
         "BLOCK ECREC DEFERRED: {calls} calls · {rows} ECDAS rows · witnesses {busy:.2}s (summed) · the finish waited {waited:.3}s · joined in {:.3}s",
         t.elapsed().as_secs_f64()
     );
-    Ok(())
+    Ok(join)
+}
+
+/// What [`resolve_deferred_ecrec`] found of the ECDAS rows' lookups counted
+/// where each deferred call was computed ([`ecrec::EcdasCount`]).
+#[derive(Default)]
+pub(crate) struct DeferredJoin {
+    /// It joined deferred calls (else it read nothing past the ECREC ops).
+    joined: bool,
+    /// The calls counted, by number ([`ecrec::DeferredEcrec::id`]).
+    counted: Vec<u64>,
+    /// The calls not counted.
+    uncounted: usize,
+    /// The ECDAS rows that are no deferred call's.
+    plain_rows: usize,
+    /// Their lookups, counted under this form, when asked.
+    plain: Option<(ecdas::EcdasForm, bitwise::BitwisePlane)>,
+}
+
+impl DeferredJoin {
+    /// `count` closed; its planes, with the plane of the rows that are no
+    /// deferred call's, when together they hold every ECDAS row's lookups
+    /// under `form` and no other: every deferred call counted, the calls on
+    /// its planes these ([`ecrec::EcdasCount::close`]), and the other rows,
+    /// if any, counted here under `form`. Else `None`, and the finish counts
+    /// ECDAS's rows from the list.
+    pub(crate) fn planes(
+        self,
+        count: &ecrec::EcdasCount,
+        form: ecdas::EcdasForm,
+    ) -> Option<Vec<bitwise::BitwisePlane>> {
+        let mut planes = count.close(self.counted, form)?;
+        if !self.joined || self.uncounted > 0 {
+            return None;
+        }
+        match self.plain {
+            Some((plain_form, plane)) if plain_form == form && self.plain_rows > 0 => {
+                planes.push(plane);
+            }
+            None if self.plain_rows == 0 => {}
+            _ => return None,
+        }
+        Some(planes)
+    }
 }
 
 /// The register accesses one copy ecall makes, all at the raw ECALL timestamp.
@@ -8209,6 +8283,10 @@ pub(crate) struct PreCounted {
     pub(crate) cpu_decoded: usize,
     pub(crate) memw_aligned_rows: usize,
     pub(crate) shift_rows: usize,
+    /// Where the walkers' deferred ECREC calls count their ECDAS rows'
+    /// lookups (`LAMBDA_VM_FINISH_EARLY=ecdas-count`); the finish takes the
+    /// counts when they are every row's ([`DeferredJoin::planes`]).
+    pub(crate) ecdas_count: Option<std::sync::Arc<ecrec::EcdasCount>>,
 }
 
 impl PreCounted {
@@ -11707,7 +11785,7 @@ mod ecrec_ops_tests {
             super::CpuOp::new(&decode, &op),
             &mut memory_state,
             &mut register_state,
-            false,
+            false.into(),
         )
         .expect("the operands are held");
         assert_eq!(memw.len(), 25);

@@ -7,6 +7,11 @@
 //!   its packed form by row ranges at once, and digests its multiplicities
 //!   for the log on a thread beside the fill, instead of each in turn on one
 //!   thread with the table built at 8 bytes a cell first.
+//! - `ecdas-count`: the ECDAS rows' BITWISE lookups of the ECREC calls whose
+//!   witnesses the walk hands off are counted where each witness is computed,
+//!   and the finish adds those counts instead of counting the rows; when they
+//!   are not every row's (a call computed in the walk, one not counted) it
+//!   counts the rows, as without the part.
 
 use crate::Error;
 
@@ -17,15 +22,20 @@ pub struct FinishEarly {
     /// BITWISE's job split: added in chunks, written packed by row ranges,
     /// digested beside.
     pub bitwise_tail: bool,
+    /// ECDAS's lookups counted beside the ECREC witnesses.
+    pub ecdas_count: bool,
 }
 
 impl FinishEarly {
     /// The knob's words.
-    pub(crate) const WORDS: &'static str = "bitwise-tail";
+    pub(crate) const WORDS: &'static str = "bitwise-tail, ecdas-count";
 
     /// Every part on.
     pub fn all() -> Self {
-        Self { bitwise_tail: true }
+        Self {
+            bitwise_tail: true,
+            ecdas_count: true,
+        }
     }
 
     /// The knob's reading: unset or empty, no part; else a comma-separated
@@ -39,6 +49,7 @@ impl FinishEarly {
             match word {
                 "all" => early = Self::all(),
                 "bitwise-tail" => early.bitwise_tail = true,
+                "ecdas-count" => early.ecdas_count = true,
                 _ => {
                     return Err(Error::Prover(format!(
                         "LAMBDA_VM_FINISH_EARLY={value}: a comma-separated list of {}, or all \
@@ -58,10 +69,13 @@ impl FinishEarly {
 
     /// The parts on, as the knob names them, or `none`.
     pub fn describe(self) -> String {
-        let parts: Vec<&str> = [(self.bitwise_tail, "bitwise-tail")]
-            .into_iter()
-            .filter_map(|(on, word)| on.then_some(word))
-            .collect();
+        let parts: Vec<&str> = [
+            (self.bitwise_tail, "bitwise-tail"),
+            (self.ecdas_count, "ecdas-count"),
+        ]
+        .into_iter()
+        .filter_map(|(on, word)| on.then_some(word))
+        .collect();
         if parts.is_empty() {
             "none".to_string()
         } else {
@@ -85,6 +99,23 @@ pub(crate) fn note_bitwise_tail() {
 #[cfg(test)]
 pub(crate) fn bitwise_tails() -> usize {
     BITWISE_TAILS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Finishes that added ECDAS's lookups counted beside the ECREC witnesses
+/// (`ecdas-count`) since the process began: a test's proof the part ran.
+#[cfg(test)]
+static ECDAS_COUNTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A finish that added them.
+#[cfg(test)]
+pub(crate) fn note_ecdas_count() {
+    ECDAS_COUNTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`ECDAS_COUNTS`].
+#[cfg(test)]
+pub(crate) fn ecdas_counts() -> usize {
+    ECDAS_COUNTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -121,6 +152,8 @@ mod tests {
             "tail",
             "bitwise_tail",
             "bitwise-tail,",
+            "ecdas",
+            "ecdas_count",
             "none",
             "1",
         ] {
