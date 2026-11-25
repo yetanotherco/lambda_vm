@@ -19,6 +19,18 @@ jobs:
     name: Lean build and export check
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # One pattern, shared by the gate below and by the probe that proves the gate fires.
+      # Keeping them as one string is the point: two copies could drift, and then the probe
+      # would be testing something the gate does not use.
+      #
+      # It replaced an exact match on `declaration uses 'sorry'`, with single quotes, which
+      # matched nothing: Lean emits backticks, and it does so on BOTH toolchains this repo
+      # has used -- checked by hand on v4.33.1 and v4.35.0, which print
+      # `declaration uses ` + backtick + `sorry` + backtick. So the check never caught a
+      # sorry here; it is not that the wording changed under us. `[^[:alnum:]]?` accepts a
+      # quote, a backtick or no delimiter at all.
+      SORRY_RE: "declaration uses [^[:alnum:]]?sorry"
     defaults:
       run:
         working-directory: formal
@@ -54,6 +66,36 @@ jobs:
       - name: Fetch Mathlib binaries
         run: lake exe cache get
 
+      # The gate below is a grep against a compiler message, and a grep that stops matching
+      # fails open: the step passes, the PR goes green, and nothing says the check did
+      # nothing. That is not hypothetical here -- the previous pattern matched no toolchain
+      # this repo ever used. So compile a deliberate `sorry` and require that the pattern
+      # fires on it, which turns a silent failure into a loud one.
+      - name: The sorry gate catches a sorry
+        run: |
+          set -euo pipefail
+          # Built with `lake build`, not with `lean`, because that is what the gate greps.
+          # Lake wraps the compiler's message, and a bare `lean` probe would keep passing if
+          # Lake ever changed that wrapping while the gate went quietly blind. A throwaway
+          # package with no dependencies, on this job's toolchain, needs no network.
+          probe="${RUNNER_TEMP:-/tmp}/sorry-probe"
+          rm -rf "$probe"
+          mkdir -p "$probe"
+          cp lean-toolchain "$probe/lean-toolchain"
+          printf 'name = "probe"\ndefaultTargets = ["Probe"]\n\n[[lean_lib]]\nname = "Probe"\n' > "$probe/lakefile.toml"
+          printf 'theorem sorryProbe : True := by sorry\n' > "$probe/Probe.lean"
+          log="$probe/build.log"
+          # No `|| true`: a build that emits only this warning exits 0, so the only thing it
+          # could hide is a genuine failure, and then the error below would blame the pattern
+          # for something unrelated to it.
+          (cd "$probe" && lake build) > "$log" 2>&1
+          cat "$log"
+          if ! grep -qE "$SORRY_RE" "$log"; then
+            echo "::error::the sorry pattern matches nothing a build of a deliberate sorry emits, so the gate in the next step would let a sorry through"
+            exit 1
+          fi
+          echo "the pattern fires on a real sorry; the gate below is live"
+
       # `lake build` only *warns* on a `sorry`, so without this check a sorry anywhere in the
       # library merges green, including in declarations the axiom gate below does not reach.
       - name: Build, and no sorry anywhere in the library
@@ -61,9 +103,9 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/build.log"
           lake build 2>&1 | tee "$log"
-          if grep -q "declaration uses 'sorry'" "$log"; then
+          if grep -qE "$SORRY_RE" "$log"; then
             echo "::error::a declaration uses sorry"
-            grep -n "declaration uses 'sorry'" "$log"
+            grep -nE "$SORRY_RE" "$log"
             exit 1
           fi
 
