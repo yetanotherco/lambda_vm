@@ -2,8 +2,10 @@
 //! proves: a block proved with every cut of the walk on, with every finish
 //! part on, and with both, is the block proved with none, on three walkers in
 //! record mode (the default) and on one, under the split memory format with
-//! many windows and under the word memory format with a private input across
-//! two pages: the same partition, heights, counts, output and group roots,
+//! many windows, under the word memory format with a private input across
+//! two pages, and on ECREC calls whose witnesses the walk hands off (the
+//! finish taking ECDAS's lookups counted beside them): the same partition,
+//! heights, counts, output and group roots,
 //! every proof verifies, and under the deterministic grind
 //! (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once a process: run alone) the
 //! same bytes. The proving tests run where a block can be proved (the box's
@@ -26,6 +28,8 @@ fn bytes(proof: &BlockWhirProof) -> Vec<u8> {
 
 #[test]
 fn the_walk_cuts_prove_the_same_block() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let opts = ProofOptions::default_test_options();
     let two_pages: Vec<u8> = (0..(crate::tables::page::DEFAULT_PAGE_SIZE as u32 + 300))
         .map(|i| (i * 7 + 3) as u8)
@@ -46,6 +50,15 @@ fn the_walk_cuts_prove_the_same_block() {
                 .with_memory(MemoryFormat::Words)
                 .with_page_run(0),
             9,
+        ),
+        (
+            "words, ECREC calls in windows of 16 cycles",
+            "test_ecrec",
+            Vec::new(),
+            BlockFormat::production()
+                .with_memory(MemoryFormat::Words)
+                .with_page_run(0),
+            4,
         ),
     ] {
         let elf = asm_elf_bytes(program);
@@ -95,12 +108,19 @@ fn the_walk_cuts_prove_the_same_block() {
                     arm.1.describe()
                 );
                 let tails = crate::tables::trace_builder::finish_early::bitwise_tails();
+                let ecdas = crate::tables::trace_builder::finish_early::ecdas_counts();
                 let on = proved(arm);
                 assert_eq!(
                     crate::tables::trace_builder::finish_early::bitwise_tails() > tails,
                     arm.1.bitwise_tail,
                     "{what}: BITWISE's job split"
                 );
+                if program == "test_ecrec" && arm.1.ecdas_count {
+                    assert!(
+                        crate::tables::trace_builder::finish_early::ecdas_counts() > ecdas,
+                        "{what}: ECDAS's lookups counted beside the witnesses"
+                    );
+                }
                 assert!(
                     matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
                     "{what}: verifies"
