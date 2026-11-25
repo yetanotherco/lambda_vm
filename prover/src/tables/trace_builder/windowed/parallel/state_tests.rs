@@ -282,10 +282,13 @@ fn record_build(
 fn record_mode_with_the_state_hoisted_builds_the_same_tables() {
     let _turn = turn();
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    // Counted: another test's block prove beside this one, under the knob's
+    // default, hoists a state this count must not see.
     let state = HostHoist {
         state: true,
-        ..HostHoist::default()
-    };
+        ..HostHoist::none()
+    }
+    .counted();
     for name in [
         "fused_mem_cases",
         "page_runs",
@@ -312,11 +315,11 @@ fn record_mode_with_the_state_hoisted_builds_the_same_tables() {
                         window,
                         walkers,
                         words,
-                        HostHoist::default(),
+                        HostHoist::none().counted(),
                     )
                     .unwrap_or_else(|e| panic!("{what}: {e:?}"));
                     assert_eq!(calls::take_states(), 0, "{what}: off never hoists");
-                    for hoist in [state, HostHoist::all()] {
+                    for hoist in [state, HostHoist::all().counted()] {
                         let got = record_build(&program, &input, window, walkers, words, hoist)
                             .unwrap_or_else(|e| panic!("{what}, {hoist:?}: {e:?}"));
                         assert_eq!(calls::take_states(), 1, "{what}, {hoist:?}: built once");
@@ -355,11 +358,14 @@ fn the_state_part_outside_record_mode_changes_nothing() {
         traces
     };
     let _ = calls::take_states();
-    let want = build(HostHoist::default());
-    let got = build(HostHoist {
-        state: true,
-        ..HostHoist::default()
-    });
+    let want = build(HostHoist::none().counted());
+    let got = build(
+        HostHoist {
+            state: true,
+            ..HostHoist::none()
+        }
+        .counted(),
+    );
     assert_eq!(calls::take_states(), 0);
     same_traces(&want, &got);
 }

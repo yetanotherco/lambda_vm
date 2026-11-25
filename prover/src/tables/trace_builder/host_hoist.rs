@@ -31,6 +31,12 @@ pub struct HostHoist {
     /// Record mode's final memory state built on the setup state, its new
     /// pages on the pool.
     pub state: bool,
+    /// Test only: a build under this value counts the final state it hoists
+    /// ([`calls::take_states`], a process-wide count). Only the tests that
+    /// read the count set it, so another test's block prove beside them,
+    /// which hoists under the knob's default, does not move their count.
+    #[cfg(test)]
+    pub(crate) counted: bool,
 }
 
 impl HostHoist {
@@ -48,6 +54,17 @@ impl HostHoist {
             pages: true,
             image: true,
             state: true,
+            #[cfg(test)]
+            counted: false,
+        }
+    }
+
+    /// This value, its hoisted final state counted ([`calls::take_states`]).
+    #[cfg(test)]
+    pub(crate) fn counted(self) -> Self {
+        Self {
+            counted: true,
+            ..self
         }
     }
 
@@ -144,12 +161,14 @@ pub(crate) mod calls {
     /// the walk's record thread): a test that reads it holds its own lock.
     static STATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// A final memory state built hoisted (`finish_state_hoisted`).
+    /// A build in record mode whose final memory state is hoisted took its
+    /// setup state as that state's base, under a [`super::HostHoist::counted`]
+    /// value.
     pub(crate) fn note_state() {
         STATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The final states built hoisted since the last take; reset.
+    /// The counted final states hoisted since the last take; reset.
     pub(crate) fn take_states() -> usize {
         STATES.swap(0, std::sync::atomic::Ordering::Relaxed)
     }

@@ -79,13 +79,13 @@ fn the_host_hoist_proves_the_same_block() {
         ),
     ] {
         let _ = calls::take_states();
-        let (elf, off) = proved(&format, HostHoist::default());
+        let (elf, off) = proved(&format, HostHoist::none().counted());
         assert_eq!(
             calls::take_states(),
             0,
             "{what}: off never hoists the state"
         );
-        let (_, on) = proved(&format, HostHoist::all());
+        let (_, on) = proved(&format, HostHoist::all().counted());
         assert_eq!(
             calls::take_states(),
             usize::from(record),

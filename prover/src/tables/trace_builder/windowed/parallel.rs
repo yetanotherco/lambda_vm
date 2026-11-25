@@ -745,6 +745,10 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 builder.cycles
             )));
         }
+        #[cfg(test)]
+        if builder.emitted.host_hoist.counted {
+            crate::tables::trace_builder::host_hoist::calls::note_state();
+        }
         Some(std::mem::replace(
             &mut builder.memory_state,
             MemoryState::new(),
@@ -1329,8 +1333,6 @@ fn finish_state_hoisted(
 ) -> Result<MemoryState, Error> {
     use rayon::prelude::*;
     const PAGE: usize = 1 << 16;
-    #[cfg(test)]
-    crate::tables::trace_builder::host_hoist::calls::note_state();
     if base.overlay.is_some()
         || !base.cells.page_bases().eq(image.page_bases())
         || base.cells.len() != image.len()
