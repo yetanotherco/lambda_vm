@@ -1006,6 +1006,91 @@ fn the_blake3_driver_validating_at_once_and_freeing_beside_proves_the_same_level
     assert!(run.proofs.len() >= 2, "level 2 too");
 }
 
+/// ★ Level 1's validator joined after its fill
+/// (`LAMBDA_VM_LEVELS_VALIDATE_AFTER_FILL`) and its builder on the whole pool
+/// once the base returned (`LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`): a small
+/// BLAKE3 block driven with both on proves each level's bytes as
+/// [`prove_levels`] does over the same base, the join after the fill and the
+/// builder's watch both stamped. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an
+/// untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_validating_after_the_fill_with_its_builder_on_the_whole_pool_proves_the_same_level_bytes()
+ {
+    use super::levels::set_validate_after_fill_for_test;
+    use super::wlfm::set_builder_whole_pool_for_test;
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_validate_after_fill_for_test(None);
+            set_builder_whole_pool_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    set_validate_after_fill_for_test(Some(true));
+    set_builder_whole_pool_for_test(Some(true));
+    let run = driven_under_chain_steps(ChainSteps::default());
+    assert!(
+        run.times.validated_after_fill.is_some(),
+        "level 1's validator joined after its fill"
+    );
+    let note = run
+        .times
+        .builder_whole_pool
+        .expect("the builder watched the base");
+    assert!(note.tables > 0 && note.tables_before <= note.tables);
+    println!("LEVELS BUILDER POOL (identity run): {note:?}");
+    assert!(run.proofs.len() >= 2, "level 2 too");
+}
+
+/// ★ Level 1's program made inadmissible (a constant's count raised): the
+/// driver refuses it, with its validator joined before the fill (today's) and
+/// after it (`LAMBDA_VM_LEVELS_VALIDATE_AFTER_FILL`): an error naming the
+/// admission, never a level proof, never a panic.
+#[test]
+#[ignore = "proves a small BLAKE3 block twice up to level 1's admission; box tier"]
+fn an_inadmissible_level_1_is_refused_with_its_validator_before_or_after_the_fill() {
+    use super::levels::{
+        prove_block_levels, set_level1_program_fault_for_test, set_validate_after_fill_for_test,
+    };
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_level1_program_fault_for_test(false);
+            set_validate_after_fill_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    set_level1_program_fault_for_test(true);
+    for after in [false, true] {
+        set_validate_after_fill_for_test(Some(after));
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_block_levels(
+                &elf,
+                &[],
+                &opts,
+                &format,
+                &streamed_options(),
+                WlfmFamily::B3,
+                LevelStop::DEFAULT,
+                true,
+                true,
+            )
+        }));
+        match run {
+            Ok(Err(e)) => {
+                assert!(e.contains("not admissible"), "after the fill {after}: {e}");
+                println!("LEVELS INADMISSIBLE (after the fill {after}): refused · {e}");
+            }
+            Ok(Ok(_)) => panic!("after the fill {after}: an inadmissible level 1 proved"),
+            Err(_) => panic!("after the fill {after}: the driver panicked"),
+        }
+    }
+}
+
 /// Every chain step on at once: the same level bytes.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
@@ -1453,6 +1538,40 @@ fn the_validate_at_once_and_free_beside_knobs_are_named_and_off_by_default() {
     assert!(validate_at_once() && free_beside());
     set_validate_at_once_for_test(None);
     set_free_beside_for_test(None);
+}
+
+/// The validator-after-the-fill and builder-whole-pool knobs' names; both off
+/// by default (and for any word but `1`), a test's setting read back.
+#[test]
+fn the_validate_after_fill_and_builder_whole_pool_knobs_are_named_and_off_by_default() {
+    use super::levels::{
+        VALIDATE_AFTER_FILL_ENV, set_validate_after_fill_for_test, validate_after_fill,
+    };
+    use super::wlfm::{
+        BUILDER_WHOLE_POOL_ENV, builder_whole_pool, set_builder_whole_pool_for_test,
+    };
+    assert_eq!(
+        VALIDATE_AFTER_FILL_ENV,
+        "LAMBDA_VM_LEVELS_VALIDATE_AFTER_FILL"
+    );
+    assert_eq!(
+        BUILDER_WHOLE_POOL_ENV,
+        "LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL"
+    );
+    if std::env::var_os(VALIDATE_AFTER_FILL_ENV).is_none() {
+        assert!(
+            !validate_after_fill(),
+            "validate after the fill off by default"
+        );
+    }
+    if std::env::var_os(BUILDER_WHOLE_POOL_ENV).is_none() {
+        assert!(!builder_whole_pool(), "builder whole pool off by default");
+    }
+    set_validate_after_fill_for_test(Some(true));
+    set_builder_whole_pool_for_test(Some(true));
+    assert!(validate_after_fill() && builder_whole_pool());
+    set_validate_after_fill_for_test(None);
+    set_builder_whole_pool_for_test(None);
 }
 
 /// A program taken ([`super::levels::take_program`], the free-beside path) is
@@ -2171,6 +2290,21 @@ fn rta_one_run(
         "RTA LEVEL1 RELEASE: {:.3}s on the driver's thread · beside {}",
         t.release.0, t.release.1
     );
+    match t.validated_after_fill {
+        Some(wait) => println!("RTA LEVEL1 VALIDATE AFTER FILL: on · the join waited {wait:.3}s"),
+        None => println!("RTA LEVEL1 VALIDATE AFTER FILL: off"),
+    }
+    match t.builder_whole_pool {
+        Some(note) => println!(
+            "RTA LEVEL1 BUILDER POOL: watched · {} of {} tables' columns on one thread · the base seen at {}              into the columns · packs on the whole pool {}",
+            note.tables_before,
+            note.tables,
+            note.seen_at
+                .map_or_else(|| "never".to_string(), |s| format!("{s:.3}s")),
+            note.packs_whole
+        ),
+        None => println!("RTA LEVEL1 BUILDER POOL: off"),
+    }
     let landing = &t.landing;
     let list = |xs: Vec<String>| xs.join(" ");
     println!(

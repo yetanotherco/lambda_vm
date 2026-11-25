@@ -667,14 +667,37 @@ fn beside_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// [`prepare_level`] as the driver runs it beside the base: on the beside pool
 /// under [`beside_nice`], on the prover's pool otherwise. The same prebuild.
+/// The driver calls [`prepare_level_watching`]; tests call this.
+#[cfg(test)]
 pub(crate) fn prepare_level_beside(
     program: &LfmProgram,
     family: WlfmFamily,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
+    prepare_level_watching(program, family, rounds, None).map(|(pre, _)| pre)
+}
+
+/// [`prepare_level_beside`], watching `base_returned` when given
+/// ([`super::wlfm::BUILDER_WHOLE_POOL_ENV`]): raised, the columns not yet
+/// made and the packs go to the whole pool. The same prebuild, and what the
+/// watch did.
+pub(crate) fn prepare_level_watching(
+    program: &LfmProgram,
+    family: WlfmFamily,
+    rounds: Option<u8>,
+    base_returned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(WlfmPrebuild, Option<super::wlfm::WholePoolNote>), String> {
+    // On the thread that runs the prepare (a pool's worker under the beside
+    // pool): the watch and its note are that thread's.
+    let run = move || {
+        let _watch = base_returned.map(super::wlfm::watch_base);
+        let _ = super::wlfm::take_whole_pool_note();
+        let pre = prepare_level(program, family, rounds)?;
+        Ok((pre, super::wlfm::take_whole_pool_note()))
+    };
     match beside_nice().then(beside_pool).flatten() {
-        Some(pool) => pool.install(|| prepare_level(program, family, rounds)),
-        None => prepare_level(program, family, rounds),
+        Some(pool) => pool.install(run),
+        None => run(),
     }
 }
 
@@ -736,6 +759,73 @@ pub fn validate_at_once() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_VALIDATE_AFTER_FILL=1`: level 1's admission validator,
+/// run beside the execution ([`program_fast`]), is joined after level 1's
+/// fill beside the base ([`fill_beside`]) instead of before it, so the fill
+/// no longer waits for the verdict. The verdict is still read on level 1's
+/// thread before it hands anything to the prove: an inadmissible program is
+/// refused before a byte of level 1 is proved. Without [`program_fast`] or
+/// [`fill_beside`] it does nothing. Off by default (and for any word but
+/// `1`). Read once a process.
+pub const VALIDATE_AFTER_FILL_ENV: &str = "LAMBDA_VM_LEVELS_VALIDATE_AFTER_FILL";
+
+/// A test's [`validate_after_fill`], process wide (0 the knob, 1 off, 2 on).
+static VALIDATE_AFTER_FILL_FOR_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`validate_after_fill`] forced for the process (`None`
+/// restores the knob).
+#[doc(hidden)]
+pub fn set_validate_after_fill_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    VALIDATE_AFTER_FILL_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`VALIDATE_AFTER_FILL_ENV`] is on (or a test's override).
+pub fn validate_after_fill() -> bool {
+    match VALIDATE_AFTER_FILL_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(VALIDATE_AFTER_FILL_ENV).ok().as_deref())
+    })
+}
+
+/// A test's fault in level 1's emitted program (process wide): a constant's
+/// count raised by one, which the admission validator refuses
+/// ([`set_level1_program_fault_for_test`]).
+#[cfg(test)]
+static LEVEL1_PROGRAM_FAULT_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: level 1's emitted program gets a constant's count raised by
+/// one (`false` restores today's), so its admission must refuse it.
+#[cfg(test)]
+pub(crate) fn set_level1_program_fault_for_test(on: bool) {
+    LEVEL1_PROGRAM_FAULT_FOR_TEST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `program`, faulted when a test asked ([`set_level1_program_fault_for_test`]).
+#[cfg(test)]
+fn level1_program_fault_for_test(mut program: LfmProgram) -> LfmProgram {
+    if LEVEL1_PROGRAM_FAULT_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(super::instr::Instr::Const { mult, .. }) = program
+            .instrs
+            .iter_mut()
+            .find(|i| matches!(i, super::instr::Instr::Const { .. }))
+    {
+        *mult += 1;
+    }
+    program
+}
+
 /// Level 1's admission validator over `program`: its five checks in series,
 /// or at once under [`VALIDATE_AT_ONCE_ENV`].
 fn validate_level(program: &LfmProgram) -> Result<(), super::validator::LfmViolation> {
@@ -795,10 +885,18 @@ pub(crate) fn prepare_level_packs(
 ) -> Result<WlfmPrebuild, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, level_levers(family), rounds)?;
+    // Under `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`, once the base has
+    // returned, the narrow packs leave their two threads for the caller's
+    // pool (the same packs).
+    let packs_whole = super::wlfm::base_returned_seen();
+    let pack_pool = || (!packs_whole).then(narrow_pack_pool).flatten();
+    if super::wlfm::narrow_commit() && super::wlfm::base_watched() {
+        super::wlfm::note_whole_pool_packs(packs_whole);
+    }
     if beside && super::wlfm::chip_records() && super::wlfm::narrow_commit() {
         let (prefixes, packs) = std::thread::scope(|scope| {
             let pre = &pre;
-            let packs = scope.spawn(move || match narrow_pack_pool() {
+            let packs = scope.spawn(move || match pack_pool() {
                 Some(pool) => pool.install(|| pre.narrow_packs_made()),
                 None => pre.narrow_packs_made(),
             });
@@ -817,7 +915,7 @@ pub(crate) fn prepare_level_packs(
         pre.hold_chip_prefixes()?;
     }
     if super::wlfm::narrow_commit() {
-        match narrow_pack_pool() {
+        match pack_pool() {
             Some(pool) => pool.install(|| pre.hold_narrow_packs()),
             None => pre.hold_narrow_packs(),
         }
@@ -2187,6 +2285,12 @@ pub struct LevelClock {
 /// What a levels run measured.
 #[derive(Clone, Debug, Default)]
 pub struct LevelsTimes {
+    /// Under `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`, what level 1's builder
+    /// did once the base returned ([`super::wlfm::WholePoolNote`]).
+    pub builder_whole_pool: Option<super::wlfm::WholePoolNote>,
+    /// Whether level 1's validator was joined after its fill
+    /// ([`VALIDATE_AFTER_FILL_ENV`]), and the seconds that join waited.
+    pub validated_after_fill: Option<f64>,
     /// Level 1's program let go on the driver's thread before its prove: the
     /// seconds there, and whether it went to the purge's thread instead
     /// ([`FREE_BESIDE_ENV`]).
@@ -2497,6 +2601,21 @@ pub fn prove_block_levels(
     let commit_next_early_on = commit_next_early();
     let next_beside_on = next_beside();
     let waves_in_order_on = waves_in_order();
+    // The validator joined after the fill: only where it runs beside the
+    // execution and the fill is level 1's thread's.
+    let validate_after_fill_on = validate_after_fill() && fill_beside_on;
+    // The builder's columns and packs on the whole pool from the base's
+    // return (`LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`): the driver raises this
+    // as the base returns; the builder reads it between tables.
+    let base_returned = super::wlfm::builder_whole_pool()
+        .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let base_returned_ref = &base_returned;
+    let whole_pool_note: std::sync::OnceLock<Option<super::wlfm::WholePoolNote>> =
+        std::sync::OnceLock::new();
+    let whole_pool_note_ref = &whole_pool_note;
+    // Under the validator after the fill: the seconds its join waited.
+    let after_fill_wait: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let after_fill_wait_ref = &after_fill_wait;
     let stream_opts = StreamOpts {
         fill_parts: fill_parts_on,
         in_order: waves_in_order_on,
@@ -2525,7 +2644,13 @@ pub fn prove_block_levels(
                     .map_err(|_| "level 1's program was never emitted")?;
                 let program = program_ref.get().ok_or("the program is set")?;
                 let plan = plan_ref.get().ok_or("the plan is set")?;
-                let pre = prepare_level_beside(program, family, level_rounds(plan))?;
+                let (pre, note) = prepare_level_watching(
+                    program,
+                    family,
+                    level_rounds(plan),
+                    base_returned_ref.clone(),
+                )?;
+                let _ = whole_pool_note_ref.set(note);
                 Ok((pre, now()))
             })
         });
@@ -2547,6 +2672,8 @@ pub fn prove_block_levels(
             let (program, marks, (walk, compiled)) =
                 plan.closed_block_program_marked_timed(beside_check)?;
             let compile_split = super::compiler::take_compile_split();
+            #[cfg(test)]
+            let program = level1_program_fault_for_test(program);
             // Off the knob, validated before the execution, as always.
             let t = std::time::Instant::now();
             if !beside_check {
@@ -2713,9 +2840,13 @@ pub fn prove_block_levels(
                     .map(|(a, b)| super::placement::usage_delta(a, b));
                 landing.placement = Some(placed);
             }
-            let validated = match checker {
-                Some(handle) => Some((joined_validation(handle)?, now())),
-                None => None,
+            // Under `LAMBDA_VM_LEVELS_VALIDATE_AFTER_FILL` the verdict is read
+            // after the fill below, still before level 1 is handed on.
+            let (validated, checker) = match checker {
+                Some(handle) if !validate_after_fill_on => {
+                    (Some((joined_validation(handle)?, now())), None)
+                }
+                other => (None, other),
             };
             drop(lean_tx);
             let lean = match lean_fill {
@@ -2762,6 +2893,18 @@ pub fn prove_block_levels(
                 }
             } else {
                 Level1Out::Executed(execution, lean)
+            };
+            // The verdict, when it waited for the fill: read here, before
+            // level 1 leaves this thread, so an inadmissible program is
+            // refused before anything of it is proved.
+            let validated = match checker {
+                Some(handle) => {
+                    let t = std::time::Instant::now();
+                    let secs = joined_validation(handle)?;
+                    let _ = after_fill_wait_ref.set(t.elapsed().as_secs_f64());
+                    Some((secs, now()))
+                }
+                None => validated,
             };
             Ok((
                 planned,
@@ -2816,6 +2959,9 @@ pub fn prove_block_levels(
             WlfmFamily::B3 => crate::base_only::with_blake3_levels(prove_base),
         };
         let _ = base_end_ref.set(now());
+        if let Some(flag) = base_returned_ref {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         let at_base = resident_now();
         *stx.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ptx.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2873,6 +3019,8 @@ pub fn prove_block_levels(
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
     times.builder_end = builder_end.get().copied();
+    times.builder_whole_pool = whole_pool_note.get().copied().flatten();
+    times.validated_after_fill = after_fill_wait.get().copied();
     let (
         planned,
         emitted,
