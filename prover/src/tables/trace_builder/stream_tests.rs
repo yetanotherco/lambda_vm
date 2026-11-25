@@ -2526,6 +2526,15 @@ fn states_its_height_for(
         for slide in [false, true] {
             let block: Configure = Box::new(move |b| block_like(b, words));
             let late: Configure = Box::new(move |b| block_like(b, words).late_rows_first());
+            // The block's with the host levers it runs beside the early
+            // statement: the same tables, so the same rows.
+            let levers: Configure = Box::new(move |b| {
+                block_like(b, words)
+                    .host_hoist(super::super::HostHoist::all())
+                    .finish_early(super::super::FinishEarly::all())
+                    .walk_cuts(super::super::WalkCuts::all())
+                    .expect("before any window")
+            });
             let plain: Vec<(String, &Configure)> = configs
                 .iter()
                 .map(|(c, f)| (c.to_string(), f))
@@ -2533,6 +2542,10 @@ fn states_its_height_for(
                 .chain(std::iter::once((
                     "the block's, late first".to_string(),
                     &late,
+                )))
+                .chain(std::iter::once((
+                    "the block's, host levers".to_string(),
+                    &levers,
                 )))
                 .collect();
             for (config, configure) in plain {
