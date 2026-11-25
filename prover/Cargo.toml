@@ -15,7 +15,7 @@ parallel = [
     "dep:rayon",
 ]
 cuda = ["stark/cuda", "multilinear/cuda"]
-test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
+test-cuda-faults = ["cuda", "multilinear/test-cuda-faults", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 # GPU profiling build (Nsight): implies cuda — the toolkit always traces the GPU prover.

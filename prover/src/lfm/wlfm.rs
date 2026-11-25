@@ -62,7 +62,7 @@ use stark::multilinear_table::{BatchedArgue, CommittedTable, MultiProof, TableSt
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use crate::block_whir::{
-    GroupPrepared, GroupStack, PreparedColumns, commit_group, commit_groups_on_host, group_stacks,
+    GroupPrepared, GroupStack, PreparedColumns, commit_groups_on_host, group_stacks,
 };
 use crate::multilinear_prove::{layout_of, stacks};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -1150,51 +1150,16 @@ enum PreparedHold<H: WhirHash> {
 
 impl<H: WhirHash> WlfmPrepared<H> {
     fn held(p: GroupPrepared<H>) -> Self {
-        // A held stack's opening reads its host columns: the packed bytes go.
-        let (narrow, _) = narrow_parts(p.packed);
         WlfmPrepared {
             group: p.group,
             tables: p.tables,
             columns: p.columns,
             roots: p.roots,
             hold: PreparedHold::Held(p.commitment),
-            narrow,
+            narrow: None,
             packed: None,
             card: 0,
         }
-    }
-
-    /// Committed, its codewords let go at once (`drop`: the tree levels it
-    /// keeps none of).
-    fn retired(
-        p: GroupPrepared<H>,
-        drop: multilinear::whir_commit::TreeDrop,
-        config: &ChainConfig,
-    ) -> Result<Self, String> {
-        let retired = p
-            .commitment
-            .retire(drop, config)
-            .map_err(|e| format!("group {}: retiring its prepared stack: {e:?}", p.group))?;
-        if retired.roots() != p.roots {
-            return Err(format!(
-                "group {}: a retired prepared stack's roots moved",
-                p.group
-            ));
-        }
-        // Its opening's store sends the packed bytes only under the narrow
-        // store; without it they would sit on the host unread.
-        let (narrow, packed) = narrow_parts(p.packed);
-        let packed = packed.filter(|_| narrow_store());
-        Ok(WlfmPrepared {
-            group: p.group,
-            tables: p.tables,
-            columns: p.columns,
-            roots: p.roots,
-            hold: PreparedHold::Retired(retired),
-            narrow,
-            packed,
-            card: 0,
-        })
     }
 
     fn layout(&self) -> &StackedLayout {
@@ -1273,39 +1238,49 @@ fn commit_under<H: WhirHash>(
         // One stack at a time: committed, then held or let go before the next.
         None => stacks
             .into_iter()
-            .map(|stack| commit_one::<H>(stack, config, place))
+            .map(|mut stack| commit_one::<H>(&mut stack, config, place))
             .collect(),
         Some(cards) => commit_by_card::<H>(stacks, config, place, cards),
     }
 }
 
-/// One stack committed on this thread's card and made held or retired by
-/// `place`.
+/// Commits one stack on this thread's card. Its columns move to the prepared
+/// result only once the commit and any retirement have succeeded.
 fn commit_one<H: WhirHash>(
-    stack: GroupStack,
+    stack: &mut GroupStack,
     config: &ChainConfig,
     place: StackPlace,
 ) -> Result<WlfmPrepared<H>, String> {
-    let drop = crate::block_whir::tree_drop_for_chain(config);
-    let p = if narrow_commit() {
-        crate::block_whir::commit_group_narrow::<H>(stack, config, narrow_commit_staged())
+    let group = stack.group;
+    let (commitment, packed) = stack
+        .commit::<H>(config, false, narrow_commit().then(narrow_commit_staged))
+        .map_err(|e| format!("{e:?}"))?;
+    let roots = commitment.roots();
+    let hold = if place == StackPlace::CardRetired {
+        let drop = crate::block_whir::tree_drop_for_chain(config);
+        let retired = commitment
+            .retire(drop, config)
+            .map_err(|e| format!("group {group}: retiring its prepared stack: {e:?}"))?;
+        if retired.roots() != roots {
+            return Err(format!(
+                "group {group}: a retired prepared stack's roots moved"
+            ));
+        }
+        PreparedHold::Retired(retired)
     } else {
-        commit_group::<H>(stack, config)
-    }
-    .map_err(|e| format!("{e:?}"))?;
-    match place {
-        StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config),
-        _ => Ok(WlfmPrepared::held(p)),
-    }
-}
-
-/// What the second card's list of stacks came to: the stacks committed there
-/// (by their place in the level's order), the ones it never took, and the
-/// error that stopped it, with whether that error took a stack with it.
-struct SecondList<H: WhirHash> {
-    done: Vec<(usize, WlfmPrepared<H>)>,
-    left: Vec<(usize, GroupStack)>,
-    error: Option<(String, bool)>,
+        PreparedHold::Held(commitment)
+    };
+    let (narrow, packed) = narrow_parts(packed);
+    Ok(WlfmPrepared {
+        group,
+        tables: stack.table_prefixes(),
+        columns: std::mem::take(&mut stack.columns),
+        roots,
+        hold,
+        narrow,
+        packed: packed.filter(|_| place == StackPlace::CardRetired && narrow_store()),
+        card: 0,
+    })
 }
 
 /// ★ `LAMBDA_VM_LEVELS_STACKS_BY_CARD`: the stacks of groups `cards` puts on
@@ -1315,8 +1290,8 @@ struct SecondList<H: WhirHash> {
 /// order (the program's identity hashes them in it). The same columns under
 /// the same config: the same roots wherever they are committed. If the second
 /// card fails, it is marked failed and every stack of its list is committed
-/// here on card 0 (one it made is turned back into its columns first); only a
-/// stack the failing call consumed cannot be, and its error is returned.
+/// here on card 0. The failed stack still has its columns, and successful
+/// stacks hand their columns back before their card commitments are dropped.
 fn commit_by_card<H: WhirHash>(
     stacks: Vec<GroupStack>,
     config: &ChainConfig,
@@ -1331,113 +1306,97 @@ fn commit_by_card<H: WhirHash>(
             _ => first.push((k, stack)),
         }
     }
-    // Each card-1 stack's table triples, to turn a made stack back into its
-    // columns if the second card fails after making it.
-    let triples: std::collections::HashMap<usize, Vec<(usize, usize, usize)>> = second
-        .iter()
-        .map(|(_, s)| (s.group, s.tables.clone()))
-        .collect();
-    let fault = second_stack_fault_for_test();
+    #[cfg(test)]
+    let fault = SECOND_STACK_FAULT_FOR_TEST.with(std::cell::Cell::get);
     let (on0, on1) = std::thread::scope(|scope| {
+        let second = &mut second;
         let worker = scope.spawn(move || {
             multilinear::gpu::on_second_card(move || {
-                let mut out = SecondList {
-                    done: Vec::new(),
-                    left: Vec::new(),
-                    error: None,
-                };
-                let mut list = second.into_iter().enumerate();
-                for (i, (k, stack)) in list.by_ref() {
-                    if fault == Some(i) {
-                        out.error = Some(("a test's second-card fault".into(), false));
-                        out.left.push((k, stack));
-                        break;
-                    }
-                    match commit_one::<H>(stack, config, place) {
-                        Ok(p) => out.done.push((k, WlfmPrepared { card: 1, ..p })),
-                        Err(e) => {
-                            out.error = Some((e, true));
-                            break;
-                        }
+                let mut done = Vec::with_capacity(second.len());
+                for (_, stack) in second {
+                    #[cfg(test)]
+                    let result = SecondStackFault::run_at(fault, done.len(), || {
+                        commit_one::<H>(stack, config, place)
+                    });
+                    #[cfg(not(test))]
+                    let result = commit_one::<H>(stack, config, place);
+                    match result {
+                        Ok(p) => done.push(WlfmPrepared { card: 1, ..p }),
+                        Err(e) => return (done, Some(e)),
                     }
                 }
-                out.left.extend(list.map(|(_, ks)| ks));
-                out
+                (done, None)
             })
         });
         let on0: Result<Vec<(usize, WlfmPrepared<H>)>, String> = first
             .into_iter()
-            .map(|(k, stack)| commit_one::<H>(stack, config, place).map(|p| (k, p)))
+            .map(|(k, mut stack)| commit_one::<H>(&mut stack, config, place).map(|p| (k, p)))
             .collect();
-        let on1 = worker
-            .join()
-            .map_err(|_| "the second card's stack commits panicked");
-        (on0, on1)
+        (on0, worker.join())
     });
+    let (done, error) = on1.map_err(|_| {
+        multilinear::gpu::mark_second_failed("a level's stack commit panicked");
+        "the second card's stack commits panicked".to_string()
+    })?;
+    if error.is_some() {
+        multilinear::gpu::mark_second_failed("a level's stack commit");
+    }
     let mut out = on0?;
-    let on1 = on1.map_err(str::to_string)?;
-    match on1.error {
-        None => out.extend(on1.done),
-        Some((e, lost)) => {
-            multilinear::gpu::mark_second_failed("a level's stack commit");
-            if lost {
-                return Err(format!(
-                    "the second card failed committing a level's stack: {e}"
-                ));
-            }
-            let again = on1.done.len() + on1.left.len();
-            let back = on1.done.into_iter().map(|(k, p)| {
-                let tables = triples.get(&p.group).cloned().unwrap_or_default();
-                (k, stack_back(p, tables))
-            });
-            for (k, stack) in back.chain(on1.left) {
-                out.push((k, commit_one::<H>(stack, config, place)?));
-            }
-            eprintln!(
-                "LEVELS STACKS: the second card failed ({e}); its {again} stack(s) committed on card 0"
-            );
+    if let Some(e) = error {
+        for ((_, stack), p) in second.iter_mut().zip(done) {
+            stack.columns = p.columns;
+            stack.packed = p.packed.or_else(|| stack.packed.take());
         }
+        let again = second.len();
+        for (k, mut stack) in second {
+            let p = commit_one::<H>(&mut stack, config, place).map_err(|retry| {
+                format!("second card failed ({e}); card 0 retry failed ({retry})")
+            })?;
+            out.push((k, p));
+        }
+        eprintln!(
+            "LEVELS STACKS: the second card failed ({e}); its {again} stack(s) committed on card 0"
+        );
+    } else {
+        out.extend(second.into_iter().map(|(k, _)| k).zip(done));
     }
     out.sort_by_key(|(k, _)| *k);
     Ok(out.into_iter().map(|(_, p)| p).collect())
 }
 
-/// A stack made on the second card turned back into what it was committed
-/// from (its commitment let go): its group, its table triples, its columns
-/// and any packed bytes it kept.
-fn stack_back<H: WhirHash>(p: WlfmPrepared<H>, tables: Vec<(usize, usize, usize)>) -> GroupStack {
-    let WlfmPrepared {
-        group,
-        columns,
-        packed,
-        ..
-    } = p;
-    GroupStack {
-        group,
-        tables,
-        columns: columns.into_iter().map(Mle::into_evals).collect(),
-        packed,
-    }
-}
-
+#[cfg(test)]
 std::thread_local! {
-    /// A test's fault in the second card's stack commits, on the thread that
-    /// commits the level: the list stops before its stack at this index,
-    /// taking nothing with it.
-    static SECOND_STACK_FAULT_FOR_TEST: std::cell::Cell<Option<usize>> =
+    static SECOND_STACK_FAULT_FOR_TEST: std::cell::Cell<Option<(usize, SecondStackFault)>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Tests only: [`SECOND_STACK_FAULT_FOR_TEST`] on this thread (`None`: no
-/// fault).
-#[doc(hidden)]
-pub fn set_second_stack_fault_for_test(at: Option<usize>) {
-    SECOND_STACK_FAULT_FOR_TEST.with(|c| c.set(at));
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum SecondStackFault {
+    BeforeCommit,
+    #[cfg(feature = "test-cuda-faults")]
+    Device(multilinear::whir_commit::DeviceStackFault),
 }
 
-/// This thread's test fault in the second card's stack commits.
-fn second_stack_fault_for_test() -> Option<usize> {
-    SECOND_STACK_FAULT_FOR_TEST.with(std::cell::Cell::get)
+#[cfg(test)]
+impl SecondStackFault {
+    fn run_at<T>(
+        fault: Option<(usize, Self)>,
+        index: usize,
+        commit: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        match fault.filter(|&(at, _)| at == index) {
+            Some((_, Self::BeforeCommit)) => Err("a test's second-card fault".into()),
+            #[cfg(feature = "test-cuda-faults")]
+            Some((_, Self::Device(fault))) => fault.inject(commit),
+            None => commit(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_second_stack_fault_for_test(fault: Option<(usize, SecondStackFault)>) {
+    SECOND_STACK_FAULT_FOR_TEST.with(|c| c.set(fault));
 }
 
 /// What a build keeps of each prepared commitment, under any hash.
@@ -1858,9 +1817,7 @@ impl WlfmPrebuild {
             stacks
                 .iter()
                 .map(|stack| {
-                    let raw: Vec<&[FieldElement<F>]> =
-                        stack.columns.iter().map(Vec::as_slice).collect();
-                    multilinear::gpu::pack_store_fields(&raw)
+                    multilinear::gpu::pack_store(&multilinear::stacking::borrow(&stack.columns))
                 })
                 .collect()
         })
@@ -1918,10 +1875,7 @@ impl WlfmPrebuild {
                     for &(position, _, n) in &stack.tables {
                         if position == table {
                             return Some(
-                                stack.columns[at..at + n]
-                                    .iter()
-                                    .map(Vec::as_slice)
-                                    .collect(),
+                                stack.columns[at..at + n].iter().map(Mle::evals).collect(),
                             );
                         }
                         at += n;
@@ -1943,7 +1897,7 @@ impl WlfmPrebuild {
 
     /// Each stack's columns, for a test that compares two prebuilds.
     #[cfg(test)]
-    pub(crate) fn stack_columns_for_test(&self) -> Option<Vec<&[Vec<FieldElement<F>>]>> {
+    pub(crate) fn stack_columns_for_test(&self) -> Option<Vec<&[Mle<F>]>> {
         self.stacks
             .as_ref()
             .map(|stacks| stacks.iter().map(|s| s.columns.as_slice()).collect())
@@ -3598,7 +3552,7 @@ pub fn narrow_store() -> bool {
 /// stack on the card from its columns sent narrow: packed in the level's host
 /// part (beside the base's phase B; at the commit for a build made without
 /// it), widened on the card into a store, the commit reading the store
-/// ([`crate::block_whir::commit_group_narrow`]), where today the commit copies
+/// ([`GroupStack::commit`]), where today the commit copies
 /// the wide columns in. `2` is the same with each packed run copied through
 /// the card's pinned staging ([`narrow_commit_staged`]). A retired stack keeps
 /// its packed bytes on the host, and under [`NARROW_STORE_ENV`] its opening's
@@ -4085,6 +4039,7 @@ pub fn table_shapes(airs: &[DynLfmAir<'_>], table_num_vars: &[u8]) -> Vec<(usize
 #[cfg(test)]
 pub(crate) mod test_format {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use multilinear::whir_chain::{ChainConfig, GrindBits};
 
@@ -4096,6 +4051,49 @@ pub(crate) mod test_format {
         static CHIP_RECORDS: Cell<Option<bool>> = const { Cell::new(None) };
         static LEAN_BESIDE: Cell<Option<bool>> = const { Cell::new(None) };
         static GROUP_POLYS: Cell<Option<usize>> = const { Cell::new(None) };
+        static STACK_LOG: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// The levels driver builds on scoped threads. Tests that use these
+    /// options run alone, so the base, those threads and the verifier agree.
+    static DRIVER_OPTIONS: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) struct DriverOptions(bool);
+
+    impl Drop for DriverOptions {
+        fn drop(&mut self) {
+            DRIVER_OPTIONS.store(self.0, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn set_driver_options() -> DriverOptions {
+        DriverOptions(DRIVER_OPTIONS.swap(true, Ordering::Relaxed))
+    }
+
+    pub(crate) fn apply_driver_options(mut config: ChainConfig) -> ChainConfig {
+        if DRIVER_OPTIONS.load(Ordering::Relaxed) {
+            let options = super::ProofOptions::default_test_options();
+            config.num_queries = options.fri_number_of_queries;
+            config.grind.folding = config.grind.folding.min(options.grinding_factor);
+            config.grind.ood = config.grind.ood.min(options.grinding_factor);
+            config.grind.query = config.grind.query.min(options.grinding_factor);
+        }
+        config
+    }
+
+    #[cfg(feature = "test-cuda-faults")]
+    pub(crate) struct StackLog(Option<usize>);
+
+    #[cfg(feature = "test-cuda-faults")]
+    impl Drop for StackLog {
+        fn drop(&mut self) {
+            STACK_LOG.with(|c| c.set(self.0));
+        }
+    }
+
+    #[cfg(feature = "test-cuda-faults")]
+    pub(crate) fn set_stack_log(log: usize) -> StackLog {
+        StackLog(STACK_LOG.with(|c| c.replace(Some(log))))
     }
 
     /// Every W-LFM build and verify on this thread groups `polys` stacked
@@ -4212,7 +4210,14 @@ pub(crate) mod test_format {
     }
 
     pub(super) fn apply(config: ChainConfig) -> ChainConfig {
-        let mut config = config;
+        let mut config = apply_driver_options(config);
+        let stack_log = STACK_LOG
+            .with(Cell::get)
+            .or_else(|| DRIVER_OPTIONS.load(Ordering::Relaxed).then_some(15));
+        if let Some(log) = stack_log {
+            config.format.stack =
+                multilinear::whir_chain::StackVars::new(log).expect("test stack cap");
+        }
         if UNGROUND.with(Cell::get) {
             config.grind = GrindBits::uniform(0);
         }

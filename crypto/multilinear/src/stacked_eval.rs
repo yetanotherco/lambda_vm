@@ -511,6 +511,14 @@ where
                 domain = Some(d);
             }
         }
+        #[cfg(feature = "test-cuda-faults")]
+        if commitments.iter().any(|c| c.codeword().on_device())
+            && crate::whir_commit::DeviceStackFault::Commit.take()
+        {
+            return Err(Error::DeviceFailed {
+                stage: "committing a prepared stack on CUDA (injected)",
+            });
+        }
         // ★ THE COMMITS ARE OVER, SO IS THEIR TURN. What runs next is the
         // per-table argument — the whole of it, every table — and only then
         // the openings; the argument reserves against the same budget and

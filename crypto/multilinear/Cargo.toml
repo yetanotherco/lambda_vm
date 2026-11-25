@@ -31,3 +31,4 @@ math-cuda = { path = "../math-cuda", optional = true }
 parallel = ["dep:rayon", "math/parallel", "crypto/parallel"]
 # The device path: the grind through `crypto`, the kernels through `math-cuda`.
 cuda = ["crypto/cuda", "dep:math-cuda"]
+test-cuda-faults = ["cuda"]

@@ -38,6 +38,43 @@ pub type Commitment = [u8; 32];
 type Backend<F, H> = <H as WhirHash>::Backend<F>;
 type Tree<F, H> = MerkleTree<Backend<F, H>>;
 
+/// A fault injected on the thread committing one prepared stack.
+#[cfg(feature = "test-cuda-faults")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum DeviceStackFault {
+    Commit,
+    Retire,
+}
+
+#[cfg(feature = "test-cuda-faults")]
+thread_local! {
+    static DEVICE_STACK_FAULT: std::cell::Cell<Option<DeviceStackFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "test-cuda-faults")]
+impl DeviceStackFault {
+    pub fn inject<T>(self, commit: impl FnOnce() -> T) -> T {
+        struct Restore(Option<DeviceStackFault>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DEVICE_STACK_FAULT.with(|fault| fault.set(self.0));
+            }
+        }
+        let _restore = Restore(DEVICE_STACK_FAULT.with(|fault| fault.replace(Some(self))));
+        let result = commit();
+        assert!(
+            DEVICE_STACK_FAULT.with(|fault| fault.get().is_none()),
+            "no CUDA stack fault fired"
+        );
+        result
+    }
+
+    pub(crate) fn take(self) -> bool {
+        DEVICE_STACK_FAULT.with(|fault| fault.get() == Some(self) && fault.take().is_some())
+    }
+}
+
 /// Where a chain's round-0 trees put their leaves.
 ///
 /// [`Natural`](Self::Natural) is today's: block `j` (the coset that folds onto
@@ -1099,6 +1136,12 @@ where
                 });
             }
         };
+        #[cfg(feature = "test-cuda-faults")]
+        if on_device && DeviceStackFault::Retire.take() {
+            return Err(Error::DeviceFailed {
+                stage: "reading back a prepared stack's tree top (injected)",
+            });
+        }
         if nodes.len() != keep || nodes.first() != Some(&self.tree.root) {
             return Err(Error::RecomputedCodewordMismatch { block: 0 });
         }
