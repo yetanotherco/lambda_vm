@@ -1140,6 +1140,16 @@ fn narrow_parts(
     }
 }
 
+fn prepared_device_failed(card: Option<usize>, error: &multilinear::Error) -> String {
+    if let Some(card) = card
+        && matches!(error, multilinear::Error::DeviceFailed { .. })
+    {
+        multilinear::gpu::mark_indexed_card_failed(card, "its prepared stack failed");
+        return format!("prepared stack on card {card}: ");
+    }
+    String::new()
+}
+
 enum PreparedHold<H: WhirHash> {
     Held(multilinear::stacked_eval::StackedCommitment<F, H>),
     Retired(multilinear::stacked_eval::RetiredStack<F>),
@@ -1167,11 +1177,15 @@ impl<H: WhirHash> WlfmPrepared<H> {
         p: GroupPrepared<H>,
         drop: multilinear::whir_commit::TreeDrop,
         config: &ChainConfig,
+        card: Option<usize>,
     ) -> Result<Self, String> {
-        let retired = p
-            .commitment
-            .retire(drop, config)
-            .map_err(|e| format!("group {}: retiring its prepared stack: {e:?}", p.group))?;
+        let retired = p.commitment.retire(drop, config).map_err(|e| {
+            let backend = prepared_device_failed(card, &e);
+            format!(
+                "{backend}group {}: retiring its prepared stack: {e:?}",
+                p.group
+            )
+        })?;
         if retired.roots() != p.roots {
             return Err(format!(
                 "group {}: a retired prepared stack's roots moved",
@@ -1252,18 +1266,22 @@ fn commit_under<H: WhirHash>(
     let drop = crate::block_whir::tree_drop_for_chain(config);
     let narrow = narrow_commit();
     let staged = narrow && narrow_commit_staged();
-    let commit = |card, stack| {
+    let commit = |card: Option<usize>, stack| {
         let p = if narrow {
             crate::block_whir::commit_group_narrow::<H>(stack, config, staged)
         } else {
             commit_group::<H>(stack, config)
         }
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| {
+            let backend = prepared_device_failed(card, &e.source);
+            let e = crate::Error::from(e);
+            format!("{backend}{e:?}")
+        })?;
         match place {
-            StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config),
+            StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config, card),
             _ => {
                 let mut prepared = WlfmPrepared::held(p);
-                prepared.card = card;
+                prepared.card = card.unwrap_or(0);
                 Ok(prepared)
             }
         }
@@ -1279,7 +1297,7 @@ fn commit_under<H: WhirHash>(
             stacks,
             &cards,
             &stack_lanes,
-            |card, _, stack| commit(card, stack),
+            |card, _, stack| commit(Some(card), stack),
             |card| {
                 multilinear::gpu::mark_indexed_card_failed(
                     card,
@@ -1290,7 +1308,10 @@ fn commit_under<H: WhirHash>(
         );
     }
     // In compatibility mode, release each retired stack before the next one.
-    stacks.into_iter().map(|stack| commit(0, stack)).collect()
+    stacks
+        .into_iter()
+        .map(|stack| commit(None, stack))
+        .collect()
 }
 
 fn level_group_prices(artifacts: &WlfmArtifacts) -> Vec<u64> {

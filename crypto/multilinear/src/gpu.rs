@@ -1514,6 +1514,16 @@ pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether the process opted in to indexed placement.
+pub fn has_indexed_cards() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::card_set().has_explicit_cards()
+    }
+    #[cfg(not(feature = "cuda"))]
+    false
+}
+
 /// Snapshot the explicit topology and prepare every eligible worker.
 pub fn indexed_cards() -> Result<Option<Vec<usize>>, String> {
     #[cfg(feature = "cuda")]
@@ -1549,6 +1559,9 @@ pub fn settle_peer_cards(trim: bool) {
     #[cfg(feature = "cuda")]
     {
         let cards = math_cuda::device::card_set();
+        if !cards.has_explicit_cards() {
+            return;
+        }
         let mut seen = std::collections::BTreeSet::new();
         if let Some(main) = cards.started(0) {
             seen.insert(main.ordinal());

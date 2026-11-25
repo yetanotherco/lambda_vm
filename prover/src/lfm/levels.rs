@@ -1302,14 +1302,69 @@ fn card_pad_bytes() -> Result<u64, String> {
         .clone()
 }
 
-// The level driver owns these overrides from the base's end through the
-// last level, including any scoped commit threads.
-static LEVELS_LEDGER_EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static MAIN_PAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The levels' pad, while the driver holds it, and its size.
+static LEVELS_PAD: std::sync::Mutex<Option<(multilinear::gpu::DeviceRoom, u64)>> =
+    std::sync::Mutex::new(None);
 
+/// The bytes of the levels' pad held now (0 when none).
 fn levels_pad_held() -> u64 {
-    MAIN_PAD_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+    if multilinear::gpu::has_indexed_cards() {
+        return INDEXED_MAIN_PAD_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    LEVELS_PAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(_, b)| *b)
 }
+
+/// Takes the levels' pad ([`CARD_PAD_ENV`]): the bytes held, 0 when there is
+/// none to take or no card, or the ledger would not promise it.
+fn take_levels_pad() -> Result<u64, String> {
+    let bytes = card_pad_bytes()?;
+    if bytes == 0 {
+        return Ok(0);
+    }
+    let held = multilinear::gpu::reserve_room(bytes).map(|room| (room, bytes));
+    let got = held.as_ref().map_or(0, |(_, b)| *b);
+    *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = held;
+    // Under the levels' split (`LAMBDA_VM_TWO_CARD_LEVELS`) the levels prove
+    // on the second card too: the same pad there, promised in the second
+    // role so it is that card's ledger's (and goes back to it when dropped).
+    // A pad the second ledger refuses is not held there; the bytes returned
+    // stay card 0's.
+    if multilinear::gpu::two_card_levels_on() && multilinear::gpu::two_card_split_ready() {
+        let second = multilinear::gpu::in_second_role(|| multilinear::gpu::reserve_room(bytes))
+            .map(|room| (room, bytes));
+        *SECOND_LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = second;
+    }
+    Ok(got)
+}
+
+/// The levels' pad on the second card, under the levels' split, while the
+/// driver holds it ([`take_levels_pad`]).
+static SECOND_LEVELS_PAD: std::sync::Mutex<Option<(multilinear::gpu::DeviceRoom, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Gives the levels' pad back, on both cards.
+fn release_levels_pad() {
+    *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SECOND_LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Gives the levels' pad back when the driver returns, by any path.
+struct PadRelease;
+
+impl Drop for PadRelease {
+    fn drop(&mut self) {
+        release_levels_pad();
+    }
+}
+
+// Indexed overrides span the base's end through the last level, including
+// scoped commit threads. Legacy callers retain their original ledger path.
+static LEVELS_LEDGER_EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static INDEXED_MAIN_PAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `LAMBDA_VM_LEVELS_CARD_BUDGET_PCT=<percent>`: from the base's end to the
 /// driver's return, the card ledger's budget is this share of the card's
@@ -1361,45 +1416,103 @@ fn card_budget_pct() -> Result<Option<u64>, String> {
     .clone()
 }
 
+/// The base's budget while the levels' own is in force ([`CARD_BUDGET_ENV`]).
+static BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Under the levels' split (`LAMBDA_VM_TWO_CARD_LEVELS`): the second card's
+/// budget before the levels' was put in force there too.
+static SECOND_BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Puts the levels' budget in force ([`CARD_BUDGET_ENV`], 85 % by default) on
+/// a card of `total` bytes: the budget now (unchanged without a card, or when
+/// the process set its own card budget and the knob says nothing).
+fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
+    let (Some(pct), Some(total)) = (card_budget_pct()?, total) else {
+        return Ok(multilinear::gpu::reserve_budget());
+    };
+    // The levels' split (`LAMBDA_VM_TWO_CARD_LEVELS`) argues and opens on the
+    // second card as well: the same share there (the cards are alike), its own
+    // budget back at the return; two backends on one card (forced, one card)
+    // get half each, as at the second backend's start. Asked only with the
+    // levels' knob on; ready makes the second backend if the prove's set-up
+    // has not yet.
+    let split = multilinear::gpu::two_card_levels_on() && multilinear::gpu::two_card_split_ready();
+    let bytes = match split && multilinear::gpu::second_shares_card_0() {
+        true => total / 100 * pct / 2,
+        false => total / 100 * pct,
+    };
+    let base = multilinear::gpu::set_reserve_budget(bytes);
+    let mut held = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_none() {
+        *held = Some(base);
+    }
+    if split && let Some(second) = multilinear::gpu::set_second_reserve_budget(bytes) {
+        let mut held2 = SECOND_BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if held2.is_none() {
+            *held2 = Some(second);
+        }
+        eprintln!(
+            "LEVELS CARD budget on the second card: {:.2} GiB (LAMBDA_VM_TWO_CARD_LEVELS), its {:.2} GiB \
+             back at the driver's return",
+            bytes as f64 / (1u64 << 30) as f64,
+            held2.unwrap_or(second) as f64 / (1u64 << 30) as f64
+        );
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "LEVELS CARD budget: {:.2} GiB ({pct} % of {:.2}) for the levels, the base's {:.2} GiB back at \
+         the driver's return",
+        gib(bytes),
+        gib(total),
+        gib(held.unwrap_or(base))
+    );
+    Ok(bytes)
+}
+
+/// Puts the base's budget back, if the levels' was in force.
+fn release_levels_budget() {
+    if let Some(base) = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        multilinear::gpu::set_reserve_budget(base);
+    }
+    if let Some(second) = SECOND_BASE_BUDGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        multilinear::gpu::set_second_reserve_budget(second);
+    }
+}
+
+/// Puts the base's budget back when the driver returns, by any path.
+struct BudgetRelease;
+
+impl Drop for BudgetRelease {
+    fn drop(&mut self) {
+        release_levels_budget();
+    }
+}
+
 #[derive(Default)]
-struct LevelsMemory {
+struct IndexedLevelsMemory {
     pads: Vec<multilinear::gpu::DeviceRoom>,
     budgets: Vec<multilinear::gpu::CardBudget>,
 }
 
-impl LevelsMemory {
-    fn activate(&mut self, main_total: Option<u64>) -> Result<(), String> {
+impl IndexedLevelsMemory {
+    fn activate(&mut self) -> Result<(), String> {
         use multilinear::gpu;
 
         let pct = card_budget_pct()?;
         let pad = card_pad_bytes()?;
-        let indexed = gpu::indexed_cards()?;
-        let legacy_split = indexed.is_none()
-            && gpu::two_card_levels_on()
-            && (main_total.is_some() && pct.is_some() || pad != 0)
-            && gpu::two_card_split_ready();
-        let cards = indexed.unwrap_or_else(|| if legacy_split { vec![0, 1] } else { vec![0] });
-        let devices: Vec<_> = cards.iter().map(|&card| gpu::card_memory(card)).collect();
+        let cards = gpu::indexed_cards()?.expect("explicit card list");
         let mut physical = std::collections::BTreeSet::new();
-        for (&card, device) in cards.iter().zip(&devices) {
-            if let (Some(pct), Some((ordinal, total))) = (pct, *device)
-                && (main_total.is_some() || card != 0)
-            {
-                let whole = total / 100 * pct;
-                let shares = if legacy_split {
-                    devices
-                        .iter()
-                        .flatten()
-                        .filter(|&&(o, _)| o == ordinal)
-                        .count() as u64
-                } else {
-                    1
-                };
-                let bytes = whole / shares;
+        for card in cards {
+            if let (Some(pct), Some((ordinal, total))) = (pct, gpu::card_memory(card)) {
+                let bytes = total / 100 * pct;
                 if let Some(budget) = gpu::override_card_budget(
                     card,
                     bytes,
-                    physical.insert(ordinal).then_some(whole),
+                    physical.insert(ordinal).then_some(bytes),
                 ) {
                     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
                     if card == 0 {
@@ -1427,7 +1540,7 @@ impl LevelsMemory {
                 };
                 if let Some(room) = room {
                     if card == 0 {
-                        MAIN_PAD_BYTES.store(pad, std::sync::atomic::Ordering::Relaxed);
+                        INDEXED_MAIN_PAD_BYTES.store(pad, std::sync::atomic::Ordering::Relaxed);
                     }
                     self.pads.push(room);
                 }
@@ -1437,13 +1550,26 @@ impl LevelsMemory {
     }
 }
 
-impl Drop for LevelsMemory {
+impl Drop for IndexedLevelsMemory {
     fn drop(&mut self) {
         self.pads.clear();
-        MAIN_PAD_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        INDEXED_MAIN_PAD_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
         while let Some(budget) = self.budgets.pop() {
             drop(budget);
         }
+    }
+}
+
+fn activate_levels_memory(
+    memory: &mut Option<IndexedLevelsMemory>,
+    total: Option<u64>,
+) -> Result<(), String> {
+    if let Some(memory) = memory {
+        memory.activate()
+    } else {
+        take_levels_budget(total)?;
+        take_levels_pad()?;
+        Ok(())
     }
 }
 
@@ -1657,6 +1783,63 @@ fn settle_base_end(late: bool) -> (Option<CardReading>, f64, bool) {
     multilinear::gpu::settle_peer_cards(!late);
     let reading = card_settle_on("base end", !late);
     (reading, t.elapsed().as_secs_f64(), !late)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[test]
+#[ignore = "card: legacy split ready, run once per tail setting"]
+fn legacy_levels_preserve_primary_budget_and_settle_counts() {
+    use math_cuda::device;
+    use multilinear::gpu;
+
+    assert!(!gpu::has_indexed_cards());
+    assert!(gpu::two_card_levels_on() && gpu::two_card_split_ready());
+    assert_eq!(card_budget_pct(), Ok(Some(85)));
+    let original = || {
+        (
+            gpu::reserve_budget(),
+            gpu::in_second_role(gpu::reserve_budget),
+        )
+    };
+    let base_budgets = original();
+    // e2bb5f79f used the base-end reading from the primary for both
+    // budgets, regardless of the secondary's actual total VRAM.
+    let second_total =
+        gpu::in_second_role(|| device::backend().unwrap().device_mem_info().unwrap().1);
+    let primary_total = if second_total == 24 << 30 {
+        48 << 30
+    } else {
+        24 << 30
+    };
+    {
+        let _restore = BudgetRelease;
+        let _pad = PadRelease;
+        activate_levels_memory(&mut None, Some(primary_total)).unwrap();
+        let bytes = 85 * (primary_total / 100);
+        let expected = if gpu::second_shares_card_0() {
+            bytes / 2
+        } else {
+            bytes
+        };
+        assert_eq!(original(), (expected, expected));
+    }
+    assert_eq!(original(), base_budgets);
+
+    let untrimmed = super::wlfm_knobs::levels_untrimmed();
+    let drains = device::trims();
+    let readings = untrimmed_readings();
+    let (reading, _, trimmed) = settle_base_end(untrimmed);
+    assert!(reading.is_some());
+    assert_eq!(trimmed, !untrimmed);
+    assert_eq!(device::trims() - drains, 1);
+    assert!(card_settle_levels("level 1 committed").is_some());
+    assert_eq!(device::trims() - drains, 2);
+    assert!(card_settle_levels("level 1 proved").is_some());
+    assert_eq!(device::trims() - drains, 3);
+    assert_eq!(
+        untrimmed_readings() - readings,
+        if untrimmed { 3 } else { 0 }
+    );
 }
 
 /// This process's resident set, in bytes (Linux; `None` elsewhere).
@@ -2752,10 +2935,18 @@ pub fn prove_block_levels(
     };
     card_pad_bytes()?;
     card_budget_pct()?;
-    let _memory_exclusive = LEVELS_LEDGER_EXCLUSIVE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut levels_memory = LevelsMemory::default();
+    let indexed = multilinear::gpu::has_indexed_cards();
+    let _memory_exclusive = indexed.then(|| {
+        LEVELS_LEDGER_EXCLUSIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    });
+    let (_pad, _budget) = if indexed {
+        (None, None)
+    } else {
+        (Some(PadRelease), Some(BudgetRelease))
+    };
+    let mut levels_memory = indexed.then(IndexedLevelsMemory::default);
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
     let at_start = if keep { None } else { card_settle("start") };
@@ -3229,7 +3420,7 @@ pub fn prove_block_levels(
                         return Err("the base did not prove".to_string());
                     }
                     let (settled, settle_secs, trimmed) = settle_base_end(late);
-                    levels_memory.activate(settled.map(|c| c.total))?;
+                    activate_levels_memory(&mut levels_memory, settled.map(|c| c.total))?;
                     let build = commit_level(pre, 1)?;
                     let committed = card_settle_levels("level 1 committed");
                     Ok((
@@ -3341,7 +3532,7 @@ pub fn prove_block_levels(
             let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
             let (settled, settle_secs, trimmed) =
                 settle_base_end(settle_late() || super::wlfm_knobs::levels_untrimmed());
-            levels_memory.activate(settled.map(|c| c.total))?;
+            activate_levels_memory(&mut levels_memory, settled.map(|c| c.total))?;
             let build = commit_level(pre, 1)?;
             let committed = card_settle_levels("level 1 committed");
             (

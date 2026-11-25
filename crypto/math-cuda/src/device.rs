@@ -993,22 +993,21 @@ pub fn window_high_water() -> u64 {
 /// it MUST NOT call `reserve` or `grow` — those would re-enter the allocator that
 /// called it and deadlock.
 ///
-/// It takes the asking backend's slot ([`CardId::index`]) and frees only
-/// layers whose promise is that slot's: another card's layers give no room on
-/// this card.
-static EVICTOR: OnceLock<fn(u64, usize) -> u64> = OnceLock::new();
+/// The predicate selects which reservation owners can cover the deficit.
+type RetentionEvictor = fn(u64, &dyn Fn(usize) -> bool) -> u64;
+static EVICTOR: OnceLock<RetentionEvictor> = OnceLock::new();
 
 /// Install the retention evictor. Idempotent — only the first install sticks.
-pub fn set_retention_evictor(evictor: fn(u64, usize) -> u64) {
+pub fn set_retention_evictor(evictor: RetentionEvictor) {
     let _ = EVICTOR.set(evictor);
 }
 
-/// Ask the retention to give back at least `target` bytes of `slot`'s budget;
+/// Ask the retention to give back at least `target` bytes from eligible owners;
 /// returns how many it freed (0 if none is installed or nothing was
 /// reclaimable).
-fn try_evict_retained(target: u64, slot: usize) -> u64 {
+fn try_evict_retained(target: u64, eligible: impl Fn(usize) -> bool) -> u64 {
     match EVICTOR.get() {
-        Some(evict) => evict(target, slot),
+        Some(evict) => evict(target, &eligible),
         None => 0,
     }
 }
@@ -1115,6 +1114,11 @@ fn charge(held: &AtomicU64, limit: &AtomicU64, bytes: u64) -> std::result::Resul
             Err(seen) => current = seen,
         }
     }
+}
+
+enum RoomDeficit {
+    Backend(u64),
+    Physical(u64),
 }
 
 impl Backend {
@@ -1617,33 +1621,48 @@ impl Backend {
     /// [`Self::reserve`], asking the retention for spare bytes on a miss only
     /// when `evict`.
     fn reserve_with(&self, bytes: u64, evict: bool) -> Option<DeviceReservation> {
-        if let Err(deficit) = self.take_room(bytes) {
-            // A cache may give back genuinely spare leaf layers. Retry once
-            // after owner-local eviction, outside the reservation operation.
-            if !evict || try_evict_retained(deficit, self.id.index()) == 0 {
-                return None;
-            }
-            self.take_room(bytes).ok()?;
+        let mut room = self.take_room(bytes);
+        if evict
+            && let Err(RoomDeficit::Backend(deficit)) = room
+            && try_evict_retained(deficit, |owner| owner == self.id.index()) != 0
+        {
+            room = self.take_room(bytes);
         }
+        if evict
+            && let Err(RoomDeficit::Physical(deficit)) = room
+            && try_evict_retained(deficit, |owner| {
+                card_set()
+                    .started(owner)
+                    .is_some_and(|backend| Arc::ptr_eq(&backend.physical, &self.physical))
+            }) != 0
+        {
+            room = self.take_room(bytes);
+        }
+        room.ok()?;
         Some(DeviceReservation {
             bytes: AtomicU64::new(bytes),
             slot: self.id,
         })
     }
 
-    fn take_room(&self, bytes: u64) -> std::result::Result<(), u64> {
+    fn take_room(&self, bytes: u64) -> std::result::Result<(), RoomDeficit> {
         // Check both the backend's share and the physical GPU's ceiling.
-        let total = charge(&self.reserved, &self.vram_budget_bytes, bytes)?;
-        if let Err(deficit) = charge(&self.physical.reserved, &self.physical.limit, bytes) {
+        let total =
+            charge(&self.reserved, &self.vram_budget_bytes, bytes).map_err(RoomDeficit::Backend)?;
+        if self.physical.shared
+            && let Err(deficit) = charge(&self.physical.reserved, &self.physical.limit, bytes)
+        {
             self.reserved.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(deficit);
+            return Err(RoomDeficit::Physical(deficit));
         }
         self.peaks.note(total);
         Ok(())
     }
 
     fn give_room(&self, bytes: u64) {
-        self.physical.reserved.fetch_sub(bytes, Ordering::Relaxed);
+        if self.physical.shared {
+            self.physical.reserved.fetch_sub(bytes, Ordering::Relaxed);
+        }
         self.reserved.fetch_sub(bytes, Ordering::Relaxed);
     }
 
@@ -1983,14 +2002,16 @@ impl CardId {
 }
 
 struct PhysicalLedger {
+    shared: bool,
     recursion: Mutex<()>,
     limit: AtomicU64,
     reserved: AtomicU64,
 }
 
-impl Default for PhysicalLedger {
-    fn default() -> Self {
+impl PhysicalLedger {
+    fn new(shared: bool) -> Self {
         Self {
+            shared,
             recursion: Mutex::new(()),
             limit: AtomicU64::new(u64::MAX),
             reserved: AtomicU64::new(0),
@@ -2073,6 +2094,11 @@ impl CardSet {
         &self.entries[id.index()]
     }
 
+    /// Whether a card list was supplied.
+    pub fn has_explicit_cards(&self) -> bool {
+        !matches!(self.configured, Ok(None))
+    }
+
     /// Explicit topology for a new phase, excluding quarantined workers.
     pub fn configured_indices(&self) -> std::result::Result<Option<Vec<usize>>, String> {
         let cards = self.configured.as_ref().map_err(Clone::clone)?;
@@ -2132,18 +2158,18 @@ impl CardSet {
             .and_then(|cards| cards.get(id.index()).or_else(|| cards.first()))
             .copied()
             .unwrap_or(legacy_ordinal);
+        let aliases = configured
+            .as_ref()
+            .is_some_and(|cards| cards.iter().filter(|&&o| o == ordinal).count() > 1);
         let physical = self
             .physical
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(ordinal)
-            .or_default()
+            .or_insert_with(|| Arc::new(PhysicalLedger::new(aliases)))
             .clone();
         let be = Backend::init_on(id, ordinal, physical)?;
-        let aliases = configured.as_ref().map_or(1, |cards| {
-            cards.iter().filter(|&&o| o == ordinal).count() as u64
-        });
-        if aliases > 1 {
+        if aliases {
             // Explicit aliases can use a peer's idle room, up to the same
             // physical ceiling. The legacy forced slot keeps its fixed half.
             be.physical
@@ -2155,7 +2181,6 @@ impl CardSet {
         {
             // The legacy forced second lane appears after the main backend.
             let whole = main.vram_budget_bytes();
-            main.physical.limit.store(whole, Ordering::Relaxed);
             main.set_vram_budget_bytes(whole / 2);
             be.set_vram_budget_bytes(be.vram_budget_bytes().min(whole / 2));
             eprintln!(

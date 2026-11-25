@@ -393,6 +393,19 @@ fn indexed_cards_assemble_shuffled_phase_b() {
     let topology = multilinear::gpu::indexed_cards()
         .expect("configured backends initialize")
         .expect("set LAMBDA_VM_CARDS");
+    let ordinals: Vec<usize> = std::env::var("LAMBDA_VM_CARDS")
+        .expect("explicit list")
+        .split(',')
+        .map(|ordinal| ordinal.trim().parse().expect("CUDA ordinal"))
+        .collect();
+    for (&card, ordinal) in topology.iter().zip(ordinals) {
+        assert_eq!(
+            multilinear::gpu::card_memory(card)
+                .expect("backend memory")
+                .0,
+            ordinal
+        );
+    }
     let argue = ArgueFormat::PerTable;
     let keep = [false; SIZES.len()];
     let (serial, baseline) = prove_split(
@@ -405,6 +418,7 @@ fn indexed_cards_assemble_shuffled_phase_b() {
         OverlapFaults::default(),
     );
     let reversed: Vec<_> = in_order().into_iter().rev().collect();
+    let declines = multilinear::gpu::cross_card_declines();
     let (shuffled, pieces) = prove_split(
         argue,
         PhaseBOverlap::On,
@@ -419,6 +433,7 @@ fn indexed_cards_assemble_shuffled_phase_b() {
     ran.sort_unstable();
     ran.dedup();
     assert_eq!(ran, topology);
+    assert_eq!(multilinear::gpu::cross_card_declines(), declines);
     assert_ne!(
         pieces.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
         in_order()
@@ -429,6 +444,60 @@ fn indexed_cards_assemble_shuffled_phase_b() {
         bytes(&serial.expect("serial reference proves"))
     );
     verify(argue, &shuffled).expect("verifies");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: two explicit backends, openings and retention off"]
+fn indexed_secondary_admission_fallback_preserves_proof_bytes() {
+    use multilinear::gpu;
+
+    let topology = gpu::indexed_cards().unwrap().expect("set LAMBDA_VM_CARDS");
+    assert_eq!(topology, [0, 1]);
+    let prove = || {
+        let (result, _) = prove_split(
+            ArgueFormat::PerTable,
+            PhaseBOverlap::Off,
+            &in_order(),
+            true,
+            Split::OptedIn,
+            &[false; SIZES.len()],
+            OverlapFaults::default(),
+        );
+        let proof = result.expect("both drivers prove");
+        let used = cards(&proof);
+        assert!(used.contains(&0) && used.contains(&1));
+        verify(ArgueFormat::PerTable, &proof).expect("verifies");
+        proof
+    };
+    let declines = gpu::cross_card_declines();
+    let baseline = prove();
+    let refusals = gpu::room_revive_refusals();
+    let _tight = gpu::override_card_budget(1, 1, None).expect("secondary has a ledger");
+    let fallback = prove();
+    assert!(
+        gpu::room_revive_refusals() > refusals,
+        "revive room refused"
+    );
+    assert_eq!(gpu::cross_card_declines(), declines);
+    assert_eq!(bytes(&fallback), bytes(&baseline));
+    let archives = |proof: &BlockProved<Fp, Ext>| {
+        use rkyv::{rancor::Error, to_bytes};
+        [
+            to_bytes::<Error>(&proof.0).unwrap(),
+            to_bytes::<Error>(&proof.1).unwrap(),
+            to_bytes::<Error>(&proof.2).unwrap(),
+            to_bytes::<Error>(&proof.4).unwrap(),
+            to_bytes::<Error>(&proof.5).unwrap(),
+        ]
+    };
+    assert!(
+        archives(&fallback)
+            .iter()
+            .zip(&archives(&baseline))
+            .all(|(fallback, baseline)| fallback.as_slice() == baseline.as_slice()),
+        "secondary admission fallback changed the raw archives"
+    );
 }
 
 /// Run with four aliases and retention disabled, in its own process because
@@ -467,6 +536,63 @@ fn indexed_driver_error_joins_and_releases_its_work() {
     ));
     assert_eq!(held(), before, "every driver's promises have been returned");
     assert_eq!(gpu::indexed_cards().unwrap().unwrap().len(), 3);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: two explicit backends, openings auto, retention off"]
+fn migrated_opening_error_quarantines_its_backend_and_allows_a_fresh_prove() {
+    use math_cuda::device;
+    use multilinear::gpu;
+
+    let topology = gpu::indexed_cards().unwrap().expect("set LAMBDA_VM_CARDS");
+    assert_eq!(topology, [0, 1]);
+    assert!(
+        gpu::two_card_openings(),
+        "set LAMBDA_VM_TWO_CARD_OPENINGS=auto"
+    );
+    let prove = |faults| {
+        prove_split(
+            ArgueFormat::PerTable,
+            PhaseBOverlap::On,
+            &in_order(),
+            true,
+            Split::OptedIn,
+            &[true, true, true, true, true, true, false],
+            faults,
+        )
+        .0
+    };
+    let settled = || {
+        topology
+            .iter()
+            .map(|&card| {
+                gpu::in_indexed_card(card, || {
+                    device::drain_untrimmed().unwrap();
+                    (gpu::ledger_reserved(), device::pool_used_bytes().unwrap().0)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let warm = prove(OverlapFaults::default()).expect("warm proof");
+    assert_eq!(cards(&warm), [0, 0, 0, 0, 0, 0, 1]);
+    let baseline = settled();
+    let failed = prove(OverlapFaults {
+        migrated_open_fails: Some(0),
+        ..OverlapFaults::default()
+    });
+    assert!(matches!(
+        failed,
+        Err(MlError::DeviceFailed {
+            stage: "a test's migrated opening after upload",
+        })
+    ));
+    assert_eq!(gpu::indexed_cards().unwrap().unwrap(), [0]);
+    assert_eq!(settled(), baseline);
+    let fresh = prove(OverlapFaults::default()).expect("fresh proof with card 0 pins");
+    assert_eq!(cards(&fresh), [0; SIZES.len()]);
+    verify(ArgueFormat::PerTable, &fresh).expect("fresh proof verifies");
+    assert_eq!(bytes(&fresh), bytes(&warm));
 }
 
 #[cfg(feature = "cuda")]

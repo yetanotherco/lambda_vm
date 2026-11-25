@@ -325,7 +325,7 @@ fn a_level_with_its_stacks_held_stays_on_card_0_under_the_split() {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "card: run alone with four aliases"]
+#[ignore = "card: run alone with two or four explicit backends"]
 fn indexed_level_prepared_stacks_follow_their_groups() {
     let _fast = test_format::set(Some(2));
     let _groups = test_format::set_group_polys(1);
@@ -335,7 +335,8 @@ fn indexed_level_prepared_stacks_follow_their_groups() {
     let topology = multilinear::gpu::indexed_cards()
         .unwrap()
         .expect("set LAMBDA_VM_CARDS");
-    assert_eq!(topology.len(), 4);
+    assert!(matches!(topology.len(), 2 | 4));
+    let declines = multilinear::gpu::cross_card_declines();
     let prove = |place| {
         let build = build_wlfm_placed(
             &program,
@@ -346,8 +347,8 @@ fn indexed_level_prepared_stacks_follow_their_groups() {
         )
         .expect("level stacks build");
         assert!(
-            build.artifacts.sizes.len() >= 4,
-            "the fixture needs four groups"
+            build.artifacts.sizes.len() >= topology.len(),
+            "the fixture needs a group for each backend"
         );
         let filled = execute_and_fill_unmerged(&program, &arenas, hasher).expect("executes");
         let proof = prove_wlfm_traces_as(&build, filled, true, WlfmProving::Streamed)
@@ -386,4 +387,66 @@ fn indexed_level_prepared_stacks_follow_their_groups() {
             "{place:?} changed the canonical proof bytes",
         );
     }
+    assert_eq!(multilinear::gpu::cross_card_declines(), declines);
+}
+
+#[cfg(feature = "test-cuda-faults")]
+#[test]
+#[ignore = "card: two explicit backends, retention off"]
+fn prepared_retirement_error_quarantines_its_backend_and_allows_a_fresh_prove() {
+    use math_cuda::device;
+    use multilinear::gpu;
+
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let _stack = test_format::set_stack_log(12);
+    let topology = gpu::indexed_cards().unwrap().expect("set LAMBDA_VM_CARDS");
+    assert_eq!(topology, [0, 1]);
+    let (program, arenas) = super::levels_probe::level_program(4, 16);
+    let hasher = HasherKind::Poseidon1W16;
+    let build = || {
+        build_wlfm_placed(
+            &program,
+            hasher,
+            WlfmRate::Two,
+            WlfmLevers::with_family(WlfmFamily::B3),
+            StackPlace::CardRetired,
+        )
+    };
+    let settled = || {
+        topology
+            .iter()
+            .map(|&card| {
+                gpu::in_indexed_card(card, || {
+                    device::drain_untrimmed().unwrap();
+                    (gpu::ledger_reserved(), device::pool_used_bytes().unwrap().0)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    drop(build().expect("warm device commits"));
+    let baseline = settled();
+    math_cuda::whir::fail_top_readback_for_test(1);
+    let err = build()
+        .err()
+        .expect("retirement must report the readback failure");
+    assert!(
+        err.contains("prepared stack on card 1")
+            && err.contains("retiring its prepared stack: DeviceFailed"),
+        "{err}"
+    );
+    assert_eq!(gpu::indexed_cards().unwrap().unwrap(), [0]);
+    assert_eq!(settled(), baseline);
+    let build = build().expect("prepared stacks rebuild on the surviving card");
+    let filled = execute_and_fill_unmerged(&program, &arenas, hasher).expect("executes");
+    let proof = prove_wlfm_traces_as(&build, filled, true, WlfmProving::Streamed)
+        .expect("fresh level proves");
+    let stamps = take_wlfm_stamps().expect("the level stamps");
+    assert!(
+        stamps
+            .groups
+            .iter()
+            .all(|g| g.card == 0 && g.commit_card == 0)
+    );
+    verify_wlfm(&build.artifacts, &proof, &proof.public_words).expect("fresh proof verifies");
 }

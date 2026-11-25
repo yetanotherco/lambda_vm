@@ -5283,11 +5283,27 @@ pub(crate) fn check_page_traces(airs: &VmAirs, pages: usize) -> Result<(), Error
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedCommitError {
+    group: Option<usize>,
+    pub(crate) source: multilinear::Error,
+}
+
+impl From<PreparedCommitError> for Error {
+    fn from(err: PreparedCommitError) -> Self {
+        let source = err.source;
+        Error::Prover(match err.group {
+            Some(group) => format!("group {group}: {source:?}"),
+            None => format!("{source:?}"),
+        })
+    }
+}
+
 /// Commits one group's prepared stack under `config`.
 pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
-) -> Result<GroupPrepared<H>, Error> {
+) -> Result<GroupPrepared<H>, PreparedCommitError> {
     commit_group_where::<H>(stack, config, false, false, false)
 }
 
@@ -5305,7 +5321,7 @@ pub(crate) fn commit_group_narrow<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
     staged: bool,
-) -> Result<GroupPrepared<H>, Error> {
+) -> Result<GroupPrepared<H>, PreparedCommitError> {
     commit_group_where::<H>(stack, config, false, true, staged)
 }
 
@@ -5326,7 +5342,7 @@ pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, true, false, false)
+    commit_group_where::<H>(stack, config, true, false, false).map_err(Error::from)
 }
 
 fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
@@ -5335,17 +5351,26 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
     on_host: bool,
     narrow: bool,
     staged: bool,
-) -> Result<GroupPrepared<H>, Error> {
+) -> Result<GroupPrepared<H>, PreparedCommitError> {
     let shapes = stack.shapes();
     let group = stack.group;
     let prepacked = stack.packed;
     let columns: Vec<Mle<F>> = stack
         .columns
         .into_iter()
-        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("group {group}: {e:?}"))))
+        .map(|values| {
+            Mle::new(values).map_err(|source| PreparedCommitError {
+                group: Some(group),
+                source,
+            })
+        })
         .collect::<Result<_, _>>()?;
-    let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack).map_err(
+        |source| PreparedCommitError {
+            group: None,
+            source,
+        },
+    )?;
     let borrowed = multilinear::stacking::borrow(&columns);
     let budget = multilinear::gpu::reserve_budget();
     // Packed ahead (the level's host part) when it fits these columns; else
@@ -5401,7 +5426,10 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
             config,
         )
     }
-    .map_err(|e| Error::Prover(format!("group {group}: {e:?}")))?;
+    .map_err(|source| PreparedCommitError {
+        group: Some(group),
+        source,
+    })?;
     // The store goes when this returns, before a retired stack is let go.
     let roots = commitment.roots();
     Ok(GroupPrepared {
@@ -5421,7 +5449,7 @@ pub(crate) fn commit_groups<H: multilinear::whir_hash::WhirHash>(
 ) -> Result<Vec<GroupPrepared<H>>, Error> {
     stacks
         .into_iter()
-        .map(|stack| commit_group::<H>(stack, config))
+        .map(|stack| commit_group::<H>(stack, config).map_err(Error::from))
         .collect()
 }
 

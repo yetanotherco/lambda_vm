@@ -2425,6 +2425,9 @@ pub enum PhaseBOverlap {
 pub struct OverlapFaults {
     /// The openings of the group at this place fail, on whichever thread.
     pub open_fails: Option<usize>,
+    /// Fail the migrated opening of this group after its device upload.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub migrated_open_fails: Option<usize>,
     /// The argue of the group at this place fails.
     pub argue_fails: Option<usize>,
     /// The opening thread of the group at this place panics (test builds).
@@ -5101,6 +5104,20 @@ where
 /// answer when the other card's own failure is there.
 const OTHER_CARD_FAILED: &str = "the other card's phase B failed";
 
+struct PhaseBDriverError {
+    error: MlError,
+    backend: Option<usize>,
+}
+
+impl From<MlError> for PhaseBDriverError {
+    fn from(error: MlError) -> Self {
+        Self {
+            error,
+            backend: None,
+        }
+    }
+}
+
 /// Groups phase B proved on the second card under the two-card split,
 /// process-wide: what a test reads to know the split ran ([`split_second_groups`]).
 static SPLIT_SECOND_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5520,7 +5537,9 @@ where
 
     // One card's phase B over its own groups, in phase B's order: today's
     // loop, the only one without the split.
-    let drive = |lane: usize, lane_in: LaneIn<'_, '_, F, E, T>| -> Result<LaneOut<F, E>, MlError> {
+    let drive = |lane: usize,
+                 lane_in: LaneIn<'_, '_, F, E, T>|
+     -> Result<LaneOut<F, E>, PhaseBDriverError> {
         let LaneIn {
             post,
             tables: mut lane_tables,
@@ -5546,7 +5565,9 @@ where
         // groups open where they argue): the groups opened on the openings' card
         // (counted after their openings ran there, a fallback to card 0 not), and
         // those kept on card 0 (a held prepared stack).
-        let openings_move = card_id == 0 && multilinear::gpu::two_card_openings();
+        let openings_move = card_id == 0
+            && multilinear::gpu::two_card_openings()
+            && (!indexed || cards.contains(&1));
         let mut two_card = (0usize, 0usize);
         let opened_on_own = std::sync::atomic::AtomicUsize::new(0);
         // Of those, the groups whose compact upload on the openings' card was
@@ -5563,7 +5584,8 @@ where
             if abort.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(MlError::DeviceFailed {
                     stage: OTHER_CARD_FAILED,
-                });
+                }
+                .into());
             }
             // This card's turn: its group, the turns started before it on both
             // cards (`p`, each value once; the place the hook reads it at with one
@@ -5580,7 +5602,7 @@ where
                 if let Some(rest) = reorder.and_then(|reorder| reorder(turn.place, &turn.view)) {
                     let got = rest.len();
                     if let Err(expected) = queue.rerank(rest) {
-                        return Err(MlError::QueryCountMismatch { expected, got });
+                        return Err(MlError::QueryCountMismatch { expected, got }.into());
                     }
                 }
                 (turn.group, turn.turn, queue.claim_next(lane))
@@ -5618,7 +5640,8 @@ where
                         return Err(MlError::SpillFailed {
                             table: first + k,
                             reason: "its columns are still spilled when its group is read",
-                        });
+                        }
+                        .into());
                     }
                 }
             }
@@ -5722,7 +5745,7 @@ where
                             on_lane_openings(
                                 indexed,
                                 card_id,
-                                move || -> Result<Opened<F, E>, MlError> {
+                                move || -> Result<Opened<F, E>, PhaseBDriverError> {
                                     // Every stream this thread draws is a background one,
                                     // so the argue's kernels are dispatched first.
                                     let _background = multilinear::gpu::background_streams();
@@ -5735,7 +5758,7 @@ where
                                     }
                                     let fails = overlap_faults.open_fails == Some(earlier.place);
                                     let (opened, stacked) = if prev_on_own_card {
-                                        let opened = multilinear::gpu::on_openings_card(|| {
+                                        let open_migrated = || {
                                             // The group's columns once more, compact
                                             // (records filled and narrow columns
                                             // widened on the openings' card, into its
@@ -5750,13 +5773,35 @@ where
                                                     std::sync::atomic::Ordering::Relaxed,
                                                 );
                                             }
-                                            open_group::<F, E, T, H>(
-                                                earlier, its_tables, prepared, deviations, config,
-                                                false, fails,
-                                            )
-                                        });
+                                            let mut open = || {
+                                                #[cfg(any(test, feature = "test-utils"))]
+                                                if indexed
+                                                    && overlap_faults.migrated_open_fails == Some(earlier.group)
+                                                    && earlier.store.is_some()
+                                                {
+                                                    return Err(MlError::DeviceFailed {
+                                                        stage: "a test's migrated opening after upload",
+                                                    });
+                                                }
+                                                open_group::<F, E, T, H>(
+                                                    earlier, its_tables, prepared, deviations, config,
+                                                    false, fails,
+                                                )
+                                            };
+                                            open().map_err(|error| PhaseBDriverError {
+                                                backend: indexed.then_some(1),
+                                                error,
+                                            })
+                                        };
+                                        // Keep the target fixed through uploads, openings and
+                                        // readbacks, even if another prove quarantines it.
+                                        let opened = if indexed {
+                                            multilinear::gpu::on_indexed_card(1, true, open_migrated)
+                                        } else {
+                                            multilinear::gpu::on_openings_card(open_migrated)
+                                        };
                                         if opened.is_ok()
-                                            && multilinear::gpu::openings_on_own_backend()
+                                            && (indexed || multilinear::gpu::openings_on_own_backend())
                                         {
                                             opened_on_own_ref
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5768,7 +5813,7 @@ where
                                         open_group::<F, E, T, H>(
                                             earlier, its_tables, prepared, deviations, config,
                                             false, fails,
-                                        )
+                                        ).map_err(PhaseBDriverError::from)
                                     }?;
                                     on_group(GroupOpened {
                                         group: earlier.group,
@@ -5983,7 +6028,8 @@ where
                 Some(Err(_)) => {
                     return Err(MlError::DeviceFailed {
                         stage: "the previous group's openings",
-                    });
+                    }
+                    .into());
                 }
             };
             argue_result?;
@@ -6223,9 +6269,12 @@ where
                 drive(lane, input)
             }
         }))
-        .unwrap_or(Err(MlError::DeviceFailed {
-            stage: "phase B driver panicked",
-        }));
+        .unwrap_or_else(|_| {
+            Err(MlError::DeviceFailed {
+                stage: "phase B driver panicked",
+            }
+            .into())
+        });
         if out.is_err() {
             abort.store(true, Relaxed);
         }
@@ -6250,20 +6299,19 @@ where
     for (lane, result) in results.into_iter().enumerate() {
         match result {
             Ok(out) => outs.push(out),
-            Err(e) => {
-                let cancelled =
-                    matches!(&e, MlError::DeviceFailed { stage } if *stage == OTHER_CARD_FAILED);
-                if !cancelled && !split_on_host && matches!(&e, MlError::DeviceFailed { .. }) {
+            Err(PhaseBDriverError { error, backend }) => {
+                let cancelled = matches!(&error, MlError::DeviceFailed { stage } if *stage == OTHER_CARD_FAILED);
+                if !cancelled && !split_on_host && matches!(&error, MlError::DeviceFailed { .. }) {
                     if indexed {
                         multilinear::gpu::mark_indexed_card_failed(
-                            cards[lane],
-                            "its phase-B driver failed",
+                            backend.unwrap_or(cards[lane]),
+                            "its phase-B work failed",
                         );
                     } else if lane == 1 {
                         multilinear::gpu::mark_second_failed("its phase-B driver failed");
                     }
                 }
-                errors.push(((cancelled, places[lane].load(Relaxed), lane), e));
+                errors.push(((cancelled, places[lane].load(Relaxed), lane), error));
             }
         }
     }
@@ -6318,7 +6366,8 @@ where
     }
     if indexed {
         eprintln!(
-            "BLOCK INDEXED PHASE B: {lane_summary:?} on cards {cards:?} · pinned {pinned_count}"
+            "BLOCK INDEXED PHASE B: {lane_summary:?} on cards {cards:?} · pinned {pinned_count} · cross-card declines {}",
+            multilinear::gpu::cross_card_declines().saturating_sub(declines_before),
         );
     }
     if !indexed && lanes == 2 {
