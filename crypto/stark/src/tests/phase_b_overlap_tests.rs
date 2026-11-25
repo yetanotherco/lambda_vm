@@ -297,6 +297,7 @@ pub(super) fn prove_block_with<Hh: WhirHash>(
             },
             columns,
             packed: None,
+            card: 0,
         })
         .collect();
     let committed = match phase_a {

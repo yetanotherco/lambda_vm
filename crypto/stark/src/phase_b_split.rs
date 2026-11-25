@@ -21,17 +21,28 @@ pub fn split_price(cells: u64, tables: usize) -> u64 {
 /// descending, ties to the lower group — each to the card with the smaller
 /// load, ties to card 0. Deterministic in `prices` and `pinned` alone.
 pub fn assign_cards(prices: &[u64], pinned: &[bool]) -> Vec<u8> {
+    let pins: Vec<Option<u8>> = (0..prices.len())
+        .map(|g| pinned.get(g).copied().unwrap_or(false).then_some(0))
+        .collect();
+    assign_cards_pinned(prices, &pins)
+}
+
+/// [`assign_cards`] with each pin naming its card: a group pinned to a card
+/// (a card above 1 reads as 1) goes there and counts in that card's load; the
+/// free ones go longest first to the lighter card, ties to card 0. A missing
+/// pin is free. Deterministic in `prices` and `pins` alone.
+pub fn assign_cards_pinned(prices: &[u64], pins: &[Option<u8>]) -> Vec<u8> {
     let n = prices.len();
+    let pin = |g: usize| pins.get(g).copied().flatten().map(|c| c.min(1));
     let mut card = vec![0u8; n];
     let mut load = [0u128; 2];
     for (g, &price) in prices.iter().enumerate() {
-        if pinned.get(g).copied().unwrap_or(false) {
-            load[0] += u128::from(price);
+        if let Some(c) = pin(g) {
+            card[g] = c;
+            load[usize::from(c)] += u128::from(price);
         }
     }
-    let mut free: Vec<usize> = (0..n)
-        .filter(|&g| !pinned.get(g).copied().unwrap_or(false))
-        .collect();
+    let mut free: Vec<usize> = (0..n).filter(|&g| pin(g).is_none()).collect();
     free.sort_by(|&a, &b| prices[b].cmp(&prices[a]).then(a.cmp(&b)));
     for g in free {
         let c = usize::from(load[1] < load[0]);
@@ -39,6 +50,43 @@ pub fn assign_cards(prices: &[u64], pinned: &[bool]) -> Vec<u8> {
         load[c] += u128::from(prices[g]);
     }
     card
+}
+
+/// Phase B's plan over `n = prices.len()` groups: each group's card, or one
+/// card and why. `asked`: the caller's groups kept on card 0 (`true`; a
+/// missing one is kept), `None` when the caller asked for no split; `on`: the
+/// split's knob on and its second card ready (or its drivers on the host, a
+/// test's); `held_on`: the card of each group's held prepared stack, `None`
+/// for none (or a retired one). Pins: a kept group to card 0, a held stack's
+/// group to its stack's card. One card when not asked or not on, when fewer
+/// than two groups are free of a pin and no pin names card 1, or when nothing
+/// lands on card 1; a pin on card 1 makes two cards however few are free.
+pub fn plan_cards(
+    asked: Option<&[bool]>,
+    on: Result<(), &'static str>,
+    prices: &[u64],
+    held_on: &[Option<u8>],
+) -> Result<Vec<u8>, &'static str> {
+    let Some(keep) = asked else {
+        return Err("not asked by the caller");
+    };
+    on?;
+    let pins: Vec<Option<u8>> = (0..prices.len())
+        .map(|g| match keep.get(g).copied().unwrap_or(true) {
+            true => Some(0),
+            false => held_on.get(g).copied().flatten().map(|c| c.min(1)),
+        })
+        .collect();
+    let on_card_1 = pins.contains(&Some(1));
+    if !on_card_1 && pins.iter().filter(|p| p.is_none()).count() < 2 {
+        return Err("fewer than two groups free of a pin");
+    }
+    let card = assign_cards_pinned(prices, &pins);
+    if card.contains(&1) {
+        Ok(card)
+    } else {
+        Err("no group for the second card")
+    }
 }
 
 /// Each card's summed price under `card`.
@@ -349,6 +397,94 @@ mod tests {
         );
         let all_pinned = assign_cards(&prices, &vec![true; prices.len()]);
         assert!(all_pinned.iter().all(|&c| c == 0));
+    }
+
+    /// A pin is honoured on either card and counts in that card's load; the
+    /// free groups fill the lighter card; every pin on card 0 is
+    /// [`assign_cards`]' answer.
+    #[test]
+    fn a_pin_names_its_card_and_counts_in_its_load() {
+        let prices = [100u64, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+        let mut pins = vec![None; prices.len()];
+        pins[0] = Some(1);
+        let card = assign_cards_pinned(&prices, &pins);
+        assert_eq!(card[0], 1, "pinned to card 1");
+        assert!(
+            card[1..].iter().all(|&c| c == 0),
+            "the 100 pinned on card 1 outweighs the other ten: {card:?}"
+        );
+        pins[1] = Some(0);
+        pins[2] = Some(1);
+        let card = assign_cards_pinned(&prices, &pins);
+        assert_eq!((card[0], card[1], card[2]), (1, 0, 1));
+        assert_eq!(assign_cards_pinned(&prices, &pins), card, "deterministic");
+        // A card above 1 reads as 1; a missing pin is free.
+        assert_eq!(
+            assign_cards_pinned(&[5, 5, 5], &[Some(7)]),
+            assign_cards_pinned(&[5, 5, 5], &[Some(1)])
+        );
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for trial in 0..40 {
+            let n = 1 + trial % 20;
+            let prices: Vec<u64> = (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 33) % 1_000_000 + 1
+                })
+                .collect();
+            let pinned: Vec<bool> = (0..n).map(|g| (state >> (g % 60)) & 1 == 1).collect();
+            let as_pins: Vec<Option<u8>> = pinned.iter().map(|&p| p.then_some(0)).collect();
+            assert_eq!(
+                assign_cards(&prices, &pinned),
+                assign_cards_pinned(&prices, &as_pins),
+                "trial {trial}: every pin on card 0 is the old assignment"
+            );
+            assert_eq!(
+                assign_cards(&prices, &vec![false; n]),
+                assign_cards_pinned(&prices, &[]),
+                "trial {trial}: no pin"
+            );
+        }
+    }
+
+    /// The plan: a held stack on card 1 makes two cards however few groups
+    /// are free; with every pin on card 0 and one free group it is one card
+    /// with the old reason; not asked, off and nothing for card 1 keep theirs.
+    #[test]
+    fn a_stack_held_on_card_1_makes_the_plan_two_cards() {
+        let prices = [10u64, 10, 10];
+        let free = [false; 3];
+        let on = Ok(());
+        // Every group held on card 0 but one: one card, the old reason.
+        let held0 = [Some(0), Some(0), None];
+        assert_eq!(
+            plan_cards(Some(&free[..]), on, &prices, &held0),
+            Err("fewer than two groups free of a pin")
+        );
+        // One held on card 1, none free: two cards, the pins honoured.
+        let held1 = [Some(1), Some(0), Some(0)];
+        assert_eq!(plan_cards(Some(&free[..]), on, &prices, &held1), Ok(vec![1, 0, 0]));
+        // A kept group is card 0's even with a stack on card 1.
+        assert_eq!(
+            plan_cards(Some(&[true, false, false][..]), on, &prices, &held1),
+            Err("fewer than two groups free of a pin")
+        );
+        // Not asked, or off: one card whatever the stacks say.
+        assert_eq!(
+            plan_cards(None, on, &prices, &held1),
+            Err("not asked by the caller")
+        );
+        assert_eq!(
+            plan_cards(Some(&free[..]), Err("the knob is off"), &prices, &held1),
+            Err("the knob is off")
+        );
+        // No stack at all: the old plan.
+        let none = [None; 3];
+        let card = plan_cards(Some(&free[..]), on, &prices, &none).expect("two cards");
+        let pinned = [false; 3];
+        assert_eq!(card, assign_cards(&prices, &pinned));
     }
 
     #[test]

@@ -6712,6 +6712,7 @@ pub(crate) fn prove_traces(
                 commitment: (&p.commitment).into(),
                 columns,
                 packed: None,
+                card: 0,
             })
             .collect();
         let t = Instant::now();
@@ -10556,6 +10557,7 @@ fn prove_streamed(
                 commitment: (&p.commitment).into(),
                 columns,
                 packed: None,
+                card: 0,
             })
             .collect();
         let _ = multilinear::whir_split::take_chain();

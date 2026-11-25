@@ -2210,6 +2210,11 @@ where
     /// [`BlockCommitted::with_prepared_store_narrow`] a retired stack's store
     /// sends these bytes instead of packing again. `None` packs there.
     pub packed: Option<&'a multilinear::gpu::PackedStore>,
+    /// The card a held commitment lives on (0, or 1 for a recursion level's
+    /// stack committed on the second card): phase B argues and opens its
+    /// group there. Ignored for a retired stack, which is revived where its
+    /// group runs.
+    pub card: u8,
 }
 
 /// Where a [`BlockPrepared`] stack's commitment is when its group opens it.
@@ -4628,6 +4633,20 @@ where
         .any(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Held(_)))
 }
 
+/// The card `group`'s held prepared stack lives on ([`BlockPrepared::card`]);
+/// `None` when it has none held.
+fn held_on<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> Option<u8>
+where
+    F: IsFFTField + IsPrimeField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    prepared
+        .iter()
+        .find(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Held(_)))
+        .map(|p| p.card.min(1))
+}
+
 /// Whether `group`'s prepared stack was committed and let go: it is revived
 /// at the group's opening ([`open_prepared`]).
 fn prepared_is_retired<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
@@ -5263,36 +5282,43 @@ where
     // for one card (a parked table comes back under its own lock, per group),
     // nor a local argue begun in phase A (host data). Pinned to card 0: the
     // caller's groups and a held prepared stack's.
-    let plan: Result<Vec<u8>, &'static str> = match &two_card_split {
-        None => Err("not asked by the caller"),
-        Some(_) if !split_on_host && !two_card_knob.on() => Err("the knob is off"),
-        Some(_) if !split_on_host && !multilinear::gpu::two_card_split_ready() => {
-            Err("the second card is not ready")
-        }
-        Some(keep) => {
-            let prices: Vec<u64> = (0..n)
-                .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
-                .collect();
-            let pinned: Vec<bool> = (0..n)
-                .map(|g| keep.get(g).copied().unwrap_or(true) || prepared_is_held(prepared, g))
-                .collect();
-            if pinned.iter().filter(|&&p| !p).count() < 2 {
-                Err("fewer than two groups free of a pin")
-            } else {
-                let card = phase_b_split::assign_cards(&prices, &pinned);
-                if card.contains(&1) {
-                    Ok(card)
-                } else {
-                    Err("no group for the second card")
-                }
-            }
-        }
+    // A held stack pins its group to the card it lives on: card 0 but for a
+    // recursion level's stack committed on the second card
+    // (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`), whose group goes to card 1 however
+    // few groups are free ([`phase_b_split::plan_cards`]).
+    let held: Vec<Option<u8>> = (0..n).map(|g| held_on(prepared, g)).collect();
+    let on = if split_on_host {
+        Ok(())
+    } else if !two_card_knob.on() {
+        Err("the knob is off")
+    } else if !multilinear::gpu::two_card_split_ready() {
+        Err("the second card is not ready")
+    } else {
+        Ok(())
     };
+    let prices: Vec<u64> = (0..n)
+        .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
+        .collect();
+    let plan = phase_b_split::plan_cards(two_card_split.as_deref(), on, &prices, &held);
+    // A stack held on card 1 is opened there or nowhere: from card 0's
+    // driver it cannot be read.
+    if plan.is_err() && held.contains(&Some(1)) {
+        return Err(MlError::DeviceFailed {
+            stage: "a prepared stack is held on the second card, which is gone",
+        });
+    }
     let pinned_count = match (&two_card_split, &plan) {
-        (Some(keep), Ok(_)) => (0..n)
-            .filter(|&g| keep.get(g).copied().unwrap_or(true) || prepared_is_held(prepared, g))
-            .count(),
-        _ => 0,
+        (Some(keep), Ok(_)) => {
+            let pin = |g: usize, c: u8| match keep.get(g).copied().unwrap_or(true) {
+                true => c == 0,
+                false => held[g] == Some(c),
+            };
+            [
+                (0..n).filter(|&g| pin(g, 0)).count(),
+                (0..n).filter(|&g| pin(g, 1)).count(),
+            ]
+        }
+        _ => [0, 0],
     };
     if let (Some(_), Err(why)) = (&two_card_split, &plan) {
         match two_card_knob {
@@ -6184,10 +6210,16 @@ where
             _ => 0.0,
         };
         let tail = format!(
-            "{} · {} · argue gap {gap:.3} s · pinned to card 0 {pinned_count} · cross-card declines {} · second \
+            "{} · {} · argue gap {gap:.3} s · pinned to card 0 {}{} · cross-card declines {} · second \
              upload {}",
             card(0),
             card(1),
+            pinned_count[0],
+            if pinned_count[1] > 0 {
+                format!(" · to card 1 {}", pinned_count[1])
+            } else {
+                String::new()
+            },
             multilinear::gpu::cross_card_declines().saturating_sub(declines_before),
             if two_card.0 == 0 {
                 "none".to_string()
