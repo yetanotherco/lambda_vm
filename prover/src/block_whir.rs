@@ -3320,6 +3320,53 @@ fn parse_word_stream(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// How the streamed word families' chunks leave the walk
+/// (`LAMBDA_VM_WORD_CHUNKS`). The chunks, and so the tables and the proof, are
+/// the same under every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WordChunks {
+    /// `copy` (the default): every window's rows appended to one list a
+    /// family, each chunk copied out of its front.
+    Copy,
+    /// `part`: the windows' lists kept as they are, each chunk handed out as
+    /// the parts its rows lie in
+    /// ([`WindowedTraceBuilder::word_chunks_in_place`]).
+    Parts,
+}
+
+/// `LAMBDA_VM_WORD_CHUNKS`'s reading: unset, empty or `copy` (the default),
+/// [`WordChunks::Copy`]; `part`, [`WordChunks::Parts`]. Anything else refuses
+/// the prove.
+fn parse_word_chunks(value: Option<&str>) -> Result<WordChunks, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "copy") => Ok(WordChunks::Copy),
+        Some("part") => Ok(WordChunks::Parts),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_WORD_CHUNKS={v}: copy (the default: each chunk copied out of one list a \
+             family) or part (each chunk handed out as the windows' parts its rows lie in)"
+        ))),
+    }
+}
+
+/// [`WordChunks::Parts`] hands out the word families' streamed chunks, so it
+/// runs only where they stream: the word memory format with its families cut
+/// as the walk fills them and the streamed ops dropped as handed out. Refused
+/// elsewhere, never ignored.
+fn refuse_word_chunks(
+    chunks: WordChunks,
+    word_stream: bool,
+    drop_streamed_ops: bool,
+) -> Result<(), Error> {
+    if chunks == WordChunks::Parts && !(word_stream && drop_streamed_ops) {
+        return Err(Error::Prover(format!(
+            "LAMBDA_VM_WORD_CHUNKS=part needs the word families streamed (the word memory \
+             format and LAMBDA_VM_WORD_STREAM on: {word_stream}) and the streamed ops dropped as \
+             handed out ({drop_streamed_ops})"
+        )));
+    }
+    Ok(())
+}
+
 /// `LAMBDA_VM_LIGHT_WALK`: the walkers' light walk
 /// ([`WindowedTraceBuilder::light_walk`]). Unset, empty or `2` (the default):
 /// record mode's cycles that are no ECALL walked without their cells, each
@@ -5782,6 +5829,9 @@ pub(crate) struct Deviations {
     /// Whether the word memory format's word families stream in chunks as
     /// the walk fills them, instead of the knob (`LAMBDA_VM_WORD_STREAM`).
     pub word_stream: Option<bool>,
+    /// How the streamed word families' chunks leave the walk, instead of the
+    /// knob (`LAMBDA_VM_WORD_CHUNKS`).
+    pub word_chunks: Option<WordChunks>,
     /// Whether the executor's stream is lean, instead of the knob
     /// ([`EXEC_STREAM_ENV`]): `Some(true)` refused where it does not run.
     pub exec_stream_lean: Option<bool>,
@@ -9796,6 +9846,24 @@ fn prove_streamed(
             }
         );
     }
+    // How the streamed word families' chunks leave the walk: a word it does
+    // not take refuses the prove, and so does `part` where they do not stream.
+    // The chunks, and so the tables, are the same either way.
+    let word_chunks = match deviations.word_chunks {
+        Some(chunks) => chunks,
+        None => parse_word_chunks(std::env::var("LAMBDA_VM_WORD_CHUNKS").ok().as_deref())?,
+    };
+    refuse_word_chunks(word_chunks, word_stream, options.drop_streamed_ops)?;
+    if word_stream {
+        eprintln!(
+            "★ BLOCK WORD CHUNKS: {} (LAMBDA_VM_WORD_CHUNKS)",
+            match word_chunks {
+                WordChunks::Copy => "copy: each chunk copied out of one list a family, the default",
+                WordChunks::Parts =>
+                    "part: each chunk handed out as the windows' parts its rows lie in",
+            }
+        );
+    }
     // The serial host work hoisted: a word it does not take refuses the
     // prove. The tables are the same with any part on.
     let host_hoist = match deviations.host_hoist {
@@ -10596,6 +10664,9 @@ fn prove_streamed(
                 builder = builder.page_run_log2(format.page_runs())?;
                 if word_stream {
                     builder = builder.stream_word_tables()?;
+                    if word_chunks == WordChunks::Parts {
+                        builder = builder.word_chunks_in_place()?;
+                    }
                 }
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
@@ -14375,10 +14446,41 @@ mod producer_report_tests {
         ExecutorStamps, ProducerStamps, StreamTable, ThreadUsage,
     };
     use super::{
-        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_stream,
-        parse_light_walk, parse_word_stream, refuse_lean_stream, resolve_exec_stream,
+        WordChunks, exec_mode_from, parse_exec_history, parse_exec_history_check,
+        parse_exec_stream, parse_light_walk, parse_word_chunks, parse_word_stream,
+        refuse_lean_stream, refuse_word_chunks, resolve_exec_stream,
     };
     use crate::Error;
+
+    /// `LAMBDA_VM_WORD_CHUNKS`: copied unless `part`; any other word refused
+    /// (the branch's `card` among them: not on this line). `part` is refused
+    /// unless the word families stream with their ops dropped as handed out;
+    /// `copy` runs anywhere.
+    #[test]
+    fn the_word_chunks_are_copied_unless_handed_out_in_parts() {
+        for (word, chunks) in [
+            (None, WordChunks::Copy),
+            (Some(""), WordChunks::Copy),
+            (Some(" copy "), WordChunks::Copy),
+            (Some("part"), WordChunks::Parts),
+            (Some(" part "), WordChunks::Parts),
+        ] {
+            assert_eq!(parse_word_chunks(word).ok(), Some(chunks), "{word:?}");
+        }
+        for bad in ["card", "parts", "1", "0", "Part", "copied"] {
+            assert!(parse_word_chunks(Some(bad)).is_err(), "{bad}");
+        }
+        for stream in [false, true] {
+            for drop in [false, true] {
+                assert!(refuse_word_chunks(WordChunks::Copy, stream, drop).is_ok());
+                assert_eq!(
+                    refuse_word_chunks(WordChunks::Parts, stream, drop).is_ok(),
+                    stream && drop,
+                    "part, stream {stream}, drop {drop}"
+                );
+            }
+        }
+    }
 
     /// `LAMBDA_VM_WORD_STREAM`: on unless `0`; any other word refused.
     #[test]

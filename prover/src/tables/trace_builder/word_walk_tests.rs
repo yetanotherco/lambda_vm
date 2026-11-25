@@ -835,13 +835,15 @@ fn word_record_build(
         level,
         recheck,
         &MaxRowsConfig::small(),
-        false,
+        (false, false),
     )
 }
 
 /// [`word_record_build`] at `max_rows`, the word families streamed in chunks
 /// as the walk fills them when `stream`
-/// ([`super::windowed::WindowedTraceBuilder::stream_word_tables`]).
+/// ([`super::windowed::WindowedTraceBuilder::stream_word_tables`]), handed
+/// out as the windows' parts their rows lie in when `in_place`
+/// ([`super::windowed::WindowedTraceBuilder::word_chunks_in_place`]).
 fn word_record_build_with(
     program: &Elf,
     window: usize,
@@ -849,7 +851,7 @@ fn word_record_build_with(
     level: u8,
     recheck: usize,
     max_rows: &MaxRowsConfig,
-    stream: bool,
+    (stream, in_place): (bool, bool),
 ) -> Result<Traces, crate::Error> {
     use super::windowed::parallel::{ExecWindow, RunEnd, walk_windows_from_history};
     use super::windowed::{ChunkJob, WindowedTraceBuilder};
@@ -864,6 +866,9 @@ fn word_record_build_with(
         .light_walk(level)?;
     if stream {
         builder = builder.stream_word_tables()?;
+    }
+    if in_place {
+        builder = builder.word_chunks_in_place()?;
     }
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
     let mut chunks = Vec::new();
@@ -1099,7 +1104,9 @@ fn tiny() -> MaxRowsConfig {
 
 /// `program`'s run built by windows of `window` cycles under the word memory
 /// format at `max_rows`, the word families streamed when `stream`, the
-/// streamed ops dropped as handed out when `drop_ops`; each chunk passed
+/// streamed ops dropped as handed out when `drop_ops`, and then the word
+/// families' chunks handed out as the windows' parts their rows lie in when
+/// `in_place` (`word_chunks_in_place`); each chunk passed
 /// through `edit` before it is put back. The traces and the word chunks
 /// handed out.
 fn streamed_word_build(
@@ -1107,7 +1114,7 @@ fn streamed_word_build(
     logs: &[Log],
     max_rows: &MaxRowsConfig,
     window: usize,
-    (stream, drop_ops): (bool, bool),
+    (stream, drop_ops, in_place): (bool, bool, bool),
     edit: impl Fn(&mut Vec<super::windowed::StreamedChunk>),
 ) -> (Traces, usize) {
     use super::windowed::WindowedTraceBuilder;
@@ -1124,6 +1131,9 @@ fn streamed_word_build(
     }
     if drop_ops {
         builder = builder.drop_streamed_ops().expect("before any window");
+        if in_place {
+            builder = builder.word_chunks_in_place().expect("before any window");
+        }
     }
     let body = logs.len() - 1;
     let cut = body - body % window;
@@ -1157,9 +1167,11 @@ const STREAMED: [&str; 6] = [
 /// ★ The word families streamed in chunks as the walk fills them
 /// (`stream_word_tables`) build the finish-built tables, byte for byte: each
 /// run at word caps of 4 rows (families cut into many chunks), at windows of
-/// 7, 33 and 4096 cycles, with the windows kept whole and with the streamed
-/// ops dropped as handed out (the block's tails); word chunks are handed out
-/// in every run. Off (the default), none is.
+/// 7, 33 and 4096 cycles, with the windows kept whole, with the streamed
+/// ops dropped as handed out (the block's tails), and with those tails' word
+/// chunks handed out as the windows' parts (`word_chunks_in_place`); word
+/// chunks are handed out in every run, as many in each mode. Off (the
+/// default), none is.
 #[test]
 fn streamed_word_families_are_the_finish_built_tables() {
     // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
@@ -1169,24 +1181,37 @@ fn streamed_word_families_are_the_finish_built_tables() {
     for name in STREAMED {
         let (program, logs) = run(name);
         for window in [7, 33, 4096] {
-            let (want, none) =
-                streamed_word_build(&program, &logs, &max_rows, window, (false, false), |_| {});
+            let (want, none) = streamed_word_build(
+                &program,
+                &logs,
+                &max_rows,
+                window,
+                (false, false, false),
+                |_| {},
+            );
             assert_eq!(none, 0, "{name}/{window}: off streams no word chunk");
-            for drop_ops in [false, true] {
+            // Every mode hands out the same word chunks.
+            let mut handed: Option<usize> = None;
+            for (drop_ops, in_place) in [(false, false), (true, false), (true, true)] {
                 let (got, words) = streamed_word_build(
                     &program,
                     &logs,
                     &max_rows,
                     window,
-                    (true, drop_ops),
+                    (true, drop_ops, in_place),
                     |_| {},
                 );
                 streamed += words;
+                assert_eq!(
+                    *handed.get_or_insert(words),
+                    words,
+                    "{name}/{window}/{drop_ops}/{in_place}: the word chunks handed out"
+                );
                 crate::tests::windowed_builder_tests::same_traces(&want, &got);
                 assert_eq!(
                     got.word_counts(),
                     want.word_counts(),
-                    "{name}/{window}/{drop_ops}"
+                    "{name}/{window}/{drop_ops}/{in_place}"
                 );
             }
         }
@@ -1196,8 +1221,9 @@ fn streamed_word_families_are_the_finish_built_tables() {
 
 /// ★ Record mode with the word families streamed: a run walked from the
 /// executor's word history on one walker and on three, at light walk levels
-/// 0, 1 and 2, builds the finish-built tables at word caps of 4 rows, and
-/// they balance every bus.
+/// 0, 1 and 2, builds the finish-built tables at word caps of 4 rows, with
+/// the chunks copied out and handed out as the windows' parts
+/// (`word_chunks_in_place`), and they balance every bus.
 #[test]
 fn record_mode_with_streamed_word_families_builds_the_finish_built_tables() {
     // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
@@ -1205,12 +1231,23 @@ fn record_mode_with_streamed_word_families_builds_the_finish_built_tables() {
     let max_rows = tiny();
     for name in STREAMED {
         let (program, logs) = run(name);
-        let (want, _) = streamed_word_build(&program, &logs, &max_rows, 7, (false, false), |_| {});
+        let (want, _) =
+            streamed_word_build(&program, &logs, &max_rows, 7, (false, false, false), |_| {});
         for window in [7, 33] {
-            for (walkers, level) in [(1, 0u8), (3, 1), (3, 2)] {
-                let mut got =
-                    word_record_build_with(&program, window, walkers, level, 0, &max_rows, true)
-                        .unwrap_or_else(|e| panic!("{name}/{window}/{walkers}/{level}: {e:?}"));
+            for ((walkers, level), in_place) in [(1, 0u8), (3, 1), (3, 2)]
+                .into_iter()
+                .flat_map(|w| [(w, false), (w, true)])
+            {
+                let mut got = word_record_build_with(
+                    &program,
+                    window,
+                    walkers,
+                    level,
+                    0,
+                    &max_rows,
+                    (true, in_place),
+                )
+                .unwrap_or_else(|e| panic!("{name}/{window}/{walkers}/{level}/{in_place}: {e:?}"));
                 crate::tests::windowed_builder_tests::same_traces(&want, &got);
                 let left = left(&program, &mut got, RegisterFormat::InRow);
                 assert!(
@@ -1231,7 +1268,8 @@ fn a_dropped_or_swapped_word_chunk_reds_the_parity() {
     use super::windowed::StreamTable;
     let max_rows = tiny();
     let (program, logs) = run("fused_mem_cases");
-    let (want, _) = streamed_word_build(&program, &logs, &max_rows, 7, (false, false), |_| {});
+    let (want, _) =
+        streamed_word_build(&program, &logs, &max_rows, 7, (false, false, false), |_| {});
     let differs = |got: &Traces| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::tests::windowed_builder_tests::same_traces(&want, got)
@@ -1248,37 +1286,142 @@ fn a_dropped_or_swapped_word_chunk_reds_the_parity() {
     };
     // The family with the most chunks handed out.
     let most = std::cell::Cell::new(StreamTable::MemLoad8);
-    streamed_word_build(&program, &logs, &max_rows, 7, (true, false), |chunks| {
-        let best = StreamTable::WORDS
-            .into_iter()
-            .max_by_key(|&t| of(chunks, t).len())
-            .expect("a word family");
-        assert!(
-            of(chunks, best).len() >= 2,
-            "a family with two chunks handed out"
-        );
-        most.set(best);
-    });
+    streamed_word_build(
+        &program,
+        &logs,
+        &max_rows,
+        7,
+        (true, false, false),
+        |chunks| {
+            let best = StreamTable::WORDS
+                .into_iter()
+                .max_by_key(|&t| of(chunks, t).len())
+                .expect("a word family");
+            assert!(
+                of(chunks, best).len() >= 2,
+                "a family with two chunks handed out"
+            );
+            most.set(best);
+        },
+    );
     let table = most.get();
-    for drop_ops in [false, true] {
-        let (got, _) =
-            streamed_word_build(&program, &logs, &max_rows, 7, (true, drop_ops), |chunks| {
+    for (drop_ops, in_place) in [(false, false), (true, false), (true, true)] {
+        let (got, _) = streamed_word_build(
+            &program,
+            &logs,
+            &max_rows,
+            7,
+            (true, drop_ops, in_place),
+            |chunks| {
                 let at = of(chunks, table);
                 chunks.remove(at[0]);
-            });
+            },
+        );
         assert!(
             differs(&got),
-            "{table:?} {drop_ops}: a dropped chunk passed"
+            "{table:?} {drop_ops}/{in_place}: a dropped chunk passed"
         );
-        let (got, _) =
-            streamed_word_build(&program, &logs, &max_rows, 7, (true, drop_ops), |chunks| {
+        let (got, _) = streamed_word_build(
+            &program,
+            &logs,
+            &max_rows,
+            7,
+            (true, drop_ops, in_place),
+            |chunks| {
                 let at = of(chunks, table);
                 assert!(at.len() >= 2, "two {table:?} chunks");
                 let (a, b) = (chunks[at[0]].index, chunks[at[1]].index);
                 chunks[at[0]].index = b;
                 chunks[at[1]].index = a;
-            });
-        assert!(differs(&got), "{drop_ops}: swapped chunks passed");
+            },
+        );
+        assert!(
+            differs(&got),
+            "{drop_ops}/{in_place}: swapped chunks passed"
+        );
+    }
+}
+
+/// The hand-out of a word run's streamed chunks with the streamed ops dropped
+/// as handed out, by windows of `window` cycles at `max_rows`, the word
+/// chunks handed out as the windows' parts their rows lie in when `in_place`:
+/// the hand-out's stamps, and how many chunks each word family handed out.
+fn word_handout(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    in_place: bool,
+) -> (super::windowed::HandoutStamps, [usize; 7]) {
+    use super::windowed::WindowedTraceBuilder;
+    let keccak_rnd = crate::block_whir::BlockFormat::production().keccak_rnd;
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
+        .map(|b| b.keccak_rnd_form(keccak_rnd))
+        .map(|b| b.ecdas_form(crate::block_whir::BlockFormat::production().ecdas))
+        .and_then(|b| b.memory_format(MemoryFormat::Words))
+        .and_then(WindowedTraceBuilder::stream_word_tables)
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .expect("the builder");
+    if in_place {
+        builder = builder.word_chunks_in_place().expect("before any window");
+    }
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut handed = [0usize; 7];
+    for w in logs[..cut].chunks(window) {
+        for chunk in builder.push(w).expect("a window") {
+            if let Some(k) = chunk.table.word_family() {
+                handed[k] += 1;
+            }
+        }
+    }
+    let stamps = builder.stamps().handout;
+    builder.finish(&logs[cut..]).expect("the last window");
+    (stamps, handed)
+}
+
+/// ★ The word families' chunks handed out as the windows' parts their rows
+/// lie in (`word_chunks_in_place`, `LAMBDA_VM_WORD_CHUNKS=part`) copy no row:
+/// the hand-out notes 0 rows copied for each of the seven families, where
+/// copied out of one list (the default) it notes every row of every chunk,
+/// the family's chunks times its cap. Both hand out the same chunks, and the
+/// stamps count them.
+#[test]
+fn word_chunks_handed_out_in_place_copy_no_row() {
+    use super::windowed::StreamTable;
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let max_rows = tiny();
+    let caps = super::word_walk::word_max_rows(&max_rows);
+    for name in ["fused_mem_cases", "all_loadstore_32", "test_ecrec"] {
+        let (program, logs) = run(name);
+        let (copied_out, by_copy) = word_handout(&program, &logs, &max_rows, 7, false);
+        let (in_place, by_parts) = word_handout(&program, &logs, &max_rows, 7, true);
+        assert_eq!(by_copy, by_parts, "{name}: the word chunks handed out");
+        assert!(
+            by_copy.iter().sum::<usize>() >= 2,
+            "{name}: word chunks handed out {by_copy:?}"
+        );
+        for (k, table) in StreamTable::WORDS.into_iter().enumerate() {
+            let i = table.position();
+            for (mode, stamps) in [("copy", &copied_out), ("part", &in_place)] {
+                assert_eq!(
+                    stamps.chunks[i], by_copy[k],
+                    "{name} {table:?} {mode}: the chunks noted"
+                );
+            }
+            assert_eq!(
+                copied_out.copied[i],
+                by_copy[k] * caps[k],
+                "{name} {table:?}: copy copies every row it hands out"
+            );
+            assert_eq!(
+                in_place.copied[i], 0,
+                "{name} {table:?}: part copies no row"
+            );
+        }
     }
 }
 
