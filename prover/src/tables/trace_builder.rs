@@ -1007,7 +1007,9 @@ use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 #[cfg(feature = "parallel")]
 pub(crate) use finish::hand_on_order_first;
-pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen, RowsNote};
+pub(crate) use finish::{
+    Emitted, RegenFamily, RegenJob, RestHeader, RestRegen, RowsNote, UnitRows, rows_misses,
+};
 pub use finish_early::FinishEarly;
 pub use host_hoist::HostHoist;
 pub use walk_cuts::WalkCuts;
@@ -1021,7 +1023,7 @@ pub use windowed::{
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::{head_log, keccak_rnd_arrivals, parallel};
 #[cfg(feature = "parallel")]
-pub(crate) use windowed::RestSink;
+pub(crate) use windowed::{RestSink, RowsSink};
 
 // =============================================================================
 // Memory and Register State Tracking

@@ -5820,6 +5820,7 @@ pub(crate) fn prove_block_whir_with(
         options,
         deviations,
         &|_, _| {},
+        None,
         &|_| {},
         None,
     )
@@ -5881,6 +5882,7 @@ pub(crate) fn prove_block_whir_local_with(
         options,
         deviations,
         &|_, _| {},
+        None,
         &|_| {},
         None,
     )
@@ -5900,6 +5902,36 @@ pub fn prove_block_whir_local_observed_led(
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
+    prove_block_whir_local_observed_early(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        on_statement,
+        None,
+        on_group,
+        lead,
+    )
+}
+
+/// [`prove_block_whir_local_observed_led`], and with `early` the statement
+/// predicted before phase A ends handed to it ([`early_statement`]): a
+/// prediction its caller may use only once the final statement, handed to
+/// `on_statement` as always, equals it in every field and its roots are
+/// equal. The proof is the same.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_block_whir_local_observed_early(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    on_statement: StatementObserver<'_>,
+    early: Option<StatementObserver<'_>>,
+    on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
+) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
     if !format.local_lookups() {
         return Err(Error::Prover(
             "prove_block_whir_local proves a format with local lookups".to_string(),
@@ -5913,6 +5945,7 @@ pub fn prove_block_whir_local_observed_led(
         options,
         &Deviations::default(),
         on_statement,
+        early,
         on_group,
         lead,
     )
@@ -5963,16 +5996,45 @@ pub fn prove_block_whir_observed_groups(
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
-    prove_block_whir_observed_led(
+    prove_block_whir_observed_early(
         elf_bytes,
         private_inputs,
         proof_options,
         format,
         options,
         on_statement,
+        None,
+        on_group,
+    )
+}
+
+/// [`prove_block_whir_observed_groups`], and with `early` the predicted
+/// statement handed to it as [`prove_block_whir_local_observed_early`] hands
+/// it. The proof is the same.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_block_whir_observed_early(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    on_statement: StatementObserver<'_>,
+    early: Option<StatementObserver<'_>>,
+    on_group: GroupObserver<'_>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    prove_block_whir_inner(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        &Deviations::default(),
+        on_statement,
+        early,
         on_group,
         None,
     )
+    .and_then(todays)
 }
 
 /// [`prove_block_whir_observed_groups`] with phase B led by `lead`: once the
@@ -5998,6 +6060,7 @@ pub fn prove_block_whir_observed_led(
         options,
         &Deviations::default(),
         on_statement,
+        None,
         on_group,
         lead,
     )
@@ -6350,6 +6413,7 @@ pub(crate) fn trace_block_host_only(
         options,
         &deviations,
         &|_, _| {},
+        None,
         &|_| {},
         None,
         &mut stamps,
@@ -6381,6 +6445,7 @@ pub(crate) fn prove_block_whir_observed_with(
         options,
         deviations,
         on_statement,
+        None,
         &|_| {},
         None,
     )
@@ -6396,6 +6461,7 @@ fn prove_block_whir_inner(
     options: &BlockOptions,
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
+    early: Option<StatementObserver<'_>>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
@@ -6420,6 +6486,7 @@ fn prove_block_whir_inner(
         options,
         deviations,
         on_statement,
+        early,
         on_group,
         lead,
     );
@@ -6546,6 +6613,7 @@ fn prove_block_whir_body(
     options: &BlockOptions,
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
+    early: Option<StatementObserver<'_>>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
@@ -6565,6 +6633,7 @@ fn prove_block_whir_body(
             options,
             deviations,
             on_statement,
+            early,
             on_group,
             lead,
             &mut stamps,
@@ -7370,6 +7439,9 @@ enum Built {
 struct RestStream {
     header: crate::tables::trace_builder::RestHeader,
     tables: std::sync::mpsc::Receiver<crate::tables::trace_builder::Emitted>,
+    /// The rows the finish states, when an early statement is asked for
+    /// ([`early_statement`]).
+    rows: Option<std::sync::mpsc::Receiver<crate::tables::trace_builder::RowsNote>>,
 }
 
 /// The rest as the layout thread receives it.
@@ -7943,6 +8015,491 @@ impl<'a> Packer<'a> {
 /// waited on phase A ([`Packer::finish`]).
 type Packed = (Vec<Vec<Key>>, Vec<f64>, f64);
 
+/// The packer's grouping decisions alone ([`Packer::place`],
+/// [`Packer::finish`]): which group each table joins, from the tables'
+/// keys, shapes and local sends in the order they reach the packer, without
+/// the tables. The early statement replays the run through it
+/// ([`early_statement`]); the final statement is the packer's own, and the two
+/// are compared field by field before the early one is used.
+#[derive(Clone)]
+struct PackPlan {
+    cap: multilinear::whir_chain::StackVars,
+    max_polys: usize,
+    max_groups: usize,
+    /// The format's local lookups: a group with a local sender closes with
+    /// its LOCAL_BYTES table.
+    local: bool,
+    open_shapes: Vec<(usize, usize)>,
+    open_keys: Vec<Key>,
+    open_local: bool,
+    /// KECCAK_RND's streamed chunks packed apart ([`OwnGroups`]).
+    own: Option<OwnPlan>,
+    group_keys: Vec<Vec<Key>>,
+    /// LOCAL_BYTES tables made: the next one's `j`.
+    locals: usize,
+}
+
+/// [`PackPlan`]'s KECCAK_RND own open group.
+#[derive(Clone, Default)]
+struct OwnPlan {
+    shapes: Vec<(usize, usize)>,
+    keys: Vec<Key>,
+    local: bool,
+}
+
+impl PackPlan {
+    fn new(
+        cap: multilinear::whir_chain::StackVars,
+        max_polys: usize,
+        max_groups: usize,
+        local: bool,
+        own: bool,
+    ) -> Self {
+        Self {
+            cap,
+            max_polys,
+            max_groups,
+            local,
+            open_shapes: Vec::new(),
+            open_keys: Vec::new(),
+            open_local: false,
+            own: own.then(OwnPlan::default),
+            group_keys: Vec::new(),
+            locals: 0,
+        }
+    }
+
+    fn polys(&self, shapes: &[(usize, usize)]) -> Result<usize, Error> {
+        Ok(stark::multilinear_table::global_layout(shapes, self.cap)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?
+            .num_polys())
+    }
+
+    /// [`Packer::place`]'s decisions for a table of `key` and `shape`
+    /// (`sends_local`: it has local sends).
+    fn place(&mut self, key: Key, shape: (usize, usize), sends_local: bool) -> Result<(), Error> {
+        if sends_local && !self.local {
+            return Err(Error::Prover(
+                "a local sender outside the format's local lookups".into(),
+            ));
+        }
+        if let Some(own) = self.own.as_mut() {
+            if let Key::Streamed(StreamTable::KeccakRnd, _) = key {
+                own.shapes.push(shape);
+                let shapes = own.shapes.clone();
+                let open = !own.keys.is_empty();
+                if self.polys(&shapes)? > self.max_polys && open {
+                    self.close_own()?;
+                }
+                let own = self.own.as_mut().ok_or_else(|| {
+                    Error::Prover("the plan lost KECCAK_RND's own group".into())
+                })?;
+                if own.shapes.is_empty() {
+                    own.shapes.push(shape);
+                }
+                own.local |= sends_local;
+                own.keys.push(key);
+                return Ok(());
+            }
+            if matches!(key, Key::Air(_)) && !own.keys.is_empty() {
+                self.close_own()?;
+            }
+        }
+        self.open_shapes.push(shape);
+        if self.polys(&self.open_shapes)? > self.max_polys && !self.open_keys.is_empty() {
+            self.open_shapes.clear();
+            self.open_shapes.push(shape);
+            self.close_main()?;
+        }
+        self.open_local |= sends_local;
+        self.open_keys.push(key);
+        Ok(())
+    }
+
+    /// The main open group closed ([`Packer::close`]).
+    fn close_main(&mut self) -> Result<(), Error> {
+        let mut keys = std::mem::take(&mut self.open_keys);
+        if std::mem::take(&mut self.open_local) && self.local {
+            keys.push(Key::Local(self.locals));
+            self.locals += 1;
+        }
+        self.closed(keys)
+    }
+
+    /// KECCAK_RND's own open group closed ([`Packer::close_own`]).
+    fn close_own(&mut self) -> Result<(), Error> {
+        let Some(own) = self.own.as_mut() else {
+            return Ok(());
+        };
+        let mut keys = std::mem::take(&mut own.keys);
+        own.shapes.clear();
+        if std::mem::take(&mut own.local) && self.local {
+            keys.push(Key::Local(self.locals));
+            self.locals += 1;
+        }
+        self.closed(keys)
+    }
+
+    /// [`Packer::send`]'s refusal and record.
+    fn closed(&mut self, keys: Vec<Key>) -> Result<(), Error> {
+        let reached = self.group_keys.len() + 1;
+        if reached > self.max_groups {
+            return Err(Error::InvalidTableCounts(format!(
+                "a block takes at most {} groups; this one reached {reached} as its groups close",
+                self.max_groups
+            )));
+        }
+        self.group_keys.push(keys);
+        Ok(())
+    }
+
+    /// [`Packer::finish`]'s order: KECCAK_RND's own open group, then the
+    /// main one.
+    fn finish(mut self) -> Result<Vec<Vec<Key>>, Error> {
+        if self.own.as_ref().is_some_and(|own| !own.keys.is_empty()) {
+            self.close_own()?;
+        }
+        if !self.open_keys.is_empty() {
+            self.close_main()?;
+        }
+        Ok(self.group_keys)
+    }
+}
+
+/// Each group's tables as indices into the block's tables: a streamed
+/// chunk's AIR by its name in `names`, a rest table's AIR index, the `j`-th
+/// LOCAL_BYTES at `base + j` ([`prove_streamed`]'s final layout does the same).
+fn group_indices(
+    keys: Vec<Vec<Key>>,
+    names: &std::collections::HashMap<String, usize>,
+    base: usize,
+) -> Result<Vec<Vec<u32>>, Error> {
+    keys.into_iter()
+        .map(|keys| {
+            keys.into_iter()
+                .map(|key| match key {
+                    Key::Local(j) => Ok((base + j) as u32),
+                    Key::Air(i) => Ok(i as u32),
+                    Key::Streamed(table, index) => names
+                        .get(&stream_name(table, index))
+                        .map(|&i| i as u32)
+                        .ok_or_else(|| {
+                            Error::Prover(format!("no AIR for {}", stream_name(table, index)))
+                        }),
+                })
+                .collect::<Result<Vec<u32>, Error>>()
+        })
+        .collect()
+}
+
+/// A test's fault in the early statement, each one ending in a mismatch the
+/// final statement catches (and today's path).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EarlyFault {
+    #[default]
+    None,
+    /// The first rest table's rows stated twice what they are.
+    DoubledRows,
+    /// The replay fed one rest table short.
+    ShortReplay,
+    /// The early prepared roots' first word changed.
+    RootWord,
+    /// The early public output's first byte changed.
+    PublicOutput,
+}
+
+std::thread_local! {
+    /// A test's [`EarlyFault`] for the proves this thread starts.
+    static EARLY_FAULT_FOR_TEST: std::cell::Cell<EarlyFault> =
+        const { std::cell::Cell::new(EarlyFault::None) };
+}
+
+/// Tests only: the early statement's fault for the proves this thread starts
+/// ([`EarlyFault::None`]: none).
+#[doc(hidden)]
+pub fn set_early_fault_for_test(fault: EarlyFault) {
+    EARLY_FAULT_FOR_TEST.with(|c| c.set(fault));
+}
+
+/// The streamed chunks as the packer placed them, in order: each one's table,
+/// index, shape and whether it sends locally ([`early_statement`]'s replay).
+type EarlyStreamed = Vec<(StreamTable, usize, (usize, usize), bool)>;
+
+/// What the rest's layout hands the early statement once the run's AIR set is
+/// there ([`lay_out_rest_streamed`]): the rows the finish states, the order
+/// the rest's tables reach the packer in, each AIR's name, width and local
+/// sends, and the statement's fields the header settles.
+struct EarlyRest {
+    rows: std::sync::mpsc::Receiver<crate::tables::trace_builder::RowsNote>,
+    due: Vec<usize>,
+    names: Vec<String>,
+    widths: Vec<usize>,
+    locals: Vec<bool>,
+    table_counts: TableCounts,
+    runtime_page_ranges: Vec<RuntimePageRange>,
+    public_output: Vec<u8>,
+    num_private_input_pages: usize,
+    fused_memory: [u64; 2],
+    word_memory: [u64; 7],
+    page_configs: Vec<crate::tables::page::PageConfig>,
+}
+
+/// The early statement's inputs, beside the layout thread.
+struct EarlyIn<'a> {
+    streamed: std::sync::mpsc::Receiver<EarlyStreamed>,
+    rest: std::sync::mpsc::Receiver<EarlyRest>,
+    run_airs: &'a std::sync::OnceLock<VmAirs>,
+    format: &'a BlockFormat,
+    commit_config: &'a multilinear::whir_chain::ChainConfig,
+    deviations: &'a Deviations,
+    plan: PackPlan,
+    observer: StatementObserver<'a>,
+    start: Instant,
+    fault: EarlyFault,
+}
+
+/// What the early statement came to: sent (the statement it sent, and when,
+/// the prove's clock) or why not.
+struct EarlyOutcome {
+    sent: Result<(OwnedBlockStatement, f64), String>,
+}
+
+/// ★ The statement predicted before phase A ends: once every streamed chunk
+/// is placed, the run's AIR set is there and the finish has told every
+/// table's rows (the deduplicating families' as their tables are built), the
+/// packer's decisions are replayed over every table's shape in the order the
+/// tables reach it ([`PackPlan`]), the prepared stacks are committed under
+/// that partition, and `observer` is handed the statement and the roots. A
+/// prediction: the caller uses it only if the final statement equals it in
+/// every field and the roots are equal. Nothing here fails the prove: any
+/// failure says why and sends nothing.
+fn early_statement<H: multilinear::whir_hash::WhirHash>(input: EarlyIn<'_>) -> EarlyOutcome {
+    use crate::tables::trace_builder::{RowsNote, UnitRows};
+    let EarlyIn {
+        streamed,
+        rest,
+        run_airs,
+        format,
+        commit_config,
+        deviations,
+        mut plan,
+        observer,
+        start,
+        fault,
+    } = input;
+    let sent = (|| -> Result<(OwnedBlockStatement, f64), String> {
+        if !deviations.prepared_stack.is_empty()
+            || deviations.other_prepared
+            || !deviations.prepared_points.is_empty()
+        {
+            return Err("a test's prepared deviations".into());
+        }
+        let streamed = streamed
+            .recv()
+            .map_err(|_| "the streamed chunks were never all placed")?;
+        let rest = rest
+            .recv()
+            .map_err(|_| "the rest's layout stopped before its AIR set")?;
+        let Ok(RowsNote::Stated(units)) = rest.rows.recv() else {
+            return Err("the finish stated no rows".into());
+        };
+        let n = rest.widths.len();
+        if units.len() != n {
+            return Err(format!("{} rows stated for {n} tables", units.len()));
+        }
+        let mut rows: Vec<Option<usize>> = units
+            .iter()
+            .map(|u| match u {
+                UnitRows::Exact(r) => Some(*r),
+                UnitRows::Slot | UnitRows::Late => None,
+            })
+            .collect();
+        let mut late = units.iter().filter(|u| **u == UnitRows::Late).count();
+        while late > 0 {
+            match rest.rows.recv() {
+                Ok(RowsNote::Built { position, rows: r }) => {
+                    if units.get(position) == Some(&UnitRows::Late)
+                        && let Some(slot) = rows.get_mut(position)
+                        && slot.replace(r).is_none()
+                    {
+                        late -= 1;
+                    }
+                }
+                Ok(RowsNote::Stated(_)) => return Err("the rows stated twice".into()),
+                Err(_) => return Err(format!("{late} late table(s) never told their rows")),
+            }
+        }
+        if fault == EarlyFault::DoubledRows
+            && let Some(p) = rest.due.iter().copied().find(|&p| rows[p].is_some())
+            && let Some(r) = rows[p].as_mut()
+        {
+            *r *= 2;
+        }
+        // The packer's run: every streamed chunk, then the rest in the order
+        // it hands them on (a streamed chunk's slot reaches no packer).
+        let names: std::collections::HashMap<String, usize> = rest
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        let mut shapes: Vec<Option<(usize, usize)>> = vec![None; n];
+        let e = |e: Error| format!("{e:?}");
+        for &(table, index, shape, local) in &streamed {
+            let at = *names
+                .get(&stream_name(table, index))
+                .ok_or_else(|| format!("no AIR for {}", stream_name(table, index)))?;
+            shapes[at] = Some(shape);
+            plan.place(Key::Streamed(table, index), shape, local)
+                .map_err(e)?;
+        }
+        let due: Vec<usize> = rest
+            .due
+            .iter()
+            .copied()
+            .filter(|&p| units[p] != UnitRows::Slot)
+            .collect();
+        let replayed = match fault {
+            EarlyFault::ShortReplay => due.len().saturating_sub(1),
+            _ => due.len(),
+        };
+        for (k, p) in due.into_iter().enumerate() {
+            let r = rows[p].ok_or_else(|| format!("table {p}'s rows never told"))?;
+            if !r.is_power_of_two() {
+                return Err(format!("table {p} states {r} rows"));
+            }
+            let shape = (rest.widths[p], r.trailing_zeros() as usize);
+            if shapes[p].replace(shape).is_some() {
+                return Err(format!("table {p} placed twice"));
+            }
+            if k < replayed {
+                plan.place(Key::Air(p), shape, rest.locals[p]).map_err(e)?;
+            }
+        }
+        let keys = plan.finish().map_err(e)?;
+        let mut shapes: Vec<(usize, usize)> = shapes
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| s.ok_or_else(|| format!("table {i} has no shape")))
+            .collect::<Result<_, _>>()?;
+        let locals = keys
+            .iter()
+            .flatten()
+            .filter(|key| matches!(key, Key::Local(_)))
+            .count();
+        shapes.extend(std::iter::repeat_n(
+            (local_bytes::cols::NUM_COLUMNS, local_bytes::LOG_ROWS),
+            locals,
+        ));
+        let groups = group_indices(keys, &names, n).map_err(e)?;
+        let config = format.chain_config(&shapes);
+        if config.log_blowup != commit_config.log_blowup
+            || config.log_folding != commit_config.log_folding
+            || config.format != commit_config.format
+        {
+            return Err("the predicted shapes give another config".into());
+        }
+        let airs = run_airs.get().ok_or("the run's AIR set is not there")?;
+        let prepared = prepared_tables(airs, &rest.page_configs, format).map_err(e)?;
+        let (prepared, _, _) =
+            prover_prepared::<H>(prepared, &groups, &config, deviations).map_err(e)?;
+        let mut roots = prepared_roots(&prepared);
+        drop(prepared);
+        if fault == EarlyFault::RootWord
+            && let Some(root) = roots.first_mut().and_then(|(_, r)| r.first_mut())
+        {
+            *root = tampered_root(root);
+        }
+        let mut public_output = rest.public_output;
+        if fault == EarlyFault::PublicOutput {
+            match public_output.first_mut() {
+                Some(b) => *b ^= 1,
+                None => public_output.push(1),
+            }
+        }
+        let statement = OwnedBlockStatement {
+            table_num_vars: shapes.iter().map(|&(_, v)| v as u8).collect(),
+            runtime_page_ranges: rest.runtime_page_ranges,
+            table_counts: rest.table_counts,
+            public_output,
+            num_private_input_pages: rest.num_private_input_pages,
+            groups,
+            fused_memory: rest.fused_memory,
+            word_memory: rest.word_memory,
+        };
+        let at = start.elapsed().as_secs_f64();
+        observer(statement.view(), &roots);
+        Ok((statement, at))
+    })();
+    EarlyOutcome { sent }
+}
+
+/// A root with its first word changed (a test's [`EarlyFault::RootWord`]).
+fn tampered_root(
+    root: &multilinear::whir_commit::Commitment,
+) -> multilinear::whir_commit::Commitment {
+    let mut bytes = *root;
+    bytes[0] ^= 1;
+    bytes
+}
+
+/// The first field where `early` and the final statement differ, or `None`.
+fn early_differs(early: &OwnedBlockStatement, fin: BlockStatement<'_>) -> Option<String> {
+    if early.table_num_vars != fin.table_num_vars {
+        let at = early
+            .table_num_vars
+            .iter()
+            .zip(fin.table_num_vars)
+            .position(|(a, b)| a != b)
+            .unwrap_or(early.table_num_vars.len().min(fin.table_num_vars.len()));
+        return Some(format!(
+            "table {at}: 2^{} predicted, 2^{} built ({} against {} tables)",
+            early.table_num_vars.get(at).copied().unwrap_or(0),
+            fin.table_num_vars.get(at).copied().unwrap_or(0),
+            early.table_num_vars.len(),
+            fin.table_num_vars.len()
+        ));
+    }
+    if early.groups != fin.groups {
+        let at = early
+            .groups
+            .iter()
+            .zip(fin.groups)
+            .position(|(a, b)| a != b)
+            .unwrap_or(early.groups.len().min(fin.groups.len()));
+        return Some(format!(
+            "group {at} differs ({} against {} groups)",
+            early.groups.len(),
+            fin.groups.len()
+        ));
+    }
+    if format!("{:?}", early.table_counts) != format!("{:?}", fin.table_counts) {
+        return Some("the table counts".into());
+    }
+    if format!("{:?}", early.runtime_page_ranges) != format!("{:?}", fin.runtime_page_ranges) {
+        return Some("the runtime page ranges".into());
+    }
+    if early.public_output != fin.public_output {
+        return Some("the public output".into());
+    }
+    if early.num_private_input_pages != fin.num_private_input_pages {
+        return Some("the private input pages".into());
+    }
+    if early.fused_memory != fin.fused_memory || early.word_memory != fin.word_memory {
+        return Some("the memory counts".into());
+    }
+    None
+}
+
+/// Early statements whose final statement differed ([`early_differs`]),
+/// since the process started.
+static EARLY_MISMATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`EARLY_MISMATCHES`]' count.
+pub fn early_statement_mismatches() -> usize {
+    EARLY_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A streamed chunk laid out: its table, its index, its shape and the table.
 type LaidChunk<'a> = (
     StreamTable,
@@ -8177,6 +8734,7 @@ fn stream_pipelined<'a, R>(
     gate: Option<&'a crate::tables::trace_builder::gate::ByteGate>,
     recorder: Option<&regen::Recorder>,
     waits: Option<&ProducerWaits>,
+    early: Option<std::sync::mpsc::SyncSender<EarlyStreamed>>,
     rest: impl FnOnce(RestIn, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
 ) -> Result<(StreamLaid<'a>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
@@ -8239,6 +8797,7 @@ fn stream_pipelined<'a, R>(
             let mut pending = std::collections::BTreeMap::new();
             let mut next = 0usize;
             let mut shapes = Vec::new();
+            let mut early_streamed: EarlyStreamed = Vec::new();
             let mut chunks = 0.0;
             for (seq, secs, laid) in drx {
                 chunks += secs;
@@ -8246,6 +8805,9 @@ fn stream_pipelined<'a, R>(
                 while let Some(laid) = pending.remove(&next) {
                     let (table, index, shape, laid, counts) = laid?;
                     shapes.push((table, index, shape));
+                    if early.is_some() {
+                        early_streamed.push((table, index, shape, counts.is_some()));
+                    }
                     packer.place(Key::Streamed(table, index), shape, laid, counts)?;
                     head_log::chunk_placed(next);
                     if let Some(permits) = permits {
@@ -8260,6 +8822,9 @@ fn stream_pipelined<'a, R>(
                 )));
             }
             let placed_at = packer.start.elapsed().as_secs_f64();
+            if let Some(early) = early {
+                let _ = early.send(early_streamed);
+            }
             // The rest's tables, after every chunk, in AIR order: the first at
             // the block index after the last chunk's.
             if let Some(recorder) = recorder {
@@ -8693,13 +9258,18 @@ fn lay_out_rest_streamed<'a>(
     ecdas: crate::tables::ecdas::EcdasForm,
     page_run_log2: u8,
     close_ahead: Option<std::sync::Arc<CloseAhead>>,
+    early_rest: Option<std::sync::mpsc::SyncSender<EarlyRest>>,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
         sink.ok_or_else(|| Error::Prover("a streamed rest needs the packer's sink".into()))?;
     let at = || start.elapsed().as_secs_f64();
     let mut marks = vec![("rest received", at())];
-    let RestStream { header, tables } = *stream;
+    let RestStream {
+        header,
+        tables,
+        rows,
+    } = *stream;
     validate_block_counts(&header.table_counts)?;
     // The finish cut its page tables at the format's page runs.
     if header.page_run_log2 != page_run_log2 {
@@ -8929,6 +9499,32 @@ fn lay_out_rest_streamed<'a>(
             pages.last().map_or(0, |p| p + 1)
         );
     }
+    // The early statement ([`early_statement`]): the rows the finish states,
+    // the order the packer is handed the rest in, and what the header
+    // settles, now that the AIR set is there.
+    if let (Some(early_rest), Some(rows)) = (early_rest, rows) {
+        let _ = early_rest.send(EarlyRest {
+            rows,
+            due: order.due.clone(),
+            names: refs.iter().map(|air| air.name().to_string()).collect(),
+            widths: refs.iter().map(|air| air.trace_layout().0).collect(),
+            locals: refs
+                .iter()
+                .map(|air| {
+                    keccak_rnd.byte_lookups_local()
+                        && local_bytes::sends_local(air.bus_interactions())
+                })
+                .collect(),
+            table_counts: header.table_counts.clone(),
+            runtime_page_ranges: runtime_page_ranges.clone(),
+            public_output: header.public_output_bytes.clone(),
+            num_private_input_pages,
+            fused_memory,
+            word_memory,
+            page_configs: header.page_configs.clone(),
+        });
+        marks.push(("early sent", at()));
+    }
     // The tables laid out before the set: admitted in their order, each AIR
     // the run's own.
     for &(position, width, air) in &before {
@@ -9072,6 +9668,7 @@ fn prove_streamed(
     options: &BlockOptions,
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
+    early_statement_to: Option<StatementObserver<'_>>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
     stamps: &mut BlockStamps,
@@ -9600,8 +10197,59 @@ fn prove_streamed(
                 "full: the executor writes the logs"
             }
         );
-        let (block, built, laid, executed) = std::thread::scope(|scope| {
+        // ★ The early statement ([`early_statement`]): asked by a caller that
+        // can use it, and only where the rest is laid out off the packer's
+        // thread (the streamed finish states its rows there).
+        let early_to = early_statement_to.filter(|_| options.layout_workers != 0);
+        let early_on = early_to.is_some();
+        let early_fault = EARLY_FAULT_FOR_TEST.with(std::cell::Cell::get);
+        let (early_streamed_tx, early_streamed_rx) = match early_on {
+            true => {
+                let (t, r) = std::sync::mpsc::sync_channel::<EarlyStreamed>(1);
+                (Some(t), Some(r))
+            }
+            false => (None, None),
+        };
+        let (early_rest_tx, early_rest_rx) = match early_on {
+            true => {
+                let (t, r) = std::sync::mpsc::sync_channel::<EarlyRest>(1);
+                (Some(t), Some(r))
+            }
+            false => (None, None),
+        };
+        let early_plan = early_on.then(|| {
+            PackPlan::new(
+                cap,
+                format.group_polys,
+                format.max_groups,
+                format.local_lookups(),
+                own_groups,
+            )
+        });
+        let (block, built, laid, executed, early_outcome) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
+            // The early statement's thread, beside the layout's.
+            let early = match (early_to, early_streamed_rx, early_rest_rx, early_plan) {
+                (Some(observer), Some(streamed), Some(rest), Some(early_plan)) => {
+                    let input = EarlyIn {
+                        streamed,
+                        rest,
+                        run_airs: &run_airs,
+                        format,
+                        commit_config: &commit_config,
+                        deviations,
+                        plan: early_plan,
+                        observer,
+                        start,
+                        fault: early_fault,
+                    };
+                    std::thread::Builder::new()
+                        .name("early-statement".into())
+                        .spawn_scoped(scope, move || early_statement::<H>(input))
+                        .ok()
+                }
+                _ => None,
+            };
             // The executor, a window at a time, two windows ahead of the walk;
             // with walkers, each window with the memory at its start.
             // The logs shared between the walk and the card fill.
@@ -10220,11 +10868,26 @@ fn prove_streamed(
                     start_early();
                     let emitted = builder.finish_streamed_keeping(&last, rest_gate, keep, |header| {
                         let (tx, rx) = std::sync::mpsc::channel();
+                        // The rows the finish states, for the early statement.
+                        let (rows_tx, rows_rx) = match early_on {
+                            true => {
+                                let (t, r) = std::sync::mpsc::channel();
+                                (Some(t), Some(r))
+                            }
+                            false => (None, None),
+                        };
                         btx.send(Built::Stream(Box::new(RestStream {
                             header,
                             tables: rx,
+                            rows: rows_rx,
                         })))
                         .map_err(|_| Error::Prover("the layout thread stopped".into()))?;
+                        let rows: Option<crate::tables::trace_builder::RowsSink<'_>> =
+                            rows_tx.map(|t| {
+                                Box::new(move |note: crate::tables::trace_builder::RowsNote| {
+                                    let _ = t.send(note);
+                                }) as crate::tables::trace_builder::RowsSink<'_>
+                            });
                         let send: crate::tables::trace_builder::RestSink<'_> = Box::new(
                             move |emitted: crate::tables::trace_builder::Emitted| {
                                 if let (Some(ledger), Some(table)) = (ledger, &emitted.table) {
@@ -10237,7 +10900,7 @@ fn prove_streamed(
                                 })
                             },
                         );
-                        Ok((send, None))
+                        Ok((send, rows))
                     });
                     if let Some(ledger) = ledger {
                         crate::tables::trace_builder::build_stamps::set_hook(None);
@@ -10414,6 +11077,7 @@ fn prove_streamed(
                         format.ecdas,
                         format.page_runs(),
                         close_ahead.clone(),
+                        early_rest_tx,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -10429,6 +11093,7 @@ fn prove_streamed(
                         Some(rest_gate),
                         recorder,
                         Some(waits),
+                        early_streamed_tx,
                         rest_of,
                     )?
                 };
@@ -10644,7 +11309,12 @@ fn prove_streamed(
                         }),
                 ))
             };
-            (block, builder.join(), layout.join(), executor.join())
+            let early = early.map(|h| {
+                h.join().unwrap_or_else(|_| EarlyOutcome {
+                    sent: Err("its thread panicked".into()),
+                })
+            });
+            (block, builder.join(), layout.join(), executor.join(), early)
         });
         stamps.head = head_log::take_lines();
         for line in &stamps.head {
@@ -10941,6 +11611,41 @@ fn prove_streamed(
         stamps.prepared = (prepared.len(), derive);
         if let Some(ledger) = ledger {
             ledger.line("prepared committed");
+        }
+        // The early statement against this one, field by field: a stamp and a
+        // count here; the caller makes its own comparison before it uses it.
+        if let Some(outcome) = early_outcome {
+            let misses = crate::tables::trace_builder::rows_misses();
+            match outcome.sent {
+                Ok((early, at)) => {
+                    let fin = BlockStatement {
+                        table_num_vars: &table_num_vars,
+                        runtime_page_ranges: &laid.runtime_page_ranges,
+                        table_counts: &laid.table_counts,
+                        public_output: &laid.public_output,
+                        num_private_input_pages: laid.num_private_input_pages,
+                        groups: &laid.groups,
+                        fused_memory: laid.fused_memory,
+                        word_memory: laid.word_memory,
+                    };
+                    let ended = start.elapsed().as_secs_f64();
+                    let verdict = match early_differs(&early, fin) {
+                        None => "confirmed".to_string(),
+                        Some(why) => {
+                            EARLY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            format!("MISMATCH ({why})")
+                        }
+                    };
+                    eprintln!(
+                        "BLOCK EARLY STATEMENT: sent at {at:.3}s · phase A ended at {ended:.3}s · lead \
+                         {:.3}s · {verdict} · rows misses {misses}",
+                        ended - at
+                    );
+                }
+                Err(why) => {
+                    eprintln!("BLOCK EARLY STATEMENT: not sent ({why}) · rows misses {misses}")
+                }
+            }
         }
         on_statement(
             BlockStatement {
@@ -15243,5 +15948,146 @@ mod narrow_commit_tests {
         assert!(!narrow_commit_fits(words, staging, price, need - 1));
         assert!(!narrow_commit_fits(words, 0, price, words + price));
         assert!(!narrow_commit_fits(u64::MAX, staging, price, u64::MAX - 1));
+    }
+}
+
+#[cfg(test)]
+mod pack_plan_tests {
+    use super::{Key, PackPlan, StreamTable};
+
+    /// A run of tables as they reach the packer: streamed chunks
+    /// (KECCAK_RND's and another family's) first, then the rest's tables; a
+    /// table's shape and whether it sends locally from a simple generator.
+    fn run(seed: u64, n: usize) -> Vec<(Key, (usize, usize), bool)> {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let streamed = n / 3;
+        (0..n)
+            .map(|i| {
+                let r = next();
+                let shape = (1 + (r % 40) as usize, 4 + (r >> 8) as usize % 7);
+                let local = (r >> 20) % 3 == 0;
+                let key = if i < streamed {
+                    match r % 2 {
+                        0 => Key::Streamed(StreamTable::KeccakRnd, i),
+                        _ => Key::Streamed(StreamTable::Cpu, i),
+                    }
+                } else {
+                    Key::Air(i)
+                };
+                (key, shape, local)
+            })
+            .collect()
+    }
+
+    fn plan(own: bool, local: bool, max_groups: usize) -> PackPlan {
+        let cap = multilinear::whir_chain::StackVars::new(12).expect("a cap");
+        PackPlan::new(cap, 6, max_groups, local, own)
+    }
+
+    fn label(key: &Key) -> String {
+        match key {
+            Key::Streamed(t, i) => format!("{t:?}{i}"),
+            Key::Air(i) => format!("A{i}"),
+            Key::Local(j) => format!("L{j}"),
+        }
+    }
+
+    fn groups(keys: &[Vec<Key>]) -> Vec<Vec<String>> {
+        keys.iter().map(|g| g.iter().map(label).collect()).collect()
+    }
+
+    /// ★ The plan is a function of the run: a clone taken after any prefix
+    /// and fed the rest gives the whole run's groups; every table lands in
+    /// exactly one group, in order within the main and own groups; each group
+    /// with a local sender ends with its LOCAL_BYTES key, numbered in closing
+    /// order; KECCAK_RND's own chunks never share a group with another table;
+    /// and a group past the most is refused.
+    #[test]
+    fn the_pack_plan_is_a_function_of_the_run() {
+        for seed in 0..30u64 {
+            let tables = run(seed, 10 + (seed as usize % 40));
+            for (own, local) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut whole = plan(own, local, usize::MAX);
+                for &(key, shape, sends) in &tables {
+                    whole.place(key, shape, sends && local).expect("placed");
+                }
+                let want = whole.clone().finish().expect("finished");
+                for cut in [0, 1, tables.len() / 2, tables.len()] {
+                    let mut head = plan(own, local, usize::MAX);
+                    for &(key, shape, sends) in &tables[..cut] {
+                        head.place(key, shape, sends && local).expect("placed");
+                    }
+                    let mut tail = head.clone();
+                    for &(key, shape, sends) in &tables[cut..] {
+                        tail.place(key, shape, sends && local).expect("placed");
+                    }
+                    assert_eq!(
+                        groups(&tail.finish().expect("finished")),
+                        groups(&want),
+                        "seed {seed} own {own} local {local} cut {cut}"
+                    );
+                }
+                let flat: Vec<String> = want
+                    .iter()
+                    .flatten()
+                    .filter(|k| !matches!(k, Key::Local(_)))
+                    .map(label)
+                    .collect();
+                assert_eq!(flat.len(), tables.len(), "seed {seed}: every table once");
+                let mut seen = std::collections::HashSet::new();
+                assert!(flat.iter().all(|k| seen.insert(k.clone())), "seed {seed}");
+                let locals: Vec<usize> = want
+                    .iter()
+                    .flat_map(|g| {
+                        g.iter().enumerate().filter_map(move |(at, k)| match k {
+                            Key::Local(j) => {
+                                assert_eq!(at + 1, g.len(), "LOCAL_BYTES closes its group");
+                                Some(*j)
+                            }
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                assert_eq!(locals, (0..locals.len()).collect::<Vec<_>>());
+                assert!(local || locals.is_empty(), "no local lookups, no LOCAL_BYTES");
+                if own {
+                    for g in &want {
+                        let own_keys = g
+                            .iter()
+                            .filter(|k| matches!(k, Key::Streamed(StreamTable::KeccakRnd, _)))
+                            .count();
+                        let others = g
+                            .iter()
+                            .filter(|k| {
+                                !matches!(k, Key::Streamed(StreamTable::KeccakRnd, _) | Key::Local(_))
+                            })
+                            .count();
+                        assert!(own_keys == 0 || others == 0, "seed {seed}: {:?}", groups(&[g.clone()]));
+                    }
+                }
+                if want.len() > 1 {
+                    let mut few = plan(own, local, want.len() - 1);
+                    let refused = tables
+                        .iter()
+                        .try_for_each(|&(key, shape, sends)| few.place(key, shape, sends && local))
+                        .and_then(|()| few.finish().map(|_| ()));
+                    assert!(refused.is_err(), "seed {seed}: one group past the most");
+                }
+            }
+        }
+    }
+
+    /// A local sender outside the format's local lookups is refused, as the
+    /// packer refuses it.
+    #[test]
+    fn a_local_sender_without_local_lookups_is_refused() {
+        let mut p = plan(false, false, usize::MAX);
+        assert!(p.place(Key::Air(0), (3, 5), true).is_err());
     }
 }
