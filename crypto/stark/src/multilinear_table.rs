@@ -242,6 +242,26 @@ where
     }
 }
 
+/// A table's columns as a lane on another card owns them
+/// ([`CommittedTable::lane_columns`]): its records' handle, or a copy of a
+/// small table's packed or wide columns. Nothing in it borrows the table.
+pub(crate) enum LaneColumns<F: IsField> {
+    Records(multilinear::records::Records),
+    Narrow(multilinear::narrow::NarrowColumns),
+    Wide(Vec<Mle<F>>),
+}
+
+impl<F: IsField> LaneColumns<F> {
+    /// The columns as they go to the card ([`multilinear::gpu::upload_tables`]).
+    pub(crate) fn upload_view(&self) -> multilinear::gpu::TableColumns<'_, F> {
+        match self {
+            Self::Records(records) => multilinear::gpu::TableColumns::Records(records),
+            Self::Narrow(packed) => multilinear::gpu::TableColumns::Narrow(packed),
+            Self::Wide(columns) => multilinear::gpu::TableColumns::Wide(columns),
+        }
+    }
+}
+
 /// One table's structure and its trace, with **no commitment of its own**.
 ///
 /// A table used to carry its own, so a proof of N tables paid N openings — and
@@ -464,6 +484,41 @@ where
     /// ([`multilinear::narrow::HostColumns`]).
     pub fn trace(&self) -> &TraceData<F, E> {
         &self.trace
+    }
+
+    /// The table's columns as a lane on another card takes them, owned
+    /// ([`LaneColumns`]): its records' handle (the same `Arc`), or a copy of
+    /// the packed or wide columns of a table of at most `max_cells` cells.
+    /// `None` for a table neither held as records nor that small (or spilled):
+    /// its group is not light. It never reads a records or packed table's
+    /// host columns, so it neither fills nor widens one on the host.
+    pub(crate) fn lane_columns(&self, max_cells: usize) -> Option<LaneColumns<F>> {
+        if let Some(records) = self.trace.records() {
+            return Some(LaneColumns::Records(records.clone()));
+        }
+        let cells = self
+            .num_committed_columns()
+            .checked_mul(1usize.checked_shl(self.num_vars() as u32)?)?;
+        if cells > max_cells || self.trace.is_spilled() {
+            return None;
+        }
+        match self.trace.narrow() {
+            Some(packed) => Some(LaneColumns::Narrow(packed.clone())),
+            // Neither records, packed nor spilled: held wide, so `columns()`
+            // borrows them as they are.
+            None => Some(LaneColumns::Wide(self.trace.columns().to_vec())),
+        }
+    }
+
+    /// A lane's shell of this table on another card: its layout and shape, no
+    /// device copy (not even card 0's store, which it would keep alive) and,
+    /// with `host_columns` (a test's host lane), a copy of its columns on the
+    /// host. The lane points it at its own store once it uploads
+    /// ([`Self::set_resident`]).
+    pub(crate) fn lane_shell(&self, host_columns: bool) -> Self {
+        let mut shell = self.probe_view(host_columns);
+        shell.clear_resident();
+        shell
     }
 
     /// The columns as they go to the card: their field elements, or packed.
