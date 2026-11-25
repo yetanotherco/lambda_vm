@@ -1208,6 +1208,26 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// With [`Self::drop_streamed_ops`], keeps the word memory format's rows
+    /// as the windows' lists and hands each streamed word family's chunk out
+    /// as the parts its rows lie in, instead of appending every window's rows
+    /// to one list and copying each chunk out of its front. The chunks, and so
+    /// the tables, are the same; under any other format, or without
+    /// [`Self::stream_word_tables`], the finish's lists are the same. After
+    /// [`Self::drop_streamed_ops`] and before the first window only.
+    pub fn word_chunks_in_place(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "word_chunks_in_place after a window was walked".to_string(),
+            ));
+        }
+        let kept = self.kept.as_mut().ok_or_else(|| {
+            Error::Prover("word_chunks_in_place without drop_streamed_ops".to_string())
+        })?;
+        kept.word_tails.get_or_insert_with(WordTails::default);
+        Ok(self)
+    }
+
     /// A test's fault ([`StreamSkip::card_fill_fault`]): with
     /// [`Self::card_fill_keccak_rnd`], each KECCAK_RND table's records start
     /// `rows` rows late, the same wrong table however they are filled.
@@ -4022,6 +4042,116 @@ impl KeptWords {
     }
 }
 
+/// The word memory format's rows not yet handed out, under
+/// [`WindowedTraceBuilder::word_chunks_in_place`]: each streamed family's
+/// windows' lists moved in whole, a chunk handed out as the parts its rows lie
+/// in, nothing copied; COPY_W's rows (never streamed), appended.
+#[derive(Default)]
+struct WordTails {
+    load8: Tail<mem_load8::Load8Row>,
+    store8: Tail<mem_store8::Store8Row>,
+    loadw: Tail<mem_loadw::LoadWRow>,
+    storew: Tail<mem_storew::StoreWRow>,
+    load2w: Tail<mem_load2w::Load2WRow>,
+    store2w: Tail<mem_store2w::Store2WRow>,
+    memw: Tail<memw_w::MemwWordRow>,
+    copy: Vec<crate::tables::copy_w::CopyWordRow>,
+}
+
+impl WordTails {
+    /// A window's rows, after the run's so far.
+    fn append(&mut self, rows: super::WordRows) {
+        let super::WordRows {
+            load8,
+            store8,
+            loadw,
+            storew,
+            load2w,
+            store2w,
+            memw,
+            mut copy,
+        } = rows;
+        self.load8.push(load8);
+        self.store8.push(store8);
+        self.loadw.push(loadw);
+        self.storew.push(storew);
+        self.load2w.push(load2w);
+        self.store2w.push(store2w);
+        self.memw.push(memw);
+        self.copy.append(&mut copy);
+    }
+
+    /// The rows not handed out, one list a family: the finish's.
+    fn into_rows(self) -> super::WordRows {
+        super::WordRows {
+            load8: self.load8.into_vec(),
+            store8: self.store8.into_vec(),
+            loadw: self.loadw.into_vec(),
+            storew: self.storew.into_vec(),
+            load2w: self.load2w.into_vec(),
+            store2w: self.store2w.into_vec(),
+            memw: self.memw.into_vec(),
+            copy: self.copy,
+        }
+    }
+
+    /// The bytes its lists take on the heap.
+    fn heap_bytes(&self) -> usize {
+        self.load8.heap_bytes()
+            + self.store8.heap_bytes()
+            + self.loadw.heap_bytes()
+            + self.storew.heap_bytes()
+            + self.load2w.heap_bytes()
+            + self.store2w.heap_bytes()
+            + self.memw.heap_bytes()
+            + super::vec_heap_bytes(&self.copy)
+    }
+
+    /// The bytes its largest single allocation takes: a window's list of one
+    /// family, or COPY_W's list.
+    fn largest_bytes(&self) -> usize {
+        [
+            self.load8.largest_bytes(),
+            self.store8.largest_bytes(),
+            self.loadw.largest_bytes(),
+            self.storew.largest_bytes(),
+            self.load2w.largest_bytes(),
+            self.store2w.largest_bytes(),
+            self.memw.largest_bytes(),
+            super::vec_heap_bytes(&self.copy),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+
+    /// Family `k`'s next `cap` rows ([`StreamTable::WORDS`]' order), as the
+    /// parts they lie in, or `None` when fewer remain.
+    fn take(&mut self, k: usize, cap: usize) -> Option<WordFamilyChunk> {
+        macro_rules! parts {
+            ($field:ident, $variant:ident) => {
+                (cap > 0 && self.$field.len >= cap)
+                    .then(|| WordFamilyChunk::$variant(self.$field.take_segments(cap)))
+            };
+        }
+        match k {
+            0 => parts!(load8, Load8),
+            1 => parts!(store8, Store8),
+            2 => parts!(loadw, LoadW),
+            3 => parts!(storew, StoreW),
+            4 => parts!(load2w, Load2W),
+            5 => parts!(store2w, Store2W),
+            _ => parts!(memw, MemwW),
+        }
+    }
+}
+
+impl<T: Clone> Default for Tail<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A MEMW_R chunk in words mode: its words, the whole rows its markers name
 /// (the first at run index `whole_base`), and the logs of the windows its
 /// rows lie in (shared with the CPU tail and records).
@@ -4096,8 +4226,13 @@ struct Kept {
     mem_load: Tail<MemLoadRow>,
     mem_store: Tail<MemStoreRow>,
     /// The word memory format's rows, the run so far (the finish builds
-    /// their tables: none streams); empty under any other format.
+    /// their tables: none streams); empty under any other format, and under
+    /// [`WindowedTraceBuilder::word_chunks_in_place`], which keeps them in
+    /// `word_tails`.
     word_rows: super::WordRows,
+    /// [`WindowedTraceBuilder::word_chunks_in_place`]: the word rows as the
+    /// windows' lists, in place of `word_rows`.
+    word_tails: Option<WordTails>,
     /// Every other walk list, the run so far, in blocks (the in-walk lookups
     /// only hold what is left to count).
     rest: KeptRest,
@@ -4233,6 +4368,7 @@ impl Kept {
             mem_load: Tail::new(),
             mem_store: Tail::new(),
             word_rows: super::WordRows::default(),
+            word_tails: None,
             rest: KeptRest::new(max_rows),
             decode,
             listless: false,
@@ -4254,6 +4390,7 @@ impl Kept {
             + self.mem_load.heap_bytes()
             + self.mem_store.heap_bytes()
             + self.word_rows.heap_bytes()
+            + self.word_tails.as_ref().map_or(0, WordTails::heap_bytes)
             + self
                 .rest
                 .sizes()
@@ -4279,7 +4416,11 @@ impl Kept {
             ("kept shift".to_string(), self.shift.heap_bytes()),
             ("kept mem_load".to_string(), self.mem_load.heap_bytes()),
             ("kept mem_store".to_string(), self.mem_store.heap_bytes()),
-            ("kept word rows".to_string(), self.word_rows.heap_bytes()),
+            (
+                "kept word rows".to_string(),
+                self.word_rows.heap_bytes()
+                    + self.word_tails.as_ref().map_or(0, WordTails::heap_bytes),
+            ),
             ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
@@ -4310,7 +4451,12 @@ impl Kept {
             ("kept shift".to_string(), self.shift.largest_bytes()),
             ("kept mem_load".to_string(), self.mem_load.largest_bytes()),
             ("kept mem_store".to_string(), self.mem_store.largest_bytes()),
-            ("kept word rows".to_string(), self.word_rows.heap_bytes()),
+            (
+                "kept word rows".to_string(),
+                self.word_rows
+                    .heap_bytes()
+                    .max(self.word_tails.as_ref().map_or(0, WordTails::largest_bytes)),
+            ),
             ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
@@ -4422,7 +4568,10 @@ impl Kept {
         self.shift.push(shift_ops);
         self.mem_load.push(mem_load_rows);
         self.mem_store.push(mem_store_rows);
-        self.word_rows.append(word_rows);
+        match self.word_tails.as_mut() {
+            Some(tails) => tails.append(word_rows),
+            None => self.word_rows.append(word_rows),
+        }
         let rest = &mut self.rest;
         rest.bitwise_ops.extend(bitwise_ops);
         rest.copy_ops.extend(copy_ops);
@@ -4460,6 +4609,7 @@ impl Kept {
             mem_load,
             mem_store,
             word_rows,
+            word_tails,
             rest,
             decode,
             listless: _,
@@ -4493,7 +4643,16 @@ impl Kept {
         walk.cpu_side = cpu_side.into_vec();
         walk.mem_load_rows = mem_load.into_vec();
         walk.mem_store_rows = mem_store.into_vec();
-        walk.word_rows = word_rows;
+        // Under the in-place hand-out `word_rows` holds nothing: the tails'
+        // rows follow whatever it holds, so a row kept in both shows twice.
+        walk.word_rows = match word_tails {
+            Some(tails) => {
+                let mut rows = word_rows;
+                rows.append(tails.into_rows());
+                rows
+            }
+            None => word_rows,
+        };
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
@@ -5216,7 +5375,20 @@ fn tail_jobs(
     // tables: each chunk drained from the front of its kept list (what is
     // left is less than a chunk, so each drain moves little); their lookups
     // are in-walk lookups, counted as their windows were.
-    if e.stream_words && e.memory_format == MemoryFormat::Words {
+    if e.stream_words
+        && e.memory_format == MemoryFormat::Words
+        && let Some(tails) = kept.word_tails.as_mut()
+    {
+        // In place: each chunk the parts its rows lie in, nothing copied.
+        jobs.extend(word_chunks(m, &mut e.words, |k, _, cap| {
+            let t = Instant::now();
+            let chunk = tails.take(k, cap);
+            if chunk.is_some() {
+                stamps.note(StreamTable::WORDS[k], t.elapsed().as_secs_f64(), 0.0, 0);
+            }
+            chunk
+        }));
+    } else if e.stream_words && e.memory_format == MemoryFormat::Words {
         let rows = &mut kept.word_rows;
         jobs.extend(word_chunks(m, &mut e.words, |k, _, cap| {
             macro_rules! drained {

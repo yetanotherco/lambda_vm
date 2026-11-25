@@ -185,6 +185,9 @@ pub mod walk_cuts_block_tests;
 pub mod windowed_builder_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
+pub mod word_chunks_block_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
 pub mod word_memory_block_tests;
 
 pub mod shift_tests;
