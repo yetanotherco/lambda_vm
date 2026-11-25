@@ -3980,6 +3980,7 @@ impl<'a> FinishPlan<'a> {
             None,
             ecdas_form,
             None,
+            &[],
         )
     }
 
@@ -4002,6 +4003,7 @@ impl<'a> FinishPlan<'a> {
         let last = (slide && self.header.bitwise_last).then_some(0);
         let keccak_rnd_first = slide && self.header.keccak_rnd_first;
         let pages_first = slide && self.header.pages_first;
+        let late_first = slide && self.skip.late_first;
         let ecdas_form = self.skip.ecdas_form;
         let (units, regen, side) = match self.units_keeping(keep) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
@@ -4024,8 +4026,27 @@ impl<'a> FinishPlan<'a> {
             }
             _ => Vec::new(),
         };
+        // Under `late_first`, the late families' tables start first.
+        let start_first: Vec<usize> = match (&units, late_first) {
+            (Ok(units), true) => units
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| matches!(u, Unit::Build { family, .. } if rows_late(*family)))
+                .map(|(p, _)| p)
+                .collect(),
+            _ => Vec::new(),
+        };
         emit_streamed_units_ordered(
-            units, gate, send, slide, &first, last, side, ecdas_form, on_rows,
+            units,
+            gate,
+            send,
+            slide,
+            &first,
+            last,
+            side,
+            ecdas_form,
+            on_rows,
+            &start_first,
         )?;
         Ok(regen)
     }
@@ -4160,6 +4181,7 @@ fn emit_streamed_units<'a>(
         side,
         ecdas::EcdasForm::Bytes,
         None,
+        &[],
     )
 }
 
@@ -4178,10 +4200,21 @@ fn emit_streamed_units_ordered<'a>(
     side: Option<Side<'a>>,
     ecdas_form: ecdas::EcdasForm,
     mut on_rows: Option<&mut dyn FnMut(RowsNote)>,
+    start_first: &[usize],
 ) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send, first, last, side, ecdas_form, &mut on_rows)
+        emit_units_sliding(
+            units,
+            gate,
+            send,
+            first,
+            last,
+            side,
+            ecdas_form,
+            &mut on_rows,
+            start_first,
+        )
     } else {
         if let Some(side) = side {
             side();
@@ -4190,7 +4223,7 @@ fn emit_streamed_units_ordered<'a>(
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
-        let _ = (slide, first, last);
+        let _ = (slide, first, last, start_first);
         if let Some(side) = side {
             side();
         }
@@ -4376,6 +4409,7 @@ fn emit_units_sliding<'a>(
     side: Option<Side<'a>>,
     ecdas_form: ecdas::EcdasForm,
     on_rows: &mut Option<&mut dyn FnMut(RowsNote)>,
+    start_first: &[usize],
 ) -> Result<(), Error> {
     let units = units?;
     let last_waits = side.is_some();
@@ -4387,7 +4421,17 @@ fn emit_units_sliding<'a>(
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
             });
         }
-        slide_units(units, gate, send, first, last, last_waits, ecdas_form, on_rows)
+        slide_units(
+            units,
+            gate,
+            send,
+            first,
+            last,
+            last_waits,
+            ecdas_form,
+            on_rows,
+            start_first,
+        )
     })
 }
 
@@ -4403,6 +4447,7 @@ fn slide_units(
     last_waits: bool,
     ecdas_form: ecdas::EcdasForm,
     on_rows: &mut Option<&mut dyn FnMut(RowsNote)>,
+    start_first: &[usize],
 ) -> Result<(), Error> {
     let total = units.len();
     let mut estimates = Estimates::new(ecdas_form);
@@ -4428,17 +4473,30 @@ fn slide_units(
     // The estimated bytes of the tables building now.
     let mut building_bytes = 0usize;
     // Started in the order they are handed on, but `last` first (it still
-    // starts first when the gate admits it): without `first`, AIR order.
+    // starts first when the gate admits it), then `start_first` (the same
+    // way): without `first`, AIR order.
+    let mut early_start = vec![false; total];
+    for &p in start_first {
+        if let Some(e) = early_start.get_mut(p) {
+            *e = Some(p) != last;
+        }
+    }
     let mut slots: Vec<Option<Unit<'_>>> = units.into_iter().map(Some).collect();
     let mut units: std::collections::VecDeque<(usize, Unit<'_>)> = last
         .into_iter()
-        .chain(order.iter().copied().filter(|&p| Some(p) != last))
+        .chain(order.iter().copied().filter(|&p| early_start[p]))
+        .chain(
+            order
+                .iter()
+                .copied()
+                .filter(|&p| Some(p) != last && !early_start[p]),
+        )
         .filter_map(|p| Some((p, slots.get_mut(p)?.take()?)))
         .collect();
-    // `last`'s table when the gate did not admit it as it came: the tables
-    // after it start meanwhile, and it is tried again before them, and goes
-    // once it is due.
-    let mut aside = None;
+    // `last`'s table (and a table started first) when the gate did not admit
+    // it as it came: the tables after it start meanwhile, and it is tried
+    // again before them, and goes once it is due.
+    let mut aside: Vec<(usize, Unit<'_>)> = Vec::new();
     let mut families = [FamilyBuild::default(); FAMILIES.len()];
     rayon::in_place_scope_fifo(|scope| {
         loop {
@@ -4457,13 +4515,13 @@ fn slide_units(
             }
             // Start every table the gate admits, in order.
             let mut waiting = false;
-            if let Some(unit) = aside.take() {
+            for unit in aside.drain(..).rev() {
                 units.push_front(unit);
             }
             while let Some((position, unit)) = units.front() {
                 // Started only once it is due ([`Side`]).
                 if last_waits && Some(*position) == last && order.get(sent) != Some(position) {
-                    aside = units.pop_front();
+                    aside.extend(units.pop_front());
                     continue;
                 }
                 let mut est_now = 0usize;
@@ -4475,8 +4533,8 @@ fn slide_units(
                         || !gate.try_acquire(numbers[*position], est)?
                     {
                         waiting = true;
-                        if Some(*position) == last {
-                            aside = units.pop_front();
+                        if Some(*position) == last || early_start[*position] {
+                            aside.extend(units.pop_front());
                             continue;
                         }
                         break;

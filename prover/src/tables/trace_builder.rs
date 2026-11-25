@@ -7910,6 +7910,13 @@ pub struct StreamSkip {
     /// the groups, and so the proof's bytes, are not. In waves it changes
     /// nothing.
     pub pages_first: bool,
+    /// With the slide, the tables of the families whose rows are known only
+    /// once built (LT, MUL, DVRM, BRANCH, BYTEWISE: they pad their
+    /// deduplicated rows) start building before the others, so their heights
+    /// are told early ([`finish::RowsNote`]). Only when they start: the
+    /// tables, their hand-on order and the groups are the same. In waves it
+    /// changes nothing.
+    pub late_first: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

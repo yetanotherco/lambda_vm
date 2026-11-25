@@ -1155,6 +1155,7 @@ fn tables_handed_on_first_stream_under_a_one_byte_budget() {
                 None,
                 crate::tables::ecdas::EcdasForm::Bytes,
                 None,
+                &[],
             );
             result.map(|()| (order, most.into_inner()))
         });
@@ -1163,6 +1164,83 @@ fn tables_handed_on_first_stream_under_a_one_byte_budget() {
             .expect("the stream");
         assert_eq!(order, want, "the order");
         assert_eq!(most, 1, "one table at a time");
+    }
+}
+
+/// Synthetic units of one row each that note their position as they start.
+#[cfg(feature = "parallel")]
+fn noting_units(n: usize, started: Arc<std::sync::Mutex<Vec<usize>>>) -> Vec<Unit<'static>> {
+    (0..n)
+        .map(|k| {
+            let started = Arc::clone(&started);
+            Unit::Build {
+                family: 0,
+                rows: 1,
+                job: Box::new(move || {
+                    started.lock().expect("the list").push(k);
+                    std::thread::sleep(Duration::from_millis(2));
+                    let width = FAMILIES[0].1;
+                    Ok(TraceTable::new_main(
+                        crate::tables::types::zeroed_fe_vec(width),
+                        width,
+                        1,
+                    ))
+                }) as Job<'static>,
+            }
+        })
+        .collect()
+}
+
+/// ★ Tables started first (the late families' under
+/// [`super::super::StreamSkip::late_first`]) start before the others but are
+/// handed on in the same order: one table building at a time they start
+/// `last`, then those, then the rest; under a one-byte budget the stream
+/// completes in the same hand-on order (a named timeout, not a hang, if a
+/// table started first held back the due one).
+#[test]
+#[cfg(feature = "parallel")]
+fn tables_started_first_are_handed_on_in_the_same_order() {
+    for (start, budget, build, started_want) in [
+        (vec![4, 5], usize::MAX, Some(1), Some(vec![0, 4, 5, 1, 2, 3])),
+        (vec![2], usize::MAX, Some(1), Some(vec![0, 2, 1, 3, 4, 5])),
+        (vec![4, 5], 1, None, None),
+        (vec![0, 3], 1, None, None),
+    ] {
+        let what = format!("start {start:?} budget {budget} build {build:?}");
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&started);
+        let done = within(30, move || {
+            let gate = ByteGate::new(budget).with_build(build);
+            let mut order = Vec::new();
+            let result = super::emit_streamed_units_ordered(
+                Ok(noting_units(6, noted)),
+                &gate,
+                &mut |e: Emitted| {
+                    gate.release(order.len());
+                    order.push(e.position);
+                    Ok(())
+                },
+                true,
+                &[],
+                Some(0),
+                None,
+                crate::tables::ecdas::EcdasForm::Bytes,
+                None,
+                &start,
+            );
+            result.map(|()| order)
+        });
+        let order = done
+            .unwrap_or_else(|| panic!("{what}: tables started first must not deadlock"))
+            .expect("the stream");
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 0], "{what}: the hand-on order");
+        if let Some(want) = started_want {
+            assert_eq!(
+                *started.lock().expect("the list"),
+                want,
+                "{what}: the start order"
+            );
+        }
     }
 }
 
@@ -2442,10 +2520,12 @@ fn states_its_height_for(
     for window in [7, 1000] {
         for slide in [false, true] {
             let block: Configure = Box::new(move |b| block_like(b, words));
+            let late: Configure = Box::new(move |b| block_like(b, words).late_rows_first());
             let plain: Vec<(String, &Configure)> = configs
                 .iter()
                 .map(|(c, f)| (c.to_string(), f))
                 .chain(std::iter::once(("the block's".to_string(), &block)))
+                .chain(std::iter::once(("the block's, late first".to_string(), &late)))
                 .collect();
             for (config, configure) in plain {
                 let what = format!("{name} window {window} {config} slide {slide}");
