@@ -24,16 +24,38 @@
 //! a job whose unit fails is dropped whole, and phase B argues the group
 //! from its challenges again. Either way the bytes are the ones phase B alone
 //! would send.
+//!
+//! A second lane ([`ZcLane::new_second`], `LocalPhaseA::second_card`) runs
+//! the light local groups' jobs on the two-card split's second card, idle in
+//! phase A. Its jobs own what they upload ([`LaneColumns`]: the records'
+//! handles, or a copy of a small table), so nothing of the group is borrowed
+//! once the committer hands it over, and nothing points at card 0's store;
+//! the job uploads the group to the second card at its start. No commit runs
+//! on that card, so its units never wait for one. The bytes are the same.
 
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use multilinear::whir_chain::GkrPack;
 
 use super::*;
+use crate::multilinear_table::LaneColumns;
+
+/// The most cells a table not held as records may have and still be copied
+/// to a second-card job (a group's byte table is 2^16 rows of 7 columns).
+pub(crate) const LANE_COPY_MAX_CELLS: usize = 1 << 20;
+
+/// The jobs a second lane holds at once: a queued job holds host handles and
+/// a small copy, never card memory, so card 0's hold has no reason there.
+const SECOND_LANE_HOLD: usize = 64;
+
+/// A second lane's readiness ([`ZcLane::ready`]).
+const SECOND_UNKNOWN: u8 = 0;
+const SECOND_READY: u8 = 1;
+const SECOND_NOT_READY: u8 = 2;
 
 /// A local argue the lane hands on ([`super::LocalStarted`], type-erased:
 /// the lane is not generic over the transcript).
@@ -175,6 +197,10 @@ pub struct ZcLaneStamp {
     /// A local job (local lookups): `bins`, `bins_ran` and `ladders` are its
     /// local argue's.
     pub local: bool,
+    /// The lane that took the job: 0 (card 0's), or 1 (the second card's).
+    pub card: u8,
+    /// A second-card job: its group's upload to that card (seconds).
+    pub upload: f64,
 }
 
 /// A group's merge probe in phase B ([`CsProbe::merge`]).
@@ -211,6 +237,9 @@ where
     stamp: ZcLaneStamp,
     /// A local job's argue begun at commit time ([`super::LocalStarted`]).
     local: Option<Box<dyn Any + Send>>,
+    /// A second-card job: what it uploads at its start, owned; its `tables`
+    /// are shells until then ([`CommittedTable::lane_shell`]).
+    source: Option<Vec<LaneColumns<F>>>,
 }
 
 struct LaneQueue<'a, F, E>
@@ -265,6 +294,19 @@ where
     max_growth: AtomicU64,
     queue: Mutex<LaneQueue<'a, F, E>>,
     wake: Condvar,
+    /// A second lane ([`Self::new_second`]): whether its card is ready
+    /// (unknown until its thread asks, [`Self::run_second`]); card 0's lane
+    /// is always ready.
+    ready: AtomicU8,
+    /// A second lane run on the host by a test, its card never asked.
+    on_host: bool,
+    /// A second lane: each group's copy bound (a test's), else
+    /// [`LANE_COPY_MAX_CELLS`].
+    copy_cells: Vec<usize>,
+    /// A second lane: when it learned its card was ready, and the groups
+    /// handed to card 0's lane before that.
+    ready_at: Mutex<Option<f64>>,
+    early: AtomicUsize,
 }
 
 impl<'a, F, E> ZcLane<'a, F, E>
@@ -320,7 +362,83 @@ where
                 local: Vec::new(),
             }),
             wake: Condvar::new(),
+            ready: AtomicU8::new(SECOND_READY),
+            on_host: false,
+            copy_cells: Vec::new(),
+            ready_at: Mutex::new(None),
+            early: AtomicUsize::new(0),
         })
+    }
+
+    /// The second lane: runs the light local groups' local argues on the
+    /// two-card split's second card, over `local_buses`, under `probe`'s
+    /// limits but a hold of [`SECOND_LANE_HOLD`]; its thread is
+    /// [`Self::run_second`]. `on_host`: a test's, run on the host without
+    /// asking for the card, each group's copy bound from it. `None` unless the
+    /// argue is batched.
+    pub(super) fn new_second(
+        probe: &CsProbe,
+        config: &ChainConfig,
+        local_buses: Vec<u64>,
+        on_host: Option<Vec<usize>>,
+    ) -> Option<Self> {
+        let probe = CsProbe {
+            mode: CsProbeMode::Off,
+            limits: LaneLimits {
+                hold: SECOND_LANE_HOLD,
+                ..probe.limits
+            },
+            ..probe.clone()
+        };
+        let mut lane = Self::new(&probe, config, Some(local_buses))?;
+        lane.ready = AtomicU8::new(if on_host.is_some() {
+            SECOND_READY
+        } else {
+            SECOND_UNKNOWN
+        });
+        lane.on_host = on_host.is_some();
+        lane.copy_cells = on_host.unwrap_or_default();
+        Some(lane)
+    }
+
+    /// Whether the lane runs a measurement on groups with no local job.
+    pub(super) fn has_work(&self) -> bool {
+        self.work.is_some()
+    }
+
+    /// The second lane's thread: asks whether the second card is ready (it
+    /// may wait for the card's set-up, here and not on the committer's
+    /// thread), and if it is, runs the jobs in the second card's pool, every
+    /// device call on that card, until [`Self::close`]. Not ready, it takes
+    /// no job: card 0's lane takes every group.
+    pub(super) fn run_second<T>(&self)
+    where
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        if self.on_host {
+            self.run::<T>();
+            return;
+        }
+        if !multilinear::gpu::two_card_split_ready() {
+            self.ready
+                .store(SECOND_NOT_READY, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        *self.ready_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.secs(Instant::now()));
+        self.ready
+            .store(SECOND_READY, std::sync::atomic::Ordering::SeqCst);
+        multilinear::gpu::on_second_card(|| self.run::<T>());
+    }
+
+    /// A second lane's readiness for the readout: when its card was ready
+    /// (seconds since phase A started; `None`: never), whether it said not
+    /// ready, and how many local groups went to card 0's lane before.
+    pub(super) fn readiness(&self) -> (Option<f64>, bool, usize) {
+        (
+            *self.ready_at.lock().unwrap_or_else(|e| e.into_inner()),
+            self.ready.load(std::sync::atomic::Ordering::SeqCst) == SECOND_NOT_READY,
+            self.early.load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LaneQueue<'a, F, E>> {
@@ -482,9 +600,128 @@ where
             on_card,
             stamp,
             local,
+            source: None,
         });
         drop(queue);
         self.wake.notify_all();
+    }
+
+    /// The second lane's [`Self::submit`]: group `group`, just committed,
+    /// with its local argue begun (`local`). A light group (every table held
+    /// as records or at most the copy bound) becomes a job that owns what it
+    /// uploads ([`CommittedTable::lane_columns`]) and holds shells with no
+    /// device copy ([`CommittedTable::lane_shell`]), or, past the hold, is
+    /// stamped deferred and its argue handed on to phase B; either way the
+    /// group is this lane's, and `None` comes back. A group that is not light,
+    /// or any group before the second card is known ready, comes back as it
+    /// came, for card 0's lane. No memory rule here: nothing is on a card yet
+    /// (the job reads the second card's ledger as it starts).
+    pub(super) fn submit_owned(
+        &self,
+        group: usize,
+        tables: &[CommittedTable<'a, F, E>],
+        roots: &[Commitment],
+        committed: Instant,
+        local: Option<Box<dyn Any + Send>>,
+    ) -> Option<Box<dyn Any + Send>> {
+        let local = local?;
+        if self.ready.load(std::sync::atomic::Ordering::SeqCst) != SECOND_READY {
+            if self.ready.load(std::sync::atomic::Ordering::SeqCst) == SECOND_UNKNOWN {
+                self.early.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            return Some(local);
+        }
+        let max_cells = self
+            .copy_cells
+            .get(group)
+            .copied()
+            .unwrap_or(LANE_COPY_MAX_CELLS);
+        let Some(source) = tables
+            .iter()
+            .map(|t| t.lane_columns(max_cells))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Some(local);
+        };
+        let store_bytes: u64 = tables.iter().map(|t| wide_bytes(t) as u64).sum();
+        let mut stamp = ZcLaneStamp {
+            tables: tables.len(),
+            committed_at: self.secs(committed),
+            store_bytes,
+            local: true,
+            card: 1,
+            ..Default::default()
+        };
+        let mut queue = self.lock();
+        let held = queue.jobs.len() + usize::from(queue.running.is_some());
+        stamp.ahead = held;
+        if held >= self.limits.hold {
+            stamp.state = LaneState::Deferred(LaneDefer::Hold);
+            queue.stamps.push((group, stamp));
+            queue.local.push((group, local));
+            drop(queue);
+            self.decide();
+            return None;
+        }
+        // Shells: the layout and shape, no device copy (card 0's store is not
+        // kept alive by them); the job points them at its own store.
+        let shells = tables.iter().map(|t| t.lane_shell(self.host)).collect();
+        queue.jobs.push_back(LaneJob {
+            group,
+            tables: shells,
+            roots: roots.to_vec(),
+            on_card: false,
+            stamp,
+            local: Some(local),
+            source: Some(source),
+        });
+        drop(queue);
+        self.wake.notify_all();
+        None
+    }
+
+    /// A second-card job's start: the memory rule on this card's ledger (the
+    /// thread is in the second card's role), then the group's upload from
+    /// what the job owns, its shells pointed at the store at their columns'
+    /// offsets. `Ok(on_card)`, or why the job does not run: no room
+    /// ([`LaneDefer::Memory`]) or the card declined the upload off the host
+    /// ([`LaneDefer::NoStore`]). A test's host lane goes on without a store.
+    fn upload_own(
+        &self,
+        tables: &mut [CommittedTable<'a, F, E>],
+        source: Vec<LaneColumns<F>>,
+        stamp: &mut ZcLaneStamp,
+    ) -> Result<bool, LaneDefer> {
+        let budget = multilinear::gpu::reserve_budget();
+        if self
+            .limits
+            .hold_bytes
+            .is_some_and(|cap| stamp.store_bytes > cap)
+            || (budget > 0
+                && multilinear::gpu::ledger_reserved() + stamp.store_bytes + self.limits.margin
+                    > budget.saturating_sub(self.limits.unledgered))
+        {
+            return Err(LaneDefer::Memory);
+        }
+        let tick = Instant::now();
+        let views: Vec<multilinear::gpu::TableColumns<'_, F>> =
+            source.iter().map(LaneColumns::upload_view).collect();
+        let store = multilinear::gpu::upload_tables(&views).map(Arc::new);
+        stamp.upload = tick.elapsed().as_secs_f64();
+        drop(views);
+        drop(source);
+        match store {
+            Some(store) => {
+                let mut first = 0usize;
+                for table in tables.iter_mut() {
+                    table.set_resident(store.clone(), first);
+                    first += table.num_committed_columns();
+                }
+                Ok(true)
+            }
+            None if self.host => Ok(false),
+            None => Err(LaneDefer::NoStore),
+        }
     }
 
     /// Phase A's loop ended: the job under way finishes, the rest are dropped.
@@ -607,13 +844,27 @@ where
     {
         let LaneJob {
             group,
-            tables,
+            mut tables,
             roots,
-            on_card,
+            mut on_card,
             mut stamp,
             local,
+            source,
         } = job;
         stamp.started_at = self.secs(Instant::now());
+        if let Some(source) = source {
+            match self.upload_own(&mut tables, source, &mut stamp) {
+                Ok(uploaded) => on_card = uploaded,
+                Err(why) => {
+                    // Phase B runs the bins, from the argue begun at commit
+                    // time.
+                    drop(tables);
+                    stamp.state = LaneState::Deferred(why);
+                    stamp.ended_at = self.secs(Instant::now());
+                    return (group, stamp, local);
+                }
+            }
+        }
         let at = if on_card { Where::Device } else { Where::Host };
         if let Some(local) = local {
             let local = self.run_local::<T>(group, &tables, local, at, &mut stamp);
@@ -1033,6 +1284,10 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
 /// seconds at the group's turn in phase B (the bins the lane left, in plan
 /// order). With the lane off every bin runs in phase B, so a lane-off run's
 /// per-bin seconds price the bins a lane-on run of the same block ran.
+///
+/// When a second lane took a job ([`ZcLane::new_second`]), each group's line
+/// also names its lane's card and the job's upload, and the sum what ran on
+/// the second card; otherwise the lines are as they were before it.
 #[doc(hidden)]
 pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
     let local: Vec<(usize, &GroupStamps)> = stamps
@@ -1044,13 +1299,19 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
         return String::new();
     }
     let secs = |v: &[f64]| v.iter().fold(0.0, |a, b| a + b);
+    let second = local.iter().any(|(_, s)| s.zc_lane.card == 1);
     let mut out = String::new();
     for (g, s) in &local {
         let l = &s.zc_lane;
         let bins = local_bins(s);
+        let card = if second {
+            format!(" · card {} · upload {:.3}s", l.card, l.upload)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
             "BLOCK LOCAL LANE: group {g} · {} · bins {} of {bins} in phase A · lane {:.3}s · \
-             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}]\n",
+             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}]{card}\n",
             l.state.word(),
             l.bins_ran,
             l.ladders,
@@ -1072,11 +1333,33 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
     };
     let total =
         |f: &dyn Fn(&GroupStamps) -> f64| local.iter().map(|(_, s)| f(s)).fold(0.0, |a, b| a + b);
+    let on_second: Vec<&ZcLaneStamp> = local
+        .iter()
+        .map(|(_, s)| &s.zc_lane)
+        .filter(|l| l.local && l.card == 1)
+        .collect();
+    let second_sum = if second {
+        format!(
+            " · on the second card: groups {}, ran {}, bins {}, lane {:.3}s, uploads {:.3}s, last \
+             job ended at {:.3}s",
+            on_second.len(),
+            on_second
+                .iter()
+                .filter(|l| l.state == LaneState::Ran)
+                .count(),
+            on_second.iter().map(|l| l.bins_ran).sum::<usize>(),
+            on_second.iter().map(|l| l.ladders).fold(0.0, |a, b| a + b),
+            on_second.iter().map(|l| l.upload).fold(0.0, |a, b| a + b),
+            on_second.iter().map(|l| l.ended_at).fold(0.0, f64::max),
+        )
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
         "BLOCK LOCAL LANE SUM: groups {} · lane jobs {} · bins {} of {} in phase A · ran {} · \
          deferred hold {} · memory {} · tail {} · shed {} · no store {} · stopped {} · declined {} · \
          failed {} · lane {:.3}s · phase B {:.3}s · commits waited {:.3}s (most {:.3}s) · last job \
-         ended at {:.3}s · phase A's end waited {:.3}s\n",
+         ended at {:.3}s · phase A's end waited {:.3}s{second_sum}\n",
         local.len(),
         local.iter().filter(|(_, s)| s.zc_lane.local).count(),
         local.iter().map(|(_, s)| s.zc_lane.bins_ran).sum::<usize>(),

@@ -984,14 +984,28 @@ pub struct BlockLocal {
 /// and each local group's challenges ([`local_challenges`]) are taken right
 /// after the group's commit. The proof is the same whether the lane runs or
 /// not.
+///
+/// `second_card`: with the lane, each light local group (every table held as
+/// its records or small enough to copy, [`zc_lane::LANE_COPY_MAX_CELLS`]) is
+/// argued by a second lane on the two-card split's second card, idle in phase
+/// A, which uploads the group there itself; a group that is not light stays
+/// on card 0's lane. It acts only when the split is on and its second card
+/// ready. The proof is the same either way.
 #[derive(Clone, Debug)]
 pub struct LocalPhaseA {
     pub buses: Vec<u64>,
     pub lane: bool,
+    pub second_card: bool,
     /// What each local transcript binds before its challenges:
     /// [`LocalBinding::ALL`] but in a test's mutant phase A.
     #[doc(hidden)]
     pub binding: LocalBinding,
+    /// ⛔ A test's second lane, made with `second_card` whether or not the
+    /// split is ready (on the host without a card): each group's bound on the
+    /// cells a table may be copied at (groups past the list take
+    /// [`zc_lane::LANE_COPY_MAX_CELLS`]). `None` in production.
+    #[doc(hidden)]
+    pub second_on_host: Option<Vec<usize>>,
 }
 
 /// A local group's argue begun at commit time: `(z_g, α_g)` and the group's
@@ -2784,11 +2798,35 @@ where
                 spill,
                 &probe,
                 None,
+                None,
                 local.as_ref(),
             );
         };
+        // The second lane (`LocalPhaseA::second_card`): beside card 0's lane
+        // when it runs local jobs and no measurement, under the two-card
+        // split's knob (whether its card is ready, its own thread asks), or a
+        // test's on the host.
+        let second = local
+            .as_ref()
+            .filter(|local| {
+                local.second_card
+                    && lane.runs_local()
+                    && !lane.has_work()
+                    && (local.second_on_host.is_some() || multilinear::gpu::two_card_split_on())
+            })
+            .and_then(|local| {
+                zc_lane::ZcLane::<F, E>::new_second(
+                    &probe,
+                    config,
+                    local.buses.clone(),
+                    local.second_on_host.clone(),
+                )
+            });
         let (block, close_wait) = std::thread::scope(|scope| {
             let worker = scope.spawn(|| lane.run::<T>());
+            let second_worker = second
+                .as_ref()
+                .map(|second| scope.spawn(move || second.run_second::<T>()));
             let block = Self::commit_groups_with::<H, T>(
                 groups,
                 config,
@@ -2799,12 +2837,23 @@ where
                 spill,
                 &probe,
                 Some(&lane),
+                second.as_ref(),
                 local.as_ref(),
             );
-            // Phase A's loop ended: the job under way finishes, the rest go.
+            // Phase A's loop ended: the job under way on each lane finishes,
+            // the rest go. Both lanes' threads end here, so the second card's
+            // pool is free before phase B's second driver enters it.
             let closing = Instant::now();
             lane.close();
-            if let Err(panic) = worker.join() {
+            if let Some(second) = &second {
+                second.close();
+            }
+            let joined = worker.join();
+            let second_joined = second_worker.map(|w| w.join());
+            if let Err(panic) = joined {
+                std::panic::resume_unwind(panic);
+            }
+            if let Some(Err(panic)) = second_joined {
                 std::panic::resume_unwind(panic);
             }
             (block, closing.elapsed().as_secs_f64())
@@ -2819,6 +2868,41 @@ where
         for (g, started) in started {
             if let Some(slot) = block.local_started.get_mut(g) {
                 *slot = Some(started);
+            }
+        }
+        if let Some(second) = second {
+            let (ready_at, not_ready, early) = second.readiness();
+            let (stamps, started) = second.into_parts();
+            eprintln!(
+                "BLOCK LOCAL LANE SECOND CARD: {} · groups taken {} · local groups to card 0 before \
+                 it was ready {early}",
+                match (ready_at, not_ready) {
+                    (Some(at), _) => format!("ready at {at:.3}s"),
+                    (None, true) => "not ready: card 0's lane took every group".to_string(),
+                    (None, false) => "on the host".to_string(),
+                },
+                stamps.len(),
+            );
+            // Each group is one lane's (the committer hands a local group to
+            // the second lane or to card 0's, never both): card 0's lane
+            // stamped this group's commit wait alone.
+            for (g, stamp) in stamps {
+                if let Some(stamps) = block.stamps.get_mut(g) {
+                    debug_assert!(
+                        !stamps.zc_lane.local && stamps.zc_lane.state == LaneState::Off,
+                        "group {g} on both lanes"
+                    );
+                    stamps.zc_lane = ZcLaneStamp {
+                        commit_wait: stamps.zc_lane.commit_wait,
+                        ..stamp
+                    };
+                }
+            }
+            for (g, started) in started {
+                if let Some(slot) = block.local_started.get_mut(g) {
+                    debug_assert!(slot.is_none(), "group {g}: its argue handed back twice");
+                    *slot = Some(started);
+                }
             }
         }
         if let Some(last) = block.stamps.last_mut() {
@@ -2840,6 +2924,7 @@ where
         spill: Option<BlockSpill>,
         probe: &CsProbe,
         lane: Option<&zc_lane::ZcLane<'a, F, E>>,
+        second: Option<&zc_lane::ZcLane<'a, F, E>>,
         local: Option<&LocalPhaseA>,
     ) -> Result<Self, MlError>
     where
@@ -3018,21 +3103,37 @@ where
                             }
                             _ => (Vec::new(), None),
                         };
-                        // The lane's job: the group's columns held for it.
+                        // The lane's job: the group's columns held for it. A
+                        // light local group goes to the second lane, when one
+                        // runs, with what it uploads owned; it is then not
+                        // card 0's lane's at all (one lane a group).
                         if let Some(lane) = lane {
                             if let Ok(done) = &committed {
-                                lane.submit(
-                                    group_index,
-                                    group_ref,
-                                    &done.roots,
-                                    probe_on_card,
-                                    commit_end,
-                                    if lane.runs_local() {
-                                        started.take()
-                                    } else {
-                                        None
-                                    },
-                                );
+                                let mut job = if lane.runs_local() {
+                                    started.take()
+                                } else {
+                                    None
+                                };
+                                let had = job.is_some();
+                                if let (Some(second), true) = (second, had) {
+                                    job = second.submit_owned(
+                                        group_index,
+                                        group_ref,
+                                        &done.roots,
+                                        commit_end,
+                                        job,
+                                    );
+                                }
+                                if !had || job.is_some() {
+                                    lane.submit(
+                                        group_index,
+                                        group_ref,
+                                        &done.roots,
+                                        probe_on_card,
+                                        commit_end,
+                                        job,
+                                    );
+                                }
                             }
                             lane.commit_ends();
                         }
