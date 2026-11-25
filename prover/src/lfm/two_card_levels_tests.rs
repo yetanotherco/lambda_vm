@@ -322,3 +322,68 @@ fn a_level_with_its_stacks_held_stays_on_card_0_under_the_split() {
     );
     assert_eq!(bytes(&split), bytes(&one), "held: the same bytes");
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone with four aliases"]
+fn indexed_level_prepared_stacks_follow_their_groups() {
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let _stack = test_format::set_stack_log(12);
+    let hasher = HasherKind::Poseidon1W16;
+    let (program, arenas) = super::levels_probe::level_program(4, 16);
+    let topology = multilinear::gpu::indexed_cards()
+        .unwrap()
+        .expect("set LAMBDA_VM_CARDS");
+    assert_eq!(topology.len(), 4);
+    let prove = |place| {
+        let build = build_wlfm_placed(
+            &program,
+            hasher,
+            WlfmRate::Two,
+            WlfmLevers::with_family(WlfmFamily::B3),
+            place,
+        )
+        .expect("level stacks build");
+        assert!(
+            build.artifacts.sizes.len() >= 4,
+            "the fixture needs four groups"
+        );
+        let filled = execute_and_fill_unmerged(&program, &arenas, hasher).expect("executes");
+        let proof = prove_wlfm_traces_as(&build, filled, true, WlfmProving::Streamed)
+            .expect("level proves");
+        let groups = take_wlfm_stamps().expect("the level stamps").groups;
+        verify_wlfm(&build.artifacts, &proof, &proof.public_words).expect("verifies");
+        (build, proof, groups)
+    };
+    let (held, proof, groups) = prove(StackPlace::Card);
+    assert!(
+        held.artifacts
+            .stacks
+            .iter()
+            .any(|s| groups[s.group].card > 0)
+    );
+    for stack in &held.artifacts.stacks {
+        let group = &groups[stack.group];
+        assert_eq!(
+            group.commit_card, group.card,
+            "group {} keeps its owner",
+            stack.group
+        );
+    }
+    let mut committers: Vec<_> = groups.iter().map(|g| usize::from(g.commit_card)).collect();
+    committers.sort_unstable();
+    committers.dedup();
+    assert_eq!(committers, topology);
+    drop(held);
+    // The raw archive retains field representations from the commit path.
+    // Compare canonical bytes when the stack policy changes.
+    let canonical = super::wire::encode(&proof);
+    for place in [StackPlace::CardRetired, StackPlace::Host] {
+        let (_, other, _) = prove(place);
+        assert!(
+            super::wire::encode(&other) == canonical,
+            "{place:?} changed the canonical proof bytes",
+        );
+    }
+}

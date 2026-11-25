@@ -492,6 +492,7 @@ fn the_blake3_levels_driver_proves_a_small_block() {
         verify_levels(&flipped, WlfmFamily::B3, last).is_err(),
         "the flipped plan defines other programs"
     );
+    write_identity_files(&run, WlfmFamily::B3);
     let t = &run.times;
     println!(
         "LEVELS DRIVER B3: base {:.3}s · planned {:.3}s · emitted {:.3}s · pieces {} · waves \
@@ -2631,6 +2632,7 @@ fn rta_one_run(
         "everything verifies"
     );
     assert!(refused, "a tampered last level is refused");
+    write_identity_files(&run, family);
     // Off the clock, a box row (`RTA_IDENTITY=host`, with
     // `LAMBDA_VM_DETERMINISTIC_GRIND=1`): every level proved again over the
     // same base with its prepared stacks on the host must give the same bytes
@@ -2736,6 +2738,28 @@ fn rta_last_file(
         bytes.len()
     );
     ok
+}
+
+/// Opt-in byte gate shared by the small fixture and the real-block harness.
+fn write_identity_files(run: &super::levels::LevelsRun, family: WlfmFamily) {
+    let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("proof output directory");
+    let base = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("archive base");
+    std::fs::write(dir.join("base"), &base[..]).expect("write base");
+    for (k, proof) in run.proofs.iter().enumerate() {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("archive level");
+        std::fs::write(dir.join(format!("level-{}", k + 1)), &bytes[..]).expect("write level");
+    }
+    let shipped = super::last_level::last_level_file(
+        run.proofs.last().expect("last level proof"),
+        super::last_level::last_level(family).expect("last level format"),
+        super::last_level::last_wire().expect("last level encoding"),
+    )
+    .expect("encode shipped proof");
+    std::fs::write(dir.join("shipped"), shipped).expect("write shipped proof");
 }
 
 /// One run of level 1 over a block's first `k` groups
