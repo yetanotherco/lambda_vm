@@ -315,16 +315,18 @@ since the chip receives on its pulls and owes on its pushes, so ordering the
 messages, which is how a puller and a pusher of one bus are ordered.
 
 That ensemble is not written yet, and it needs the two names for the `ALU` bus
-resolved first. The five chips that push use `Alu.channel.toRaw`, which requires
-every pull to carry `0` or `1`; DVRM's multiplicity reaches 510, so it has to
-pull on `Alu.channel.counted muMax`. Those are two different `RawChannel`s under
-one name, which `unique_channel_names` rejects, so no ensemble can hold DVRM and
-another ALU chip at once. Moving the five pushers to the counted channel leaves
-`export/` byte-identical — the channel is a choice in the Lean model, invisible
-in the AIR — but it does change proofs.
+resolved first. The six chips that push, DVRM's own two `DIVREM` pushes included,
+use `Alu.channel.toRaw`, which requires every pull to carry `0` or `1`; DVRM's
+multiplicity reaches 510, so it has to pull on `Alu.channel.counted muMax`. Those
+are two different `RawChannel`s under one name, which `unique_channel_names`
+rejects, so no ensemble can hold DVRM at all, not even on its own: its
+`channelsWithRequirements` lists both, and `ZERO` likewise (counted for its own
+pulls, plain for the ones inlined from `neg`). Moving the pushers to the counted
+channel leaves `export/` byte-identical — the channel is a choice in the Lean
+model, invisible in the AIR — but it does change proofs.
 
-The toy MIN table and the `CountedSameBus` ensemble that stood in for DVRM are gone
-from this PR: the real DVRM is here, so the stand-ins have nothing left to stand in for.
+The toy MIN table and the `CountedSameBus` ensemble that stood in for DVRM are gone:
+the real DVRM is here, so the stand-ins have nothing left to stand in for.
 The provider and consumer stand-ins of `LtStaged.lean` conclude `True`, which is what the
 next paragraphs are about.
 
@@ -383,7 +385,7 @@ pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, an
 the same. A combined ensemble would have to put EQ and SHIFT on the counted
 channel too, at `N = 1`; the pinned fork has no lemma collapsing `Channel.counted
 1` to the plain channel, so that is a proof obligation, not a rename. No ensemble
-here needs it yet: `LtStaged` and `CountedSameBus` hold LT and its toy MIN only.
+here needs it yet: `LtStaged` holds LT only.
 
 ## What is intentionally not proven
 

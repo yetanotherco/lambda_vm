@@ -26,8 +26,8 @@ its own, not `channel.toRaw`. With the bounded balance `BalancedUpTo N` of the m
 closes the gap.
 
 This file's `countedCharged` is **not** the fork's `Channel.counted`, which is what `Tables/Lt.lean`,
-`Tables/MinToy.lean` and `Ensembles/CountedSameBus.lean` pull on. On an out-of-range pull this
-file charges the guarantee, like a push; the fork forbids the multiplicity instead. Only
+`Tables/Bytewise.lean`, `Tables/Mul.lean` and `Tables/Dvrm.lean` pull on. On an out-of-range
+pull this file charges the guarantee, like a push; the fork forbids the multiplicity instead. Only
 `Demo.circuit` below uses this one. See the README, "Counted pulls".
 -/
 

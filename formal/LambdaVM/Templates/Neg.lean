@@ -26,7 +26,9 @@ makes the result the two's complement rather than `2⁶⁴ − x` unconditionall
 that inlines `neg` range-checks the halves and constrains the flag itself. The result carries
 its range in its `DWordWL` type in the spec, which is why `neg.toml` does not list it among the
 assumptions; in Lean that type holds plain field elements, so the range becomes an explicit
-assumption here and the chip range-checks both result words as well. `NegCheck.circuit` adds
+assumption here and a chip that inlines `neg` has to establish it too. DVRM does so without a
+range check: `DVRM.abs_val` derives both bounds from the two `ZERO` lookups and the chip's own
+`(1 − cond)` constraints. `NegCheck.circuit` adds
 the flag constraint to pin the meaning down on its own, the way `IsByteCheck` does.
 
 The only chip that uses this template is `dvrm.toml`.

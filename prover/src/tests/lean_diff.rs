@@ -2,15 +2,15 @@
 //!
 //! `formal/export/<table>.json` holds the operations of each Lean row circuit:
 //! the constraint polynomials (`assert`) and the bus interactions (`interact`),
-//! with variables numbered in Rust column order. For each of LT, EQ and SHIFT
-//! this test evaluates them on random rows next to what the verifier enforces,
+//! with variables numbered in Rust column order. For each of LT, EQ, SHIFT,
+//! BYTEWISE, MUL and DVRM this test evaluates them on random rows next to what the verifier enforces,
 //! the captured Rust `ConstraintSet` program and, per interaction of
 //! `bus_interactions()`, the multiplicity and LogUp fingerprint expressions of
 //! `emit_multiplicity` and `emit_fingerprint` at fixed challenges, and matches
 //! them as multisets of functions (Schwartz–Zippel over [`TRIALS`] rows).
 //! Direction, multiplicity and fingerprint are matched separately. It also
 //! checks that the Lean constraints vanish on honest Rust traces, padding rows
-//! included. The three tables read the current row only; a constraint on
+//! included. These tables read the current row only; a constraint on
 //! another row or an aux column fails in `eval_program_roots`, it is not
 //! skipped.
 //!
@@ -154,11 +154,13 @@ fn bus_id_of(channel: &str) -> u64 {
     bus as u64
 }
 
-/// Padding rows are the rows with `μ = 0`; the honest-row checks cover them only if the
-/// trace has some.
-fn assert_has_padding(label: &str, honest: &[Vec<FE>], mu: usize) {
+/// Padding rows are the rows whose multiplicities are all `0`; the honest-row checks cover them
+/// only if the trace has some.
+fn assert_has_padding(label: &str, honest: &[Vec<FE>], mus: &[usize]) {
     assert!(
-        honest.iter().any(|r| r[mu] == FE::zero()),
+        honest
+            .iter()
+            .any(|r| mus.iter().all(|&mu| r[mu] == FE::zero())),
         "[{label}] the trace has padding rows"
     );
 }
@@ -470,7 +472,7 @@ fn lean_diff_lt() {
     let lean = load_lean("lt");
     let interactions = bus_interactions();
     let honest = rows_of(&trace, cols::NUM_COLUMNS);
-    assert_has_padding("LT", &honest, cols::MU);
+    assert_has_padding("LT", &honest, &[cols::MU]);
     let report = compare(
         "LT",
         &lean,
@@ -532,7 +534,7 @@ fn lean_diff_eq() {
     }
     let trace = generate_eq_trace(&ops);
     let honest = rows_of(&trace, cols::NUM_COLUMNS);
-    assert_has_padding("EQ", &honest, cols::MU);
+    assert_has_padding("EQ", &honest, &[cols::MU]);
     let report = compare(
         "EQ",
         &load_lean("eq"),
@@ -597,7 +599,7 @@ fn lean_diff_shift() {
     }
     let trace = generate_shift_trace(&ops);
     let honest = rows_of(&trace, cols::NUM_COLUMNS);
-    assert_has_padding("SHIFT", &honest, cols::MU);
+    assert_has_padding("SHIFT", &honest, &[cols::MU]);
     let report = compare(
         "SHIFT",
         &load_lean("shift"),
@@ -796,20 +798,27 @@ fn lean_diff_bytewise() {
             OPS[(rng.next_u64() % 3) as usize],
         ));
     }
-    // Repeats, so `dedup_rows` sums multiplicities and the rows carry `μ > 1`: the counted pull
-    // is the whole point of this chip, and a trace of distinct operations never exercises it. The
-    // 300 copies also cross `MU_MAX`, so one operation becomes two rows, `μ = 255` and `μ = 45`.
+    // Repeats, so `dedup_rows` sums multiplicities and the honest trace holds rows with `μ > 1`;
+    // the 300 copies also cross `MU_MAX`, so one operation becomes two rows, `μ = 255` and
+    // `μ = 45`. Honest rows only face the constraint check, and this chip has no arithmetic
+    // constraints: the interactions, `μ` included, are matched on the random rows of `compare`.
     for _ in 0..300 {
-        ops.push(BytewiseOperation::new(0xDEAD_BEEF, 0x0123_4567, alu_op::XOR));
+        ops.push(BytewiseOperation::new(
+            0xDEAD_BEEF,
+            0x0123_4567,
+            alu_op::XOR,
+        ));
     }
     let trace = generate_bytewise_trace(&ops);
+    let honest = rows_of(&trace, cols::NUM_COLUMNS);
+    assert_has_padding("BYTEWISE", &honest, &[cols::MU]);
     let report = compare(
         "BYTEWISE",
         &load_lean("bytewise"),
         &EmptyConstraints,
         &bus_interactions(),
         cols::NUM_COLUMNS,
-        &rows_of(&trace, cols::NUM_COLUMNS),
+        &honest,
     );
     assert!(
         report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
@@ -835,10 +844,7 @@ fn lean_diff_mul() {
                     // `wants_hi` picks which half the ALU message asks for, which is what
                     // separates MUL from MULH, MULHU and MULHSU on one row.
                     for wants_hi in [false, true] {
-                        ops.push((
-                            MulOperation::new(a, lhs_signed, b, rhs_signed),
-                            wants_hi,
-                        ));
+                        ops.push((MulOperation::new(a, lhs_signed, b, rhs_signed), wants_hi));
                     }
                 }
             }
@@ -855,22 +861,25 @@ fn lean_diff_mul() {
             rng.next_u64() & 1 == 1,
         ));
     }
-    // Repeats on one operation, asking for both halves, so the row carries `μ_lo > 1` and
-    // `μ_hi > 1` at once. Every range check of this chip fires with `μ_lo + μ_hi`, so a trace
-    // where both are 1 never exercises the sum that fixes the model's counted-pull bound.
+    // Repeats on one operation, asking for both halves, so the honest trace holds a row with
+    // `μ_lo > 1` and `μ_hi > 1` at once. Honest rows only face the constraint check, none of
+    // whose constraints reads `μ`: the multiplicities, `μ_lo + μ_hi` on every range check
+    // included, are matched on the random rows of `compare`.
     for _ in 0..200 {
         let op = MulOperation::new(0x0123_4567_89AB_CDEF, true, 0xFEDC_BA98_7654_3210, true);
         ops.push((op.clone(), false));
         ops.push((op, true));
     }
     let trace = generate_mul_trace(&ops);
+    let honest = rows_of(&trace, cols::NUM_COLUMNS);
+    assert_has_padding("MUL", &honest, &[cols::MU_LO, cols::MU_HI]);
     let report = compare(
         "MUL",
         &load_lean("mul"),
         &MulConstraints,
         &bus_interactions(),
         cols::NUM_COLUMNS,
-        &rows_of(&trace, cols::NUM_COLUMNS),
+        &honest,
     );
     assert!(
         report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
@@ -917,21 +926,24 @@ fn lean_diff_dvrm() {
             rng.next_u64() & 1 == 1,
         ));
     }
-    // As in MUL: repeats on one operation asking for both results, so the row carries `μ_q > 1`
-    // and `μ_r > 1` and the range checks fire with their sum.
+    // As in MUL: repeats on one operation asking for both results, so the honest trace holds a
+    // row with `μ_q > 1` and `μ_r > 1`. As there, the multiplicities are matched on the random
+    // rows of `compare`, not on these.
     for _ in 0..200 {
         let op = DvrmOperation::new(0x0123_4567_89AB_CDEF, 0x0000_0000_1234_5678, true);
         ops.push((op.clone(), false));
         ops.push((op, true));
     }
     let trace = generate_dvrm_trace(&ops);
+    let honest = rows_of(&trace, cols::NUM_COLUMNS);
+    assert_has_padding("DVRM", &honest, &[cols::MU_Q, cols::MU_R]);
     let report = compare(
         "DVRM",
         &load_lean("dvrm"),
         &DvrmConstraints,
         &bus_interactions(),
         cols::NUM_COLUMNS,
-        &rows_of(&trace, cols::NUM_COLUMNS),
+        &honest,
     );
     assert!(
         report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
