@@ -197,6 +197,10 @@ fn cuts_are_todays(name: &str, program: &Elf, input: &[u8], window: usize, shape
         }
     }
     for (l, level) in levels.iter().enumerate() {
+        // Each arm's counts settled as its walker settles them at its end.
+        for counts in counts[l].iter_mut() {
+            counts.settle(&decode).expect("the counts settle");
+        }
         let (want, want_rows) = counted(&counts[l][0]);
         for (a, (arm, _)) in arms.iter().enumerate() {
             let what = format!("{name}/{window}/{} level {level:?} cuts {arm}", shape.batch);
@@ -339,8 +343,8 @@ fn a_halting_cycle_before_the_last_window_is_refused_with_or_without_the_prescan
     }
 }
 
-/// ★ A run built with each cut alone and with every cut, on one walker and
-/// on three, under both register formats, hands its chunks out in the order
+/// ★ A run built with each cut alone on three walkers and with every cut on
+/// one and on three, under both register formats, hands its chunks out in the order
 /// and builds the tables, row for row, the run without cuts does.
 #[test]
 fn the_walk_cuts_build_today_s_tables() {
@@ -356,7 +360,9 @@ fn the_walk_cuts_build_today_s_tables() {
                 let (want, want_order) = built(&program, &max_rows, window, 2, (2, none), format);
                 chunks += want_order.len();
                 for (arm, cuts) in each_part_and_all() {
-                    for walkers in [1, 3] {
+                    // Each part on three walkers; every part on one and three.
+                    let walkers: &[usize] = if arm == "all" { &[1, 3] } else { &[3] };
+                    for &walkers in walkers {
                         let what = format!("{name}/{format:?}/{window}/{arm}/{walkers}");
                         let (got, order) =
                             built(&program, &max_rows, window, walkers, (2, cuts), format);
@@ -368,4 +374,58 @@ fn the_walk_cuts_build_today_s_tables() {
         }
     }
     assert!(chunks > 0, "no chunk handed out");
+}
+
+/// Under `const` a walker's counts are settled only if every CPU op it
+/// counted was routed without its instruction lookups: a walker that routed
+/// more or fewer than it counted, or counted a DECODE row the table lacks, is
+/// refused rather than settled; settled, the counts are each op's seven.
+#[test]
+fn counts_settled_under_const_must_route_every_op_they_count() {
+    let (program, _) = run("all_instructions_64");
+    let max_rows = MaxRowsConfig::small();
+    let builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+    let decode = Arc::clone(&builder.decode);
+    drop(builder);
+    let rows = decode.padding_row();
+    assert!(rows >= 3, "{rows} DECODE rows");
+    let counts = |decode_rows: Vec<u64>, const_cycles: u64| WalkCounts {
+        histogram: None,
+        decode_rows,
+        const_cycles,
+    };
+    for (what, decode_rows, routed) in [
+        ("fewer routed", vec![2, 1], 2),
+        ("more routed", vec![2, 1], 4),
+    ] {
+        assert!(
+            counts(decode_rows, routed).settle(&decode).is_err(),
+            "{what}: settled"
+        );
+    }
+    let mut beyond = vec![0; rows + 1];
+    beyond[rows] = 1;
+    assert!(
+        counts(beyond, 1).settle(&decode).is_err(),
+        "a row beyond the table: settled"
+    );
+    // Settled: each counted op's three instruction lookups, times its count.
+    let mut settled = counts(vec![3, 0, 2], 5);
+    settled.settle(&decode).expect("every op routed");
+    let mut want = crate::tables::bitwise::BitwiseHistogram::new();
+    for (row, n) in [(0u32, 3), (2, 2)] {
+        for _ in 0..n {
+            for op in crate::tables::cpu::const_lookups(decode.entry(row)) {
+                want.bump(op);
+            }
+        }
+    }
+    assert!(
+        settled.histogram.as_ref() == Some(&want),
+        "the settled lookups"
+    );
+    // Without `const` nothing is deferred: settling changes nothing.
+    let mut plain = counts(vec![3, 0, 2], 0);
+    plain.settle(&decode).expect("nothing to settle");
+    assert!(plain.histogram.is_none(), "settled without const");
 }

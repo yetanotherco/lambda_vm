@@ -6,6 +6,15 @@
 //! - `prescan`: a window's logs are no longer read once ahead of the walk for
 //!   a halting cycle; the collect refuses such a cycle as it reads the log,
 //!   with the same error.
+//! - `const`: of a CPU row's seven lookups, the three its instruction alone
+//!   gives are no longer counted a cycle at a time where the walker routes:
+//!   each DECODE row's are added once, times the cycles the walker counted on
+//!   that row, at the walker's end.
+//! - `one-loop`: where the walker routes, its count's pass over a batch's
+//!   CPU ops (DECODE rows, last ECALL) and its routing pass are one loop.
+//! - `slots`: where the walker counts and lists none of the in-walk lookups,
+//!   each in-row register slot's range lookup is counted where it is made
+//!   instead of listed, counted after the batch and dropped.
 
 use crate::Error;
 
@@ -15,15 +24,26 @@ use crate::Error;
 pub struct WalkCuts {
     /// The halt check folded into the collect, no pass of its own.
     pub prescan: bool,
+    /// A CPU row's three instruction lookups counted by DECODE row.
+    pub constant: bool,
+    /// The count's pass over the CPU ops folded into the routing's.
+    pub one_loop: bool,
+    /// The register slots' lookups counted where made.
+    pub slots: bool,
 }
 
 impl WalkCuts {
     /// The knob's words.
-    pub(crate) const WORDS: &'static str = "prescan";
+    pub(crate) const WORDS: &'static str = "prescan, const, one-loop, slots";
 
     /// Every part on.
     pub fn all() -> Self {
-        Self { prescan: true }
+        Self {
+            prescan: true,
+            constant: true,
+            one_loop: true,
+            slots: true,
+        }
     }
 
     /// The knob's reading: unset or empty, no part; else a comma-separated
@@ -37,6 +57,9 @@ impl WalkCuts {
             match word {
                 "all" => cuts = Self::all(),
                 "prescan" => cuts.prescan = true,
+                "const" => cuts.constant = true,
+                "one-loop" => cuts.one_loop = true,
+                "slots" => cuts.slots = true,
                 _ => {
                     return Err(Error::Prover(format!(
                         "LAMBDA_VM_WALK_CUTS={value}: a comma-separated list of {}, or all \
@@ -56,10 +79,15 @@ impl WalkCuts {
 
     /// The parts on, as the knob names them, or `none`.
     pub fn describe(self) -> String {
-        let parts: Vec<&str> = [(self.prescan, "prescan")]
-            .into_iter()
-            .filter_map(|(on, word)| on.then_some(word))
-            .collect();
+        let parts: Vec<&str> = [
+            (self.prescan, "prescan"),
+            (self.constant, "const"),
+            (self.one_loop, "one-loop"),
+            (self.slots, "slots"),
+        ]
+        .into_iter()
+        .filter_map(|(on, word)| on.then_some(word))
+        .collect();
         if parts.is_empty() {
             "none".to_string()
         } else {
@@ -95,11 +123,42 @@ mod tests {
     /// refuses the prove.
     #[test]
     fn the_walk_cuts_knob_takes_its_words_and_refuses_the_rest() {
-        let prescan = WalkCuts::parse(Some(" prescan ")).expect("prescan");
-        assert_eq!(prescan, WalkCuts { prescan: true });
+        let one = |word: &str| WalkCuts::parse(Some(word)).expect(word);
+        let none = WalkCuts::default();
+        assert_eq!(
+            one(" prescan "),
+            WalkCuts {
+                prescan: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            one("const"),
+            WalkCuts {
+                constant: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            one("one-loop"),
+            WalkCuts {
+                one_loop: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            one("slots"),
+            WalkCuts {
+                slots: true,
+                ..none
+            }
+        );
+        assert_eq!(one("prescan,const, one-loop ,slots"), WalkCuts::all());
         assert_eq!(WalkCuts::parse(Some("all")).ok(), Some(WalkCuts::all()));
         assert_eq!(WalkCuts::all().describe(), WalkCuts::WORDS.replace(' ', ""));
-        for bad in ["pre-scan", "prescan,", "none", "1", "PRESCAN"] {
+        for bad in [
+            "pre-scan", "prescan,", "none", "1", "PRESCAN", "one_loop", "constant",
+        ] {
             assert!(WalkCuts::parse(Some(bad)).is_err(), "{bad}");
         }
     }
