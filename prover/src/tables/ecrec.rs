@@ -217,6 +217,7 @@ pub(crate) struct DeferredEcrec {
 }
 
 /// The numbers [`DeferredEcrec::id`] hands out.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 static NEXT_DEFERRED_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How a walk computes its ECREC calls' witnesses: off the walk (`on`,

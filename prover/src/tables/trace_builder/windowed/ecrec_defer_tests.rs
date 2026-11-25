@@ -506,8 +506,8 @@ fn ecdas_lookups_counted_beside_the_witnesses_are_the_rows_counted() {
 /// ★ The join hands the counts over only when they are every ECDAS row's and
 /// no other: not under another form, not with the other rows uncounted, nor
 /// counted under another form, not with a call uncounted, missing, counted
-/// twice or one too many, and not when nothing was joined. The finish then
-/// counts the rows.
+/// twice, one too many or another in one's place, and not when nothing was
+/// joined. The finish then counts the rows.
 #[cfg(feature = "parallel")]
 #[test]
 fn ecdas_counts_are_handed_over_only_when_they_are_every_row_s() {
@@ -541,6 +541,11 @@ fn ecdas_counts_are_handed_over_only_when_they_are_every_row_s() {
     refused(
         "a call too many",
         &|j| j.counted.push(u64::MAX),
+        Some(Bytes),
+    );
+    refused(
+        "another call in one's place",
+        &|j| j.counted[0] = u64::MAX,
         Some(Bytes),
     );
     refused("nothing joined", &|j| j.joined = false, Some(Bytes));
