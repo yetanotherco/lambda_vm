@@ -121,6 +121,105 @@ fn the_lean_stream_proves_the_same_block() {
     }
 }
 
+/// The lean stream beside the host build's other levers: a block proved
+/// with the serial host work hoisted, every walk cut and both finish steps
+/// (`LAMBDA_VM_HOST_HOIST`, `LAMBDA_VM_WALK_CUTS`, `LAMBDA_VM_FINISH_EARLY`),
+/// from the executor's logs and from the lean stream, is the block proved
+/// with none of them, on one walker and on three: the same partition,
+/// heights, counts, output and group roots, every proof verifies, and under
+/// the deterministic grind the same bytes. Each lever's own identity is its
+/// own test; this one is the levers stacked, the lean walk's batches through
+/// the cuts' collect and counts.
+#[test]
+fn the_lean_stream_with_the_other_host_levers_proves_the_same_block() {
+    use crate::tables::trace_builder::{FinishEarly, HostHoist, WalkCuts};
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let programs = [
+        ("fused_mem_cases", Vec::new()),
+        ("test_keccak256", Vec::new()),
+        ("test_ecrec", Vec::new()),
+        ("page_runs", two_pages_of_input()),
+    ];
+    for (name, _) in &programs {
+        for walkers in [1usize, 3] {
+            eprintln!("LEAN STACK WANTS: {name}, {walkers} walkers");
+        }
+    }
+    if !record_mode() {
+        eprintln!("the lean stream needs record mode: skipped (walkers or history off)");
+        return;
+    }
+    let opts = ProofOptions::default_test_options();
+    let format = BlockFormat::production()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
+    for (name, input) in programs {
+        let elf = asm_elf_bytes(name);
+        for walkers in [1usize, 3] {
+            let what = format!("{name}, {walkers} walkers");
+            let prove = |levers: bool, lean: bool| {
+                let options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+                let (hoist, cuts, early) = if levers {
+                    (HostHoist::all(), WalkCuts::all(), FinishEarly::all())
+                } else {
+                    (
+                        HostHoist::default(),
+                        WalkCuts::default(),
+                        FinishEarly::default(),
+                    )
+                };
+                prove_block_whir_with(
+                    &elf,
+                    &input,
+                    &opts,
+                    &format,
+                    &options,
+                    &Deviations {
+                        walkers: Some(walkers),
+                        host_hoist: Some(hoist),
+                        walk_cuts: Some(cuts),
+                        finish_early: Some(early),
+                        exec_stream_lean: Some(lean),
+                        ..Deviations::default()
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{what}, levers {levers}, lean {lean}: {e:?}"))
+                .0
+            };
+            let off = prove(false, false);
+            assert!(
+                matches!(verify_block_whir(&off, &elf, &opts, &format), Ok(true)),
+                "{what}: none verifies"
+            );
+            for (levers, lean) in [(true, false), (false, true), (true, true)] {
+                let arm = format!("{what}, levers {levers}, lean {lean}");
+                let on = prove(levers, lean);
+                assert!(
+                    matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
+                    "{arm}: verifies"
+                );
+                assert_eq!(on.groups, off.groups, "{arm}: the partition");
+                assert_eq!(on.table_num_vars, off.table_num_vars, "{arm}: the heights");
+                assert_eq!(
+                    format!("{:?}", on.table_counts),
+                    format!("{:?}", off.table_counts),
+                    "{arm}: the counts"
+                );
+                assert_eq!(on.word_memory, off.word_memory, "{arm}: the word tables");
+                assert_eq!(on.public_output, off.public_output, "{arm}: the output");
+                assert_eq!(on.proof.roots, off.proof.roots, "{arm}: the group roots");
+                if crypto::grinding::deterministic() {
+                    assert_eq!(bytes(&on), bytes(&off), "{arm}: the proof's bytes");
+                }
+            }
+            if crypto::grinding::deterministic() {
+                eprintln!("LEAN STACK SAME BYTES: {what}");
+            }
+        }
+    }
+}
+
 /// The lean stream is refused, never ignored, where it does not run: the
 /// whole-run build (no windows), and the split memory format.
 #[test]
