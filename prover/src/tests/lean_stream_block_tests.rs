@@ -43,6 +43,24 @@ fn record_mode() -> bool {
 fn the_lean_stream_proves_the_same_block() {
     // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let programs = [
+        ("fused_mem_cases", Vec::new()),
+        ("test_copy_ecalls", Vec::new()),
+        ("test_commit_split", Vec::new()),
+        ("test_keccak256", Vec::new()),
+        ("test_ecrec", Vec::new()),
+        ("page_runs", two_pages_of_input()),
+    ];
+    let regens = [None, Some(RegenMode::Always)];
+    // Every block this test compares, named before any is proved: a reader
+    // of the output counts the `SAME BYTES` lines against these, so a block
+    // skipped (record mode off, the grind not deterministic) never reads as
+    // compared.
+    for (name, _) in &programs {
+        for regen in regens {
+            eprintln!("LEAN STREAM WANTS: {name}, regeneration {regen:?}");
+        }
+    }
     if !record_mode() {
         eprintln!("the lean stream needs record mode: skipped (walkers or history off)");
         return;
@@ -51,16 +69,9 @@ fn the_lean_stream_proves_the_same_block() {
     let format = BlockFormat::production()
         .with_memory(MemoryFormat::Words)
         .with_page_run(0);
-    for (name, input) in [
-        ("fused_mem_cases", Vec::new()),
-        ("test_copy_ecalls", Vec::new()),
-        ("test_commit_split", Vec::new()),
-        ("test_keccak256", Vec::new()),
-        ("test_ecrec", Vec::new()),
-        ("page_runs", two_pages_of_input()),
-    ] {
+    for (name, input) in programs {
         let elf = asm_elf_bytes(name);
-        for regen in [None, Some(RegenMode::Always)] {
+        for regen in regens {
             let what = format!("{name}, regeneration {regen:?}");
             let prove = |lean: bool| {
                 let mut options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
