@@ -1997,6 +1997,42 @@ pub(crate) fn prepare_wlfm_tiled(
             .filter(|&(_, (_, &count))| count > 0)
             .map(|(table, (group, _))| (table, group_columns_par(&group.group)))
             .collect()
+    } else if base_watched() {
+        // Under `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`: one table at a time on
+        // this thread while the base proves, then, once the flag is raised,
+        // each remaining table's columns on the whole pool. The same columns.
+        let todo: Vec<(usize, &PrepTable<'_>)> = groups
+            .iter()
+            .zip(&counts)
+            .enumerate()
+            .filter(|&(_, (_, &count))| count > 0)
+            .map(|(table, (group, _))| (table, group))
+            .collect();
+        let mut out: Vec<PreparedColumns> = Vec::with_capacity(todo.len());
+        let mut seen_at = None;
+        let mut tables_before = 0usize;
+        for &(table, group) in &todo {
+            if seen_at.is_none() && base_returned_seen() {
+                seen_at = Some(columns_from.elapsed().as_secs_f64());
+            }
+            let columns = match seen_at {
+                Some(_) => group.columns_on_pool(tiled),
+                None => {
+                    tables_before += 1;
+                    group.columns(tiled)
+                }
+            };
+            out.push((table, columns));
+        }
+        WHOLE_POOL_NOTE.with(|n| {
+            n.set(Some(WholePoolNote {
+                tables_before,
+                tables: todo.len(),
+                seen_at,
+                packs_whole: false,
+            }))
+        });
+        out
     } else {
         groups
             .iter()
@@ -3520,6 +3556,156 @@ pub fn columns_tiled() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL=1`: level 1's builder, which makes
+/// its stacks' columns on one thread beside the base's phase B (where a
+/// pooled pass cost phase B about one for one), moves to the whole pool once
+/// the base has returned: every table's columns not yet made are made on the
+/// pool ([`group_columns_tiled_par`], [`group_columns_par`]) and the narrow
+/// packs on the caller's pool instead of their two threads. The same columns,
+/// cell for cell, and the same packs. Off by default (and for any word but
+/// `1`); read once a process.
+pub const BUILDER_WHOLE_POOL_ENV: &str = "LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL";
+
+/// A test's [`builder_whole_pool`], process wide (0 the knob, 1 off, 2 on).
+static BUILDER_WHOLE_POOL_FOR_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`builder_whole_pool`] forced for the whole process (`None`
+/// restores the knob).
+#[doc(hidden)]
+pub fn set_builder_whole_pool_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    BUILDER_WHOLE_POOL_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`BUILDER_WHOLE_POOL_ENV`] is on (or a test's override).
+pub fn builder_whole_pool() -> bool {
+    match BUILDER_WHOLE_POOL_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(
+            super::wlfm_knobs::env_word(BUILDER_WHOLE_POOL_ENV).as_deref(),
+        )
+    })
+}
+
+thread_local! {
+    /// The flag a build's host part on this thread watches ([`watch_base`]):
+    /// raised, the rest of its columns and its packs go to the whole pool.
+    static BASE_WATCH: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+    /// What the last watched build on this thread did ([`take_whole_pool_note`]).
+    static WHOLE_POOL_NOTE: std::cell::Cell<Option<WholePoolNote>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// What a watched build's host part did ([`BUILDER_WHOLE_POOL_ENV`]): of its
+/// tables with columns, how many were made before the flag was seen and how
+/// many in all; the seconds into its columns when it was seen (`None`: never,
+/// every table on one thread); and whether its packs went to the whole pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WholePoolNote {
+    pub tables_before: usize,
+    pub tables: usize,
+    pub seen_at: Option<f64>,
+    pub packs_whole: bool,
+}
+
+/// Until the guard drops, a build's host part on this thread watches `flag`
+/// ([`BUILDER_WHOLE_POOL_ENV`]); the guard puts back what was watched before.
+pub(crate) fn watch_base(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> BaseWatch {
+    BaseWatch(BASE_WATCH.with(|w| w.replace(Some(flag))))
+}
+
+/// [`watch_base`]'s guard.
+pub(crate) struct BaseWatch(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+
+impl Drop for BaseWatch {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        BASE_WATCH.with(|w| *w.borrow_mut() = before);
+    }
+}
+
+/// Whether this thread watches a flag ([`watch_base`]).
+pub(crate) fn base_watched() -> bool {
+    BASE_WATCH.with(|w| w.borrow().is_some())
+}
+
+/// Whether the flag this thread watches is raised (`false` unwatched).
+pub(crate) fn base_returned_seen() -> bool {
+    BASE_WATCH.with(|w| {
+        w.borrow()
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+    })
+}
+
+/// Notes on this thread whether a watched build's packs went to the whole
+/// pool (the build's columns are noted by the build itself).
+pub(crate) fn note_whole_pool_packs(whole: bool) {
+    WHOLE_POOL_NOTE.with(|n| {
+        let mut note = n.get().unwrap_or_default();
+        note.packs_whole = whole;
+        n.set(Some(note));
+    });
+}
+
+/// What the last watched build on this thread did, taken (`None`: none).
+pub fn take_whole_pool_note() -> Option<WholePoolNote> {
+    WHOLE_POOL_NOTE.with(|n| n.take())
+}
+
+/// [`group_columns_tiled`] on the pool: the tiles of rows split over the
+/// pool's threads, each tile writing its rows of every column (disjoint
+/// slices). The same columns, cell for cell.
+pub(crate) fn group_columns_tiled_par(
+    data: &[FieldElement<F>],
+    width: usize,
+    rows: std::ops::Range<usize>,
+    padded: usize,
+) -> Vec<Vec<FieldElement<F>>> {
+    use rayon::prelude::*;
+    assert!(
+        rows.start <= rows.end && rows.end - rows.start <= padded,
+        "rows {rows:?} past {padded} padded rows"
+    );
+    if width == 0 {
+        return Vec::new();
+    }
+    let real = rows.end - rows.start;
+    let mut columns: Vec<Vec<FieldElement<F>>> = (0..width)
+        .map(|_| vec![FieldElement::zero(); padded])
+        .collect();
+    let mut tiles: Vec<Vec<&mut [FieldElement<F>]>> = (0..real.div_ceil(TILE_ROWS))
+        .map(|_| Vec::with_capacity(width))
+        .collect();
+    for column in columns.iter_mut() {
+        for (t, cells) in column[..real].chunks_mut(TILE_ROWS).enumerate() {
+            tiles[t].push(cells);
+        }
+    }
+    tiles.into_par_iter().enumerate().for_each(|(t, mut outs)| {
+        let at = rows.start + t * TILE_ROWS;
+        let end = (at + TILE_ROWS).min(rows.end);
+        let tile = &data[at * width..end * width];
+        for (column, out) in outs.iter_mut().enumerate() {
+            for (cell, value) in out.iter_mut().zip(tile.iter().skip(column).step_by(width)) {
+                *cell = *value;
+            }
+        }
+    });
+    columns
+}
+
 /// Rows a tile of [`group_columns_tiled`] holds: `2^12` rows of a table a few
 /// tens of words wide stay in a core's cache while every column takes its
 /// cells from them.
@@ -3598,6 +3784,22 @@ impl<'a> PrepTable<'a> {
         } else {
             debug_assert!(self.rows == (0..self.group.padded_rows));
             group_columns(&self.group)
+        }
+    }
+
+    /// [`Self::columns`] on the whole pool ([`BUILDER_WHOLE_POOL_ENV`]): the
+    /// same columns, cell for cell.
+    fn columns_on_pool(&self, tiled: bool) -> Vec<Vec<FieldElement<F>>> {
+        if tiled {
+            group_columns_tiled_par(
+                &self.group.data,
+                self.group.width,
+                self.rows.clone(),
+                self.padded_rows,
+            )
+        } else {
+            debug_assert!(self.rows == (0..self.group.padded_rows));
+            group_columns_par(&self.group)
         }
     }
 }

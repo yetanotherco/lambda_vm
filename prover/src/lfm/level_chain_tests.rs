@@ -512,6 +512,97 @@ fn a_tiled_prepare_is_the_prepare() {
     }
 }
 
+/// ★ PIN: the tiled columns on the pool (the builder on the whole pool once
+/// the base returned) are the tiled columns on one thread, cell for cell, for
+/// tables narrower and wider than a tile's rows, chunks read in place at an
+/// offset, and padding.
+#[test]
+fn the_tiled_columns_on_the_pool_are_the_tiled_columns() {
+    use super::wlfm::{TILE_ROWS, group_columns_tiled, group_columns_tiled_par};
+    for (width, total, rows, padded) in [
+        (1usize, 8usize, 0..8usize, 8usize),
+        (3, 5, 0..5, 8),
+        (7, 3 * TILE_ROWS + 17, 0..3 * TILE_ROWS + 17, 4 * TILE_ROWS),
+        (
+            5,
+            3 * TILE_ROWS,
+            TILE_ROWS + 3..2 * TILE_ROWS + 9,
+            2 * TILE_ROWS,
+        ),
+        (4, 16, 6..6, 4),
+    ] {
+        let data = table(width, total);
+        let one = group_columns_tiled(&data, width, rows.clone(), padded);
+        let pool = group_columns_tiled_par(&data, width, rows.clone(), padded);
+        assert!(one == pool, "width {width} rows {rows:?} padded {padded}");
+    }
+    assert!(group_columns_tiled_par(&[], 0, 0..0, 4).is_empty());
+}
+
+/// ★ PIN: a level's host part watching the base's return
+/// (`LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`) is today's prepare whether the base
+/// returned before its first table (every table's columns on the pool) or
+/// never (every table on one thread), tiled or not, under both families: the
+/// same stacks column for column and the same committed identity; the watch's
+/// note says which.
+#[test]
+fn a_prepare_watching_the_base_is_the_prepare() {
+    use super::wlfm::{
+        StackPlace, WlfmFamily, WlfmLevers, WlfmRate, prepare_wlfm_tiled, take_whole_pool_note,
+        watch_base,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let _chunks = test_format::set_chunk_log(2);
+    for (program, family) in [
+        (super::wlfm_tests::honest(), WlfmFamily::P1),
+        (super::b3l_wlfm_tests::honest(), WlfmFamily::B3),
+    ] {
+        let levers = WlfmLevers::with_family(family);
+        for tiled in [false, true] {
+            let prepare = || {
+                prepare_wlfm_tiled(&program, HASHER, WlfmRate::Two, levers, None, tiled)
+                    .expect("prepares")
+            };
+            let today = prepare();
+            for returned in [false, true] {
+                let watched = {
+                    let _watch = watch_base(Arc::new(AtomicBool::new(returned)));
+                    let _ = take_whole_pool_note();
+                    prepare()
+                };
+                let note = take_whole_pool_note().expect("the watch's note");
+                assert!(note.tables > 0);
+                if returned {
+                    assert_eq!(note.tables_before, 0, "{family:?} tiled {tiled}: {note:?}");
+                    assert!(note.seen_at.is_some());
+                } else {
+                    assert_eq!(note.tables_before, note.tables, "{family:?}: {note:?}");
+                    assert!(note.seen_at.is_none());
+                }
+                let (a, b) = (
+                    today.stack_columns_for_test().expect("stacks"),
+                    watched.stack_columns_for_test().expect("stacks"),
+                );
+                assert!(
+                    a == b,
+                    "{family:?} tiled {tiled} returned {returned}: the same stacks"
+                );
+                assert_eq!(today.prepared_cells(), watched.prepared_cells());
+                let watched = watched.commit(StackPlace::Host).expect("commits");
+                let ours = prepare().commit(StackPlace::Host).expect("commits");
+                assert_eq!(
+                    ours.artifacts.program_id, watched.artifacts.program_id,
+                    "{family:?} tiled {tiled} returned {returned}: the same committed identity"
+                );
+            }
+        }
+        assert!(
+            take_whole_pool_note().is_none(),
+            "an unwatched prepare leaves no note"
+        );
+    }
+}
+
 // =============================================================================
 // Step 4: the two packs at once
 // =============================================================================
