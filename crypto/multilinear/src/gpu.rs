@@ -327,6 +327,9 @@ mod serial_encodes_tests {
 /// too, where every commit takes that path and the number is the commit count.
 pub(crate) fn note_host_fallback() {
     HOST_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    if let Some(counts) = indexed_commit_counts() {
+        counts.host.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn sumcheck_calls() -> u64 {
@@ -1509,6 +1512,162 @@ pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(not(feature = "cuda"))]
 pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// Snapshot the explicit topology and prepare every eligible worker.
+pub fn indexed_cards() -> Result<Option<Vec<usize>>, String> {
+    #[cfg(feature = "cuda")]
+    if let Some(cards) = math_cuda::device::card_set().configured_indices()? {
+        if cards.is_empty() {
+            return Err("no configured CUDA card is available".into());
+        }
+        for &card in &cards {
+            if !math_cuda::device::indexed_card_ready(card) {
+                return Err(format!("configured CUDA card {card} did not initialize"));
+            }
+        }
+        return Ok(Some(cards));
+    }
+    Ok(None)
+}
+
+/// An ordered lease across the physical GPUs used by an indexed recursion phase.
+pub fn indexed_recursion_leases(cards: &[usize]) -> Vec<std::sync::MutexGuard<'static, ()>> {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::card_set().recursion_leases(cards)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = cards;
+        Vec::new()
+    }
+}
+
+/// Land work from every started peer before the primary card's reading.
+pub fn settle_peer_cards(trim: bool) {
+    #[cfg(feature = "cuda")]
+    {
+        let cards = math_cuda::device::card_set();
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(main) = cards.started(0) {
+            seen.insert(main.ordinal());
+        }
+        for index in cards
+            .started_indices()
+            .into_iter()
+            .filter(|&index| index != 0)
+        {
+            let backend = cards.started(index).expect("card started");
+            let trim = trim && seen.insert(backend.ordinal());
+            in_indexed_card(index, || {
+                let _ = if trim {
+                    math_cuda::device::drain_and_trim()
+                } else {
+                    math_cuda::device::drain_untrimmed()
+                };
+            });
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = trim;
+}
+
+/// The owner ordinal and total physical VRAM of an initialized backend.
+pub fn card_memory(card: usize) -> Option<(usize, u64)> {
+    #[cfg(feature = "cuda")]
+    {
+        let backend = math_cuda::device::card_set().started(card)?;
+        let (_, total) = backend.device_mem_info()?;
+        Some((backend.ordinal(), total))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = card;
+        None
+    }
+}
+
+/// The previous budget follows its backend even if that backend is quarantined.
+pub struct CardBudget {
+    #[cfg(feature = "cuda")]
+    backend: &'static math_cuda::device::Backend,
+    pub previous: u64,
+    #[cfg(feature = "cuda")]
+    previous_physical: Option<u64>,
+}
+
+pub fn override_card_budget(card: usize, bytes: u64, physical: Option<u64>) -> Option<CardBudget> {
+    #[cfg(feature = "cuda")]
+    {
+        let backend = math_cuda::device::card_set().started(card)?;
+        Some(CardBudget {
+            backend,
+            previous: backend.set_vram_budget_bytes(bytes),
+            previous_physical: physical.and_then(|bytes| backend.set_alias_budget(bytes)),
+        })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (card, bytes, physical);
+        None
+    }
+}
+
+impl Drop for CardBudget {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            self.backend.set_vram_budget_bytes(self.previous);
+            if let Some(bytes) = self.previous_physical {
+                self.backend.set_alias_budget(bytes);
+            }
+        }
+    }
+}
+
+/// Run on a card's host pool. Openings have an independent pool.
+pub fn on_indexed_card<R: Send>(card: usize, opening: bool, f: impl FnOnce() -> R + Send) -> R {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::on_indexed_card(card, opening, f)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (card, opening);
+        f()
+    }
+}
+
+/// Bind a plain worker that does not submit tasks to Rayon.
+pub fn in_indexed_card<R>(card: usize, f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::in_indexed_card(card, f)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = card;
+        f()
+    }
+}
+
+/// Capture the calling worker's binding for a new plain thread.
+pub fn inherit_card<R>(f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+    #[cfg(feature = "cuda")]
+    let role = math_cuda::device::current_role();
+    move || {
+        #[cfg(feature = "cuda")]
+        let _role = math_cuda::device::enter_role(role);
+        f()
+    }
+}
+
+pub fn mark_indexed_card_failed(card: usize, why: &str) {
+    #[cfg(feature = "cuda")]
+    math_cuda::device::mark_indexed_card_failed(card, why);
+    #[cfg(not(feature = "cuda"))]
+    let _ = (card, why);
 }
 
 /// Marks this thread's stream draws as background work until the guard drops.
@@ -9932,10 +10091,13 @@ pub(crate) fn note_streamed_not_held(blocks: usize, log_elements: usize, transie
     #[cfg(feature = "cuda")]
     {
         let promise = math_cuda::whir::codeword_promise(transient);
-        STREAMED_BYTES.fetch_add(
-            streamed_run_bytes(blocks, log_elements, promise),
-            Ordering::Relaxed,
-        );
+        let bytes = streamed_run_bytes(blocks, log_elements, promise);
+        STREAMED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(counts) = indexed_commit_counts() {
+            counts.bytes.fetch_add(bytes, Ordering::Relaxed);
+            counts.codewords.fetch_add(blocks as u64, Ordering::Relaxed);
+            counts.streamed.fetch_add(1, Ordering::Relaxed);
+        }
         STREAMED_CODEWORDS.fetch_add(blocks as u64, Ordering::Relaxed);
         STREAMED_RUNS.fetch_add(1, Ordering::Relaxed);
     }
@@ -9986,8 +10148,56 @@ static JOINT_RUNS_TO_RETIRE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn note_joint_run(retired: bool) {
     JOINT_RUNS.fetch_add(1, Ordering::Relaxed);
+    if let Some(counts) = indexed_commit_counts() {
+        counts.joint.fetch_add(1, Ordering::Relaxed);
+        counts
+            .retired
+            .fetch_add(u64::from(retired), Ordering::Relaxed);
+    }
     if retired {
         JOINT_RUNS_TO_RETIRE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct IndexedCommitCounts {
+    host: AtomicU64,
+    joint: AtomicU64,
+    retired: AtomicU64,
+    bytes: AtomicU64,
+    codewords: AtomicU64,
+    streamed: AtomicU64,
+}
+
+fn indexed_commit_counts() -> Option<&'static IndexedCommitCounts> {
+    #[cfg(feature = "cuda")]
+    if let math_cuda::device::DeviceRole::Card(id) = math_cuda::device::current_role() {
+        // The diagnostic stamp uses deltas; entries live for the process.
+        use math_cuda::device::MAX_LOGICAL_CARDS;
+        static COUNTS: [std::sync::OnceLock<IndexedCommitCounts>; MAX_LOGICAL_CARDS] =
+            [const { std::sync::OnceLock::new() }; MAX_LOGICAL_CARDS];
+        return Some(COUNTS[id.index()].get_or_init(IndexedCommitCounts::default));
+    }
+    None
+}
+
+/// The current committer's diagnostics, with the legacy process-wide
+/// counters for the unindexed commit loop.
+pub fn commit_counters() -> ((u64, u64, u64), StreamedNotHeld, u64) {
+    if let Some(counts) = indexed_commit_counts() {
+        let read = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        let streamed = read(&counts.streamed);
+        (
+            (read(&counts.joint), read(&counts.retired), streamed),
+            StreamedNotHeld {
+                bytes: read(&counts.bytes),
+                codewords: read(&counts.codewords),
+                runs: streamed,
+            },
+            read(&counts.host),
+        )
+    } else {
+        (joint_runs(), streamed_not_held(), host_fallbacks())
     }
 }
 

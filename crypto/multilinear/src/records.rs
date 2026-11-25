@@ -314,7 +314,7 @@ pub struct DecodeRecords {
     /// The rows on each card (by backend slot): a card's fill reads only its
     /// own card's copy.
     #[cfg(feature = "cuda")]
-    card: std::sync::Mutex<[Option<Arc<math_cuda::fill::CardDecode>>; 2]>,
+    card: std::sync::Mutex<std::collections::BTreeMap<usize, Arc<math_cuda::fill::CardDecode>>>,
 }
 
 impl DecodeRecords {
@@ -340,7 +340,7 @@ impl DecodeRecords {
             entries,
             runs,
             #[cfg(feature = "cuda")]
-            card: std::sync::Mutex::new([None, None]),
+            card: std::sync::Mutex::default(),
         })
     }
 
@@ -380,10 +380,9 @@ impl DecodeRecords {
             assert!(align_of::<DecodeRun>() == align_of::<DecodeRunC>());
             assert!(std::mem::offset_of!(DecodeRun, len) == std::mem::offset_of!(DecodeRunC, len));
         };
-        let slot = math_cuda::device::current_slot();
+        let slot = math_cuda::device::CardId::of(math_cuda::device::backend().ok()?).index();
         let mut cards = self.card.lock().unwrap_or_else(|e| e.into_inner());
-        let held = cards.get_mut(slot)?;
-        if let Some(card) = held.as_ref() {
+        if let Some(card) = cards.get(&slot) {
             return Some(Arc::clone(card));
         }
         // SAFETY: each pair is `#[repr(C)]` with the same fields in the same
@@ -401,7 +400,7 @@ impl DecodeRecords {
             )
         };
         let card = Arc::new(CardDecode::resident(entries, runs).ok()?);
-        *held = Some(Arc::clone(&card));
+        cards.insert(slot, Arc::clone(&card));
         Some(card)
     }
 }
@@ -1042,6 +1041,32 @@ mod tests {
         let again = table.on_card().expect("card 0's copy again");
         assert!(Arc::ptr_eq(&main, &again), "card 0 keeps its own");
         set_two_card_openings_for_test(None);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "card: run alone with four aliases"]
+    fn indexed_aliases_cache_decode_uploads_by_owner() {
+        let cards = crate::gpu::indexed_cards()
+            .unwrap()
+            .expect("set LAMBDA_VM_CARDS");
+        assert_eq!(cards.len(), 4);
+        let table = decode();
+        let uploads: Vec<_> = cards
+            .iter()
+            .map(|&card| {
+                crate::gpu::in_indexed_card(card, || table.on_card().expect("decode upload"))
+            })
+            .collect();
+        for (&card, upload) in cards.iter().zip(&uploads) {
+            crate::gpu::in_indexed_card(card, || {
+                let again = table.on_card().expect("decode cache hit");
+                assert!(Arc::ptr_eq(upload, &again));
+            });
+        }
+        for (i, upload) in uploads.iter().enumerate() {
+            assert!(uploads[..i].iter().all(|peer| !Arc::ptr_eq(peer, upload)));
+        }
     }
 
     fn decode() -> DecodeRecords {

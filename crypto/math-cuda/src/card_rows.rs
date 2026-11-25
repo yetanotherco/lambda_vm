@@ -348,7 +348,7 @@ struct Cache {
 /// One cache a card: its entries are that card's device buffers and ledger
 /// promises, and each card's uploads queue on its own lock. The budget
 /// (`LAMBDA_VM_CARD_ROWS_CACHE_MIB`) is per card.
-static CACHE: [Mutex<Option<Cache>>; 2] = [Mutex::new(None), Mutex::new(None)];
+static CACHE: crate::device::PerBackend<Mutex<Option<Cache>>> = crate::device::PerBackend::new();
 
 /// Whether uploads keep CPU logs past their own group: only between a
 /// block's [`begin`] and [`end`]. Outside one, a group still derives its
@@ -365,7 +365,7 @@ pub fn begin() {
 /// A block's prove ended: nothing more is kept, and the cache is emptied.
 pub fn end() {
     KEEPING.store(false, Ordering::Relaxed);
-    for slot in 0..CACHE.len() {
+    for slot in 0..crate::device::backend_slots() {
         *lock_slot(slot) = None;
     }
 }
@@ -376,7 +376,9 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Cache>> {
 }
 
 fn lock_slot(slot: usize) -> std::sync::MutexGuard<'static, Option<Cache>> {
-    CACHE[slot.min(CACHE.len() - 1)]
+    CACHE
+        .cell(slot)
+        .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -385,7 +387,7 @@ fn lock_slot(slot: usize) -> std::sync::MutexGuard<'static, Option<Cache>> {
 /// no prove reads another's logs and each block's report is its own. Its
 /// entries' memory goes back in stream order.
 pub fn clear() {
-    for slot in 0..CACHE.len() {
+    for slot in 0..crate::device::backend_slots() {
         *lock_slot(slot) = None;
     }
     let c = counters();
@@ -467,7 +469,7 @@ pub fn report_line() -> String {
 
 /// Entries held and their bytes, over both cards' caches.
 pub fn held() -> (usize, u64) {
-    (0..CACHE.len()).fold((0, 0), |(n, b), slot| {
+    (0..crate::device::backend_slots()).fold((0, 0), |(n, b), slot| {
         let cache = lock_slot(slot);
         let (m, c) = cache
             .as_ref()
