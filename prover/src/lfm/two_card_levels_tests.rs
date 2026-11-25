@@ -201,3 +201,124 @@ fn a_level_proof_split_onto_the_second_card_with_a_root_swapped_is_refused() {
         "group {g}'s root swapped for group {other}'s was accepted"
     );
 }
+
+/// The probe level proved streamed with its phase B split over two drivers on
+/// the host, its stacks committed at `place`, under `faults`: the prove's
+/// answer (no verification).
+fn prove_split_on_host(
+    place: StackPlace,
+    faults: stark::multilinear_block::OverlapFaults,
+) -> Result<WlfmProof, String> {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::wlfm::set_overlap_faults_for_test(
+                stark::multilinear_block::OverlapFaults::default(),
+            );
+            set_levels_split_on_host_for_test(false);
+        }
+    }
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    let built = build_wlfm_placed(
+        &level,
+        hasher,
+        WlfmRate::Two,
+        WlfmLevers::with_family(WlfmFamily::B3),
+        place,
+    )
+    .expect("the W-LFM build");
+    let filled = execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+    let _restore = Restore;
+    set_levels_split_on_host_for_test(true);
+    super::wlfm::set_overlap_faults_for_test(faults);
+    prove_wlfm_traces_as(&built, filled, true, WlfmProving::Streamed)
+}
+
+/// A failed argue and a failed opening at any place of a level split over two
+/// drivers are the level prove's error: never a panic, never a proof. (The
+/// probe level's groups are one a driver, each opened at its driver's end, not
+/// on an opening thread, so a panicking opening thread is not reached here;
+/// `phase_b_split_tests` covers it on the drivers both paths share.)
+#[test]
+fn a_fault_on_either_driver_of_a_split_level_is_the_proves_error() {
+    use stark::multilinear_block::OverlapFaults;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let (_, _, groups) = proved(true);
+    let n = groups.len();
+    assert!(
+        cards(&groups).contains(&1),
+        "the unfaulted level split: {groups:?}"
+    );
+    for place in 0..n {
+        for (what, faults) in [
+            (
+                "argue",
+                OverlapFaults {
+                    argue_fails: Some(place),
+                    ..OverlapFaults::default()
+                },
+            ),
+            (
+                "opening",
+                OverlapFaults {
+                    open_fails: Some(place),
+                    ..OverlapFaults::default()
+                },
+            ),
+        ] {
+            let proved =
+                std::panic::catch_unwind(|| prove_split_on_host(StackPlace::CardRetired, faults));
+            match proved {
+                Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!("{what} failing at place {place}: the level proved"),
+                Err(_) => panic!("{what} failing at place {place}: the prove panicked"),
+            }
+        }
+    }
+}
+
+/// A level whose prepared stacks are held (level 2's on a real block) keeps
+/// every group on card 0 under the split: a held stack pins its group, so no
+/// two groups are free and the level proves on one driver, the same bytes.
+#[test]
+fn a_level_with_its_stacks_held_stays_on_card_0_under_the_split() {
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    let built = build_wlfm_placed(
+        &level,
+        hasher,
+        WlfmRate::Two,
+        WlfmLevers::with_family(WlfmFamily::B3),
+        StackPlace::Card,
+    )
+    .expect("the W-LFM build");
+    let prove = |split: bool| {
+        let filled = execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+        let _on_host = OnHost;
+        set_levels_split_on_host_for_test(split);
+        let _ = take_wlfm_stamps();
+        let proof =
+            prove_wlfm_traces_as(&built, filled, true, WlfmProving::Streamed).expect("proves");
+        let groups: Vec<(u8, usize)> = take_wlfm_stamps()
+            .expect("the prove's stamps")
+            .groups
+            .iter()
+            .map(|g| (g.card, g.polys))
+            .collect();
+        verify_wlfm(&built.artifacts, &proof, &proof.public_words).expect("verifies");
+        (proof, groups)
+    };
+    let (one, _) = prove(false);
+    let (split, groups) = prove(true);
+    assert!(groups.len() >= 2, "a level of several groups");
+    assert!(
+        cards(&groups).iter().all(|&c| c == 0),
+        "held stacks: every group on card 0, read {:?}",
+        cards(&groups)
+    );
+    assert_eq!(bytes(&split), bytes(&one), "held: the same bytes");
+}

@@ -1069,12 +1069,28 @@ fn take_levels_pad() -> Result<u64, String> {
     let held = multilinear::gpu::reserve_room(bytes).map(|room| (room, bytes));
     let got = held.as_ref().map_or(0, |(_, b)| *b);
     *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = held;
+    // Under the levels' split (`LAMBDA_VM_TWO_CARD_LEVELS`) the levels prove
+    // on the second card too: the same pad there, promised in the second
+    // role so it is that card's ledger's (and goes back to it when dropped).
+    // A pad the second ledger refuses is not held there; the bytes returned
+    // stay card 0's.
+    if multilinear::gpu::two_card_levels_on() && multilinear::gpu::two_card_split_ready() {
+        let second = multilinear::gpu::in_second_role(|| multilinear::gpu::reserve_room(bytes))
+            .map(|room| (room, bytes));
+        *SECOND_LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = second;
+    }
     Ok(got)
 }
 
-/// Gives the levels' pad back.
+/// The levels' pad on the second card, under the levels' split, while the
+/// driver holds it ([`take_levels_pad`]).
+static SECOND_LEVELS_PAD: std::sync::Mutex<Option<(multilinear::gpu::DeviceRoom, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Gives the levels' pad back, on both cards.
 fn release_levels_pad() {
     *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SECOND_LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Gives the levels' pad back when the driver returns, by any path.
@@ -1166,19 +1182,17 @@ fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
     if held.is_none() {
         *held = Some(base);
     }
-    if split {
-        if let Some(second) = multilinear::gpu::set_second_reserve_budget(bytes) {
-            let mut held2 = SECOND_BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-            if held2.is_none() {
-                *held2 = Some(second);
-            }
-            eprintln!(
-                "LEVELS CARD budget on the second card: {:.2} GiB (LAMBDA_VM_TWO_CARD_LEVELS), its {:.2} GiB \
-                 back at the driver's return",
-                bytes as f64 / (1u64 << 30) as f64,
-                held2.unwrap_or(second) as f64 / (1u64 << 30) as f64
-            );
+    if split && let Some(second) = multilinear::gpu::set_second_reserve_budget(bytes) {
+        let mut held2 = SECOND_BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if held2.is_none() {
+            *held2 = Some(second);
         }
+        eprintln!(
+            "LEVELS CARD budget on the second card: {:.2} GiB (LAMBDA_VM_TWO_CARD_LEVELS), its {:.2} GiB \
+             back at the driver's return",
+            bytes as f64 / (1u64 << 30) as f64,
+            held2.unwrap_or(second) as f64 / (1u64 << 30) as f64
+        );
     }
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     eprintln!(
