@@ -41,7 +41,6 @@ here, for every channel at the model's one bound, rather than at every bus and e
 that finishes one. -/
 instance {Message : TypeMap} [ProvableType Message] (channel : Channel (F p) Message) :
     (channel.counted muMax).ConsistentUpTo (Balance.logUpUpTo (F := F p) muMax).pullBound := by
-  simp only [Balance.logUpUpTo_pullBound]
   infer_instance
 
 /-! ## What a bit owes a channel counted at `muMax`

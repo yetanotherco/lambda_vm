@@ -333,19 +333,13 @@ discharge. In `LtStaged` that premise is not free, because the `ARE_BYTES`,
 into the ensemble. Each provider assumes its own answers are correct; nothing
 in the file derives that from a row of BITWISE.
 
-The LT ensemble carries **no** consumer of the ALU bus, and that is a known cost of
-putting every ALU interaction on `Alu.channelC` in this same PR. A consumer would have to
-pull there, and a counted pull gains that channel's guarantee while owing the range
-obligation on it; since `Alu.channelC` is the last channel the ensemble finishes, it is
-never among the earlier ones, and ordering whole channels cannot place a component that
-both pulls a bus and is finished by it. That is what
-`Ensemble.tableSoundness_of_stagedRequirementsOn` is for.
-
-The consequence is stated rather than hidden: the ALU bus carries LT's pushes and no pulls,
-a balanced witness sends every `μ` on it to zero, and every row spec guarded by `μ ≠ 0`
-holds vacuously, starting with `LT.RowSpec` in `LtStaged.tableSoundness`. `LtStaged.lean`'s
-own docstring says so. The `consumer` and `countedConsumer` definitions stay in the file
-because the ensemble that can use them is the staged one.
+The LT ensemble also carries a consumer of the ALU bus, `countedConsumerComponent
+Alu.channel`, which pulls once on `Alu.channelC`, the same counted channel LT pushes on.
+Without it the bus would carry only LT's pushes, a balanced witness would send every `μ` on
+it to zero, and `LT.RowSpec` — guarded by `μ ≠ 0` — would hold vacuously. The consumer's
+only requirement on ALU is a count of one, which holds without relying on any guarantee, so
+it is met whatever the finishing order and `tableSoundness_of_stagedRequirements` still
+applies.
 
 `EqLookup`, already in the model (PR #1027), is the contrast. Its `pushStatic` emits the
 entries of a real `StaticLookupChannel` and proves the guarantee from
