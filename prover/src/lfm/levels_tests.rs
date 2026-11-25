@@ -840,6 +840,8 @@ struct ChainSteps {
     next_beside: bool,
     /// `LAMBDA_VM_LEVELS_WAVES_IN_ORDER`.
     waves_in_order: bool,
+    /// `LAMBDA_VM_LEVELS_PLAN_LEAN`.
+    plan_lean: bool,
 }
 
 /// The levels' chain steps forced as given (the first two on this thread,
@@ -849,7 +851,8 @@ struct ChainSteps {
 fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     use super::levels::{
         prove_block_levels, set_commit_next_early_for_test, set_fill_parts_for_test,
-        set_next_beside_for_test, set_packs_beside_for_test, set_waves_in_order_for_test,
+        set_next_beside_for_test, set_packs_beside_for_test, set_plan_lean_for_test,
+        set_waves_in_order_for_test,
     };
     use super::wlfm::set_columns_tiled_for_test;
     struct Restore;
@@ -861,6 +864,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             set_packs_beside_for_test(None);
             set_next_beside_for_test(None);
             set_waves_in_order_for_test(None);
+            set_plan_lean_for_test(None);
         }
     }
     let ChainSteps {
@@ -870,6 +874,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         packs,
         next_beside,
         waves_in_order,
+        plan_lean,
     } = steps;
 
     assert!(
@@ -887,6 +892,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         set_commit_next_early_for_test(Some(commit_early));
         set_next_beside_for_test(Some(next_beside));
         set_waves_in_order_for_test(Some(waves_in_order));
+        set_plan_lean_for_test(Some(plan_lean));
         prove_block_levels(
             &elf,
             &[],
@@ -900,8 +906,29 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         )
         .expect("the BLAKE3 block proves to its last level")
     };
-    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
-    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    // Under a lean plan the reference is today's: a plan that measures, from
+    // the base's statement and the roots committed on the host.
+    let measured = plan_lean.then(|| {
+        super::levels::level_plan_measured(
+            &elf,
+            &opts,
+            &format,
+            run.base_proof.statement(),
+            WlfmFamily::B3,
+            None,
+            true,
+        )
+        .expect("the measured plan derives")
+    });
+    if plan_lean {
+        assert!(
+            run.plan.chip_loads().0.is_empty(),
+            "the driver's plan measured nothing"
+        );
+    }
+    let reference = measured.as_ref().unwrap_or(&run.plan);
+    let held = derive_levels(reference, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(reference, &held, &run.base_proof).expect("the levels prove");
     assert_eq!(proofs.len(), run.proofs.len());
     for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
         let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
@@ -1109,9 +1136,130 @@ fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
         packs: true,
         next_beside: true,
         waves_in_order: true,
+        plan_lean: false,
     });
     assert!(run.times.next_commit.is_some_and(|c| c.early));
     assert!(run.times.next_stream.is_some_and(|s| s.prebuilt.is_some()));
+}
+
+/// ★ Level 1's plan without its measuring probes
+/// (`LAMBDA_VM_LEVELS_PLAN_LEAN`) makes the same program: a small BLAKE3
+/// block driven with the knob on proves each level's bytes as
+/// [`prove_levels`] does over a plan that measured, its plan's chip rows
+/// empty and its probes' lap zero. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`;
+/// an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_its_plan_lean_proves_the_same_level_bytes() {
+    let run = driven_under_chain_steps(ChainSteps {
+        plan_lean: true,
+        ..ChainSteps::default()
+    });
+    assert!(run.proofs.len() >= 2, "level 2 over the lean level 1");
+    assert_eq!(run.times.plan_split[5], 0.0, "no probe ran");
+}
+
+/// ★ A level plan derived without measuring emits the measured plan's
+/// program: the same instructions, addresses, arena schema, column groups and
+/// leaf marks, the same costs and partition, over two small BLAKE3 blocks;
+/// only its chip rows are empty. A prover's plan measures unless the knob
+/// says not to; a verifier's always does, knob or not.
+#[test]
+#[ignore = "proves two small BLAKE3 blocks' bases; box tier"]
+fn a_lean_level_plan_emits_the_measured_plans_program() {
+    use super::levels::{
+        level_plan_measured, set_plan_lean_for_test, verifier_level_plan_for_test,
+    };
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_plan_lean_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let digest = |text: String| -> String {
+        use digest::Digest;
+        crypto::hash::platform_keccak::PlatformKeccak256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let format = b3_format();
+    let opts = ProofOptions::default_test_options();
+    for name in ["test_commit_4", "all_instructions_64"] {
+        let (elf, proof) = b3_small_block(name, &format);
+        let plan = |measure: bool| {
+            level_plan_measured(
+                &elf,
+                &opts,
+                &format,
+                proof.statement(),
+                WlfmFamily::B3,
+                None,
+                measure,
+            )
+            .expect("the plan derives")
+        };
+        let (lean, measured) = (plan(false), plan(true));
+        assert!(
+            lean.chip_loads().0.is_empty(),
+            "{name}: a lean plan measures nothing"
+        );
+        assert_eq!(
+            measured.chip_loads().0.len(),
+            proof.statement().groups.len(),
+            "{name}: a measured plan, every group"
+        );
+        assert_eq!(lean.costs(), measured.costs(), "{name}: the costs");
+        assert_eq!(
+            format!("{:?}", lean.partition()),
+            format!("{:?}", measured.partition()),
+            "{name}: the partition"
+        );
+        let (a, a_marks) = lean
+            .closed_block_program_marked()
+            .expect("the lean program");
+        let (b, b_marks) = measured
+            .closed_block_program_marked()
+            .expect("the measured program");
+        assert_eq!(a.instrs.len(), b.instrs.len(), "{name}: the instructions");
+        assert_eq!(a.num_addrs, b.num_addrs, "{name}: the addresses");
+        assert_eq!(a_marks, b_marks, "{name}: the leaf marks");
+        assert_eq!(
+            digest(format!("{:?}", a.arena_schema)),
+            digest(format!("{:?}", b.arena_schema)),
+            "{name}: the arena schema"
+        );
+        assert_eq!(
+            digest(format!("{a:?}")),
+            digest(format!("{b:?}")),
+            "{name}: the program, instruction for instruction"
+        );
+        // The knob on: a prover's plan (its roots in) is lean; a plan without
+        // roots and a verifier's measure.
+        set_plan_lean_for_test(Some(true));
+        let verifier = verifier_level_plan_for_test(&elf, &opts, &format, proof.statement())
+            .expect("the verifier's plan");
+        assert_eq!(
+            verifier.chip_loads().0.len(),
+            proof.statement().groups.len(),
+            "{name}: a verifier measures with the knob on"
+        );
+        let rootless = level_plan(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            WlfmFamily::B3,
+            None,
+        )
+        .expect("the plan derives");
+        assert!(
+            !rootless.chip_loads().0.is_empty(),
+            "{name}: a plan without the prover's roots measures"
+        );
+        set_plan_lean_for_test(None);
+    }
 }
 
 /// ★ Level 1's and level 2's waves run in program order on their own thread
@@ -2045,8 +2193,14 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
     let p = t.plan_split;
     println!(
         "RTA LEVEL1 PLAN: frame {:.3}s · local {:.3}s · prepared {:.3}s · costs {:.3}s · receivers {:.3}s · \
-         probes {:.3}s",
-        p[0], p[1], p[2], p[3], p[4], p[5]
+         probes {:.3}s · plan lean {}",
+        p[0],
+        p[1],
+        p[2],
+        p[3],
+        p[4],
+        p[5],
+        super::levels::plan_lean()
     );
     let c = t.compile_split;
     println!(
@@ -3366,13 +3520,14 @@ fn no_production_code_builds_weakened_verifier_checks() {
 /// - each link of the path: the pinned body refuses the process's format knobs
 ///   (`check_process_format`) and calls `verifier_level_plan`, which calls
 ///   `verifier_level_plan_with`, which calls `level_plan_with(.., None, true,
-///   Some(cap_mux))`: no prepared roots, the inverse share form and the named
-///   cap check, before anything is emitted;
+///   Some(cap_mux), true)`: no prepared roots, the inverse share form, the
+///   named cap check and the chip rows measured, before anything is emitted;
 /// - `level_plan_with` derives through the share-taking derivations only (not
 ///   `derive_blake3(`, which reads the share knob) and passes the cap check on;
 /// - every later level's child carries the plan's cap check;
-/// - no function on the path reads `share_inverse()`, `cap_mux()` or a
-///   BLAKE3 base knob (`b3_base_…`), and `pin_family` reads no environment;
+/// - no function on the path reads `share_inverse()`, `cap_mux()`,
+///   `plan_lean()` or a BLAKE3 base knob (`b3_base_…`), and `pin_family`
+///   reads no environment;
 /// - the plan-taking calls stay crate-private: `verify_levels_to` is
 ///   `pub(crate)`, `verify_levels` and `verify_block_levels_under` test-only.
 #[test]
@@ -3394,6 +3549,7 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         "std::env",
         "last_level(",
         "last_wire(",
+        "plan_lean()",
     ];
     for public in ["verify_block_levels", "verify_block_levels_at"] {
         let b = body(public);
@@ -3426,6 +3582,10 @@ fn the_levels_verifier_derives_its_plan_and_takes_none() {
         ("verifier_level_plan", "verifier_level_plan_with("),
         ("verifier_level_plan_with", "level_plan_with("),
         ("verifier_level_plan_with", "None, true, Some(cap_mux)"),
+        // A verifier's plan measures its chip rows whatever the prover's
+        // lean-plan knob says.
+        ("verifier_level_plan_with", "Some(cap_mux), true, )"),
+        ("level_plan_with", "measure, share_inverse, cap_mux, )"),
         ("level_plan_with", "derive_full("),
         ("level_plan_with", "derive_blake3_with_share("),
         ("level_plan_with", "share_inverse, cap_mux, )"),
