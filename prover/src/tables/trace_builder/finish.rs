@@ -2346,16 +2346,19 @@ type TryCutGenerator<'a, T> =
     std::sync::Arc<dyn Fn(&[T], usize, TraceForm) -> Result<Table, Error> + Send + Sync + 'a>;
 
 /// A wave's slot: a unit's AIR position and, for a table, its number among
-/// the rest's tables, its family and its job.
-type WaveSlot<'a> = (usize, Option<(usize, usize, Job<'a>)>);
+/// the rest's tables, its family, its stated rows and its job.
+type WaveSlot<'a> = (usize, Option<(usize, usize, usize, Job<'a>)>);
 
 /// One table of the rest, in AIR order ([`FinishPlan::units`]).
 pub(super) enum Unit<'a> {
     /// A streamed chunk's slot of a family ([`FAMILIES`]): its table went out
     /// with the windows.
     Streamed { family: usize },
-    /// A table to build: its family ([`FAMILIES`]), an estimate of its rows and
-    /// the job that builds it.
+    /// A table to build: its family ([`FAMILIES`]), its rows and the job that
+    /// builds it. The rows are the table's exactly (what the early statement
+    /// reads; a table built at other rows is counted by [`rows_misses`]),
+    /// except a family whose generator pads its deduplicated or merged rows
+    /// ([`rows_late`]): an estimate, its height told once built.
     Build {
         family: usize,
         rows: usize,
@@ -2555,8 +2558,8 @@ fn table_bytes(table: &Table) -> usize {
     )
 }
 
-/// The rows a table of `n` ops is padded to, as most generators pad it: an
-/// estimate only.
+/// The rows a table of `n` ops is padded to, as the generators pad it (an
+/// upper bound for a family of [`rows_late`]).
 fn rows_of(n: usize) -> usize {
     n.next_power_of_two().max(4)
 }
@@ -2940,7 +2943,7 @@ impl<'a> FinishPlan<'a> {
         let num_keccak = shared.keccak_ops.len();
         units.push(Unit::Build {
             family: family("KECCAK_RC"),
-            rows: 64,
+            rows: keccak_rc::NUM_ROWS,
             job: Box::new(move || {
                 let mut keccak_rc = keccak_rc::generate_keccak_rc_trace();
                 keccak_rc::update_multiplicities(&mut keccak_rc, num_keccak);
@@ -2949,7 +2952,7 @@ impl<'a> FinishPlan<'a> {
         });
         units.push(Unit::Build {
             family: family("REGISTER"),
-            rows: 64,
+            rows: register_rows(register_format),
             job: Box::new(move || {
                 Ok(packed_if(
                     pack,
@@ -2959,7 +2962,7 @@ impl<'a> FinishPlan<'a> {
         });
         units.push(Unit::Build {
             family: family("HALT"),
-            rows: 4,
+            rows: 1,
             job: Box::new(move || {
                 Ok(packed_if(
                     pack,
@@ -3109,7 +3112,10 @@ impl<'a> FinishPlan<'a> {
         );
         let num_blake3 = blake3_ops.len() + blake3_absorb_ops.len();
         if num_blake3 > 0 {
-            let rows = rows_of(num_blake3);
+            // An absorb takes a row a block and its end row
+            // ([`blake3::generate_blake3_trace`]).
+            let absorb_rows: usize = blake3_absorb_ops.iter().map(|op| op.blocks.len() + 1).sum();
+            let rows = rows_of(blake3_ops.len() + absorb_rows);
             units.push(Unit::Build {
                 family: family("BLAKE3"),
                 rows,
@@ -3964,19 +3970,33 @@ impl<'a> FinishPlan<'a> {
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let ecdas_form = self.skip.ecdas_form;
-        emit_streamed_units_ordered(self.units(), gate, send, false, &[], None, None, ecdas_form)
+        emit_streamed_units_ordered(
+            self.units(),
+            gate,
+            send,
+            false,
+            &[],
+            None,
+            None,
+            ecdas_form,
+            None,
+        )
     }
 
     /// [`Self::emit_streamed`], and with `keep` what phase B needs to build
     /// KECCAK_RND's and LT's tables again ([`RestRegen`]); with `slide` the
     /// tables are built as they are admitted instead of in waves
-    /// ([`emit_units_sliding`]).
+    /// ([`emit_units_sliding`]). With `on_rows`, before any table is built,
+    /// each unit's rows in AIR order ([`RowsNote::Stated`]), then each
+    /// late family's table's height as its job returns ([`RowsNote::Built`]).
+    /// Nothing is stated when the units fail.
     pub(super) fn emit_streamed_keeping(
         self,
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
         keep: bool,
         slide: bool,
+        on_rows: Option<&mut dyn FnMut(RowsNote)>,
     ) -> Result<Option<RestRegen>, Error> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
@@ -3987,6 +4007,10 @@ impl<'a> FinishPlan<'a> {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };
+        let mut on_rows = on_rows;
+        if let (Ok(units), Some(on_rows)) = (&units, on_rows.as_mut()) {
+            on_rows(RowsNote::Stated(units_rows(units)));
+        }
         let first = match &units {
             Ok(units) => {
                 let mut first = Vec::new();
@@ -4000,9 +4024,116 @@ impl<'a> FinishPlan<'a> {
             }
             _ => Vec::new(),
         };
-        emit_streamed_units_ordered(units, gate, send, slide, &first, last, side, ecdas_form)?;
+        emit_streamed_units_ordered(
+            units, gate, send, slide, &first, last, side, ecdas_form, on_rows,
+        )?;
         Ok(regen)
     }
+}
+
+/// A unit's rows as the streamed finish states them before any table is
+/// built ([`FinishPlan::emit_streamed_keeping`]'s `on_rows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnitRows {
+    /// A streamed chunk's slot: its table went out with the windows.
+    Slot,
+    /// A table built at exactly these rows.
+    Exact(usize),
+    /// A table whose rows are known once it is built ([`rows_late`]): its
+    /// height follows as a [`RowsNote::Built`].
+    Late,
+}
+
+/// What the streamed finish tells a rows sink: every unit's rows in AIR order,
+/// once, before any table is built; then each late table's height as its job
+/// returns (in the order the jobs return).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RowsNote {
+    Stated(Vec<UnitRows>),
+    Built { position: usize, rows: usize },
+}
+
+/// The families whose generators pad the rows left after deduplicating (or,
+/// LT, merging) their ops, so a table's rows are known only once it is
+/// built: LT, MUL, DVRM, BRANCH and BYTEWISE.
+const LATE_FAMILIES: [&str; 5] = ["LT", "MUL", "DVRM", "BRANCH", "BYTEWISE"];
+
+/// Whether `family`'s rows are known only once its table is built.
+pub(super) fn rows_late(family: usize) -> bool {
+    FAMILIES
+        .get(family)
+        .is_some_and(|&(name, _)| LATE_FAMILIES.contains(&name))
+}
+
+/// Each unit's rows in AIR order ([`UnitRows`]).
+pub(super) fn units_rows(units: &[Unit<'_>]) -> Vec<UnitRows> {
+    units
+        .iter()
+        .map(|unit| match unit {
+            Unit::Streamed { .. } => UnitRows::Slot,
+            Unit::Build { family, .. } if rows_late(*family) => UnitRows::Late,
+            Unit::Build { rows, .. } => UnitRows::Exact(*rows),
+        })
+        .collect()
+}
+
+/// Tables the streamed finish built at other rows than their unit stated
+/// exactly, since the process started: the early statement reads the stated
+/// rows, so any miss makes it disagree with the final one (and fall back).
+static ROWS_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`ROWS_MISSES`]' count.
+#[allow(dead_code)] // The early statement's stamp reads it.
+pub(crate) fn rows_misses() -> usize {
+    ROWS_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The table at AIR `position` of `family`, stated at `rows`, was built: a
+/// late family's height goes to the rows sink; an exact one's is counted when
+/// it differs.
+fn note_built(
+    position: usize,
+    family: usize,
+    rows: usize,
+    table: &Table,
+    on_rows: &mut Option<&mut dyn FnMut(RowsNote)>,
+) {
+    if rows_late(family) {
+        if let Some(on_rows) = on_rows.as_mut() {
+            on_rows(RowsNote::Built {
+                position,
+                rows: table.main_table.height,
+            });
+        }
+    } else {
+        note_rows(family, rows, table);
+    }
+}
+
+/// A table of `family` stated at `rows` was built: counted when its height
+/// differs.
+fn note_rows(family: usize, rows: usize, table: &Table) {
+    if table.main_table.height != rows {
+        ROWS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = FAMILIES.get(family).map_or("?", |&(name, _)| name);
+        #[cfg(test)]
+        ROWS_MISSED_HERE.with(|m| m.borrow_mut().push((name, rows, table.main_table.height)));
+        #[cfg(not(test))]
+        let _ = name;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's misses ([`note_rows`]): family, stated rows, built rows.
+    static ROWS_MISSED_HERE: std::cell::RefCell<Vec<(&'static str, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// This thread's misses since the last call: (family, stated rows, built rows).
+#[cfg(test)]
+pub(super) fn take_rows_missed_here() -> Vec<(&'static str, usize, usize)> {
+    ROWS_MISSED_HERE.with(|m| std::mem::take(&mut *m.borrow_mut()))
 }
 
 /// [`FinishPlan::emit_streamed`] over `units`, in waves or sliding (`slide`;
@@ -4029,12 +4160,14 @@ fn emit_streamed_units<'a>(
         last,
         side,
         ecdas::EcdasForm::Bytes,
+        None,
     )
 }
 
 /// [`emit_streamed_units`], sliding with the positions `first` (ascending)
 /// handed on before every other, in their order ([`hand_on_order_first`]).
-/// In waves `first` is ignored: AIR order.
+/// In waves `first` is ignored: AIR order. Each late family's built height
+/// goes to `on_rows` ([`note_built`]).
 #[allow(clippy::too_many_arguments)]
 fn emit_streamed_units_ordered<'a>(
     units: Result<Vec<Unit<'a>>, Error>,
@@ -4045,15 +4178,16 @@ fn emit_streamed_units_ordered<'a>(
     last: Option<usize>,
     side: Option<Side<'a>>,
     ecdas_form: ecdas::EcdasForm,
+    mut on_rows: Option<&mut dyn FnMut(RowsNote)>,
 ) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send, first, last, side, ecdas_form)
+        emit_units_sliding(units, gate, send, first, last, side, ecdas_form, &mut on_rows)
     } else {
         if let Some(side) = side {
             side();
         }
-        emit_units(units, gate, send, ecdas_form)
+        emit_units(units, gate, send, ecdas_form, &mut on_rows)
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
@@ -4061,7 +4195,7 @@ fn emit_streamed_units_ordered<'a>(
         if let Some(side) = side {
             side();
         }
-        emit_units(units, gate, send, ecdas_form)
+        emit_units(units, gate, send, ecdas_form, &mut on_rows)
     };
     if let Err(e) = &result {
         gate.stop(&format!("the finish stopped: {e:?}"));
@@ -4120,6 +4254,7 @@ fn emit_units(
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ecdas_form: ecdas::EcdasForm,
+    on_rows: &mut Option<&mut dyn FnMut(RowsNote)>,
 ) -> Result<(), Error> {
     let wave_bytes = (gate.budget() / 2).max(1);
     let mut estimates = Estimates::new(ecdas_form);
@@ -4149,8 +4284,8 @@ fn emit_units(
             };
             match unit {
                 Unit::Streamed { .. } => wave.push((position, None)),
-                Unit::Build { family, job, .. } => {
-                    wave.push((position, Some((next_table, family, job))));
+                Unit::Build { family, rows, job } => {
+                    wave.push((position, Some((next_table, family, rows, job))));
                     next_table += 1;
                 }
             }
@@ -4159,7 +4294,9 @@ fn emit_units(
         let (slots, jobs): (Vec<_>, Vec<_>) = wave
             .into_iter()
             .map(|(position, build)| match build {
-                Some((table, family, job)) => ((position, Some((table, family))), Some(job)),
+                Some((table, family, rows, job)) => {
+                    ((position, Some((table, family, rows))), Some(job))
+                }
                 None => ((position, None), None),
             })
             .unzip();
@@ -4172,10 +4309,11 @@ fn emit_units(
         for (position, build) in slots {
             let table = match build {
                 None => None,
-                Some((number, family)) => {
+                Some((number, family, rows)) => {
                     let table = built.next().ok_or_else(|| {
                         Error::Prover("the streamed finish lost a table of its wave".into())
                     })??;
+                    note_built(position, family, rows, &table, on_rows);
                     let bytes = table_bytes(&table);
                     gate.resize(number, bytes);
                     estimates.learn(family, &table, bytes);
@@ -4191,10 +4329,10 @@ fn emit_units(
 }
 
 /// A table built on the pool: its AIR position, its number among the rest's
-/// tables, its family, the bytes it was estimated at, the table or its error,
-/// and the seconds its job took.
+/// tables, its family, its stated rows, the bytes it was estimated at, the
+/// table or its error, and the seconds its job took.
 #[cfg(feature = "parallel")]
-type Built = (usize, usize, usize, usize, Result<Table, Error>, f64);
+type Built = (usize, usize, usize, usize, usize, Result<Table, Error>, f64);
 
 /// A family's tables built by [`emit_units_sliding`], for the build's marks:
 /// how many, when the first started and the last was built (seconds since the
@@ -4229,6 +4367,7 @@ struct FamilyBuild {
 /// `side` (run on a thread of its own while the tables build), `last` starts
 /// only once it is due: every other table is built by then.
 #[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
 fn emit_units_sliding<'a>(
     units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
@@ -4237,6 +4376,7 @@ fn emit_units_sliding<'a>(
     last: Option<usize>,
     side: Option<Side<'a>>,
     ecdas_form: ecdas::EcdasForm,
+    on_rows: &mut Option<&mut dyn FnMut(RowsNote)>,
 ) -> Result<(), Error> {
     let units = units?;
     let last_waits = side.is_some();
@@ -4248,12 +4388,13 @@ fn emit_units_sliding<'a>(
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
             });
         }
-        slide_units(units, gate, send, first, last, last_waits, ecdas_form)
+        slide_units(units, gate, send, first, last, last_waits, ecdas_form, on_rows)
     })
 }
 
 /// [`emit_units_sliding`]'s loop.
 #[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
 fn slide_units(
     units: Vec<Unit<'_>>,
     gate: &gate::ByteGate,
@@ -4262,6 +4403,7 @@ fn slide_units(
     last: Option<usize>,
     last_waits: bool,
     ecdas_form: ecdas::EcdasForm,
+    on_rows: &mut Option<&mut dyn FnMut(RowsNote)>,
 ) -> Result<(), Error> {
     let total = units.len();
     let mut estimates = Estimates::new(ecdas_form);
@@ -4347,7 +4489,7 @@ fn slide_units(
                 };
                 match unit {
                     Unit::Streamed { .. } => ready[position] = Some(None),
-                    Unit::Build { family, job, .. } => {
+                    Unit::Build { family, rows, job } => {
                         if let Some(f) = families.get_mut(family)
                             && f.first_started.is_none()
                         {
@@ -4363,7 +4505,8 @@ fn slide_units(
                                     )))
                                 });
                             let secs = t.elapsed().as_secs_f64();
-                            let _ = tx.send((position, number, family, est_now, table, secs));
+                            let _ =
+                                tx.send((position, number, family, rows, est_now, table, secs));
                         });
                         building += 1;
                         building_bytes = building_bytes.saturating_add(est_now);
@@ -4386,10 +4529,11 @@ fn slide_units(
                 rx.recv()
                     .map_err(|_| Error::Prover("the rest's builders stopped".into()))?
             };
-            let (position, number, family, est, table, secs) = built;
+            let (position, number, family, rows, est, table, secs) = built;
             building -= 1;
             building_bytes = building_bytes.saturating_sub(est);
             let table = table?;
+            note_built(position, family, rows, &table, on_rows);
             let bytes = table_bytes(&table);
             gate.resize(number, bytes);
             estimates.learn(family, &table, bytes);
@@ -4471,6 +4615,16 @@ fn positions_of(units: &[Unit<'_>], family: usize) -> Vec<usize> {
 #[cfg(test)]
 #[path = "stream_tests.rs"]
 mod stream_tests;
+
+/// The rows [`register_trace`] builds REGISTER's table at under `format`.
+fn register_rows(format: super::super::register::RegisterFormat) -> usize {
+    match format {
+        super::super::register::RegisterFormat::Tokens32 => {
+            register::NUM_REGISTER_ADDRESSES.next_power_of_two()
+        }
+        super::super::register::RegisterFormat::InRow => register::inrow::NUM_ROWS,
+    }
+}
 
 /// REGISTER's trace in the run's register format: a word a row (today's), or
 /// a register a row under [`RegisterFormat::InRow`], its final timestamps the
