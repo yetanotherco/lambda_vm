@@ -676,6 +676,13 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The finish's last jobs shortened (`LAMBDA_VM_FINISH_EARLY`,
+    /// [`super::FinishEarly`]). The tables are the same.
+    pub fn finish_early(mut self, early: super::FinishEarly) -> Self {
+        self.emitted.finish_early = early;
+        self
+    }
+
     /// Count what the table phase reads from each handed-out chunk on a
     /// thread of its own (`true`, the default) or on the accumulator's
     /// (`false`) ([`handout_count`]). The tables

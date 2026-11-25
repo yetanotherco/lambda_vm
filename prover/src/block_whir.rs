@@ -48,8 +48,8 @@ use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::local_bytes::{self, LocalCounts};
 use crate::tables::trace_builder::{
-    ChunkJob, CutPadding, HostHoist, RowFamilies, StreamTable, Traces, WalkCuts, WindowStamps,
-    WindowedTraceBuilder, exec_pad_probe, head_log, pad_write, parallel,
+    ChunkJob, CutPadding, FinishEarly, HostHoist, RowFamilies, StreamTable, Traces, WalkCuts,
+    WindowStamps, WindowedTraceBuilder, exec_pad_probe, head_log, pad_write, parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -5612,6 +5612,9 @@ pub(crate) struct Deviations {
     /// The walk's cuts, instead of the knob (`LAMBDA_VM_WALK_CUTS`,
     /// [`WalkCuts`]).
     pub walk_cuts: Option<WalkCuts>,
+    /// The finish's last jobs shortened, instead of the knob
+    /// (`LAMBDA_VM_FINISH_EARLY`, [`FinishEarly`]).
+    pub finish_early: Option<FinishEarly>,
     /// The run's AIR set built on a thread of its own while the first
     /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
     /// first table (`Some(false)`), instead of the knob
@@ -9065,6 +9068,16 @@ fn prove_streamed(
         "★ BLOCK WALK CUTS: {} (LAMBDA_VM_WALK_CUTS)",
         walk_cuts.describe()
     );
+    // The finish's last jobs shortened: a word it does not take refuses the
+    // prove. The tables are the same with any part on.
+    let finish_early = match deviations.finish_early {
+        Some(early) => early,
+        None => FinishEarly::from_env()?,
+    };
+    eprintln!(
+        "★ BLOCK FINISH EARLY: {} (LAMBDA_VM_FINISH_EARLY)",
+        finish_early.describe()
+    );
     // The walkers' light walk: a word it does not take refuses the prove.
     let light_walk = parse_light_walk(std::env::var("LAMBDA_VM_LIGHT_WALK").ok().as_deref())?;
     eprintln!(
@@ -9651,7 +9664,8 @@ fn prove_streamed(
                     private_inputs,
                     &options.max_rows,
                     host_hoist,
-                )?;
+                )?
+                .finish_early(finish_early);
                 if stream_keccak_rnd {
                     // Checked above: KECCAK_RND is cut into its tables.
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;

@@ -973,9 +973,57 @@ impl BitwiseHistogram {
         })
     }
 
+    /// [`Self::trace_as`] with its rows written as the row ranges `bounds`
+    /// at once ([`super::gpack::generate_main_rows`]): a row reads its own
+    /// index and its own counts alone, so the trace is the same, word for word
+    /// and packed byte for byte.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn trace_as_rows(
+        &self,
+        form: TraceForm,
+        bounds: &[usize],
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        if !WIDTHS.known(cols::NUM_COLUMNS) {
+            WIDTHS.learn(&SEED_WIDTHS);
+        }
+        super::gpack::generate_main_rows!(
+            form,
+            &WIDTHS,
+            NUM_ROWS,
+            cols::NUM_COLUMNS,
+            bounds,
+            |table, rows| { self.fill_rows(table, rows) }
+        )
+    }
+
+    /// [`Self::merge`] in chunks of cells at once (on the pool the caller runs
+    /// on): the same sums.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn merge_in_chunks(&mut self, other: &BitwiseHistogram) {
+        #[cfg(feature = "parallel")]
+        {
+            const CHUNK: usize = 1 << 16;
+            self.counters
+                .par_chunks_mut(CHUNK)
+                .zip(other.counters.par_chunks(CHUNK))
+                .for_each(|(mine, theirs)| {
+                    for (a, b) in mine.iter_mut().zip(theirs) {
+                        *a += *b;
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        self.merge(other);
+    }
+
     /// Every row's precomputed columns and multiplicities, rows in order.
     fn fill_row_order(&self, table: &mut impl VmTable) {
-        for row_idx in 0..NUM_ROWS {
+        self.fill_rows(table, 0..NUM_ROWS);
+    }
+
+    /// The rows `rows`' precomputed columns and multiplicities, in order.
+    fn fill_rows(&self, table: &mut impl VmTable, rows: std::ops::Range<usize>) {
+        for row_idx in rows {
             let (x, y, z) = (
                 (row_idx & 0xFF) as u32,
                 ((row_idx >> 8) & 0xFF) as u32,

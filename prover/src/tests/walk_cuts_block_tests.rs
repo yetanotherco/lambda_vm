@@ -1,9 +1,10 @@
-//! ★ `LAMBDA_VM_WALK_CUTS` on real block proves: a block proved with every
-//! cut of the walk on is the block proved with none, on three walkers in
+//! ★ `LAMBDA_VM_WALK_CUTS` and `LAMBDA_VM_FINISH_EARLY` on real block
+//! proves: a block proved with every cut of the walk on, with every finish
+//! part on, and with both, is the block proved with none, on three walkers in
 //! record mode (the default) and on one, under the split memory format with
 //! many windows and under the word memory format with a private input across
 //! two pages: the same partition, heights, counts, output and group roots,
-//! both proofs verify, and under the deterministic grind
+//! every proof verifies, and under the deterministic grind
 //! (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once a process: run alone) the
 //! same bytes. The proving tests run where a block can be proved (the box's
 //! lib run and CI).
@@ -13,7 +14,7 @@ use crate::block_whir::{
 };
 use crate::tables::MaxRowsConfig;
 use crate::tables::fused_memory::MemoryFormat;
-use crate::tables::trace_builder::WalkCuts;
+use crate::tables::trace_builder::{FinishEarly, WalkCuts};
 use crate::test_utils::asm_elf_bytes;
 use stark::proof::options::ProofOptions;
 
@@ -48,10 +49,24 @@ fn the_walk_cuts_prove_the_same_block() {
         ),
     ] {
         let elf = asm_elf_bytes(program);
-        for walkers in [3, 1] {
-            let proved = |cuts: WalkCuts| {
-                let options =
+        let none = (WalkCuts::default(), FinishEarly::default());
+        for (walkers, arms) in [
+            (
+                3,
+                vec![
+                    (WalkCuts::all(), FinishEarly::default()),
+                    (WalkCuts::default(), FinishEarly::all()),
+                    (WalkCuts::all(), FinishEarly::all()),
+                ],
+            ),
+            (1, vec![(WalkCuts::all(), FinishEarly::all())]),
+        ] {
+            let proved = |(cuts, early): (WalkCuts, FinishEarly)| {
+                // The rest streamed under its gate (a layout thread), as the
+                // prove streams it: BITWISE's job is the sliding finish's.
+                let mut options =
                     super::block_whir_tests::streamed(MaxRowsConfig::small(), 16, window_log2);
+                options.layout_workers = 3;
                 prove_block_whir_with(
                     &elf,
                     &input,
@@ -61,35 +76,48 @@ fn the_walk_cuts_prove_the_same_block() {
                     &Deviations {
                         walkers: Some(walkers),
                         walk_cuts: Some(cuts),
+                        finish_early: Some(early),
                         ..Deviations::default()
                     },
                 )
                 .expect("the block proves")
                 .0
             };
-            let what = format!("{what}, {walkers} walkers");
-            let off = proved(WalkCuts::default());
-            let on = proved(WalkCuts::all());
-            assert!(
-                matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
-                "{what}: with the cuts verifies"
-            );
+            let off = proved(none);
             assert!(
                 matches!(verify_block_whir(&off, &elf, &opts, &format), Ok(true)),
-                "{what}: without verifies"
+                "{what}, {walkers} walkers: without verifies"
             );
-            assert_eq!(on.groups, off.groups, "{what}: the partition");
-            assert_eq!(on.table_num_vars, off.table_num_vars, "{what}: the heights");
-            assert_eq!(
-                format!("{:?}", on.table_counts),
-                format!("{:?}", off.table_counts),
-                "{what}: the counts"
-            );
-            assert_eq!(on.word_memory, off.word_memory, "{what}: the word tables");
-            assert_eq!(on.public_output, off.public_output, "{what}: the output");
-            assert_eq!(on.proof.roots, off.proof.roots, "{what}: the group roots");
-            if crypto::grinding::deterministic() {
-                assert_eq!(bytes(&on), bytes(&off), "{what}: the proof's bytes");
+            for arm in arms {
+                let what = format!(
+                    "{what}, {walkers} walkers, cuts {}, finish {}",
+                    arm.0.describe(),
+                    arm.1.describe()
+                );
+                let tails = crate::tables::trace_builder::finish_early::bitwise_tails();
+                let on = proved(arm);
+                assert_eq!(
+                    crate::tables::trace_builder::finish_early::bitwise_tails() > tails,
+                    arm.1.bitwise_tail,
+                    "{what}: BITWISE's job split"
+                );
+                assert!(
+                    matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
+                    "{what}: verifies"
+                );
+                assert_eq!(on.groups, off.groups, "{what}: the partition");
+                assert_eq!(on.table_num_vars, off.table_num_vars, "{what}: the heights");
+                assert_eq!(
+                    format!("{:?}", on.table_counts),
+                    format!("{:?}", off.table_counts),
+                    "{what}: the counts"
+                );
+                assert_eq!(on.word_memory, off.word_memory, "{what}: the word tables");
+                assert_eq!(on.public_output, off.public_output, "{what}: the output");
+                assert_eq!(on.proof.roots, off.proof.roots, "{what}: the group roots");
+                if crypto::grinding::deterministic() {
+                    assert_eq!(bytes(&on), bytes(&off), "{what}: the proof's bytes");
+                }
             }
         }
     }
