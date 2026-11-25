@@ -62,17 +62,19 @@ fn the_walk_cuts_prove_the_same_block() {
         ),
     ] {
         let elf = asm_elf_bytes(program);
-        let none = (WalkCuts::default(), FinishEarly::default());
+        // Every finish counted: another test's block prove beside this one
+        // runs every finish part under the knob's default and counts nothing.
+        let none = (WalkCuts::none(), FinishEarly::none().counted());
         for (walkers, arms) in [
             (
                 3,
                 vec![
-                    (WalkCuts::all(), FinishEarly::default()),
-                    (WalkCuts::default(), FinishEarly::all()),
-                    (WalkCuts::all(), FinishEarly::all()),
+                    (WalkCuts::all(), FinishEarly::none().counted()),
+                    (WalkCuts::none(), FinishEarly::all().counted()),
+                    (WalkCuts::all(), FinishEarly::all().counted()),
                 ],
             ),
-            (1, vec![(WalkCuts::all(), FinishEarly::all())]),
+            (1, vec![(WalkCuts::all(), FinishEarly::all().counted())]),
         ] {
             let proved = |(cuts, early): (WalkCuts, FinishEarly)| {
                 // The rest streamed under its gate (a layout thread), as the

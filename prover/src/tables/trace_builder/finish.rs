@@ -1095,7 +1095,7 @@ impl<'a> FinishPlan<'a> {
             })
             .map(std::sync::Arc::new);
         #[cfg(test)]
-        if ecdas_planes.is_some() {
+        if ecdas_planes.is_some() && skip.finish_early.counted {
             super::finish_early::note_ecdas_count();
         }
 
@@ -3030,7 +3030,9 @@ impl<'a> FinishPlan<'a> {
                     });
                     build_stamps::mark(&format!("p5 bitwise by {} row ranges", bounds.len() - 1));
                     #[cfg(test)]
-                    super::finish_early::note_bitwise_tail();
+                    if skip.finish_early.counted {
+                        super::finish_early::note_bitwise_tail();
+                    }
                     return Ok(trace);
                 }
                 note_bitwise(&histogram, from);

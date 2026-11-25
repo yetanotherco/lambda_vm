@@ -566,7 +566,8 @@ fn a_windowed_build_counting_ecdas_beside_the_witnesses_builds_the_whole_run_tab
     let early = FinishEarly {
         ecdas_count: true,
         ..FinishEarly::default()
-    };
+    }
+    .counted();
     for name in ["test_ecrec", "all_instructions_64"] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
