@@ -1300,6 +1300,8 @@ impl BlockFormat {
                     .expect("a round-form config takes caps by Q");
             }
         }
+        #[cfg(test)]
+        let config = crate::lfm::wlfm::test_format::apply_driver_options(config);
         config
     }
 }
@@ -5030,13 +5032,9 @@ pub(crate) struct GroupPrepared<H: multilinear::whir_hash::WhirHash> {
     pub(crate) columns: Vec<Mle<F>>,
     pub(crate) roots: Vec<multilinear::whir_commit::Commitment>,
     pub(crate) commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
-    /// Under [`commit_group_narrow`], the columns packed narrow for the commit
-    /// (kept for a later store of the same columns) and what the commit's
-    /// narrow store cost; `None` otherwise, or where it packed nothing.
-    pub(crate) packed: Option<NarrowCommit>,
 }
 
-/// A prepared stack committed from a store sent narrow ([`commit_group_narrow`]):
+/// A prepared stack committed from a store sent narrow ([`GroupStack::commit`]):
 /// the columns' packed bytes, and whether the commit read them from the card
 /// (`sent`; `false` when the plan or the card kept them on the host), with the
 /// upload's seconds.
@@ -5060,9 +5058,9 @@ pub(crate) struct GroupStack {
     pub(crate) group: usize,
     /// `(position in the proof's table order, AIR index, prefix length)`.
     pub(crate) tables: Vec<(usize, usize, usize)>,
-    pub(crate) columns: Vec<Vec<FieldElement<F>>>,
+    pub(crate) columns: Vec<Mle<F>>,
     /// The columns packed narrow ahead of the commit (in the level's host
-    /// part, beside the base's phase B), for [`commit_group_narrow`] to send
+    /// part, beside the base's phase B), for [`Self::commit`] to send
     /// without packing them on its path; `None` packs there.
     pub(crate) packed: Option<multilinear::gpu::PackedStore>,
 }
@@ -5071,8 +5069,15 @@ impl GroupStack {
     /// [`Self::packed`] made now: the stack's columns packed narrow, on
     /// whatever pool the caller runs this on.
     pub(crate) fn pack_narrow(&mut self) {
-        let raw: Vec<&[FieldElement<F>]> = self.columns.iter().map(Vec::as_slice).collect();
-        self.packed = multilinear::gpu::pack_store_fields(&raw);
+        self.packed = multilinear::gpu::pack_store(&multilinear::stacking::borrow(&self.columns));
+    }
+
+    /// The positions and prefix lengths needed to open the stack.
+    pub(crate) fn table_prefixes(&self) -> Vec<(usize, usize)> {
+        self.tables
+            .iter()
+            .map(|&(position, _, n)| (position, n))
+            .collect()
     }
 
     /// The stack's shapes, one `(columns, variables)` per table: what its layout
@@ -5082,7 +5087,7 @@ impl GroupStack {
         self.tables
             .iter()
             .map(|&(_, _, n)| {
-                let vars = self.columns[at].len().trailing_zeros() as usize;
+                let vars = self.columns[at].num_vars();
                 at += n;
                 (n, vars)
             })
@@ -5117,7 +5122,9 @@ pub(crate) fn group_stacks(
             let table = table as usize;
             if let Some(columns) = by_table.get_mut(table).and_then(Option::take) {
                 stack.tables.push((position, table, columns.len()));
-                stack.columns.extend(columns);
+                for column in columns {
+                    stack.columns.push(prepared_column(g, column)?);
+                }
             }
             position += 1;
         }
@@ -5131,6 +5138,10 @@ pub(crate) fn group_stacks(
         )));
     }
     Ok(stacks)
+}
+
+fn prepared_column(group: usize, values: Vec<FieldElement<F>>) -> Result<Mle<F>, Error> {
+    Mle::new(values).map_err(|e| Error::Prover(format!("group {group}: {e:?}")))
 }
 
 /// Where DECODE sits among a block's tables, found by NAME.
@@ -5288,25 +5299,7 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false, false, false)
-}
-
-/// [`commit_group`] with the columns sent to the card narrow: packed on the
-/// host once (in the level's host part when [`GroupStack::packed`] holds them,
-/// else here; `multilinear::gpu::pack_store`), widened on the card into a
-/// store, and committed from that store, where today the commit copies the
-/// wide columns in; under `staged` each packed run goes up through the card's
-/// pinned staging. The same words at the same places, so the same roots.
-/// Where there is no card, or the plan (the store, its staging, a card
-/// commit's price and a margin, against what the ledger has free) or the card
-/// says no, it commits as [`commit_group`] does; the packed bytes are kept
-/// either way ([`GroupPrepared::packed`]) for a later store of the columns.
-pub(crate) fn commit_group_narrow<H: multilinear::whir_hash::WhirHash>(
-    stack: GroupStack,
-    config: &multilinear::whir_chain::ChainConfig,
-    staged: bool,
-) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false, true, staged)
+    commit_group_where::<H>(stack, config, false)
 }
 
 /// Whether a narrow commit's store fits: its words, the largest run's packed
@@ -5326,32 +5319,51 @@ pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, true, false, false)
+    commit_group_where::<H>(stack, config, true)
 }
 
 fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
-    stack: GroupStack,
+    mut stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
     on_host: bool,
-    narrow: bool,
-    staged: bool,
 ) -> Result<GroupPrepared<H>, Error> {
-    let shapes = stack.shapes();
-    let group = stack.group;
-    let prepacked = stack.packed;
-    let columns: Vec<Mle<F>> = stack
-        .columns
-        .into_iter()
-        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("group {group}: {e:?}"))))
-        .collect::<Result<_, _>>()?;
-    let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let borrowed = multilinear::stacking::borrow(&columns);
-    let budget = multilinear::gpu::reserve_budget();
-    // Packed ahead (the level's host part) when it fits these columns; else
-    // packed here.
-    let mut packed = (narrow && !on_host && budget > 0 && !multilinear::gpu::columns_disabled())
-        .then(|| match prepacked.filter(|p| p.fits(&borrowed)) {
+    let (commitment, _) = stack.commit::<H>(config, on_host, None)?;
+    Ok(GroupPrepared {
+        group: stack.group,
+        tables: stack.table_prefixes(),
+        columns: stack.columns,
+        roots: commitment.roots(),
+        commitment,
+    })
+}
+
+impl GroupStack {
+    /// Commits the stack while its columns and table triples stay available
+    /// for a retry. `narrow_staged` enables packing and widening on the card
+    /// when the ledger has room. `Some(true)` uses pinned staging.
+    pub(crate) fn commit<H: multilinear::whir_hash::WhirHash>(
+        &mut self,
+        config: &multilinear::whir_chain::ChainConfig,
+        on_host: bool,
+        narrow_staged: Option<bool>,
+    ) -> Result<
+        (
+            multilinear::stacked_eval::StackedCommitment<F, H>,
+            Option<NarrowCommit>,
+        ),
+        Error,
+    > {
+        let layout = stark::multilinear_table::global_layout(&self.shapes(), config.format.stack)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        let borrowed = multilinear::stacking::borrow(&self.columns);
+        let budget = multilinear::gpu::reserve_budget();
+        // Packed ahead (the level's host part) when it fits these columns; else
+        // packed here.
+        let mut packed = (narrow_staged.is_some()
+            && !on_host
+            && budget > 0
+            && !multilinear::gpu::columns_disabled())
+        .then(|| match self.packed.take().filter(|p| p.fits(&borrowed)) {
             Some(p) => Some((p, true)),
             None => multilinear::gpu::pack_store(&borrowed).map(|p| (p, false)),
         })
@@ -5363,55 +5375,48 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
             upload_secs: 0.0,
             packed_ahead: ahead,
         });
-    let store = match packed.as_mut() {
-        Some(p) => {
-            let lens: Vec<usize> = borrowed.iter().map(|c| c.len()).collect();
-            let staging = multilinear::narrow::store_staging_bound(
-                &lens,
-                multilinear::narrow::STORE_RUN_CELLS,
-            );
-            let price = multilinear::stacked_eval::commit_card_bytes(&layout, config);
-            let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
-            if narrow_commit_fits(p.words, staging, price, free) {
-                let t = Instant::now();
-                let store = if staged {
-                    multilinear::gpu::upload_packed_store_staged(&p.store)
+        let store = match packed.as_mut() {
+            Some(p) => {
+                let lens: Vec<usize> = borrowed.iter().map(|c| c.len()).collect();
+                let staging = multilinear::narrow::store_staging_bound(
+                    &lens,
+                    multilinear::narrow::STORE_RUN_CELLS,
+                );
+                let price = multilinear::stacked_eval::commit_card_bytes(&layout, config);
+                let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+                if narrow_commit_fits(p.words, staging, price, free) {
+                    let t = Instant::now();
+                    let store = if narrow_staged == Some(true) {
+                        multilinear::gpu::upload_packed_store_staged(&p.store)
+                    } else {
+                        multilinear::gpu::upload_packed_store(&p.store)
+                    }
+                    .map(|(s, _)| s);
+                    p.sent = store.is_some();
+                    p.upload_secs = t.elapsed().as_secs_f64();
+                    store
                 } else {
-                    multilinear::gpu::upload_packed_store(&p.store)
+                    None
                 }
-                .map(|(s, _)| s);
-                p.sent = store.is_some();
-                p.upload_secs = t.elapsed().as_secs_f64();
-                store
-            } else {
-                None
             }
+            None => None,
+        };
+        let commitment = if on_host {
+            multilinear::stacked_eval::StackedCommitment::<F, H>::commit_on_host(
+                layout, &borrowed, config,
+            )
+        } else {
+            multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+                layout,
+                &borrowed,
+                store.as_ref().map(|s| (s, 0)),
+                config,
+            )
         }
-        None => None,
-    };
-    let commitment = if on_host {
-        multilinear::stacked_eval::StackedCommitment::<F, H>::commit_on_host(
-            layout, &borrowed, config,
-        )
-    } else {
-        multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
-            layout,
-            &borrowed,
-            store.as_ref().map(|s| (s, 0)),
-            config,
-        )
+        .map_err(|e| Error::Prover(format!("group {}: {e:?}", self.group)))?;
+        // The store goes when this returns, before a retired stack is let go.
+        Ok((commitment, packed))
     }
-    .map_err(|e| Error::Prover(format!("group {group}: {e:?}")))?;
-    // The store goes when this returns, before a retired stack is let go.
-    let roots = commitment.roots();
-    Ok(GroupPrepared {
-        group,
-        tables: stack.tables.iter().map(|&(p, _, n)| (p, n)).collect(),
-        columns,
-        roots,
-        commitment,
-        packed,
-    })
 }
 
 /// Every group's prepared commitment, in group order.
@@ -5487,7 +5492,11 @@ fn prover_prepared<H: multilinear::whir_hash::WhirHash>(
     if deviations.other_prepared
         && let Some(stack) = stacks.first_mut()
     {
-        stack.columns[0][0] += FieldElement::<F>::one();
+        let mut column =
+            std::mem::replace(&mut stack.columns[0], Mle::constant(FieldElement::zero()))
+                .into_evals();
+        column[0] += FieldElement::<F>::one();
+        stack.columns[0] = prepared_column(stack.group, column)?;
         touched.push(stack.group);
     }
     for tamper in &deviations.prepared_stack {
@@ -5519,7 +5528,7 @@ fn prover_prepared<H: multilinear::whir_hash::WhirHash>(
                     return Err(Error::Prover("blocks of different widths".into()));
                 }
                 for (i, column) in range.zip(source) {
-                    stacks[k].columns[i] = column.clone();
+                    stacks[k].columns[i] = prepared_column(stacks[k].group, column.clone())?;
                 }
                 touched.push(stacks[k].group);
             }
@@ -8290,10 +8299,10 @@ struct EarlyIn<'a> {
     fault: EarlyFault,
 }
 
-/// What the early statement came to: sent (the statement it sent, and when,
-/// the prove's clock) or why not.
+/// The statement and roots sent to the observer, with their time on the
+/// prove's clock.
 struct EarlyOutcome {
-    sent: Result<(OwnedBlockStatement, f64), String>,
+    sent: Result<(OwnedBlockStatement, Vec<PreparedRoots>, f64), String>,
 }
 
 /// ★ The statement predicted before phase A ends: once every streamed chunk
@@ -8319,7 +8328,7 @@ fn early_statement<H: multilinear::whir_hash::WhirHash>(input: EarlyIn<'_>) -> E
         start,
         fault,
     } = input;
-    let sent = (|| -> Result<(OwnedBlockStatement, f64), String> {
+    let sent = (|| -> Result<_, String> {
         if !deviations.prepared_stack.is_empty()
             || deviations.other_prepared
             || !deviations.prepared_points.is_empty()
@@ -8461,7 +8470,7 @@ fn early_statement<H: multilinear::whir_hash::WhirHash>(input: EarlyIn<'_>) -> E
         };
         let at = start.elapsed().as_secs_f64();
         observer(statement.view(), &roots);
-        Ok((statement, at))
+        Ok((statement, roots, at))
     })();
     EarlyOutcome { sent }
 }
@@ -8475,8 +8484,13 @@ fn tampered_root(
     bytes
 }
 
-/// The first field where `early` and the final statement differ, or `None`.
-fn early_differs(early: &OwnedBlockStatement, fin: BlockStatement<'_>) -> Option<String> {
+/// The first difference between the early and final statements and roots.
+pub(crate) fn early_differs(
+    early: BlockStatement<'_>,
+    early_roots: &[PreparedRoots],
+    fin: BlockStatement<'_>,
+    roots: &[PreparedRoots],
+) -> Option<String> {
     if early.table_num_vars != fin.table_num_vars {
         let at = early
             .table_num_vars
@@ -8519,6 +8533,9 @@ fn early_differs(early: &OwnedBlockStatement, fin: BlockStatement<'_>) -> Option
     }
     if early.fused_memory != fin.fused_memory || early.word_memory != fin.word_memory {
         return Some("the memory counts".into());
+    }
+    if early_roots != roots {
+        return Some("the prepared roots".into());
     }
     None
 }
@@ -11653,30 +11670,30 @@ fn prove_streamed(
         if let Some(ledger) = ledger {
             ledger.line("prepared committed");
         }
-        // The early statement against this one, field by field: a stamp and a
-        // count here; the caller makes its own comparison before it uses it.
+        let final_statement = BlockStatement {
+            table_num_vars: &table_num_vars,
+            runtime_page_ranges: &laid.runtime_page_ranges,
+            table_counts: &laid.table_counts,
+            public_output: &laid.public_output,
+            num_private_input_pages: laid.num_private_input_pages,
+            groups: &laid.groups,
+            fused_memory: laid.fused_memory,
+            word_memory: laid.word_memory,
+        };
+        let final_roots = prepared_roots(&prepared);
         if let Some(outcome) = early_outcome {
             let misses = crate::tables::trace_builder::rows_misses();
             match outcome.sent {
-                Ok((early, at)) => {
-                    let fin = BlockStatement {
-                        table_num_vars: &table_num_vars,
-                        runtime_page_ranges: &laid.runtime_page_ranges,
-                        table_counts: &laid.table_counts,
-                        public_output: &laid.public_output,
-                        num_private_input_pages: laid.num_private_input_pages,
-                        groups: &laid.groups,
-                        fused_memory: laid.fused_memory,
-                        word_memory: laid.word_memory,
-                    };
+                Ok((early, roots, at)) => {
                     let ended = start.elapsed().as_secs_f64();
-                    let verdict = match early_differs(&early, fin) {
-                        None => "confirmed".to_string(),
-                        Some(why) => {
-                            EARLY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            format!("MISMATCH ({why})")
-                        }
-                    };
+                    let verdict =
+                        match early_differs(early.view(), &roots, final_statement, &final_roots) {
+                            None => "statement and roots match".to_string(),
+                            Some(why) => {
+                                EARLY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                format!("MISMATCH ({why})")
+                            }
+                        };
                     eprintln!(
                         "BLOCK EARLY STATEMENT: sent at {at:.3}s · phase A ended at {ended:.3}s · lead \
                          {:.3}s · {verdict} · rows misses {misses}",
@@ -11688,19 +11705,7 @@ fn prove_streamed(
                 }
             }
         }
-        on_statement(
-            BlockStatement {
-                table_num_vars: &table_num_vars,
-                runtime_page_ranges: &laid.runtime_page_ranges,
-                table_counts: &laid.table_counts,
-                public_output: &laid.public_output,
-                num_private_input_pages: laid.num_private_input_pages,
-                groups: &laid.groups,
-                fused_memory: laid.fused_memory,
-                word_memory: laid.word_memory,
-            },
-            &prepared_roots(&prepared),
-        );
+        on_statement(final_statement, &final_roots);
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
             .map(|p| multilinear::stacking::borrow(&p.columns))

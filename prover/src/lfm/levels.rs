@@ -706,22 +706,6 @@ struct Made {
     compile_split: Option<[f64; 3]>,
 }
 
-/// Whether two statements are the same in every field (two of their types
-/// compare by their full debug form, which names every field).
-fn same_statement(
-    a: &crate::block_whir::OwnedBlockStatement,
-    b: &crate::block_whir::OwnedBlockStatement,
-) -> bool {
-    a.table_num_vars == b.table_num_vars
-        && a.groups == b.groups
-        && a.public_output == b.public_output
-        && a.num_private_input_pages == b.num_private_input_pages
-        && a.fused_memory == b.fused_memory
-        && a.word_memory == b.word_memory
-        && format!("{:?}", a.table_counts) == format!("{:?}", b.table_counts)
-        && format!("{:?}", a.runtime_page_ranges) == format!("{:?}", b.runtime_page_ranges)
-}
-
 /// What level 1 made of the base's early statement, on the driver's clock:
 /// when the statement came, when its plan and program were made, when the
 /// final statement came and how long level 1 waited for it, and whether the
@@ -3259,14 +3243,15 @@ pub fn prove_block_levels(
                     };
                     let waited = t.elapsed().as_secs_f64();
                     let confirmed_at = now();
-                    let same = same_statement(&early, &statement) && early_roots == roots;
-                    let (made, why) = match (same, made_early) {
-                        (true, Ok(made)) => (made, None),
-                        (true, Err(e)) => (make(&statement, &roots)?, Some(e)),
-                        (false, _) => (
-                            make(&statement, &roots)?,
-                            Some("the final statement differs".to_string()),
-                        ),
+                    let difference = crate::block_whir::early_differs(
+                        early.view(),
+                        &early_roots,
+                        statement.view(),
+                        &roots,
+                    );
+                    let (made, why) = match (difference, made_early) {
+                        (None, Ok(made)) => (made, None),
+                        (None, Err(e)) | (Some(e), _) => (make(&statement, &roots)?, Some(e)),
                     };
                     if let Some(why) = &why {
                         EARLY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
