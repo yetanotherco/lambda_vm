@@ -4109,7 +4109,7 @@ mod device_state_scan_tests {
     /// knob readings, the card count, the backends themselves, pools of host
     /// threads, host function pointers). A new one fails here until a person
     /// has read it and added it, per the rule.
-    const ONCE_CELLS: [(&str, &str); 38] = [
+    const ONCE_CELLS: [(&str, &str); 39] = [
         ("argue_fused.rs", "ON"),
         ("blake3_whir.rs", "KERNELS"),
         ("card_rows.rs", "BYTES"),
@@ -4127,6 +4127,9 @@ mod device_state_scan_tests {
         ("device.rs", "SECOND_OPENINGS_POOL"),
         ("device.rs", "SECOND_POOL"),
         ("device.rs", "SETTING"),
+        ("device.rs", "SETTING"),
+        // The levels' split knob's reading: a process-wide setting like the
+        // base split's, not device state.
         ("device.rs", "SETTING"),
         ("device.rs", "WARNED"),
         ("fill.rs", "FROM_ENV"),
