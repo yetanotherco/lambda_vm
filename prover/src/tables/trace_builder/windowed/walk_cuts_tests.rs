@@ -68,7 +68,7 @@ fn walked(
         shape.memory,
         false,
         shape.batch,
-        false,
+        false.into(),
         cuts,
         Some(counts),
         true,

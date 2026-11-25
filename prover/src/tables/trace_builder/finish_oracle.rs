@@ -88,7 +88,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         mem_store_rows: _,
         word_rows: _,
     } = ops;
-    super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
+    super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops, None)?;
     // The CPU, MEMW_A and SHIFT rows counted where they were made
     // ([`PreCounted::cpu_decoded`], `memw_aligned_rows`, `shift_rows`): the
     // counts below read the rest.

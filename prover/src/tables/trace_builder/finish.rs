@@ -193,6 +193,11 @@ pub(super) struct FinishPlan<'a> {
     cpu32_ops: BlockVec<cpu32::Cpu32Operation>,
     ecsm_ops: BlockVec<ecsm::EcsmOperation>,
     ecdas_ops: BlockVec<ecdas::CompactEcdasOp>,
+    /// ECDAS's rows' BITWISE lookups, counted where the ECREC witnesses were
+    /// computed (`LAMBDA_VM_FINISH_EARLY=ecdas-count`,
+    /// [`ecrec::EcdasCount`]): phase 4 adds these instead of counting the
+    /// rows. `None`: it counts the rows.
+    ecdas_planes: Option<std::sync::Arc<Vec<bitwise::BitwisePlane>>>,
     hint_ops: BlockVec<hint::HintOperation>,
     ecrec_ops: BlockVec<ecrec::EcrecOperation>,
     /// The fused memory format's rows; empty under the split format.
@@ -231,6 +236,8 @@ struct P4Lists<'s> {
     bytewise_ops: &'s CompactBytewise,
     keccak_ops: &'s BlockVec<KeccakOperation>,
     ecdas_ops: &'s BlockVec<ecdas::CompactEcdasOp>,
+    /// [`FinishPlan::ecdas_planes`]: added instead of `ecdas_ops` counted.
+    ecdas_planes: Option<&'s [bitwise::BitwisePlane]>,
     copy_ops: &'s BlockVec<copy::CopyOperation>,
     blake3_ops: &'s BlockVec<Blake3Operation>,
     blake3_absorb_ops: &'s BlockVec<blake3::Blake3AbsorbOperation>,
@@ -318,6 +325,7 @@ fn count_bitwise(
         bytewise_ops,
         keccak_ops,
         ecdas_ops,
+        ecdas_planes,
         copy_ops,
         blake3_ops,
         blake3_absorb_ops,
@@ -523,11 +531,19 @@ fn count_bitwise(
         }));
     }
     starts.push(("ECDAS", collectors.len()));
-    let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
-    for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
-        collectors.push(Box::new(move |h| {
-            h.add_ops(&collect_bitwise_from_compact_ecdas_in(slice, ecdas_form))
-        }));
+    if let Some(planes) = ecdas_planes {
+        // Counted where the ECREC witnesses were computed: added, a
+        // collector a plane.
+        for plane in planes {
+            collectors.push(Box::new(move |h| h.merge_plane(plane)));
+        }
+    } else {
+        let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
+        for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_compact_ecdas_in(slice, ecdas_form))
+            }));
+        }
     }
     // COPY's rows are millions at a block's size: a collector a block of
     // them, each counted straight into its histogram.
@@ -827,6 +843,7 @@ struct P4Shared {
     bytewise_ops: std::sync::Arc<CompactBytewise>,
     keccak_ops: std::sync::Arc<BlockVec<KeccakOperation>>,
     ecdas_ops: std::sync::Arc<BlockVec<ecdas::CompactEcdasOp>>,
+    ecdas_planes: Option<std::sync::Arc<Vec<bitwise::BitwisePlane>>>,
     copy_ops: std::sync::Arc<BlockVec<copy::CopyOperation>>,
     blake3_ops: std::sync::Arc<BlockVec<Blake3Operation>>,
     blake3_absorb_ops: std::sync::Arc<BlockVec<blake3::Blake3AbsorbOperation>>,
@@ -858,6 +875,7 @@ impl P4Shared {
             bytewise_ops: &self.bytewise_ops,
             keccak_ops: &self.keccak_ops,
             ecdas_ops: &self.ecdas_ops,
+            ecdas_planes: self.ecdas_planes.as_deref().map(Vec::as_slice),
             copy_ops: &self.copy_ops,
             blake3_ops: &self.blake3_ops,
             blake3_absorb_ops: &self.blake3_absorb_ops,
@@ -1047,7 +1065,39 @@ impl<'a> FinishPlan<'a> {
             )));
         }
         // The ECREC witnesses the walkers handed to the pool, in place.
-        super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
+        let joined = super::resolve_deferred_ecrec(
+            &mut ecdas_ops,
+            &mut ecrec_ops,
+            pre.as_ref()
+                .and_then(|pre| pre.ecdas_count.as_ref())
+                .map(|count| count.form()),
+        )?;
+        // ECDAS's lookups counted where the witnesses were computed, when
+        // they are every row's (`LAMBDA_VM_FINISH_EARLY=ecdas-count`).
+        let ecdas_planes = pre
+            .as_mut()
+            .and_then(|pre| pre.ecdas_count.take())
+            .and_then(|count| {
+                let planes = joined.planes(&count, skip.ecdas_form);
+                eprintln!(
+                    "BLOCK ECDAS COUNT: {}",
+                    match &planes {
+                        Some(planes) => format!(
+                            "ECDAS's lookups counted beside the ECREC witnesses, on {} planes",
+                            planes.len()
+                        ),
+                        None => "not every ECDAS row's lookups counted beside the ECREC \
+                                 witnesses: counted from the rows"
+                            .to_string(),
+                    }
+                );
+                planes
+            })
+            .map(std::sync::Arc::new);
+        #[cfg(test)]
+        if ecdas_planes.is_some() {
+            super::finish_early::note_ecdas_count();
+        }
 
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
@@ -1237,6 +1287,7 @@ impl<'a> FinishPlan<'a> {
                 bytewise_ops: &bytewise_ops,
                 keccak_ops: &keccak_ops,
                 ecdas_ops: &ecdas_ops,
+                ecdas_planes: ecdas_planes.as_deref().map(Vec::as_slice),
                 copy_ops: &copy_ops,
                 blake3_ops: &blake3_ops,
                 blake3_absorb_ops: &blake3_absorb_ops,
@@ -1518,6 +1569,7 @@ impl<'a> FinishPlan<'a> {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecdas_planes,
             hint_ops,
             ecrec_ops,
             mem_load_rows,
@@ -1626,6 +1678,7 @@ impl<'a> FinishPlan<'a> {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecdas_planes,
             hint_ops,
             ecrec_ops,
             mem_load_rows,
@@ -1657,6 +1710,7 @@ impl<'a> FinishPlan<'a> {
                     bytewise_ops: &bytewise_ops,
                     keccak_ops: &keccak_ops,
                     ecdas_ops: &ecdas_ops,
+                    ecdas_planes: ecdas_planes.as_deref().map(Vec::as_slice),
                     copy_ops: &copy_ops,
                     blake3_ops: &blake3_ops,
                     blake3_absorb_ops: &blake3_absorb_ops,
@@ -2816,6 +2870,7 @@ impl<'a> FinishPlan<'a> {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecdas_planes,
             hint_ops,
             ecrec_ops,
             mem_load_rows,
@@ -2892,6 +2947,7 @@ impl<'a> FinishPlan<'a> {
             bytewise_ops: Arc::new(bytewise_ops),
             keccak_ops: Arc::new(keccak_ops),
             ecdas_ops: Arc::new(ecdas_ops),
+            ecdas_planes,
             copy_ops: Arc::new(copy_ops),
             blake3_ops: Arc::new(blake3_ops),
             blake3_absorb_ops: Arc::new(blake3_absorb_ops),

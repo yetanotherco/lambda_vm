@@ -635,6 +635,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 cpu_decoded: 0,
                 memw_aligned_rows: 0,
                 shift_rows: 0,
+                ecdas_count: None,
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -681,6 +682,22 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub fn finish_early(mut self, early: super::FinishEarly) -> Self {
         self.emitted.finish_early = early;
         self
+    }
+
+    /// Where the walk's deferred ECREC calls count their ECDAS rows' lookups
+    /// (`ecdas-count`, [`crate::tables::ecrec::EcdasCount`]): the run's, made
+    /// at the walk's start under the run's ECDAS form; `None` without the
+    /// part or without deferring.
+    fn ecdas_count(&mut self) -> Option<Arc<crate::tables::ecrec::EcdasCount>> {
+        if !(self.defer_ecrec && self.emitted.finish_early.ecdas_count) {
+            return None;
+        }
+        let form = self.emitted.ecdas_form;
+        let count = self
+            .counted
+            .ecdas_count
+            .get_or_insert_with(|| crate::tables::ecrec::EcdasCount::new(form));
+        Some(Arc::clone(count))
     }
 
     /// Count what the table phase reads from each handed-out chunk on a
@@ -1967,6 +1984,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// what [`push_jobs`](Self::push_jobs) builds; afterwards
     /// [`finish`](Self::finish) takes the last window as usual.
     pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
+        let ecdas_count = self.ecdas_count();
         let made = self.counts_where_made();
         self.walked_rows.on = made;
         let listless = self.cpu_listless();
@@ -1983,6 +2001,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
                 defer_ecrec: self.defer_ecrec,
+                ecdas_count,
                 cuts: self.walk_cuts,
                 counts: made.then_some(&mut self.own_counts),
                 listless,
@@ -2433,6 +2452,8 @@ pub struct Walker<'b> {
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
     defer_ecrec: bool,
+    /// [`WindowedTraceBuilder::ecdas_count`].
+    ecdas_count: Option<Arc<crate::tables::ecrec::EcdasCount>>,
     /// [`WindowedTraceBuilder::walk_cuts`].
     cuts: super::WalkCuts,
     /// What it counts of the rows it makes
@@ -2466,7 +2487,10 @@ impl Walker<'_> {
             self.memory,
             self.lookups,
             self.batch,
-            self.defer_ecrec,
+            crate::tables::ecrec::EcrecDefer {
+                on: self.defer_ecrec,
+                count: self.ecdas_count.as_ref(),
+            },
             self.cuts,
             self.counts.as_deref_mut(),
             list,
@@ -2524,7 +2548,7 @@ fn walk_window(
     memory_format: MemoryFormat,
     lookups: bool,
     batch: usize,
-    defer_ecrec: bool,
+    defer_ecrec: crate::tables::ecrec::EcrecDefer<'_>,
     cuts: super::WalkCuts,
     mut counts: Option<&mut WalkCounts>,
     list: bool,

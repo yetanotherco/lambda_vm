@@ -118,7 +118,7 @@ fn walked(
         memory,
         false,
         batch,
-        false,
+        false.into(),
         crate::tables::trace_builder::WalkCuts::default(),
         Some(counts),
         true,

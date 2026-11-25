@@ -7,9 +7,9 @@
 use crate::tables::MaxRowsConfig;
 use crate::tables::cpu::{CpuOp, CpuOperation};
 use crate::tables::ecdas::{CompactEcdasOp, EcdasOperation};
-use crate::tables::ecrec::EcrecOperation;
+use crate::tables::ecrec::{EcdasCount, EcrecDefer, EcrecOperation};
 use crate::tables::memw::MemwOperation;
-use crate::tables::trace_builder::Traces;
+use crate::tables::trace_builder::{FinishEarly, Traces};
 use crate::tests::windowed_builder_tests::{run, same_traces, whole};
 
 use super::super::{
@@ -43,6 +43,21 @@ fn call(
     t: u64,
     bail: bool,
     defer: bool,
+) -> (
+    Vec<MemwOperation>,
+    EcrecOperation,
+    Vec<EcdasOperation>,
+    Vec<u32>,
+) {
+    call_with(t, bail, defer.into())
+}
+
+/// [`call`] under `defer` (its ECDAS rows' lookups counted where it is
+/// computed with its `count`).
+fn call_with(
+    t: u64,
+    bail: bool,
+    defer: EcrecDefer<'_>,
 ) -> (
     Vec<MemwOperation>,
     EcrecOperation,
@@ -102,11 +117,19 @@ fn other_row(timestamp: u64) -> CompactEcdasOp {
 /// bail) between other ECDAS rows, each call walked with `defer`, laid out as
 /// a list built whole (`block` 0) or pushed in blocks of `block` rows.
 fn lists(defer: bool, block: usize) -> (BlockVec<CompactEcdasOp>, BlockVec<EcrecOperation>) {
+    lists_with(defer.into(), block)
+}
+
+/// [`lists`] under `defer`.
+fn lists_with(
+    defer: EcrecDefer<'_>,
+    block: usize,
+) -> (BlockVec<CompactEcdasOp>, BlockVec<EcrecOperation>) {
     let mut ecdas = Vec::new();
     let mut ecrec = Vec::new();
     ecdas.push(other_row(100));
     for (t, bail) in [(400, false), (800, true), (1200, false)] {
-        let (_, op, rows, _) = call(t, bail, defer);
+        let (_, op, rows, _) = call_with(t, bail, defer);
         ecdas.extend(compact(&rows));
         ecdas.push(other_row(t + 100));
         ecrec.push(op);
@@ -167,7 +190,7 @@ fn joined_deferred_calls_are_the_computed_calls() {
         let (want_ecdas, want_ecrec) = lists(false, block);
         let (mut ecdas, mut ecrec) = lists(true, block);
         assert!(ecdas.len() < want_ecdas.len());
-        resolve_deferred_ecrec(&mut ecdas, &mut ecrec).expect("the join");
+        resolve_deferred_ecrec(&mut ecdas, &mut ecrec, None).expect("the join");
         assert!(ecrec.iter().all(|op| op.pending.is_none()), "block {block}");
         assert_eq!(
             dbg(&ecrec.to_vec()),
@@ -186,7 +209,7 @@ fn joined_deferred_calls_are_the_computed_calls() {
         );
         // Nothing deferred: left as it is.
         let (mut ecdas, mut ecrec) = lists(false, block);
-        resolve_deferred_ecrec(&mut ecdas, &mut ecrec).expect("nothing to join");
+        resolve_deferred_ecrec(&mut ecdas, &mut ecrec, None).expect("nothing to join");
         assert_eq!(dbg(&ecdas.to_vec()), dbg(&want_ecdas.to_vec()));
         assert_eq!(layout(&ecdas), layout(&want_ecdas));
     }
@@ -200,7 +223,7 @@ fn joined_after(
     let (mut ecdas, mut ecrec) = (ecdas.to_vec(), ecrec.to_vec());
     tamper(&mut ecdas, &mut ecrec);
     let (mut ecdas, mut ecrec) = (BlockVec::from_vec(ecdas), BlockVec::from_vec(ecrec));
-    resolve_deferred_ecrec(&mut ecdas, &mut ecrec)
+    resolve_deferred_ecrec(&mut ecdas, &mut ecrec, None).map(|_| ())
 }
 
 fn refused(what: &str, got: Result<(), crate::Error>, says: &str) {
@@ -280,9 +303,29 @@ fn deferred_build(
     window: usize,
     drop: bool,
 ) -> (Traces, usize) {
+    deferred_build_with(
+        program,
+        logs,
+        max_rows,
+        window,
+        drop,
+        FinishEarly::default(),
+    )
+}
+
+/// [`deferred_build`] with the finish's parts `early`.
+fn deferred_build_with(
+    program: &executor::elf::Elf,
+    logs: &[executor::vm::logs::Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    drop: bool,
+    early: FinishEarly,
+) -> (Traces, usize) {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
         .expect("the builder")
-        .defer_ecrec_witnesses(true);
+        .defer_ecrec_witnesses(true)
+        .finish_early(early);
     if drop {
         builder = builder
             .drop_streamed_ops()
@@ -366,7 +409,7 @@ fn deferred_witnesses_never_run_inside_one_another() {
     let (sig, msg) = inputs(false);
     let (sig, msg): ([u8; 64], [u8; 32]) = (sig.try_into().unwrap(), msg.try_into().unwrap());
     let calls: Vec<_> = (0..96)
-        .map(|_| crate::tables::ecrec::DeferredEcrec::spawn(sig, msg, 0, 400))
+        .map(|_| crate::tables::ecrec::DeferredEcrec::spawn(sig, msg, 0, 400, None))
         .collect();
     let got: Vec<String> = calls
         .par_iter()
@@ -386,4 +429,156 @@ fn deferred_witnesses_never_run_inside_one_another() {
         1,
         "a deferred witness ran inside another"
     );
+}
+
+/// The ECDAS lookups of `rows` under `form`, as the finish counts them.
+#[cfg(feature = "parallel")]
+fn counted_rows(
+    rows: &BlockVec<CompactEcdasOp>,
+    form: crate::tables::ecdas::EcdasForm,
+) -> crate::tables::bitwise::BitwiseHistogram {
+    let mut h = crate::tables::bitwise::BitwiseHistogram::new();
+    for part in rows.parts() {
+        h.add_ops(&super::super::collect_bitwise_from_compact_ecdas_in(
+            part, form,
+        ));
+    }
+    h
+}
+
+/// [`lists`]'s calls deferred with their rows' lookups counted on a run's
+/// count under `form`, then joined with the other rows counted under
+/// `plain`: the join, the count, and the lists joined.
+#[cfg(feature = "parallel")]
+fn counted_join(
+    form: crate::tables::ecdas::EcdasForm,
+    plain: Option<crate::tables::ecdas::EcdasForm>,
+) -> (
+    super::super::DeferredJoin,
+    std::sync::Arc<EcdasCount>,
+    BlockVec<CompactEcdasOp>,
+) {
+    let count = EcdasCount::new(form);
+    let defer = EcrecDefer {
+        on: true,
+        count: Some(&count),
+    };
+    let (mut ecdas, mut ecrec) = lists_with(defer, 0);
+    assert_eq!(
+        ecrec.iter().filter(|op| op.pending.is_some()).count(),
+        2,
+        "the calls deferred"
+    );
+    let join = resolve_deferred_ecrec(&mut ecdas, &mut ecrec, plain).expect("the join");
+    (join, count, ecdas)
+}
+
+/// ★ `LAMBDA_VM_FINISH_EARLY=ecdas-count`: the ECDAS rows' lookups of the
+/// deferred calls, counted where each witness is computed, with the other
+/// rows' counted at the join, are the lookups the finish counts from the
+/// joined rows, under either form; the calls on the planes are the calls
+/// joined, by number.
+#[cfg(feature = "parallel")]
+#[test]
+fn ecdas_lookups_counted_beside_the_witnesses_are_the_rows_counted() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    for form in [
+        crate::tables::ecdas::EcdasForm::Bytes,
+        crate::tables::ecdas::EcdasForm::Halves,
+    ] {
+        let (join, count, ecdas) = counted_join(form, Some(form));
+        assert_eq!(join.counted.len(), 2, "{form:?}: the calls counted");
+        assert!(join.plain_rows > 0, "{form:?}: the rows between the calls");
+        let planes = join.planes(&count, form).expect("every row counted");
+        let mut got = crate::tables::bitwise::BitwiseHistogram::new();
+        for plane in &planes {
+            got.merge_plane(plane);
+        }
+        assert!(got == counted_rows(&ecdas, form), "{form:?}: the lookups");
+        // Closed: a call counted after is not counted.
+        assert!(
+            !count.count(u64::MAX, &[]),
+            "{form:?}: counted after the close"
+        );
+    }
+}
+
+/// ★ The join hands the counts over only when they are every ECDAS row's and
+/// no other: not under another form, not with the other rows uncounted, nor
+/// counted under another form, not with a call uncounted, missing, counted
+/// twice or one too many, and not when nothing was joined. The finish then
+/// counts the rows.
+#[cfg(feature = "parallel")]
+#[test]
+fn ecdas_counts_are_handed_over_only_when_they_are_every_row_s() {
+    use crate::tables::ecdas::EcdasForm::{Bytes, Halves};
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let refused = |what: &str, tamper: &dyn Fn(&mut super::super::DeferredJoin), plain| {
+        let (mut join, count, _) = counted_join(Bytes, plain);
+        tamper(&mut join);
+        assert!(join.planes(&count, Bytes).is_none(), "{what}: handed over");
+    };
+    let (join, count, _) = counted_join(Bytes, Some(Bytes));
+    assert!(
+        join.planes(&count, Halves).is_none(),
+        "another form: handed over"
+    );
+    refused("the other rows uncounted", &|_| {}, None);
+    refused("the other rows under another form", &|_| {}, Some(Halves));
+    refused("a call uncounted", &|j| j.uncounted += 1, Some(Bytes));
+    refused(
+        "a call missing",
+        &|j| {
+            j.counted.pop();
+        },
+        Some(Bytes),
+    );
+    refused(
+        "a call twice",
+        &|j| j.counted.push(j.counted[0]),
+        Some(Bytes),
+    );
+    refused(
+        "a call too many",
+        &|j| j.counted.push(u64::MAX),
+        Some(Bytes),
+    );
+    refused("nothing joined", &|j| j.joined = false, Some(Bytes));
+    // Untampered, it hands them over.
+    let (join, count, _) = counted_join(Bytes, Some(Bytes));
+    assert!(join.planes(&count, Bytes).is_some(), "untampered");
+}
+
+/// ★ A windowed build that counts ECDAS's lookups beside the ECREC witnesses
+/// builds the whole-run tables at every window length, the handed-out ops
+/// kept or dropped, and on `test_ecrec` walked a cycle at a time the finish
+/// takes those counts; programs without ECREC calls build the same.
+#[cfg(feature = "parallel")]
+#[test]
+fn a_windowed_build_counting_ecdas_beside_the_witnesses_builds_the_whole_run_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let max_rows = MaxRowsConfig::small();
+    let early = FinishEarly {
+        ecdas_count: true,
+        ..FinishEarly::default()
+    };
+    for name in ["test_ecrec", "all_instructions_64"] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 33, 1000] {
+            for drop in [false, true] {
+                let before = crate::tables::trace_builder::finish_early::ecdas_counts();
+                let (traces, deferred) =
+                    deferred_build_with(&program, &logs, &max_rows, window, drop, early);
+                same_traces(&reference, &traces);
+                if name == "test_ecrec" && window == 1 {
+                    assert_eq!(deferred, 2, "{name}: the calls deferred");
+                    assert!(
+                        crate::tables::trace_builder::finish_early::ecdas_counts() > before,
+                        "{name}/{window}/{drop}: the finish took the counts"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -205,8 +205,143 @@ pub(crate) struct DeferredEcrec {
     msg: [u8; 32],
     parity: u8,
     timestamp: u64,
+    /// The process's number for this call, which no other call takes
+    /// ([`EcdasCount`] names the calls it counted by it).
+    id: u64,
+    /// Where its ECDAS rows' BITWISE lookups are counted as they are made
+    /// (`LAMBDA_VM_FINISH_EARLY=ecdas-count`); `None`: by the finish, from
+    /// the list.
+    count: Option<std::sync::Arc<EcdasCount>>,
     state: std::sync::Mutex<DeferState>,
     done: std::sync::Condvar,
+}
+
+/// The numbers [`DeferredEcrec::id`] hands out.
+static NEXT_DEFERRED_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How a walk computes its ECREC calls' witnesses: off the walk (`on`,
+/// [`DeferredEcrec`]) or in it; and off the walk, where their ECDAS rows'
+/// BITWISE lookups are counted (`count`, [`EcdasCount`]), if not by the
+/// finish.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EcrecDefer<'a> {
+    pub(crate) on: bool,
+    pub(crate) count: Option<&'a std::sync::Arc<EcdasCount>>,
+}
+
+impl From<bool> for EcrecDefer<'_> {
+    /// Off the walk or not, the lookups counted by the finish.
+    fn from(on: bool) -> Self {
+        Self { on, count: None }
+    }
+}
+
+/// The ECDAS rows' BITWISE lookups of a run's deferred ECREC calls, counted
+/// where each call's witness is computed (on the witness pool, or by the
+/// finish when the pool has not started it) instead of by the finish from
+/// the ECDAS list (`LAMBDA_VM_FINISH_EARLY=ecdas-count`). A sum, so the
+/// counts are the list's counted when every call counted here is a call of
+/// the list, once, and every row of the list a counted call's:
+/// [`Self::close`] hands its counts only then.
+///
+/// The counts are kept on planes ([`super::bitwise::BitwisePlane`]), one a
+/// call being counted at once: a call takes a free plane (a new one when none
+/// is free), counts its rows on it and gives it back with its number noted.
+pub(crate) struct EcdasCount {
+    /// The ECDAS form the lookups are counted under.
+    form: super::ecdas::EcdasForm,
+    state: std::sync::Mutex<CountState>,
+}
+
+/// `rows`' BITWISE lookups under `form` counted on `plane`: the lookups
+/// `trace_builder::collect_bitwise_from_compact_ecdas_in` lists.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn count_ecdas_rows(
+    plane: &mut super::bitwise::BitwisePlane,
+    rows: &[CompactEcdasOp],
+    form: super::ecdas::EcdasForm,
+) {
+    for op in super::trace_builder::collect_bitwise_from_compact_ecdas_in(rows, form) {
+        plane.bump_n(op, 1);
+    }
+}
+
+/// [`EcdasCount`]'s planes not in use, each with the numbers of the calls
+/// counted on it; and whether the finish has closed it.
+#[derive(Default)]
+struct CountState {
+    free: Vec<(super::bitwise::BitwisePlane, Vec<u64>)>,
+    closed: bool,
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+impl EcdasCount {
+    /// The form its lookups are counted under.
+    pub(crate) fn form(&self) -> super::ecdas::EcdasForm {
+        self.form
+    }
+
+    /// None counted yet, under `form`.
+    pub(crate) fn new(form: super::ecdas::EcdasForm) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            form,
+            state: std::sync::Mutex::new(CountState::default()),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CountState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The call `id`'s ECDAS rows' lookups counted. `false` when the finish
+    /// has closed it: the call is not counted (and a plane given back after
+    /// the close is lost with every call on it, which [`Self::close`] has
+    /// already found missing).
+    pub(crate) fn count(&self, id: u64, rows: &[CompactEcdasOp]) -> bool {
+        let free = {
+            let mut state = self.lock();
+            if state.closed {
+                return false;
+            }
+            state.free.pop()
+        };
+        let (mut plane, mut ids) =
+            free.unwrap_or_else(|| (super::bitwise::BitwisePlane::new(), Vec::new()));
+        count_ecdas_rows(&mut plane, rows, self.form);
+        ids.push(id);
+        let mut state = self.lock();
+        if state.closed {
+            return false;
+        }
+        state.free.push((plane, ids));
+        true
+    }
+
+    /// The finish's: closed, so no call is counted after; its planes, when
+    /// the calls counted on them are `calls`, each once (by number), and the
+    /// finish's form is the one counted under. Else `None`: the finish counts
+    /// ECDAS's rows from the list, as without it.
+    pub(crate) fn close(
+        &self,
+        mut calls: Vec<u64>,
+        form: super::ecdas::EcdasForm,
+    ) -> Option<Vec<super::bitwise::BitwisePlane>> {
+        let free = {
+            let mut state = self.lock();
+            state.closed = true;
+            std::mem::take(&mut state.free)
+        };
+        if form != self.form {
+            return None;
+        }
+        let mut counted: Vec<u64> = free
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        counted.sort_unstable();
+        calls.sort_unstable();
+        (counted == calls).then(|| free.into_iter().map(|(plane, _)| plane).collect())
+    }
 }
 
 /// Where a [`DeferredEcrec`] is.
@@ -224,6 +359,8 @@ pub(crate) struct ResolvedEcrec {
     pub(crate) witness: EcrecWitness,
     pub(crate) rows: Vec<CompactEcdasOp>,
     pub(crate) secs: f64,
+    /// Its rows' lookups were counted where it was computed ([`EcdasCount`]).
+    pub(crate) counted: bool,
 }
 
 /// The threads deferred ECREC witnesses are computed on: as many as the
@@ -300,12 +437,15 @@ impl DeferredEcrec {
         msg: [u8; 32],
         parity: u8,
         timestamp: u64,
+        count: Option<std::sync::Arc<EcdasCount>>,
     ) -> std::sync::Arc<Self> {
         let call = std::sync::Arc::new(Self {
             sig,
             msg,
             parity,
             timestamp,
+            id: NEXT_DEFERRED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            count,
             state: std::sync::Mutex::new(DeferState::Queued),
             done: std::sync::Condvar::new(),
         });
@@ -328,6 +468,11 @@ impl DeferredEcrec {
         self.timestamp
     }
 
+    /// The call's number, which no other call of the process takes.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, DeferState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -340,16 +485,23 @@ impl DeferredEcrec {
         let _nest = nesting::enter();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut witness = ecsm::compute_ecrec_witness_serial(&self.sig, &self.msg, self.parity);
-            let rows = take_ecdas_ops(&mut witness, self.timestamp)
+            let rows: Vec<CompactEcdasOp> = take_ecdas_ops(&mut witness, self.timestamp)
                 .iter()
                 .map(CompactEcdasOp::from_op)
                 .collect();
             (witness, rows)
         }))
-        .map(|(witness, rows)| ResolvedEcrec {
-            witness,
-            rows,
-            secs: t.elapsed().as_secs_f64(),
+        .map(|(witness, rows)| {
+            let counted = self
+                .count
+                .as_ref()
+                .is_some_and(|count| count.count(self.id, &rows));
+            ResolvedEcrec {
+                witness,
+                rows,
+                secs: t.elapsed().as_secs_f64(),
+                counted,
+            }
         })
         .map_err(|panic| {
             panic

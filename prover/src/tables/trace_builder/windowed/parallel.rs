@@ -188,6 +188,8 @@ struct WalkSettings {
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
     defer_ecrec: bool,
+    /// [`WindowedTraceBuilder::ecdas_count`].
+    ecdas_count: Option<Arc<crate::tables::ecrec::EcdasCount>>,
     /// The walkers count where they make the rows
     /// ([`WindowedTraceBuilder::counts_where_made`]).
     count_made: bool,
@@ -210,6 +212,16 @@ struct WalkSettings {
     route: bool,
     /// The walk's cuts ([`WindowedTraceBuilder::walk_cuts`]).
     cuts: crate::tables::trace_builder::WalkCuts,
+}
+
+impl WalkSettings {
+    /// How its walks compute the ECREC witnesses.
+    fn defer(&self) -> crate::tables::ecrec::EcrecDefer<'_> {
+        crate::tables::ecrec::EcrecDefer {
+            on: self.defer_ecrec,
+            count: self.ecdas_count.as_ref(),
+        }
+    }
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -334,7 +346,7 @@ impl WindowWalker {
             s.memory_format,
             s.lookups,
             s.batch,
-            s.defer_ecrec,
+            s.defer(),
             s.cuts,
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
@@ -393,7 +405,7 @@ impl WindowWalker {
             s.memory_format,
             s.lookups,
             s.batch,
-            s.defer_ecrec,
+            s.defer(),
             s.cuts,
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
@@ -759,6 +771,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
+        ecdas_count: builder.ecdas_count(),
         count_made: builder.counts_where_made(),
         listless: builder.cpu_listless(),
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
