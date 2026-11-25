@@ -976,6 +976,7 @@ impl WhirBlockPlan {
             fan_in,
             prepared_roots,
             leaf_cap,
+            true,
             share_inverse(),
             None,
         )
@@ -983,7 +984,9 @@ impl WhirBlockPlan {
 
     /// [`Self::derive_capped`] with the leaves' share form named
     /// (`share_inverse`, [`emit_share`]) rather than the process's knob: the
-    /// pinned verifier's derivation.
+    /// pinned verifier's derivation. `measure`: whether each group's chip rows
+    /// are measured by emission under a fixed leaf count too
+    /// ([`Self::derive_under`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn derive_full(
         elf_bytes: &[u8],
@@ -994,6 +997,7 @@ impl WhirBlockPlan {
         fan_in: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
         leaf_cap: usize,
+        measure: bool,
         share_inverse: bool,
         cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
@@ -1018,6 +1022,7 @@ impl WhirBlockPlan {
             fan_in,
             prepared_roots,
             leaf_cap,
+            measure,
             share_inverse,
             wrap_hash,
             cap_mux,
@@ -1054,6 +1059,7 @@ impl WhirBlockPlan {
             statement,
             num_leaves,
             prepared_roots,
+            true,
             share_inverse(),
             None,
         )
@@ -1061,7 +1067,8 @@ impl WhirBlockPlan {
 
     /// [`Self::derive_blake3`] with the leaves' share form named
     /// (`share_inverse`, [`emit_share`]) rather than the process's knob: the
-    /// pinned levels verifier's derivation.
+    /// pinned levels verifier's derivation. `measure` as
+    /// [`Self::derive_full`]'s.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn derive_blake3_with_share(
         elf_bytes: &[u8],
@@ -1070,6 +1077,7 @@ impl WhirBlockPlan {
         statement: BlockStatement<'_>,
         num_leaves: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+        measure: bool,
         share_inverse: bool,
         cap_mux: Option<super::merkle_cap::CapMux>,
     ) -> Result<Self, String> {
@@ -1088,6 +1096,7 @@ impl WhirBlockPlan {
             BLOCK_FAN_IN,
             prepared_roots,
             usize::MAX,
+            measure,
             share_inverse,
             super::edsl::WrapHash::Blake3,
             cap_mux,
@@ -1095,7 +1104,12 @@ impl WhirBlockPlan {
     }
 
     /// The derivation's body once the base and the wrap hash are settled.
-    /// Its split by part is left for [`take_plan_split`] on this thread.
+    /// Its split by part is left for [`take_plan_split`] on this thread. Each
+    /// group's chip rows are measured by emission ([`chip_loads_by_emission`])
+    /// when the leaf count is free (the partition reads them) or `measure`
+    /// asks; under a fixed count without it they are not, and
+    /// [`Self::chip_loads`] is empty: nothing else reads them, and the
+    /// programs are emitted the same either way.
     #[allow(clippy::too_many_arguments)]
     fn derive_under(
         elf_bytes: &[u8],
@@ -1106,6 +1120,7 @@ impl WhirBlockPlan {
         fan_in: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
         leaf_cap: usize,
+        measure: bool,
         share_inverse: bool,
         wrap_hash: super::edsl::WrapHash,
         cap_mux: Option<super::merkle_cap::CapMux>,
@@ -1415,8 +1430,10 @@ impl WhirBlockPlan {
         lap(4);
         // Every chip's rows by group, emitted; the partition bounds them all,
         // at the format's leaf scale (a fixed leaf count, the tests', bounds
-        // none).
-        (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
+        // none, and reads them only when `measure` asks).
+        if measure || num_leaves.is_none() {
+            (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
+        }
         lap(5);
         LAST_PLAN_SPLIT.with(|c| c.set(Some(split)));
         plan.partition = match num_leaves {
@@ -1467,7 +1484,9 @@ impl WhirBlockPlan {
     }
 
     /// Each group's rows in every bounded chip, and the per-leaf front's —
-    /// what the partition admitted each leaf by.
+    /// what the partition admitted each leaf by. Empty (no group, a zero
+    /// front) under a plan derived without measuring
+    /// ([`Self::derive_under`]'s `measure`).
     pub fn chip_loads(&self) -> (&[ChipRows], ChipRows) {
         (&self.loads, self.front)
     }
@@ -2426,6 +2445,7 @@ fn verify_block_tree_with(
         fan_in,
         None,
         leaf_cap,
+        true,
         share_inverse,
         None,
     )?;
@@ -2449,6 +2469,7 @@ pub(crate) fn verifier_plan(
         BLOCK_FAN_IN,
         None,
         LEAF_P1_CAP,
+        true,
         presets.share_inverse,
         None,
     )

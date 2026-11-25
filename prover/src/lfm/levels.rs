@@ -142,7 +142,8 @@ pub fn check_base(base: &BaseFormat, family: WlfmFamily) -> Result<(), String> {
 /// (the block family's for [`WlfmFamily::P1`],
 /// [`WhirBlockPlan::derive_blake3`] for [`WlfmFamily::B3`]). The prover hands
 /// its prepared roots in; a verifier passes `None` and commits them on the
-/// host.
+/// host. A prover's plan skips the chip rows' measuring under
+/// [`PLAN_LEAN_ENV`] ([`level_plan_measured`]).
 pub fn level_plan(
     elf: &[u8],
     proof_options: &crate::ProofOptions,
@@ -150,6 +151,31 @@ pub fn level_plan(
     statement: crate::block_whir::BlockStatement<'_>,
     family: WlfmFamily,
     prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
+) -> Result<WhirBlockPlan, String> {
+    let measure = !(plan_lean() && prepared_roots.is_some());
+    level_plan_measured(
+        elf,
+        proof_options,
+        format,
+        statement,
+        family,
+        prepared_roots,
+        measure,
+    )
+}
+
+/// [`level_plan`] with the measuring named: `measure` false skips each
+/// group's chip rows measured by emission, which a level's fixed leaf count
+/// never reads ([`WhirBlockPlan::chip_loads`] is then empty). The same
+/// programs either way.
+pub(crate) fn level_plan_measured(
+    elf: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
+    measure: bool,
 ) -> Result<WhirBlockPlan, String> {
     level_plan_with(
         elf,
@@ -160,13 +186,15 @@ pub fn level_plan(
         prepared_roots,
         super::whir_block::share_inverse(),
         None,
+        measure,
     )
 }
 
 /// [`level_plan`] with the leaves' share form named (`share_inverse`,
 /// `whir_block::emit_share`) rather than the process's knob, and the
 /// programs' cap check named (`cap_mux`; `None` reads the process's knob)
-/// before the derivation emits anything.
+/// before the derivation emits anything; `measure` as
+/// [`level_plan_measured`]'s (a verifier always measures).
 #[allow(clippy::too_many_arguments)]
 fn level_plan_with(
     elf: &[u8],
@@ -177,6 +205,7 @@ fn level_plan_with(
     prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
     share_inverse: bool,
     cap_mux: Option<CapMux>,
+    measure: bool,
 ) -> Result<WhirBlockPlan, String> {
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
@@ -190,6 +219,7 @@ fn level_plan_with(
             super::whir_block::BLOCK_FAN_IN,
             prepared_roots,
             super::whir_block::LEAF_P1_CAP,
+            measure,
             share_inverse,
             cap_mux,
         )?,
@@ -200,6 +230,7 @@ fn level_plan_with(
             statement,
             1,
             prepared_roots,
+            measure,
             share_inverse,
             cap_mux,
         )?,
@@ -495,6 +526,38 @@ pub fn commit_next_early() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         super::wlfm_knobs::knob_word_on(std::env::var(COMMIT_NEXT_EARLY_ENV).ok().as_deref())
+    })
+}
+
+/// `LAMBDA_VM_LEVELS_PLAN_LEAN=1`: level 1's plan, made by the prover from its
+/// own prepared roots, skips measuring each group's chip rows by emitting it
+/// alone ([`WhirBlockPlan::chip_loads`]): a level's leaf count is fixed at
+/// one, so nothing reads them. The program is emitted once, over every
+/// group, either way: the same proofs. A verifier's plan measures whatever
+/// this says. Off by default (and for any word but `1`). Read once a process,
+/// on the driver's thread.
+pub const PLAN_LEAN_ENV: &str = "LAMBDA_VM_LEVELS_PLAN_LEAN";
+
+std::thread_local! {
+    /// A test's [`plan_lean`] on this thread.
+    static PLAN_LEAN_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`plan_lean`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_plan_lean_for_test(on: Option<bool>) {
+    PLAN_LEAN_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`PLAN_LEAN_ENV`] is on (or this thread's test override).
+pub fn plan_lean() -> bool {
+    if let Some(on) = PLAN_LEAN_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(PLAN_LEAN_ENV).ok().as_deref())
     })
 }
 
@@ -2036,6 +2099,25 @@ pub(crate) fn verifier_level_plan(
     verifier_level_plan_with(elf, &options, format, statement, family, cap_mux)
 }
 
+/// Tests only: a BLAKE3 verifier's level plan under the fixture's proof
+/// options and the process's cap check ([`verifier_level_plan_with`]).
+#[cfg(test)]
+pub(crate) fn verifier_level_plan_for_test(
+    elf: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+) -> Result<WhirBlockPlan, String> {
+    verifier_level_plan_with(
+        elf,
+        proof_options,
+        format,
+        statement,
+        WlfmFamily::B3,
+        super::merkle_cap::cap_mux(),
+    )
+}
+
 /// [`verifier_level_plan`] under the caller's proof options: the fixture
 /// options a test proves its base under.
 fn verifier_level_plan_with(
@@ -2055,6 +2137,7 @@ fn verifier_level_plan_with(
         None,
         true,
         Some(cap_mux),
+        true,
     )
 }
 
@@ -2599,6 +2682,7 @@ pub fn prove_block_levels(
     let fill_beside_on = fill_beside();
     let fill_parts_on = fill_parts();
     let commit_next_early_on = commit_next_early();
+    let plan_lean_on = plan_lean();
     let next_beside_on = next_beside();
     let waves_in_order_on = waves_in_order();
     // The validator joined after the fill: only where it runs beside the
@@ -2658,13 +2742,14 @@ pub fn prove_block_levels(
         // landed as soon as phase B has finished its groups.
         let level1 = scope.spawn(move || -> Result<Level1, String> {
             let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
-            let plan = level_plan(
+            let plan = level_plan_measured(
                 elf_ref,
                 opts_ref,
                 format_ref,
                 statement.view(),
                 family,
                 Some(&roots),
+                !plan_lean_on,
             )?;
             let planned = now();
             let plan_split = super::whir_block::take_plan_split();
