@@ -700,6 +700,52 @@ impl Drop for ProgramFastForTest {
     }
 }
 
+/// `LAMBDA_VM_LEVELS_VALIDATE_AT_ONCE=1`: level 1's admission validator runs
+/// its five checks at once, each on a thread of its own
+/// ([`super::validator::validate_at_once`]), where they otherwise run one
+/// after another on one thread. The same checks, the same verdict (of several
+/// failures, the earliest check's). Off by default (and for any word but `1`).
+/// Read once a process.
+pub const VALIDATE_AT_ONCE_ENV: &str = "LAMBDA_VM_LEVELS_VALIDATE_AT_ONCE";
+
+/// A test's [`validate_at_once`], process wide (0 the knob, 1 off, 2 on).
+static VALIDATE_AT_ONCE_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`validate_at_once`] forced for the process (`None` restores
+/// the knob).
+#[doc(hidden)]
+pub fn set_validate_at_once_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    VALIDATE_AT_ONCE_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`VALIDATE_AT_ONCE_ENV`] is on (or a test's override).
+pub fn validate_at_once() -> bool {
+    match VALIDATE_AT_ONCE_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(VALIDATE_AT_ONCE_ENV).ok().as_deref())
+    })
+}
+
+/// Level 1's admission validator over `program`: its five checks in series,
+/// or at once under [`VALIDATE_AT_ONCE_ENV`].
+fn validate_level(program: &LfmProgram) -> Result<(), super::validator::LfmViolation> {
+    if validate_at_once() {
+        super::validator::validate_at_once(program)
+    } else {
+        super::validator::validate(program)
+    }
+}
+
 /// The admission validator over `program` on a thread of `scope`'s: its
 /// seconds, or why the program is not admissible.
 pub(crate) fn spawn_validation<'scope, 'env>(
@@ -711,7 +757,7 @@ pub(crate) fn spawn_validation<'scope, 'env>(
             super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE);
         }
         let t = std::time::Instant::now();
-        super::validator::validate(program)
+        validate_level(program)
             .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
         Ok(t.elapsed().as_secs_f64())
     })
@@ -1168,12 +1214,75 @@ impl Drop for BudgetRelease {
     }
 }
 
+/// `LAMBDA_VM_LEVELS_FREE_BESIDE=1`: level 1's filled program (its
+/// instructions and instruction columns) is let go on the thread that hands
+/// the execution's memory back beside the prove, where it is otherwise freed
+/// on the driver's thread before the prove starts. The same program dropped,
+/// later and elsewhere; the prove never reads it. Off by default (and for any
+/// word but `1`). Read once a process.
+pub const FREE_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_FREE_BESIDE";
+
+/// A test's [`free_beside`], process wide (0 the knob, 1 off, 2 on).
+static FREE_BESIDE_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`free_beside`] forced for the process (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_free_beside_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    FREE_BESIDE_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`FREE_BESIDE_ENV`] is on (or a test's override).
+pub fn free_beside() -> bool {
+    match FREE_BESIDE_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(FREE_BESIDE_ENV).ok().as_deref())
+    })
+}
+
+/// What [`take_program`] took out of a program: dropped wherever it goes.
+pub(crate) struct TakenProgram {
+    _instrs: Vec<super::instr::Instr>,
+    _columns: Vec<Vec<crate::tables::types::FE>>,
+}
+
 /// A filled level's program let go: its instructions and instruction
 /// columns (their counts kept in `sizes`). The prove reads the build and the
 /// filled traces, never the program; the heights stay.
 fn release_program(p: &mut LfmProgram, sizes: &mut Vec<(usize, usize)>) {
+    drop(take_program(p, sizes));
+}
+
+/// Tests only: [`release_program`].
+#[cfg(test)]
+pub(crate) fn release_program_for_test(p: &mut LfmProgram, sizes: &mut Vec<(usize, usize)>) {
+    release_program(p, sizes);
+}
+
+impl TakenProgram {
+    /// Tests only: the instructions taken.
+    #[cfg(test)]
+    pub(crate) fn instrs_len(&self) -> usize {
+        self._instrs.len()
+    }
+}
+
+/// [`release_program`]'s taking without the freeing: the program left as
+/// [`release_program`] leaves it, what it held handed back.
+pub(crate) fn take_program(p: &mut LfmProgram, sizes: &mut Vec<(usize, usize)>) -> TakenProgram {
     sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
-    p.instrs = Vec::new();
+    let instrs = std::mem::take(&mut p.instrs);
+    let mut columns = Vec::with_capacity(15);
     let g = &mut p.groups;
     for group in [
         &mut g.const_,
@@ -1192,7 +1301,11 @@ fn release_program(p: &mut LfmProgram, sizes: &mut Vec<(usize, usize)>) {
         &mut g.cap,
         &mut g.cap_read,
     ] {
-        group.data = Vec::new();
+        columns.push(std::mem::take(&mut group.data));
+    }
+    TakenProgram {
+        _instrs: instrs,
+        _columns: columns,
     }
 }
 
@@ -2060,6 +2173,10 @@ pub struct LevelClock {
 /// What a levels run measured.
 #[derive(Clone, Debug, Default)]
 pub struct LevelsTimes {
+    /// Level 1's program let go on the driver's thread before its prove: the
+    /// seconds there, and whether it went to the purge's thread instead
+    /// ([`FREE_BESIDE_ENV`]).
+    pub release: (f64, bool),
     /// The base proof's end, the plan's derivation, level 1's program emitted
     /// and every level built.
     pub base: f64,
@@ -2419,7 +2536,7 @@ pub fn prove_block_levels(
             // Off the knob, validated before the execution, as always.
             let t = std::time::Instant::now();
             if !beside_check {
-                super::validator::validate(&program)
+                validate_level(&program)
                     .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
             }
             let emit_split = (walk, compiled, t.elapsed().as_secs_f64());
@@ -2933,10 +3050,25 @@ pub fn prove_block_levels(
             }
             Level1Ready::Filled(filled, fill) => (filled, fill),
         };
-        release_program(&mut levels[0].program, &mut times.sizes);
+        // Level 1's program let go: here, or under the knob on the purge's
+        // thread below, beside the prove.
+        let t_release = std::time::Instant::now();
+        let free_beside_on = free_beside();
+        let taken = take_program(&mut levels[0].program, &mut times.sizes);
+        let taken = match free_beside_on {
+            true => Some(taken),
+            false => {
+                drop(taken);
+                None
+            }
+        };
+        times.release = (t_release.elapsed().as_secs_f64(), free_beside_on);
         // What the execution and the program held, back to the OS on a
         // thread of its own beside the prove.
-        let purge_filled = scope.spawn(crate::alloc_purge::purge_now);
+        let purge_filled = scope.spawn(move || {
+            drop(taken);
+            crate::alloc_purge::purge_now()
+        });
         if let Some(r) = resident_now() {
             times.resident.push(("level 1 filled", r));
         }

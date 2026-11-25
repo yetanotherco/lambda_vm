@@ -982,6 +982,30 @@ fn the_blake3_driver_with_its_packs_at_once_proves_the_same_level_bytes() {
     assert!(run.proofs.len() >= 2, "level 2 prepared too");
 }
 
+/// ★ Level 1's validator with its checks at once
+/// (`LAMBDA_VM_LEVELS_VALIDATE_AT_ONCE`) and its program let go beside the
+/// prove (`LAMBDA_VM_LEVELS_FREE_BESIDE`): a small BLAKE3 block driven with
+/// both on proves each level's bytes as [`prove_levels`] does over the same
+/// base. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_validating_at_once_and_freeing_beside_proves_the_same_level_bytes() {
+    use super::levels::{set_free_beside_for_test, set_validate_at_once_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_validate_at_once_for_test(None);
+            set_free_beside_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    set_validate_at_once_for_test(Some(true));
+    set_free_beside_for_test(Some(true));
+    let run = driven_under_chain_steps(ChainSteps::default());
+    assert!(run.times.release.1, "level 1's program freed beside");
+    assert!(run.proofs.len() >= 2, "level 2 too");
+}
+
 /// Every chain step on at once: the same level bytes.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
@@ -1406,6 +1430,52 @@ fn the_fill_beside_knob_is_named_and_on_by_default() {
         assert!(fill_beside());
     }
     assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
+}
+
+/// The validator-at-once and free-beside knobs' names; both off by default
+/// (and for any word but `1`), a test's setting read back.
+#[test]
+fn the_validate_at_once_and_free_beside_knobs_are_named_and_off_by_default() {
+    use super::levels::{
+        FREE_BESIDE_ENV, VALIDATE_AT_ONCE_ENV, free_beside, set_free_beside_for_test,
+        set_validate_at_once_for_test, validate_at_once,
+    };
+    assert_eq!(VALIDATE_AT_ONCE_ENV, "LAMBDA_VM_LEVELS_VALIDATE_AT_ONCE");
+    assert_eq!(FREE_BESIDE_ENV, "LAMBDA_VM_LEVELS_FREE_BESIDE");
+    if std::env::var_os(VALIDATE_AT_ONCE_ENV).is_none() {
+        assert!(!validate_at_once(), "validate at once off by default");
+    }
+    if std::env::var_os(FREE_BESIDE_ENV).is_none() {
+        assert!(!free_beside(), "free beside off by default");
+    }
+    set_validate_at_once_for_test(Some(true));
+    set_free_beside_for_test(Some(true));
+    assert!(validate_at_once() && free_beside());
+    set_validate_at_once_for_test(None);
+    set_free_beside_for_test(None);
+}
+
+/// A program taken ([`super::levels::take_program`], the free-beside path) is
+/// left as a released one, with the same counts noted, and what was taken
+/// holds every instruction and column.
+#[test]
+fn a_taken_program_is_left_as_a_released_one() {
+    let mut taken = super::programs::trivial_program();
+    let mut released = super::programs::trivial_program();
+    let instrs = taken.instrs.len();
+    assert!(instrs > 0);
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let held = super::levels::take_program(&mut taken, &mut a);
+    super::levels::release_program_for_test(&mut released, &mut b);
+    assert_eq!(a, b, "the same counts noted");
+    assert_eq!(a, vec![(instrs, released.groups.b3l.real_rows)]);
+    assert!(taken.instrs.is_empty() && released.instrs.is_empty());
+    assert_eq!(
+        taken.groups.const_.data.len(),
+        released.groups.const_.data.len()
+    );
+    assert_eq!(taken.groups.const_.data.len(), 0);
+    assert_eq!(held.instrs_len(), instrs, "every instruction taken");
 }
 
 /// The settle-late knob's name; it is off by default, and only `1` turns it
@@ -2091,11 +2161,16 @@ fn rta_one_run(
     match t.validated_beside {
         Some((secs, at)) => println!(
             "RTA LEVEL1 VALIDATE: beside on · {secs:.3}s · done by {at:.3}s · the execution ended at \
-             {:.3}s",
-            t.levels.first().map_or(0.0, |l| l.executed)
+             {:.3}s · at once {}",
+            t.levels.first().map_or(0.0, |l| l.executed),
+            super::levels::validate_at_once()
         ),
         None => println!("RTA LEVEL1 VALIDATE: beside off"),
     }
+    println!(
+        "RTA LEVEL1 RELEASE: {:.3}s on the driver's thread · beside {}",
+        t.release.0, t.release.1
+    );
     let landing = &t.landing;
     let list = |xs: Vec<String>| xs.join(" ");
     println!(
