@@ -933,9 +933,9 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         .expect("the BLAKE3 block proves to its last level")
     };
     let probes = super::whir_block::plan_probes_for_test() - probes;
-    // Under a lean plan the reference is today's: a plan that measures, from
-    // the base's statement and the roots committed on the host.
-    let measured = plan_lean.then(|| {
+    // Check both speculative paths against a fresh plan from the final base
+    // statement, with its prepared roots derived on the host.
+    let measured = (plan_lean || statement_early).then(|| {
         super::levels::level_plan_measured(
             &elf,
             &opts,
@@ -1192,23 +1192,17 @@ fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
 /// (`LAMBDA_VM_LEVELS_PLAN_LEAN`) makes the same program: a small BLAKE3
 /// block driven with the knob on proves each level's bytes as
 /// [`prove_levels`] does over a plan that measured, its plan's chip rows
-/// empty and its probes' lap zero. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`;
+/// empty and its probe-call count zero. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`;
 /// an untimed identity check.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
 fn the_blake3_driver_with_its_plan_lean_proves_the_same_level_bytes() {
+    let _options = super::wlfm::test_format::set_driver_options();
     let run = driven_under_chain_steps(ChainSteps {
         plan_lean: true,
         ..ChainSteps::default()
     });
     assert!(run.proofs.len() >= 2, "level 2 over the lean level 1");
-    // No probe call (counted in the driver); the probes' lap is only the
-    // clock's own read, never exactly zero.
-    println!(
-        "LEVELS PLAN LEAN: the probes' lap {:.9} s",
-        run.times.plan_split[5]
-    );
-    assert!(run.times.plan_split[5] < 1e-3, "the probes' lap is empty");
 }
 
 /// ★ Level 1's program made from the base's early statement
@@ -1238,14 +1232,9 @@ fn the_blake3_driver_with_its_statement_early_proves_the_same_level_bytes() {
     }
 }
 
-/// ★ Each wrong early statement ends in today's path: a unit's rows doubled,
-/// the replay one table short, the early roots' first word changed, the early
-/// public output changed. Level 1 is made again from the final statement,
-/// proves each level's bytes as [`prove_levels`] does, and exactly one
-/// mismatch is counted. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`.
-#[test]
-#[ignore = "proves a small BLAKE3 block and its levels eight times; box tier, deterministic grind"]
-fn a_wrong_early_statement_falls_back_to_the_final_ones_bytes() {
+/// An early fault falls back to the proof bytes derived from the final
+/// statement and its independently committed roots.
+fn assert_early_fault_fallback(fault: crate::block_whir::EarlyFault) {
     use crate::block_whir::{EarlyFault, set_early_fault_for_test};
     struct Restore;
     impl Drop for Restore {
@@ -1254,28 +1243,45 @@ fn a_wrong_early_statement_falls_back_to_the_final_ones_bytes() {
         }
     }
     let _restore = Restore;
-    for fault in [
-        EarlyFault::DoubledRows,
-        EarlyFault::ShortReplay,
-        EarlyFault::RootWord,
-        EarlyFault::PublicOutput,
-    ] {
-        set_early_fault_for_test(fault);
-        let before = super::levels::early_mismatches();
-        let run = driven_under_chain_steps(ChainSteps {
-            statement_early: true,
-            ..ChainSteps::default()
-        });
-        set_early_fault_for_test(EarlyFault::None);
-        let note = run.times.early.expect("an early statement came");
-        assert!(!note.used, "{fault:?}: the early program was not used");
-        assert_eq!(
-            super::levels::early_mismatches(),
-            before + 1,
-            "{fault:?}: one mismatch counted"
-        );
-        println!("LEVELS EARLY FAULT {fault:?}: fell back, the same level bytes");
-    }
+    let _options = super::wlfm::test_format::set_driver_options();
+    set_early_fault_for_test(fault);
+    let before_level = super::levels::early_mismatches();
+    let before_base = crate::block_whir::early_statement_mismatches();
+    let run = driven_under_chain_steps(ChainSteps {
+        statement_early: true,
+        ..ChainSteps::default()
+    });
+    let note = run.times.early.expect("an early statement came");
+    assert!(!note.used, "{fault:?}: the early program was not used");
+    assert_eq!(super::levels::early_mismatches(), before_level + 1);
+    assert_eq!(
+        crate::block_whir::early_statement_mismatches(),
+        before_base + 1
+    );
+}
+
+#[test]
+#[ignore = "box tier, run alone with deterministic grind"]
+fn early_fault_doubled_rows_falls_back_to_final_bytes() {
+    assert_early_fault_fallback(crate::block_whir::EarlyFault::DoubledRows);
+}
+
+#[test]
+#[ignore = "box tier, run alone with deterministic grind"]
+fn early_fault_short_replay_falls_back_to_final_bytes() {
+    assert_early_fault_fallback(crate::block_whir::EarlyFault::ShortReplay);
+}
+
+#[test]
+#[ignore = "box tier, run alone with deterministic grind"]
+fn early_fault_root_word_falls_back_to_final_bytes() {
+    assert_early_fault_fallback(crate::block_whir::EarlyFault::RootWord);
+}
+
+#[test]
+#[ignore = "box tier, run alone with deterministic grind"]
+fn early_fault_public_output_falls_back_to_final_bytes() {
+    assert_early_fault_fallback(crate::block_whir::EarlyFault::PublicOutput);
 }
 
 /// ★ The base's early statement is its final one: small blocks' streamed
@@ -1709,6 +1715,104 @@ fn the_blake3_driver_with_its_stacks_by_card_on_card_1_proves_the_same_level_byt
     assert_eq!(split_placement().ordinal, 1, "the second driver on card 1");
     let second = driven_under_levels_split_stacks(TwoCardSplit::Auto, true);
     assert!(second > 0, "no level group proved on card 1");
+}
+
+/// The three knobs together preserve the base and both recursion proofs.
+/// Forced split exercises both CUDA backends on a single physical card.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone with deterministic grind and fixed trace hash"]
+fn the_blake3_driver_with_all_three_early_knobs_preserves_the_chain() {
+    use super::levels::{
+        prove_block_levels, set_plan_lean_for_test, set_stacks_by_card_for_test,
+        set_stacks_for_test, set_statement_early_for_test, verify_block_levels_under,
+    };
+    use math_cuda::device::{
+        TwoCardSplit, set_two_card_levels_for_test, set_two_card_split_for_test,
+    };
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_statement_early_for_test(None);
+            set_plan_lean_for_test(None);
+            set_stacks_by_card_for_test(None);
+            set_two_card_levels_for_test(None);
+            set_two_card_split_for_test(None);
+        }
+    }
+
+    let _restore = Restore;
+    let _options = super::wlfm::test_format::set_driver_options();
+    let _stacks = set_stacks_for_test(Some(StackPlace::Card));
+    assert!(crypto::grinding::deterministic());
+    assert_eq!(
+        std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
+        Ok("1")
+    );
+    set_two_card_split_for_test(Some(TwoCardSplit::Off));
+    set_two_card_levels_for_test(Some(TwoCardSplit::Forced));
+    assert!(multilinear::gpu::two_card_split_ready());
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let options = pipelined_options();
+    let prove = |on| {
+        set_statement_early_for_test(Some(on));
+        set_plan_lean_for_test(Some(on));
+        set_stacks_by_card_for_test(Some(on));
+        let before = super::whir_block::plan_probes_for_test();
+        let run = prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &options,
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the small block proves through level 2");
+        assert_eq!(run.proofs.len(), 2);
+        assert_eq!(run.times.early.map(|note| note.used), on.then_some(true));
+        assert_eq!(super::whir_block::plan_probes_for_test() == before, on);
+        let second_holds_a_stack = run.levels[0]
+            .build
+            .artifacts
+            .stacks
+            .iter()
+            .any(|stack| run.times.stamps[0].groups[stack.group].card == 1);
+        assert_eq!(
+            second_holds_a_stack, on,
+            "level 1 prepared stacks on card 1"
+        );
+        run
+    };
+    let off = prove(false);
+    let on = prove(true);
+    let base_bytes = |run: &super::levels::LevelsRun| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes")
+    };
+    let (a, b) = (base_bytes(&off), base_bytes(&on));
+    assert!(a[..] == b[..], "the same base proof bytes");
+    println!("ALL THREE KNOBS base: {} B equal", a.len());
+    for (level, (a, b)) in off.proofs.iter().zip(&on.proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {} proof bytes", level + 1);
+        println!("ALL THREE KNOBS level {}: {} B equal", level + 1, a.len());
+    }
+    verify_block_levels_under(
+        &elf,
+        &opts,
+        &format,
+        on.base_proof.statement(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        on.proofs.last().expect("the last level"),
+    )
+    .expect("the independently derived verifier accepts the final proof");
 }
 
 /// ★ Level 2 executed beside its own preparation

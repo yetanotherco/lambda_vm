@@ -881,15 +881,19 @@ fn a_joint_tree_block_round_trips_and_refuses_the_other_mode() {
 fn prepared_roots_on_the_host_cost() {
     use crate::block_whir::{GroupStack, commit_group, commit_group_on_host};
     use math::field::element::FieldElement;
+    use multilinear::mle::Mle;
     use multilinear::whir_chain::Round0Trees;
-    let column = |vars: usize,
-                  seed: u64|
-     -> Vec<FieldElement<crate::tables::types::GoldilocksField>> {
-        (0..1u64 << vars)
-            .map(|i| {
-                FieldElement::from(i.wrapping_add(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11)
-            })
-            .collect()
+    let column = |vars: usize, seed: u64| -> Mle<crate::tables::types::GoldilocksField> {
+        Mle::new(
+            (0..1u64 << vars)
+                .map(|i| {
+                    FieldElement::from(
+                        i.wrapping_add(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11,
+                    )
+                })
+                .collect(),
+        )
+        .expect("the column's power-of-two length")
     };
     let decode = |seed: u64| (0..5).map(|c| column(20, seed + c)).collect::<Vec<_>>();
     let page = |seed: u64| (0..2).map(|c| column(18, seed + c)).collect::<Vec<_>>();

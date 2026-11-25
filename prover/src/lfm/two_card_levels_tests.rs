@@ -431,6 +431,7 @@ fn a_stack_held_on_card_1_without_the_split_is_a_clean_error() {
 /// level's bytes with every group on card 0.
 #[test]
 fn a_second_card_fault_in_the_stack_commits_commits_them_on_card_0() {
+    use super::wlfm::SecondStackFault;
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -443,7 +444,7 @@ fn a_second_card_fault_in_the_stack_commits_commits_them_on_card_0() {
     let (one_built, _, one, _) = held_by_card(None, true);
     let one = one.expect("the held level proves");
     for at in [0usize, 1] {
-        super::wlfm::set_second_stack_fault_for_test(Some(at));
+        super::wlfm::set_second_stack_fault_for_test(Some((at, SecondStackFault::BeforeCommit)));
         let (built, stacks, proof, groups) = held_by_card(Some(&all_on_card_1), true);
         super::wlfm::set_second_stack_fault_for_test(None);
         assert!(
@@ -461,4 +462,132 @@ fn a_second_card_fault_in_the_stack_commits_commits_them_on_card_0() {
         );
         assert_eq!(bytes(&proof), bytes(&one), "fault at {at}: the same bytes");
     }
+}
+
+#[cfg(feature = "test-cuda-faults")]
+fn assert_cuda_stack_fault_fallback(
+    fault: multilinear::whir_commit::DeviceStackFault,
+    place: StackPlace,
+) {
+    use super::wlfm::{SecondStackFault, prepare_wlfm, set_second_stack_fault_for_test};
+    use math_cuda::device::{
+        TwoCardSplit, backend, card_count, second_backend_started, set_two_card_levels_for_test,
+        set_two_card_split_for_test, two_card_split_ready,
+    };
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_second_stack_fault_for_test(None);
+            set_two_card_levels_for_test(None);
+            set_two_card_split_for_test(None);
+        }
+    }
+
+    let _restore = Restore;
+    let _fast = test_format::set(Some(2));
+    let _stack = test_format::set_stack_log(15);
+    let _groups = test_format::set_group_polys(1);
+    let _chunks = test_format::set_chunk_log(13);
+    set_two_card_split_for_test(Some(TwoCardSplit::Off));
+    set_two_card_levels_for_test(Some(if card_count() == 1 {
+        TwoCardSplit::Forced
+    } else {
+        TwoCardSplit::Auto
+    }));
+    assert!(two_card_split_ready());
+    let main = backend().expect("the main CUDA backend");
+    let second = second_backend_started().expect("the second CUDA backend");
+    let before = (main.reserved_bytes(), second.reserved_bytes());
+
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    let prepare = || {
+        prepare_wlfm(
+            &level,
+            hasher,
+            WlfmRate::Two,
+            WlfmLevers {
+                first_fold: Some(4),
+                ..WlfmLevers::with_family(WlfmFamily::B3)
+            },
+        )
+        .expect("the level prepares")
+    };
+    let prove = |build: &WlfmBuild| {
+        let filled = execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+        let proof =
+            prove_wlfm_traces_as(build, filled, true, WlfmProving::Streamed).expect("proves");
+        let stamps = take_wlfm_stamps().expect("the proof's group stamps");
+        assert!(stamps.groups.iter().all(|g| g.card == 0));
+        verify_wlfm(&build.artifacts, &proof, &proof.public_words).expect("verifies");
+        proof
+    };
+    let pre = prepare();
+    let cells = pre.prepared_cells_by_group();
+    let groups: Vec<_> = (0..cells.len()).filter(|&g| cells[g] != 0).collect();
+    // Leave a card-0 stack between each pair of card-1 stacks. Fault the
+    // middle card-1 stack, whose codeword must be large enough for CUDA.
+    let target = (2..groups.len().saturating_sub(2))
+        .find(|&i| cells[groups[i]] >= 1 << 15)
+        .unwrap_or_else(|| {
+            panic!("need five prepared stacks with a CUDA stack in between: {cells:?}")
+        });
+    let mut assigned = vec![0; cells.len()];
+    for i in [target - 2, target, target + 2] {
+        assigned[groups[i]] = 1;
+    }
+
+    set_second_stack_fault_for_test(Some((1, SecondStackFault::Device(fault))));
+    let recovered = pre
+        .commit_on(place, Some(assigned))
+        .expect("card 0 recovers the failed stack");
+    set_second_stack_fault_for_test(None);
+    assert!(!two_card_split_ready(), "the failed backend was disabled");
+    assert_eq!(
+        second.reserved_bytes(),
+        before.1,
+        "the second backend gave back its stack reservations"
+    );
+    let actual = prove(&recovered);
+    let program_id = recovered.artifacts.program_id;
+    drop(recovered);
+    let reference = prepare().commit(place).expect("card 0 commits every stack");
+    assert_eq!(
+        reference.artifacts.program_id, program_id,
+        "the prepared roots in stack order"
+    );
+    let expected = prove(&reference);
+    drop(reference);
+    let actual = bytes(&actual);
+    assert_eq!(actual, bytes(&expected));
+    assert_eq!(
+        (main.reserved_bytes(), second.reserved_bytes()),
+        before,
+        "both ledgers after proving"
+    );
+    println!(
+        "CUDA STACK FALLBACK: {} B equal, ledger {before:?}",
+        actual.len()
+    );
+}
+
+#[cfg(feature = "test-cuda-faults")]
+#[test]
+#[ignore = "card: run alone in a fresh process"]
+fn a_cuda_stack_commit_fault_replays_interleaved_stacks_on_card_0() {
+    assert_cuda_stack_fault_fallback(
+        multilinear::whir_commit::DeviceStackFault::Commit,
+        StackPlace::Card,
+    );
+}
+
+#[cfg(feature = "test-cuda-faults")]
+#[test]
+#[ignore = "card: run alone in a fresh process"]
+fn a_cuda_stack_retirement_fault_replays_interleaved_stacks_on_card_0() {
+    assert_cuda_stack_fault_fallback(
+        multilinear::whir_commit::DeviceStackFault::Retire,
+        StackPlace::CardRetired,
+    );
 }

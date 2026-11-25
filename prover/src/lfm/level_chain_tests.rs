@@ -700,7 +700,12 @@ fn pieces_in(order: &[usize]) -> std::sync::mpsc::Receiver<(usize, Vec<LfmWord>)
 
 /// A prebuild's stacks, column for column, and the identity it commits to on
 /// the host.
-fn prebuild_identity(pre: super::wlfm::WlfmPrebuild) -> (Vec<Vec<Vec<FE>>>, [u8; 32]) {
+fn prebuild_identity(
+    pre: super::wlfm::WlfmPrebuild,
+) -> (
+    Vec<Vec<multilinear::mle::Mle<crate::tables::types::GoldilocksField>>>,
+    [u8; 32],
+) {
     let columns = pre
         .stack_columns_for_test()
         .expect("stacks")
