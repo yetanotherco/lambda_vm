@@ -276,6 +276,26 @@ class AiReviewTriggerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 ai_review.assert_safe_lane_id(lane_id)
 
+    def test_exclude_pathspecs_skips_comments_and_blank_lines(self) -> None:
+        import tempfile
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "exclude.txt"
+        path.write_text("# generated\n\na/b/**\n  c.lean  \n", encoding="utf-8")
+        self.assertEqual(
+            ai_review.exclude_pathspecs(path),
+            [":(glob,exclude)a/b/**", ":(glob,exclude)c.lean"],
+        )
+        self.assertEqual(ai_review.exclude_pathspecs(path.with_name("missing.txt")), [])
+
+    def test_report_header_counts_excluded_files(self) -> None:
+        def header(excluded: int) -> str:
+            context = {"pr_number": 1, "changed_files": [{}] * 3, "excluded_file_count": excluded}
+            report = ai_review.render_report(context, {"issues": []}, [], [], {"lanes": {}})
+            return report.splitlines()[3]
+
+        self.assertEqual(header(0), "PR #1 · 3 changed files")
+        self.assertEqual(header(5), "PR #1 · 3 changed files (5 generated files not reviewed)")
+
 
 class AiReviewCandidateTests(unittest.TestCase):
     def test_build_candidates_merges_duplicate_findings_and_preserves_sources(self) -> None:

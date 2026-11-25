@@ -41,6 +41,13 @@ any model runner:
   (see "Lessons learned").
 - `lanes/verify.md` is the verifier prompt.
 
+Generated code is kept out of the review: the globs in
+`.github/ai-review/exclude.txt` are dropped from the diff and file context the
+swarm gets, and `general.md` tells every reviewer (including native Codex/Claude,
+which build their own diff) to skip them. Like the prompts, a `/ai-review` comment
+reads it from the default branch, so a change to it applies once merged. The
+report header says how many files were left out.
+
 Model-specific workflows should load one of these prompt files and pass its
 contents to the reviewer. Do not duplicate prompt bodies inside model-specific
 workflow YAML unless the model adapter requires a small wrapper around the shared

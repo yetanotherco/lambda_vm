@@ -232,12 +232,20 @@ def cmd_context(args: argparse.Namespace) -> int:
     base = args.base_sha
     head = args.head_ref
     pr_range = f"{base}...{head}"
-    pathspec = ["--", ".", *exclude_pathspecs(pathlib.Path(args.exclude_file))]
+    excludes = exclude_pathspecs(pathlib.Path(args.exclude_file))
+    pathspec = ["--", ".", *excludes]
     diff = git_text(repo, "diff", "--find-renames", "--find-copies", "--unified=80", pr_range, *pathspec)
     name_status = git_text(
         repo, "diff", "--name-status", "--find-renames", "--find-copies", pr_range, *pathspec
     )
     changed_files = parse_name_status(name_status)
+    # Count what the exclude list dropped, so the report doesn't understate the PR's size.
+    excluded_file_count = 0
+    if excludes:
+        all_files = git_text(
+            repo, "diff", "--name-only", "--find-renames", "--find-copies", pr_range
+        ).splitlines()
+        excluded_file_count = max(0, len([f for f in all_files if f]) - len(changed_files))
 
     diff_truncated = len(diff) > args.max_diff_chars
     if diff_truncated:
@@ -278,6 +286,7 @@ def cmd_context(args: argparse.Namespace) -> int:
         "diff_truncated": diff_truncated,
         "changed_file_count": len(changed_files),
         "changed_files": changed_files,
+        "excluded_file_count": excluded_file_count,
         "diff": diff,
         "file_context": file_context,
     }
@@ -1146,7 +1155,12 @@ def render_report(
         marker,
         "## AI Review",
         "",
-        f"PR #{context['pr_number']} · {len(context.get('changed_files', []))} changed files",
+        f"PR #{context['pr_number']} · {len(context.get('changed_files', []))} changed files"
+        + (
+            f" ({context['excluded_file_count']} generated files not reviewed)"
+            if context.get("excluded_file_count")
+            else ""
+        ),
     ]
     if context.get("diff_truncated"):
         lines.append("")
