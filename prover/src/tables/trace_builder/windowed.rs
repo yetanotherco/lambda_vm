@@ -1755,7 +1755,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                     let mut made_counts = made_counts;
                     made_counts.push(own_counts);
                     for counts in made_counts {
-                        counts.add_into(&mut counted.histogram, kept.decode.table())?;
+                        counts.add_into(&mut counted.histogram, kept.decode.table(), &decode)?;
                     }
                     eprintln!(
                         "BLOCK WALK COUNTS: the walkers counted {} CPU ops, {} MEMW_R, {} MEMW_A and \
@@ -2598,6 +2598,12 @@ fn walk_window(
         }
         lap(|t| &mut t.collect, &mut times);
         from += part.len();
+        // Under `slots`, where the walker counts and lists none of the
+        // in-walk lookups, the slots' lookups go straight to its counts.
+        let slot_counts = match counts.as_deref_mut() {
+            Some(counts) if cuts.slots && !lookups => Some(counts.histogram_mut()),
+            _ => None,
+        };
         super::collect_window_ops_into(
             &cpu_ops[start..],
             decode,
@@ -2606,6 +2612,7 @@ fn walk_window(
             &mut walk,
             lookups,
             defer_ecrec,
+            slot_counts,
         )?;
         if pad_bytes > 0 {
             WALK_PAD.with(|buf| {
@@ -2623,12 +2630,15 @@ fn walk_window(
         }
         lap(|t| &mut t.walk, &mut times);
         if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
+            // Under `one-loop` the routing's pass counts the ops' DECODE rows
+            // and last ECALL; without routing the count keeps its pass.
+            let one_loop = cuts.one_loop && router.is_some();
             counts.count_batch(
                 decode,
                 &cpu_ops[start..],
                 &walk,
                 marks,
-                last_ecall,
+                (!one_loop).then_some(&mut *last_ecall),
                 times.as_mut(),
             );
             // A walk that lists no lookup of its own still lists each in-row
@@ -2644,7 +2654,13 @@ fn walk_window(
             }
             lap(|t| &mut t.count, &mut times);
             if let Some(router) = router.as_mut() {
-                counts.route_batch(decode, &cpu_ops[start..], router);
+                counts.route_batch(
+                    decode,
+                    &cpu_ops[start..],
+                    router,
+                    cuts,
+                    one_loop.then_some(last_ecall),
+                );
                 lap(|t| &mut t.route, &mut times);
             }
         }
@@ -2735,18 +2751,71 @@ pub(crate) struct WalkCounts {
     histogram: Option<bitwise::BitwiseHistogram>,
     /// DECODE's lookups, by row.
     decode_rows: Vec<u64>,
+    /// The CPU ops routed under `const` ([`super::WalkCuts::constant`]):
+    /// their three instruction lookups not yet in `histogram`, added by
+    /// DECODE row at [`Self::settle`].
+    const_cycles: u64,
 }
 
 impl WalkCounts {
+    /// Its histogram, allocated at the first use (80 MiB).
+    fn histogram_mut(&mut self) -> &mut bitwise::BitwiseHistogram {
+        self.histogram
+            .get_or_insert_with(bitwise::BitwiseHistogram::new)
+    }
+
+    /// Under `const`, the CPU ops' three instruction lookups
+    /// ([`crate::tables::cpu::const_lookups`]) added to the histogram: each
+    /// DECODE row's three, times the ops it counted on that row. Every op it
+    /// counted must have been routed under `const`, else it refuses. A
+    /// sum, so the histogram is the one counting each op's seven gives.
+    pub(crate) fn settle(&mut self, decode: &DecodeTable) -> Result<(), Error> {
+        if self.const_cycles == 0 {
+            return Ok(());
+        }
+        let counted: u64 = self.decode_rows.iter().sum();
+        if counted != self.const_cycles {
+            return Err(Error::Prover(format!(
+                "a walker routed {} CPU ops without their instruction lookups but counted {counted}",
+                self.const_cycles
+            )));
+        }
+        let Self {
+            histogram,
+            decode_rows,
+            const_cycles,
+        } = self;
+        let histogram = histogram.get_or_insert_with(bitwise::BitwiseHistogram::new);
+        for (row, &n) in decode_rows.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let row = u32::try_from(row)
+                .ok()
+                .filter(|&r| (r as usize) < decode.padding_row())
+                .ok_or_else(|| {
+                    Error::Prover(format!(
+                        "a walker counted DECODE row {row}, which the decode table lacks"
+                    ))
+                })?;
+            for op in crate::tables::cpu::const_lookups(decode.entry(row)) {
+                histogram.bump_n(op, n);
+            }
+        }
+        *const_cycles = 0;
+        Ok(())
+    }
+
     /// One batch's: `cpu_ops`, its CPU ops' DECODE lookups and its last ECALL
-    /// into `last_ecall`; and the rows `walk` gained from `marks` on.
+    /// into `last_ecall` (`None`: the routing counts them, `one-loop`); and
+    /// the rows `walk` gained from `marks` on.
     fn count_batch(
         &mut self,
         decode: &DecodeTable,
         cpu_ops: &[super::CpuOperation],
         walk: &WalkOutputs,
         marks: BatchMarks,
-        last_ecall: &mut Option<(u64, u64)>,
+        last_ecall: Option<&mut Option<(u64, u64)>>,
         times: Option<&mut WalkTimes>,
     ) {
         // Its parts timed into `times` when the walk is timed.
@@ -2754,15 +2823,17 @@ impl WalkCounts {
         let histogram = self
             .histogram
             .get_or_insert_with(bitwise::BitwiseHistogram::new);
-        for raw in cpu_ops {
-            let op = decode.op(raw);
-            let row = raw.decode_row as usize;
-            if row >= self.decode_rows.len() {
-                self.decode_rows.resize(row + 1, 0);
-            }
-            self.decode_rows[row] += 1;
-            if op.decode.fields.ecall {
-                *last_ecall = Some((raw.timestamp, raw.next_pc));
+        if let Some(last_ecall) = last_ecall {
+            for raw in cpu_ops {
+                let op = decode.op(raw);
+                let row = raw.decode_row as usize;
+                if row >= self.decode_rows.len() {
+                    self.decode_rows.resize(row + 1, 0);
+                }
+                self.decode_rows[row] += 1;
+                if op.decode.fields.ecall {
+                    *last_ecall = Some((raw.timestamp, raw.next_pc));
+                }
             }
         }
         let t1 = t0.map(|_| std::time::Instant::now());
@@ -2801,20 +2872,63 @@ impl WalkCounts {
     }
 
     /// One batch's CPU ops routed into `router` and their own lookups (the
-    /// routing's, [`super::route_cpu_ops_into`]'s) counted.
+    /// routing's, [`super::route_cpu_ops_into`]'s) counted: under `const`
+    /// ([`super::WalkCuts::constant`]) the four of `res` alone, the other
+    /// three at [`Self::settle`]; with `last_ecall` (`one-loop`) the ops'
+    /// DECODE rows and last ECALL counted in the same loop.
     fn route_batch(
         &mut self,
         decode: &DecodeTable,
         cpu_ops: &[super::CpuOperation],
         router: &mut super::CpuRouter,
+        cuts: super::WalkCuts,
+        last_ecall: Option<&mut Option<(u64, u64)>>,
     ) {
-        let histogram = self
-            .histogram
-            .get_or_insert_with(bitwise::BitwiseHistogram::new);
+        match (cuts.constant, last_ecall) {
+            (false, None) => self.route_loop::<false, false>(decode, cpu_ops, router, &mut None),
+            (true, None) => self.route_loop::<true, false>(decode, cpu_ops, router, &mut None),
+            (false, Some(last)) => self.route_loop::<false, true>(decode, cpu_ops, router, last),
+            (true, Some(last)) => self.route_loop::<true, true>(decode, cpu_ops, router, last),
+        }
+    }
+
+    /// [`Self::route_batch`]'s loop: under `CONST` each op's `res` lookups
+    /// alone, with `ONE_LOOP` its DECODE row and last ECALL too.
+    #[inline]
+    fn route_loop<const CONST: bool, const ONE_LOOP: bool>(
+        &mut self,
+        decode: &DecodeTable,
+        cpu_ops: &[super::CpuOperation],
+        router: &mut super::CpuRouter,
+        last_ecall: &mut Option<(u64, u64)>,
+    ) {
+        let Self {
+            histogram,
+            decode_rows,
+            const_cycles,
+        } = self;
+        let histogram = histogram.get_or_insert_with(bitwise::BitwiseHistogram::new);
         for raw in cpu_ops {
             let op = decode.op(raw);
-            op.count_bitwise_into(histogram);
+            if ONE_LOOP {
+                let row = raw.decode_row as usize;
+                if row >= decode_rows.len() {
+                    decode_rows.resize(row + 1, 0);
+                }
+                decode_rows[row] += 1;
+                if op.decode.fields.ecall {
+                    *last_ecall = Some((raw.timestamp, raw.next_pc));
+                }
+            }
+            if CONST {
+                op.count_res_into(histogram);
+            } else {
+                op.count_bitwise_into(histogram);
+            }
             router.push(op);
+        }
+        if CONST {
+            *const_cycles += cpu_ops.len() as u64;
         }
     }
 
@@ -2829,12 +2943,15 @@ impl WalkCounts {
             .add_ops(ops);
     }
 
-    /// Adds these counts to the run's: `histogram`, and DECODE's trace.
+    /// Adds these counts to the run's: `histogram`, and DECODE's trace
+    /// (settled first, [`Self::settle`]).
     fn add_into(
-        self,
+        mut self,
         histogram: &mut bitwise::BitwiseHistogram,
         decode_trace: &mut Table,
+        decode: &DecodeTable,
     ) -> Result<(), Error> {
+        self.settle(decode)?;
         if let Some(mine) = self.histogram {
             histogram.merge(&mine);
         }

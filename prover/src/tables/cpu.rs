@@ -587,43 +587,66 @@ impl<'a> CpuOp<'a> {
         self.for_each_bitwise_op(|op| histogram.bump(op));
     }
 
+    /// [`Self::count_bitwise_into`] less the three lookups of its instruction
+    /// alone ([`const_lookups`]): the four of `res`, which the caller counts
+    /// with the rest by DECODE row.
+    #[inline]
+    pub(crate) fn count_res_into(&self, histogram: &mut super::bitwise::BitwiseHistogram) {
+        res_lookups(self.res, self.decode.fields.word_instr, |op| {
+            histogram.bump(op)
+        });
+    }
+
     /// Each of [`Self::collect_bitwise_ops`]'s lookups, in its order.
     #[inline]
     fn for_each_bitwise_op(&self, mut emit: impl FnMut(super::bitwise::BitwiseOperation)) {
-        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
-        let f = self.decode.fields;
+        for op in const_lookups(self.decode) {
+            emit(op);
+        }
+        res_lookups(self.res, self.decode.fields.word_instr, emit);
+    }
+}
 
-        // Must mirror the trace columns exactly. On word delegate rows the CPU
-        // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (half_instruction_length stays);
-        // CPU32 emits its own range checks for the real decoded values.
-        let word = f.word_instr;
-        let z = |v: u8| if word { 0 } else { v };
-        let res = if word { 0 } else { self.res };
-
-        emit(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            z(f.rs1),
-            z(f.rs2),
-        ));
-        emit(BitwiseOperation::byte_op(
+/// A CPU row's three `ARE_BYTES` lookups (rs1/rs2, rd/half_instruction_length,
+/// alu_flags/mem_flags): a function of its instruction's DECODE entry alone,
+/// so every row of one DECODE row sends the same three.
+#[inline]
+pub(crate) fn const_lookups(decode: &DecodeEntry) -> [super::bitwise::BitwiseOperation; 3] {
+    use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+    let f = decode.fields;
+    // Must mirror the trace columns exactly. On word delegate rows the CPU
+    // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (half_instruction_length stays);
+    // CPU32 emits its own range checks for the real decoded values.
+    let word = f.word_instr;
+    let z = |v: u8| if word { 0 } else { v };
+    [
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, z(f.rs1), z(f.rs2)),
+        BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             z(f.rd),
             f.half_instruction_length,
-        ));
-        emit(BitwiseOperation::byte_op(
+        ),
+        BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             z(f.alu_flags),
             z(f.mem_flags),
-        ));
+        ),
+    ]
+}
 
-        for i in 0..4 {
-            let half = ((res >> (i * 16)) & 0xFFFF) as u16;
-            emit(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+/// A CPU row's four `IS_HALF` lookups, the four halves of its `res` (zero on a
+/// word delegate row).
+#[inline]
+fn res_lookups(res: u64, word: bool, mut emit: impl FnMut(super::bitwise::BitwiseOperation)) {
+    use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+    let res = if word { 0 } else { res };
+    for i in 0..4 {
+        let half = ((res >> (i * 16)) & 0xFFFF) as u16;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
     }
 }
 

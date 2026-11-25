@@ -875,7 +875,14 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                             stopped = true;
                         }
                     }
-                    walker.counts
+                    // Its counts settled here, on its own thread, at its end
+                    // (the walk's cut `const`: each DECODE row's
+                    // instruction lookups added once).
+                    let decode = Arc::clone(&walker.settings.decode);
+                    walker
+                        .counts
+                        .map(|mut counts| counts.settle(&decode).map(|()| counts))
+                        .transpose()
                 }));
             }
             drop(done_tx);
@@ -935,7 +942,10 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             let mut counts = Vec::with_capacity(walkers);
             for thread in threads {
                 match thread.join() {
-                    Ok(mine) => counts.extend(mine),
+                    Ok(Ok(mine)) => counts.extend(mine),
+                    Ok(Err(e)) => {
+                        failure.get_or_insert(e);
+                    }
                     Err(_) => {
                         failure.get_or_insert(Error::Prover("a walker thread panicked".into()));
                     }

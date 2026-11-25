@@ -2515,14 +2515,18 @@ fn collect_ops_from_cpu_into(
         out,
         lookups,
         false,
+        None,
     )
 }
 
 /// [`collect_ops_from_cpu_into`] for a window of a windowed build: with
 /// `defer_ecrec` each ECREC call's witness is computed off the walk
 /// ([`collect_ecrec_ops`]), and the run's lists hold it pending until the
-/// finish ([`resolve_deferred_ecrec`]).
+/// finish ([`resolve_deferred_ecrec`]). With `slot_counts` (the walk's cut
+/// `slots`) each in-row register slot's lookup is counted there instead of
+/// listed.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn collect_window_ops_into(
     cpu_ops: &[CpuOperation],
     decode: &DecodeTable,
@@ -2531,6 +2535,7 @@ fn collect_window_ops_into(
     out: &mut WalkOutputs,
     lookups: bool,
     defer_ecrec: bool,
+    slot_counts: Option<&mut bitwise::BitwiseHistogram>,
 ) -> Result<(), Error> {
     walk_cpu_ops::<true>(
         cpu_ops,
@@ -2540,6 +2545,7 @@ fn collect_window_ops_into(
         out,
         lookups,
         defer_ecrec,
+        slot_counts,
     )
 }
 
@@ -2564,12 +2570,15 @@ fn collect_streamed_ops_from_cpu_into(
         out,
         false,
         false,
+        None,
     )
 }
 
 /// The walk's one body: with `REST` every list ([`collect_ops_from_cpu_into`]),
 /// without it only the streamed tables' ([`collect_streamed_ops_from_cpu_into`]).
-/// The state advances the same either way.
+/// The state advances the same either way. With `slot_counts` the in-row
+/// register slots' lookups are counted there, not listed.
+#[allow(clippy::too_many_arguments)]
 fn walk_cpu_ops<const REST: bool>(
     cpu_ops: &[CpuOperation],
     decode: &DecodeTable,
@@ -2578,6 +2587,7 @@ fn walk_cpu_ops<const REST: bool>(
     out: &mut WalkOutputs,
     lookups: bool,
     defer_ecrec: bool,
+    mut slot_counts: Option<&mut bitwise::BitwiseHistogram>,
 ) -> Result<(), Error> {
     let WalkOutputs {
         memw,
@@ -2740,7 +2750,12 @@ fn walk_cpu_ops<const REST: bool>(
                 collect_register_ops_from_cpu(op, register_state, memw);
                 super::cpu::CpuSide::default()
             } else {
-                collect_register_ops_in_row(op, register_state, memw, bitwise_ops)
+                match slot_counts.as_deref_mut() {
+                    Some(histogram) => {
+                        collect_register_ops_in_row(op, register_state, memw, histogram)
+                    }
+                    None => collect_register_ops_in_row(op, register_state, memw, bitwise_ops),
+                }
             };
             cpu_side.push(side);
         } else {
@@ -4290,6 +4305,26 @@ pub(crate) fn in_row_prev(slot_ts: u64, old_ts: u64) -> u64 {
     }
 }
 
+/// Where a walk puts a lookup it makes: a list, or straight into a histogram
+/// (a sum, so the counts are the list's counted).
+trait LookupSink {
+    fn take(&mut self, op: BitwiseOperation);
+}
+
+impl LookupSink for Vec<BitwiseOperation> {
+    #[inline]
+    fn take(&mut self, op: BitwiseOperation) {
+        self.push(op);
+    }
+}
+
+impl LookupSink for bitwise::BitwiseHistogram {
+    #[inline]
+    fn take(&mut self, op: BitwiseOperation) {
+        self.bump(op);
+    }
+}
+
 /// A non-word CPU row's register accesses under the in-row register format
 /// (`tables::register::RegisterFormat::InRow`): the row checks them itself, so
 /// they make no MEMW op. Returns the row's [`super::cpu::CpuSide`]; a slot
@@ -4298,13 +4333,13 @@ pub(crate) fn in_row_prev(slot_ts: u64, old_ts: u64) -> u64 {
 /// to `slot_ts − 1`, which no access of that register can hold (a row's
 /// register slots are `ts`, `ts + 1`, `ts + 2`; the slot before `ts` is the
 /// previous row's fourth, which no register access takes). Each slot's
-/// `IS_HALF` lookup goes to `bitwise_ops`. The register state advances as
-/// [`collect_register_ops_from_cpu`] advances it.
-fn collect_register_ops_in_row(
+/// `IS_HALF` lookup goes to `lookups` (listed, or counted where made). The
+/// register state advances as [`collect_register_ops_from_cpu`] advances it.
+fn collect_register_ops_in_row<S: LookupSink>(
     op: CpuOp<'_>,
     register_state: &mut RegisterState,
     memw: &mut MemwBuckets,
-    bitwise_ops: &mut Vec<BitwiseOperation>,
+    lookups: &mut S,
 ) -> super::cpu::CpuSide {
     let d = &op.decode.fields;
     let mut side = super::cpu::CpuSide::default();
@@ -4318,7 +4353,7 @@ fn collect_register_ops_in_row(
                 .push(RegRow::keep_alive(2 * u64::from(reg), prev, v, old_ts));
         }
         let d = (ts - prev - 1) as u16;
-        bitwise_ops.push(BitwiseOperation::halfword(
+        lookups.take(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             d as u8,
             (d >> 8) as u8,
