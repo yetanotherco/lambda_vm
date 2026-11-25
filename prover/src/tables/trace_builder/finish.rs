@@ -2840,6 +2840,9 @@ impl<'a> FinishPlan<'a> {
         };
         let tails = skip.tails;
         let (direct_page, direct_bitwise) = (finish_direct().page, finish_direct().bitwise);
+        // `LAMBDA_VM_FINISH_EARLY=bitwise-tail`: BITWISE's job split, under
+        // the packed form.
+        let bitwise_tail = skip.finish_early.bitwise_tail && form == TraceForm::Narrow;
         // Every packed kind's width hint seeded before its first table, so
         // none is built at 8 bytes a cell first ([`crate::tables::gpack_seeds`];
         // `LAMBDA_VM_FINISH_SEED_WIDTHS=0` rolls it back). The packed bytes are
@@ -2949,10 +2952,31 @@ impl<'a> FinishPlan<'a> {
                         let mut histogram = side_count.recv().map_err(|_| {
                             Error::Prover("phase 4's other sources were never counted".into())
                         })?;
-                        histogram.merge(&tables.take()?);
+                        if bitwise_tail {
+                            histogram.merge_in_chunks(&tables.take()?);
+                        } else {
+                            histogram.merge(&tables.take()?);
+                        }
                         histogram
                     }
                 };
+                if bitwise_tail {
+                    // Written packed by row ranges at once, its digest for the
+                    // log taken beside: the same table.
+                    let bounds = crate::tables::gpack::row_bounds_at(
+                        bitwise::NUM_ROWS,
+                        1 << 16,
+                        crate::tables::gpack::SPLIT_MAX_PARTS,
+                    );
+                    let trace = std::thread::scope(|scope| {
+                        scope.spawn(|| note_bitwise(&histogram, from));
+                        histogram.trace_as_rows(form, &bounds)
+                    });
+                    build_stamps::mark(&format!("p5 bitwise by {} row ranges", bounds.len() - 1));
+                    #[cfg(test)]
+                    super::finish_early::note_bitwise_tail();
+                    return Ok(trace);
+                }
                 note_bitwise(&histogram, from);
                 if direct_bitwise && form == TraceForm::Narrow {
                     return Ok(histogram.trace_as(form));

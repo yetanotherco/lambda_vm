@@ -176,3 +176,70 @@ fn bitwise_in_one_packed_pass_is_todays_packed_bitwise() {
     }
     assert_eq!(NUM_ROWS, 1 << 20);
 }
+
+/// ★ BITWISE written packed by row ranges at once
+/// (`LAMBDA_VM_FINISH_EARLY=bitwise-tail`) is today's two passes then
+/// packed, byte for byte: an empty histogram and a counted one (counts past
+/// two bytes among them), cut into one range, into the finish's ranges, and
+/// into uneven ones; and its histogram added in chunks is the one added in
+/// turn.
+#[test]
+fn bitwise_by_row_ranges_is_todays_packed_bitwise() {
+    if cfg!(feature = "debug-checks") {
+        return;
+    }
+    let mut counted = BitwiseHistogram::new();
+    let mut other = BitwiseHistogram::new();
+    let mut seed = 0x7A11_u64;
+    for (t, &kind) in BitwiseOperationType::ALL.iter().enumerate() {
+        for i in 0..20_000 {
+            let op = BitwiseOperation {
+                lookup_type: kind,
+                x: next(&mut seed) as u8,
+                y: next(&mut seed) as u8,
+                z: (next(&mut seed) % 16) as u8,
+            };
+            let into = if i % 2 == 0 { &mut counted } else { &mut other };
+            into.bump_n(op, 1 + next(&mut seed) % 3);
+        }
+        let op = BitwiseOperation {
+            lookup_type: kind,
+            x: t as u8,
+            y: 1,
+            z: 15,
+        };
+        counted.bump_n(op, 70_000 + t as u64);
+        other.bump_n(op, 1);
+    }
+    // Added in chunks: the sums added in turn.
+    let mut in_turn = BitwiseHistogram::new();
+    in_turn.merge(&counted);
+    in_turn.merge(&other);
+    let mut in_chunks = BitwiseHistogram::new();
+    in_chunks.merge_in_chunks(&counted);
+    in_chunks.merge_in_chunks(&other);
+    assert!(in_chunks == in_turn, "added in chunks");
+    let finish = crate::tables::gpack::row_bounds_at(
+        NUM_ROWS,
+        1 << 16,
+        crate::tables::gpack::SPLIT_MAX_PARTS,
+    );
+    assert!(finish.len() > 2, "the finish's ranges: {finish:?}");
+    for (name, histogram) in [("empty", BitwiseHistogram::new()), ("counted", in_turn)] {
+        let mut wide = bitwise::generate_bitwise_trace();
+        histogram.fill_multiplicities(&mut wide);
+        let today = packed(wide, name);
+        for bounds in [
+            vec![0, NUM_ROWS],
+            finish.clone(),
+            vec![0, 1, 3, 65_537, NUM_ROWS - 1, NUM_ROWS],
+        ] {
+            let by_rows = histogram.trace_as_rows(TraceForm::Narrow, &bounds);
+            assert_eq!(
+                packed_parts(&by_rows, name),
+                today,
+                "{name}, ranges {bounds:?}"
+            );
+        }
+    }
+}

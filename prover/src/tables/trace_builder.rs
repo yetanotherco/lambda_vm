@@ -986,6 +986,7 @@ mod table_count_tests {
 mod cut_padding_tests;
 mod delta;
 mod finish;
+pub mod finish_early;
 #[cfg(test)]
 mod finish_oracle;
 #[cfg(test)]
@@ -1007,6 +1008,7 @@ use compact_eq::CompactEq;
 #[cfg(feature = "parallel")]
 pub(crate) use finish::hand_on_order_first;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
+pub use finish_early::FinishEarly;
 pub use host_hoist::HostHoist;
 pub use walk_cuts::WalkCuts;
 #[cfg(test)]
@@ -8136,6 +8138,9 @@ pub struct StreamSkip {
     /// The serial host work the build hoists (`LAMBDA_VM_HOST_HOIST`). The
     /// tables are the same; the default hoists none.
     pub host_hoist: HostHoist,
+    /// The finish's last jobs shortened (`LAMBDA_VM_FINISH_EARLY`,
+    /// [`FinishEarly`]). The tables are the same.
+    pub finish_early: FinishEarly,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
