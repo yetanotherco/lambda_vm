@@ -58,11 +58,17 @@ fn streamed_options() -> crate::block_whir::BlockOptions {
     options
 }
 
-/// [`streamed_options`] with the chunks laid out off the packer's thread, as
-/// the block lays them out: where the base can state its statement early.
+/// [`streamed_options`] with the chunks laid out off the packer's thread and
+/// the rest streamed through the sliding finish, as the block lays them out:
+/// where the base can state its statement early and the finish can start its
+/// late families first. The rest streams only with KECCAK_RND's tables at
+/// 2^5 rows or more ([`crate::block_whir::BlockOptions::rest_streams`]); at
+/// the small blocks' 2^3 the finish builds the rest whole and states nothing.
 fn pipelined_options() -> crate::block_whir::BlockOptions {
     let mut options = streamed_options();
     options.layout_workers = 2;
+    options.keccak_rnd_rows_log2 = 5;
+    assert!(options.rest_streams(), "the rest streams");
     options
 }
 
@@ -1273,19 +1279,34 @@ fn a_wrong_early_statement_falls_back_to_the_final_ones_bytes() {
 }
 
 /// ★ The base's early statement is its final one: small blocks' streamed
-/// bases (local lookups, BLAKE3) proved with an early observer hand it the
-/// statement and the prepared roots the final observer gets, field for field,
-/// before the final one comes; every table's rows were told as stated (no
-/// miss).
+/// BLAKE3 bases, with and without local lookups, proved with an early
+/// observer through the entry the levels driver takes for the format hand it
+/// the statement and the prepared roots the final observer gets, field for
+/// field, before the final one comes; every table's rows were told as stated
+/// (no miss) and the block counted no mismatch.
 #[test]
-#[ignore = "proves three small BLAKE3 blocks' bases; box tier"]
+#[ignore = "proves three small BLAKE3 blocks' bases in two formats; box tier"]
 fn the_early_statement_is_the_final_one() {
     type Seen =
         std::sync::Mutex<Vec<(&'static str, String, Vec<crate::block_whir::PreparedRoots>)>>;
-    let format = b3_format();
+    let local = BlockFormat {
+        argue: multilinear::whir_chain::ArgueFormat::BATCHED,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+        ..b3_format()
+    };
+    assert!(local.local_lookups() && !b3_format().local_lookups());
     let opts = ProofOptions::default_test_options();
     let misses = crate::tables::trace_builder::rows_misses();
-    for name in ["test_commit_4", "all_instructions_64", "test_keccak_multi"] {
+    let mismatches = crate::block_whir::early_statement_mismatches();
+    for (format, name) in [b3_format(), local].into_iter().flat_map(|format| {
+        ["test_commit_4", "all_instructions_64", "test_keccak_multi"]
+            .map(move |name| (format, name))
+    }) {
+        let kind = if format.local_lookups() {
+            "local"
+        } else {
+            "global"
+        };
         let elf = crate::test_utils::asm_elf_bytes(name);
         let seen: Seen = std::sync::Mutex::new(Vec::new());
         let note = |kind: &'static str| {
@@ -1300,34 +1321,60 @@ fn the_early_statement_is_the_final_one() {
             }
         };
         let (fin, early) = (note("final"), note("early"));
+        // The entry the levels driver takes for the format: a format that
+        // argues local lookups proves a proof of its own kind.
         crate::base_only::with_blake3_levels(|| {
-            crate::block_whir::prove_block_whir_local_observed_early(
-                &elf,
-                &[],
-                &opts,
-                &format,
-                &pipelined_options(),
-                &fin,
-                Some(&early),
-                &|_| {},
-                None,
-            )
+            if format.local_lookups() {
+                crate::block_whir::prove_block_whir_local_observed_early(
+                    &elf,
+                    &[],
+                    &opts,
+                    &format,
+                    &pipelined_options(),
+                    &fin,
+                    Some(&early),
+                    &|_| {},
+                    None,
+                )
+                .map(|_| ())
+            } else {
+                crate::block_whir::prove_block_whir_observed_early(
+                    &elf,
+                    &[],
+                    &opts,
+                    &format,
+                    &pipelined_options(),
+                    &fin,
+                    Some(&early),
+                    &|_| {},
+                )
+                .map(|_| ())
+            }
         })
         .expect("the BLAKE3 base proves");
         let seen = seen.into_inner().unwrap_or_else(|e| e.into_inner());
         let kinds: Vec<&str> = seen.iter().map(|s| s.0).collect();
-        assert_eq!(kinds, ["early", "final"], "{name}: early first, then final");
+        assert_eq!(
+            kinds,
+            ["early", "final"],
+            "{name} ({kind}): early first, then final"
+        );
         assert_eq!(
             seen[0].1, seen[1].1,
-            "{name}: the statement, field for field"
+            "{name} ({kind}): the statement, field for field"
         );
-        assert_eq!(seen[0].2, seen[1].2, "{name}: the prepared roots");
-        println!("EARLY STATEMENT {name}: confirmed");
+        assert_eq!(seen[0].2, seen[1].2, "{name} ({kind}): the prepared roots");
+        println!("EARLY STATEMENT {name} ({kind}): confirmed");
     }
     assert_eq!(
         crate::tables::trace_builder::rows_misses(),
         misses,
         "a table built at other rows than stated"
+    );
+    assert_eq!(
+        crate::block_whir::early_statement_mismatches(),
+        mismatches,
+        "the block counted a mismatch"
     );
 }
 
