@@ -2556,9 +2556,36 @@ where
     /// `LAMBDA_VM_TWO_CARD_SPLIT` ([`Self::with_two_card_split`]), each group
     /// marked `true` kept on card 0; `None` unless set here: one card.
     two_card_split: Option<Vec<bool>>,
+    /// The knob that lets [`Self::two_card_split`] act: the base's
+    /// (`LAMBDA_VM_TWO_CARD_SPLIT`) unless a level opted in under its own
+    /// ([`Self::with_two_card_levels`]).
+    two_card_knob: TwoCardKnob,
     /// A test's: the split runs its two drivers on the host, no second card
     /// needed ([`Self::set_two_card_split`]).
     split_on_host: bool,
+}
+
+/// Which two-card knob lets a block's phase B split ([`BlockCommitted`]): the
+/// base's or the recursion levels'. Each prints its own line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TwoCardKnob {
+    /// `LAMBDA_VM_TWO_CARD_SPLIT`: the base's phase B
+    /// ([`BlockCommitted::with_two_card_split`]).
+    #[default]
+    Split,
+    /// `LAMBDA_VM_TWO_CARD_LEVELS`: a recursion level's phase B
+    /// ([`BlockCommitted::with_two_card_levels`]).
+    Levels,
+}
+
+impl TwoCardKnob {
+    /// Whether this knob is on in the process (its own second driver placed).
+    fn on(self) -> bool {
+        match self {
+            Self::Split => multilinear::gpu::two_card_split_on(),
+            Self::Levels => multilinear::gpu::two_card_levels_on(),
+        }
+    }
 }
 
 /// A test's fault in a block's commit-time answers
@@ -3277,6 +3304,7 @@ where
             }),
             local_started,
             two_card_split: None,
+            two_card_knob: TwoCardKnob::Split,
             split_on_host: false,
         })
     }
@@ -3304,6 +3332,18 @@ where
     /// Off unless set here. The proof is the same.
     pub fn with_two_card_split(mut self, keep_on_card_0: Vec<bool>) -> Self {
         self.two_card_split = Some(keep_on_card_0);
+        self.two_card_knob = TwoCardKnob::Split;
+        self
+    }
+
+    /// A recursion level's phase B may split its groups over two cards, as
+    /// [`Self::with_two_card_split`] lets the base's, under the levels' own
+    /// knob `LAMBDA_VM_TWO_CARD_LEVELS` (the base's knob plays no part). A
+    /// group with a held prepared stack stays on card 0. Off unless set here.
+    /// The proof is the same.
+    pub fn with_two_card_levels(mut self, keep_on_card_0: Vec<bool>) -> Self {
+        self.two_card_split = Some(keep_on_card_0);
+        self.two_card_knob = TwoCardKnob::Levels;
         self
     }
 
@@ -5129,6 +5169,7 @@ where
         local,
         mut local_started,
         two_card_split,
+        two_card_knob,
         split_on_host,
     } = committed;
     let n = sizes.len();
@@ -5224,9 +5265,7 @@ where
     // caller's groups and a held prepared stack's.
     let plan: Result<Vec<u8>, &'static str> = match &two_card_split {
         None => Err("not asked by the caller"),
-        Some(_) if !split_on_host && !multilinear::gpu::two_card_split_on() => {
-            Err("the knob is off")
-        }
+        Some(_) if !split_on_host && !two_card_knob.on() => Err("the knob is off"),
         Some(_) if !split_on_host && !multilinear::gpu::two_card_split_ready() => {
             Err("the second card is not ready")
         }
@@ -5256,7 +5295,10 @@ where
         _ => 0,
     };
     if let (Some(_), Err(why)) = (&two_card_split, &plan) {
-        eprintln!("BLOCK TWO-CARD PHASE B: off ({why})");
+        match two_card_knob {
+            TwoCardKnob::Split => eprintln!("BLOCK TWO-CARD PHASE B: off ({why})"),
+            TwoCardKnob::Levels => eprintln!("BLOCK TWO-CARD LEVEL PHASE B: off ({why})"),
+        }
     }
     let split_card = plan.ok();
     let declines_before = multilinear::gpu::cross_card_declines();
@@ -6141,9 +6183,9 @@ where
             (Some(a), Some(b)) => (a.2 - b.2).abs(),
             _ => 0.0,
         };
-        eprintln!(
-            "BLOCK TWO-CARD PHASE B: on (LAMBDA_VM_TWO_CARD_SPLIT) · {} · {} · argue gap {gap:.3} s · pinned to card 0 \
-             {pinned_count} · cross-card declines {} · second upload {}",
+        let tail = format!(
+            "{} · {} · argue gap {gap:.3} s · pinned to card 0 {pinned_count} · cross-card declines {} · second \
+             upload {}",
             card(0),
             card(1),
             multilinear::gpu::cross_card_declines().saturating_sub(declines_before),
@@ -6153,6 +6195,14 @@ where
                 format!("{} groups (the two-card openings, card 0's)", two_card.0)
             },
         );
+        match two_card_knob {
+            TwoCardKnob::Split => {
+                eprintln!("BLOCK TWO-CARD PHASE B: on (LAMBDA_VM_TWO_CARD_SPLIT) · {tail}")
+            }
+            TwoCardKnob::Levels => {
+                eprintln!("BLOCK TWO-CARD LEVEL PHASE B: on (LAMBDA_VM_TWO_CARD_LEVELS) · {tail}")
+            }
+        }
         SPLIT_SECOND_GROUPS.fetch_add(
             lane_summary.get(1).map_or(0, |s| s.0) as u64,
             std::sync::atomic::Ordering::Relaxed,

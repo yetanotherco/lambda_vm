@@ -251,6 +251,8 @@ mod rp1wa_review_tests;
 mod rp1wb_review_tests;
 #[cfg(test)]
 mod tree_plan_property_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod two_card_levels_tests;
 #[cfg(test)]
 mod whir_air_tests;
 #[cfg(test)]

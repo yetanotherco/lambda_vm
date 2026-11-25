@@ -2727,6 +2727,25 @@ fn prove_traces_under<H: WhirHash>(
                     .with_overlap_next_columns_priced(overlap_next_columns())
                     .with_overlap_faults(overlap_faults_for_test())
             })
+            .map(|b| {
+                // ★ THE LEVELS' TWO-CARD SPLIT (`LAMBDA_VM_TWO_CARD_LEVELS`): this
+                // level's phase B groups over two cards, each group on its own
+                // fork of the post-roots transcript, its share put back by group
+                // index: the same proof. A group with a held prepared stack
+                // stays on card 0 (`block_prove_in_order`). Off, nothing asked.
+                let groups = artifacts.sizes.len();
+                match levels_split_on_host_for_test() {
+                    true => {
+                        let mut b = b.with_two_card_levels(vec![false; groups]);
+                        b.set_two_card_split(Some(vec![false; groups]), true);
+                        b
+                    }
+                    false if multilinear::gpu::two_card_levels_on() => {
+                        b.with_two_card_levels(vec![false; groups])
+                    }
+                    false => b,
+                }
+            })
         }
     }
     .map_err(|e| format!("{e:?}"))?;
@@ -3181,6 +3200,26 @@ pub fn set_overlap_faults_for_test(faults: multilinear_block::OverlapFaults) {
 /// This thread's test faults: none outside a test that set them.
 fn overlap_faults_for_test() -> multilinear_block::OverlapFaults {
     OVERLAP_FAULTS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+std::thread_local! {
+    /// A test's: this thread's streamed W-LFM proves split phase B over two
+    /// drivers on the host ([`set_levels_split_on_host_for_test`]).
+    static LEVELS_SPLIT_ON_HOST_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: this thread's streamed W-LFM proves split their phase B over
+/// two drivers on the host, as the levels' two-card split
+/// (`LAMBDA_VM_TWO_CARD_LEVELS`) does over two cards: the split's schedule,
+/// forks and assembly without a second card (`false` restores today's).
+#[doc(hidden)]
+pub fn set_levels_split_on_host_for_test(on: bool) {
+    LEVELS_SPLIT_ON_HOST_FOR_TEST.with(|c| c.set(on));
+}
+
+/// This thread's test setting: off outside a test that set it.
+fn levels_split_on_host_for_test() -> bool {
+    LEVELS_SPLIT_ON_HOST_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// `LAMBDA_VM_LEVELS_UPLOAD_ONCE` (on unless `0`): a W-LFM prove whose prepared stacks are
