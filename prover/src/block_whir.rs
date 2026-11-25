@@ -3365,23 +3365,39 @@ fn parse_exec_history_check(value: Option<&str>) -> Result<usize, Error> {
     }
 }
 
-/// The executor's stream: unset, empty or `full` (the default), it writes
-/// each window's logs and its per-cycle history; `lean`, only the access
-/// records, the ECALLs' cells and each window's starting cells, and each
-/// walker re-runs its window from them, rebuilding the logs byte for byte
-/// ([`executor::vm::fast::Replay`]). The tables and the proof are the same.
+/// The executor's stream: `full`, it writes each window's logs and its
+/// per-cycle history; `lean`, only the access records, the ECALLs' cells and
+/// each window's starting cells, and each walker re-runs its window from
+/// them, rebuilding the logs byte for byte ([`executor::vm::fast::Replay`]).
+/// Unset or empty, the default: lean wherever it runs, full elsewhere
+/// ([`refuse_lean_stream`]); `full` turns it off; `lean` asks for it and is
+/// refused where it does not run. The tables and the proof are the same.
 pub const EXEC_STREAM_ENV: &str = "LAMBDA_VM_EXEC_STREAM";
 
-/// [`EXEC_STREAM_ENV`]'s reading: `true` for `lean`. Anything else than
-/// `lean`, `full`, empty or unset refuses the prove.
-fn parse_exec_stream(value: Option<&str>) -> Result<bool, Error> {
+/// [`EXEC_STREAM_ENV`]'s reading: `None` unset or empty (the default, lean
+/// where it runs), `Some(false)` for `full`, `Some(true)` for `lean`.
+/// Anything else refuses the prove.
+fn parse_exec_stream(value: Option<&str>) -> Result<Option<bool>, Error> {
     match value.map(str::trim) {
-        None | Some("" | "full") => Ok(false),
-        Some("lean") => Ok(true),
+        None | Some("") => Ok(None),
+        Some("full") => Ok(Some(false)),
+        Some("lean") => Ok(Some(true)),
         Some(v) => Err(Error::Prover(format!(
-            "{EXEC_STREAM_ENV}={v}: full (the default: the executor writes the logs) or lean \
-             (the walkers re-run each window from its access records)"
+            "{EXEC_STREAM_ENV}={v}: full (the executor writes the logs) or lean (the walkers \
+             re-run each window from its access records); unset, lean where it runs"
         ))),
+    }
+}
+
+/// The executor's stream asked for (`asked`, [`parse_exec_stream`]'s
+/// reading) against whether the lean stream runs here (`fits`,
+/// [`refuse_lean_stream`]): `lean` refused where it does not run, `full`
+/// full, unset lean where it runs and full elsewhere.
+fn resolve_exec_stream(asked: Option<bool>, fits: Result<(), Error>) -> Result<bool, Error> {
+    match asked {
+        Some(true) => fits.map(|()| true),
+        Some(false) => Ok(false),
+        None => Ok(fits.is_ok()),
     }
 }
 
@@ -5754,7 +5770,7 @@ pub(crate) struct Deviations {
     /// the walk fills them, instead of the knob (`LAMBDA_VM_WORD_STREAM`).
     pub word_stream: Option<bool>,
     /// Whether the executor's stream is lean, instead of the knob
-    /// ([`EXEC_STREAM_ENV`]).
+    /// ([`EXEC_STREAM_ENV`]): `Some(true)` refused where it does not run.
     pub exec_stream_lean: Option<bool>,
     /// Whether phase A's head is stamped, instead of the knob
     /// ([`head_log::knob`]).
@@ -6555,11 +6571,13 @@ fn prove_block_whir_body(
         )?;
         return Ok((proof, stamps));
     }
-    // The lean stream is the windowed build's: refused here, never ignored.
+    // The lean stream is the windowed build's: asked for, refused here,
+    // never ignored; unset, the whole-run build runs the full stream.
     if deviations.exec_stream_lean.map_or_else(
         || parse_exec_stream(std::env::var(EXEC_STREAM_ENV).ok().as_deref()),
-        Ok,
-    )? {
+        |on| Ok(Some(on)),
+    )? == Some(true)
+    {
         return Err(Error::Prover(format!(
             "{EXEC_STREAM_ENV}=lean needs the windowed build (`window_log2`)"
         )));
@@ -9544,24 +9562,28 @@ fn prove_streamed(
         // read it.
         let (kind, history) = exec_mode(walkers)?;
         let history_check = exec_history_check()?;
-        // The lean stream: refused, never degraded, where it does not run.
-        let lean_stream = match deviations.exec_stream_lean {
-            Some(on) => on,
+        // The lean stream: asked for, refused, never degraded, where it does
+        // not run; unset, on wherever it runs (the default).
+        let asked = match deviations.exec_stream_lean {
+            Some(on) => Some(on),
             None => parse_exec_stream(std::env::var(EXEC_STREAM_ENV).ok().as_deref())?,
         };
-        if lean_stream {
+        let lean_stream = if asked == Some(false) {
+            false
+        } else {
             let shadow = kind == EngineKind::Fast
                 && ShadowCheck::every_from_env()
                     .map_err(Error::Execution)?
                     .is_some();
-            refuse_lean_stream(
+            let fits = refuse_lean_stream(
                 history,
                 format.memory == crate::tables::fused_memory::MemoryFormat::Words,
                 light_walk,
                 shadow,
                 history_check,
-            )?;
-        }
+            );
+            resolve_exec_stream(asked, fits)?
+        };
         // The walkers' window buffers under the lean stream come from the
         // page-locked pool as the executor's would.
         let lean_pooled = lean_stream && pool_exec_logs() && multilinear::pinned::ready();
@@ -9574,7 +9596,7 @@ fn prove_streamed(
                     "lean: the walkers re-run each window from its access records"
                 }
             } else {
-                "full: the executor writes the logs, the default"
+                "full: the executor writes the logs"
             }
         );
         let (block, built, laid, executed) = std::thread::scope(|scope| {
@@ -13600,7 +13622,7 @@ mod producer_report_tests {
     };
     use super::{
         exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_stream,
-        parse_light_walk, parse_word_stream, refuse_lean_stream,
+        parse_light_walk, parse_word_stream, refuse_lean_stream, resolve_exec_stream,
     };
     use crate::Error;
 
@@ -13621,21 +13643,34 @@ mod producer_report_tests {
         }
     }
 
-    /// `LAMBDA_VM_EXEC_STREAM`: full unless `lean`; any other word refused.
-    /// The lean stream is refused, with its reason, wherever it does not run.
+    /// `LAMBDA_VM_EXEC_STREAM`: unset or empty, lean where it runs (the
+    /// default) and full elsewhere; `full` off; `lean` refused, with its
+    /// reason, wherever it does not run; any other word refused.
     #[test]
-    fn the_exec_stream_is_full_unless_lean_and_refused_where_it_does_not_run() {
+    fn the_exec_stream_is_lean_where_it_runs_unless_full_and_refused_where_asked_and_absent() {
         for (word, lean) in [
-            (None, false),
-            (Some(""), false),
-            (Some("full"), false),
-            (Some(" lean "), true),
+            (None, None),
+            (Some(""), None),
+            (Some(" "), None),
+            (Some("full"), Some(false)),
+            (Some(" full "), Some(false)),
+            (Some(" lean "), Some(true)),
         ] {
             assert_eq!(parse_exec_stream(word).ok(), Some(lean), "{word:?}");
         }
-        for bad in ["1", "0", "Lean", "on"] {
+        for bad in ["1", "0", "Lean", "on", "none", "off"] {
             assert!(parse_exec_stream(Some(bad)).is_err(), "{bad}");
         }
+        let refused = || Err(Error::Prover("does not run".into()));
+        assert_eq!(resolve_exec_stream(None, Ok(())).ok(), Some(true));
+        assert_eq!(resolve_exec_stream(None, refused()).ok(), Some(false));
+        assert_eq!(resolve_exec_stream(Some(false), Ok(())).ok(), Some(false));
+        assert_eq!(
+            resolve_exec_stream(Some(false), refused()).ok(),
+            Some(false)
+        );
+        assert_eq!(resolve_exec_stream(Some(true), Ok(())).ok(), Some(true));
+        assert!(resolve_exec_stream(Some(true), refused()).is_err());
         assert!(refuse_lean_stream(true, true, 2, false, 0).is_ok());
         assert!(refuse_lean_stream(true, true, 1, false, 0).is_ok());
         for (args, why) in [
