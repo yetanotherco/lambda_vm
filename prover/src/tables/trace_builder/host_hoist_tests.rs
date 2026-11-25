@@ -344,12 +344,13 @@ fn the_image_by_runs_is_the_image() {
     }
 }
 
-/// With the knob unset no part is on: a builder's default and the stream's
-/// default hoist nothing, and `new` writes its image a byte at a time.
+/// The knob unset hoists every part (the block prove's default); a builder
+/// made without the knob and the stream's default hoist nothing, and `new`
+/// writes its image a byte at a time.
 #[test]
-fn the_knob_off_hoists_nothing() {
-    assert_eq!(StreamSkip::default().host_hoist, HostHoist::default());
-    assert_eq!(HostHoist::parse(None).expect("unset"), HostHoist::default());
+fn the_knob_unset_hoists_every_part_and_a_plain_builder_none() {
+    assert_eq!(HostHoist::parse(None).expect("unset"), HostHoist::all());
+    assert_eq!(StreamSkip::default().host_hoist, HostHoist::none());
     let program = Elf::load(&asm_elf_bytes("fused_mem_cases")).expect("the ELF loads");
     let _ = super::host_hoist::calls::take_runs();
     let builder =

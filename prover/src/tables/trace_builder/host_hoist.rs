@@ -1,6 +1,8 @@
 //! `LAMBDA_VM_HOST_HOIST`: serial host work taken off the block build's
 //! critical path, part by part. Every part builds the same tables, so the
-//! proof's bytes are the same with any part on or off; unset, none is on.
+//! proof's bytes are the same with any part on or off. Unset (or empty),
+//! every part is on, the default; `none` turns every part off, and a list
+//! of parts turns on those alone.
 //!
 //! - `pages`: the finish computes the page layout once, each initial page
 //!   copied whole from the image's pages instead of rebuilt a byte at a time
@@ -15,8 +17,10 @@
 
 use crate::Error;
 
-/// The parts of `LAMBDA_VM_HOST_HOIST` that are on. The default is none: the
-/// build as before the knob.
+/// The parts of `LAMBDA_VM_HOST_HOIST` that are on. The knob's default is
+/// every part ([`HostHoist::all`]); this type's `Default` is no part
+/// ([`HostHoist::none`]), the build as before the knob, which a builder
+/// made without the knob (`WindowedTraceBuilder::new`) takes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostHoist {
     /// The page layout computed once, from the image's pages.
@@ -33,7 +37,12 @@ impl HostHoist {
     /// The knob's words.
     pub(crate) const WORDS: &'static str = "pages, image, state";
 
-    /// Every part on.
+    /// No part on: the build as before the knob.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Every part on: the knob's default.
     pub fn all() -> Self {
         Self {
             pages: true,
@@ -47,13 +56,18 @@ impl HostHoist {
         self.pages || self.image || self.state
     }
 
-    /// The knob's reading: unset or empty, no part; else a comma-separated
-    /// list of parts (`pages`, `image`, `state`). A word it does not take refuses the prove.
+    /// The knob's reading: unset or empty, every part (the default);
+    /// `none`, no part; else a comma-separated list of the parts that are on
+    /// (`pages`, `image`, `state`). A word it does not take refuses the
+    /// prove.
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, Error> {
-        let mut hoist = Self::default();
+        let mut hoist = Self::none();
         let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
-            return Ok(hoist);
+            return Ok(Self::all());
         };
+        if value == "none" {
+            return Ok(hoist);
+        }
         for word in value.split(',').map(str::trim) {
             match word {
                 "pages" => hoist.pages = true,
@@ -61,8 +75,8 @@ impl HostHoist {
                 "state" => hoist.state = true,
                 _ => {
                     return Err(Error::Prover(format!(
-                        "LAMBDA_VM_HOST_HOIST={value}: a comma-separated list of {} (unset: \
-                         none, the default)",
+                        "LAMBDA_VM_HOST_HOIST={value}: a comma-separated list of {}, or \
+                         none (unset: every part, the default)",
                         Self::WORDS
                     )));
                 }
@@ -161,13 +175,20 @@ pub(crate) mod calls {
 mod tests {
     use super::HostHoist;
 
+    /// Unset or empty, every part is on (the default); `none` turns every
+    /// part off; the type's `Default` is no part.
     #[test]
-    fn unset_or_empty_is_no_part() {
+    fn unset_or_empty_is_every_part_and_none_is_no_part() {
         for value in [None, Some(""), Some("  ")] {
-            assert_eq!(HostHoist::parse(value).unwrap(), HostHoist::default());
+            assert_eq!(HostHoist::parse(value).unwrap(), HostHoist::all());
         }
-        assert!(!HostHoist::default().any());
-        assert_eq!(HostHoist::default().describe(), "none");
+        assert_eq!(HostHoist::all().describe(), "pages,image,state");
+        for value in ["none", " none "] {
+            assert_eq!(HostHoist::parse(Some(value)).unwrap(), HostHoist::none());
+        }
+        assert_eq!(HostHoist::none(), HostHoist::default());
+        assert!(!HostHoist::none().any());
+        assert_eq!(HostHoist::none().describe(), "none");
     }
 
     #[test]
@@ -207,7 +228,15 @@ mod tests {
 
     #[test]
     fn a_word_it_does_not_take_refuses() {
-        for value in ["page", "pages,", "1", "all", "pages,bogus"] {
+        for value in [
+            "page",
+            "pages,",
+            "1",
+            "all",
+            "pages,bogus",
+            "none,pages",
+            "0",
+        ] {
             assert!(HostHoist::parse(Some(value)).is_err(), "{value}");
         }
     }

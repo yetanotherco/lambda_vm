@@ -8029,8 +8029,9 @@ pub struct StreamSkip {
     /// at ([`super::page_w::page_tables`]; the block format's
     /// `page_run_log2`): 0, the default, one PAGE_W table a page.
     pub page_run_log2: u8,
-    /// The serial host work the build hoists (`LAMBDA_VM_HOST_HOIST`). The
-    /// tables are the same; the default hoists none.
+    /// The serial host work the build hoists (`LAMBDA_VM_HOST_HOIST`, whose
+    /// unset default the block prove reads as every part). The tables are
+    /// the same; this struct's default hoists none.
     pub host_hoist: HostHoist,
 }
 
