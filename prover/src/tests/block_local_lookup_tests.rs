@@ -11,8 +11,8 @@
 
 use crate::block_whir::{
     self, BlockFormat, BlockWhirProof, Deviations, LocalArgues, b3_base_local_setting,
-    block_format_tag, local_lane_setting, prove_block_whir_local_with, prove_block_whir_with,
-    verify_block_whir,
+    block_format_tag, local_lane_second_setting, local_lane_setting, prove_block_whir_local_with,
+    prove_block_whir_with, verify_block_whir,
 };
 use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::tables::local_bytes;
@@ -147,6 +147,25 @@ fn the_local_lane_knob_reads_on_or_off() {
     for bad in ["on", "off", "2", "true", "lane", "01"] {
         assert!(local_lane_setting(Some(bad)).is_err(), "{bad:?}");
     }
+}
+
+/// `LAMBDA_VM_LOCAL_LANE_SECOND_CARD`: unset, empty or `0` is off (card 0's
+/// lane); `1` is on (the light local groups' argues on the second card);
+/// anything else is refused.
+#[test]
+fn the_second_card_lane_knob_reads_off_or_on() {
+    assert_eq!(local_lane_second_setting(None), Ok(false));
+    assert_eq!(local_lane_second_setting(Some("")), Ok(false));
+    assert_eq!(local_lane_second_setting(Some(" 0 ")), Ok(false));
+    assert_eq!(local_lane_second_setting(Some("1")), Ok(true));
+    for bad in ["on", "off", "2", "true", "card", "01"] {
+        assert!(local_lane_second_setting(Some(bad)).is_err(), "{bad:?}");
+    }
+    assert_eq!(
+        crate::block_whir::Deviations::default().local_lane_second,
+        None,
+        "the knob decides unless a test does"
+    );
 }
 
 /// The statement tag names local lookups (`/LL1`), and today's does not.

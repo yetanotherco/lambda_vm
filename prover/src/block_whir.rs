@@ -908,6 +908,29 @@ pub fn local_lane_setting(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// The knob that, under local lookups and phase A's lane ([`LOCAL_LANE_ENV`]),
+/// runs each light local group's local argue on the second card, idle in
+/// phase A, instead of on card 0's lane
+/// (`multilinear_block::LocalPhaseA::second_card`). It acts only when the
+/// two-card split is on and its second card ready; a group with a table that
+/// is neither held as records nor small stays on card 0's lane. The proof is
+/// the same byte for byte either way: see [`local_lane_second_setting`].
+pub const LOCAL_LANE_SECOND_ENV: &str = "LAMBDA_VM_LOCAL_LANE_SECOND_CARD";
+
+/// [`LOCAL_LANE_SECOND_ENV`]'s value: unset, empty or `0` is off (card 0's
+/// lane runs every local argue it takes); `1` is on (the light groups' on the
+/// second card). Anything else is refused.
+pub fn local_lane_second_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{LOCAL_LANE_SECOND_ENV}={other:?}: expected 0 (card 0's lane, the default) or 1 \
+             (the light local groups' argues on the second card)"
+        )),
+    }
+}
+
 /// [`B3_BASE_LOCAL_ENV`]'s value: unset is `None` (the base's default,
 /// [`B3_BASE_LOCAL_DEFAULT`] on the BLAKE3 base, off on any other); `0` or
 /// `off` is off (KECCAK_RND's byte lookups in the global bus); `keccak`
@@ -5588,6 +5611,10 @@ pub(crate) struct Deviations {
     /// (`Some(true)`) or leaves them to phase B (`Some(false)`), instead of
     /// the knob ([`LOCAL_LANE_ENV`]). The proof is the same.
     pub local_lane: Option<bool>,
+    /// Under local lookups and the lane: the light local groups' argues on
+    /// the second card (`Some(true)`) or on card 0's lane (`Some(false)`),
+    /// instead of the knob ([`LOCAL_LANE_SECOND_ENV`]). The proof is the same.
+    pub local_lane_second: Option<bool>,
     /// Under local lookups: every LOCAL_BYTES table made wrong
     /// ([`LocalBytesFault`]) and proved honestly over.
     pub local_bytes: LocalBytesFault,
@@ -9073,6 +9100,26 @@ fn prove_streamed(
         None => local_lane_setting(std::env::var(LOCAL_LANE_ENV).ok().as_deref())
             .map_err(Error::Prover)?,
     };
+    // Whether the light local groups' argues run on the second card: the proof
+    // is the same either way; a word it does not take refuses the prove.
+    let local_lane_second = match deviations.local_lane_second {
+        Some(on) => on,
+        None => local_lane_second_setting(std::env::var(LOCAL_LANE_SECOND_ENV).ok().as_deref())
+            .map_err(Error::Prover)?,
+    };
+    // Said when asked (a run that sets the knob, on or off), so a run's log
+    // names its arm; unset, today's lines.
+    if format.local_lookups() && std::env::var_os(LOCAL_LANE_SECOND_ENV).is_some() {
+        eprintln!(
+            "★ BLOCK LOCAL LANE SECOND CARD: {} ({LOCAL_LANE_SECOND_ENV}; the lane {})",
+            if local_lane_second {
+                "on: the light local groups' argues on the second card when the split is ready"
+            } else {
+                "off: card 0's lane"
+            },
+            if local_lane { "on" } else { "off" }
+        );
+    }
     // Where the in-row side records are walked into: a word it does not take
     // refuses the prove.
     let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(
@@ -10594,7 +10641,9 @@ fn prove_streamed(
                         .then(|| multilinear_block::LocalPhaseA {
                             buses: local_bytes::LOCAL_BUSES.to_vec(),
                             lane: local_lane,
+                            second_card: local_lane_second,
                             binding: stark::multilinear_table::batched::LocalBinding::ALL,
+                            second_on_host: None,
                         }),
                 ))
             };
