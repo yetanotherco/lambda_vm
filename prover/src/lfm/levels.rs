@@ -561,6 +561,105 @@ pub fn plan_lean() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_STATEMENT_EARLY=1`: the base predicts its statement
+/// once every table's shape is known, before its last commits
+/// (`block_whir::prove_block_whir_local_observed_early`), and level 1 makes
+/// its plan and program from the prediction while phase A ends. They are used
+/// only if the final statement equals the prediction in every field and the
+/// prepared roots are equal; else they are made again from the final
+/// statement, as without the knob. Nothing of level 1 is published before.
+/// The same program from an equal statement: the same proofs. Acts only
+/// where level 1 runs beside the base with its program validated beside its
+/// execution. Off by default (and for any word but `1`). Read once a
+/// process, on the driver's thread.
+pub const STATEMENT_EARLY_ENV: &str = "LAMBDA_VM_LEVELS_STATEMENT_EARLY";
+
+std::thread_local! {
+    /// A test's [`statement_early`] on this thread.
+    static STATEMENT_EARLY_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`statement_early`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_statement_early_for_test(on: Option<bool>) {
+    STATEMENT_EARLY_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`STATEMENT_EARLY_ENV`] is on (or this thread's test override).
+pub fn statement_early() -> bool {
+    if let Some(on) = STATEMENT_EARLY_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(STATEMENT_EARLY_ENV).ok().as_deref())
+    })
+}
+
+/// A statement and its prepared roots, as the base hands them to level 1.
+type StatementWithRoots = (
+    crate::block_whir::OwnedBlockStatement,
+    Vec<crate::block_whir::PreparedRoots>,
+);
+
+/// What reaches level 1's thread from the base: the predicted statement
+/// (with the driver's clock when it came), then the final one; or the final
+/// one alone.
+enum Stated {
+    Early(StatementWithRoots, f64),
+    Final(StatementWithRoots),
+}
+
+/// Level 1's plan and program, and their stamps, made from one statement.
+struct Made {
+    plan: WhirBlockPlan,
+    planned: f64,
+    plan_split: Option<[f64; 6]>,
+    program: LfmProgram,
+    marks: Vec<u32>,
+    walk: f64,
+    compiled: f64,
+    compile_split: Option<[f64; 3]>,
+}
+
+/// Whether two statements are the same in every field (two of their types
+/// compare by their full debug form, which names every field).
+fn same_statement(
+    a: &crate::block_whir::OwnedBlockStatement,
+    b: &crate::block_whir::OwnedBlockStatement,
+) -> bool {
+    a.table_num_vars == b.table_num_vars
+        && a.groups == b.groups
+        && a.public_output == b.public_output
+        && a.num_private_input_pages == b.num_private_input_pages
+        && a.fused_memory == b.fused_memory
+        && a.word_memory == b.word_memory
+        && format!("{:?}", a.table_counts) == format!("{:?}", b.table_counts)
+        && format!("{:?}", a.runtime_page_ranges) == format!("{:?}", b.runtime_page_ranges)
+}
+
+/// What level 1 made of the base's early statement, on the driver's clock:
+/// when the statement came, when its plan and program were made, when the
+/// final statement came and how long level 1 waited for it, and whether the
+/// early program was used.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EarlyNote {
+    pub stated_at: f64,
+    pub made_at: f64,
+    pub confirmed_at: f64,
+    pub waited: f64,
+    pub used: bool,
+}
+
+/// Early statements level 1 could not use, since the process started.
+static EARLY_MISMATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`EARLY_MISMATCHES`]' count.
+pub fn early_mismatches() -> usize {
+    EARLY_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `LAMBDA_VM_LEVELS_WAVES_IN_ORDER=1`: level 1's and level 2's streamed
 /// executions run each wave's instructions in program order on the wave's own
 /// thread, hashing inline ([`super::executor::StreamedExecution::new_pieced_in_order`]),
@@ -2475,6 +2574,9 @@ pub struct LevelClock {
 /// What a levels run measured.
 #[derive(Clone, Debug, Default)]
 pub struct LevelsTimes {
+    /// Under [`STATEMENT_EARLY_ENV`], when the base's early statement came
+    /// and what level 1 made of it ([`EarlyNote`]); `None` when none came.
+    pub early: Option<EarlyNote>,
     /// Under `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL`, what level 1's builder
     /// did once the base returned ([`super::wlfm::WholePoolNote`]).
     pub builder_whole_pool: Option<super::wlfm::WholePoolNote>,
@@ -2711,19 +2813,25 @@ pub fn prove_block_levels(
     let at_start = if keep { None } else { card_settle("start") };
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
-    type Statement = (
-        crate::block_whir::OwnedBlockStatement,
-        Vec<crate::block_whir::PreparedRoots>,
-    );
-    let (stx, srx) = mpsc::channel::<Statement>();
+    let (stx, srx) = mpsc::channel::<Stated>();
     let stx = std::sync::Mutex::new(Some(stx));
     let plan_cell: std::sync::OnceLock<WhirBlockPlan> = std::sync::OnceLock::new();
     let observe = |statement: crate::block_whir::BlockStatement<'_>,
                    roots: &[crate::block_whir::PreparedRoots]| {
         if let Some(tx) = stx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            let _ = tx.send((statement.to_owned(), roots.to_vec()));
+            let _ = tx.send(Stated::Final((statement.to_owned(), roots.to_vec())));
         }
     };
+    // The base's predicted statement (`LAMBDA_VM_LEVELS_STATEMENT_EARLY`),
+    // stamped with the driver's clock.
+    let observe_early = |statement: crate::block_whir::BlockStatement<'_>,
+                         roots: &[crate::block_whir::PreparedRoots]| {
+        if let Some(tx) = stx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send(Stated::Early((statement.to_owned(), roots.to_vec()), now()));
+        }
+    };
+    let early_note: std::sync::OnceLock<EarlyNote> = std::sync::OnceLock::new();
+    let early_note_ref = &early_note;
     // A group's words need the plan; a group that finishes before it is
     // derived waits in the channel as its parts, here as its words once it is.
     type Parts = (
@@ -2790,6 +2898,9 @@ pub fn prove_block_levels(
     let fill_parts_on = fill_parts();
     let commit_next_early_on = commit_next_early();
     let plan_lean_on = plan_lean();
+    // The early statement: only where level 1 runs beside the base and
+    // validates its program beside its execution.
+    let statement_early_on = statement_early() && beside && program_fast();
     let next_beside_on = next_beside();
     let waves_in_order_on = waves_in_order();
     // The validator joined after the fill: only where it runs beside the
@@ -2848,22 +2959,88 @@ pub fn prove_block_levels(
         // Level 1's thread: the plan, the program, then its execute, a piece
         // landed as soon as phase B has finished its groups.
         let level1 = scope.spawn(move || -> Result<Level1, String> {
-            let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
-            let plan = level_plan_measured(
-                elf_ref,
-                opts_ref,
-                format_ref,
-                statement.view(),
-                family,
-                Some(&roots),
-                !plan_lean_on,
-            )?;
-            let planned = now();
-            let plan_split = super::whir_block::take_plan_split();
             let beside_check = program_fast();
-            let (program, marks, (walk, compiled)) =
-                plan.closed_block_program_marked_timed(beside_check)?;
-            let compile_split = super::compiler::take_compile_split();
+            // The plan and the program from a statement and its roots.
+            let make = |statement: &crate::block_whir::OwnedBlockStatement,
+                        roots: &[crate::block_whir::PreparedRoots]|
+             -> Result<Made, String> {
+                let plan = level_plan_measured(
+                    elf_ref,
+                    opts_ref,
+                    format_ref,
+                    statement.view(),
+                    family,
+                    Some(roots),
+                    !plan_lean_on,
+                )?;
+                let planned = now();
+                let plan_split = super::whir_block::take_plan_split();
+                let (program, marks, (walk, compiled)) =
+                    plan.closed_block_program_marked_timed(beside_check)?;
+                let compile_split = super::compiler::take_compile_split();
+                Ok(Made {
+                    plan,
+                    planned,
+                    plan_split,
+                    program,
+                    marks,
+                    walk,
+                    compiled,
+                    compile_split,
+                })
+            };
+            let first = srx.recv().map_err(|_| "the prover never stated")?;
+            let made = match first {
+                Stated::Final((statement, roots)) => make(&statement, &roots)?,
+                // ★ The early statement (`LAMBDA_VM_LEVELS_STATEMENT_EARLY`):
+                // the plan and the program made from it while phase A ends,
+                // used only if the final statement is the same in every field
+                // with the same roots; else made again from the final one, as
+                // without the knob. Nothing is published before.
+                Stated::Early((early, early_roots), stated_at) => {
+                    let made_early = make(&early, &early_roots);
+                    let made_at = now();
+                    let t = std::time::Instant::now();
+                    let Stated::Final((statement, roots)) =
+                        srx.recv().map_err(|_| "the prover never stated")?
+                    else {
+                        return Err("the prover stated early twice".into());
+                    };
+                    let waited = t.elapsed().as_secs_f64();
+                    let confirmed_at = now();
+                    let same = same_statement(&early, &statement) && early_roots == roots;
+                    let (made, why) = match (same, made_early) {
+                        (true, Ok(made)) => (made, None),
+                        (true, Err(e)) => (make(&statement, &roots)?, Some(e)),
+                        (false, _) => (
+                            make(&statement, &roots)?,
+                            Some("the final statement differs".to_string()),
+                        ),
+                    };
+                    if let Some(why) = &why {
+                        EARLY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("LEVELS EARLY STATEMENT: not used ({why}); made from the final one");
+                    }
+                    let _ = early_note_ref.set(EarlyNote {
+                        stated_at,
+                        made_at,
+                        confirmed_at,
+                        waited,
+                        used: why.is_none(),
+                    });
+                    made
+                }
+            };
+            let Made {
+                plan,
+                planned,
+                plan_split,
+                program,
+                marks,
+                walk,
+                compiled,
+                compile_split,
+            } = made;
             #[cfg(test)]
             let program = level1_program_fault_for_test(program);
             // Off the knob, validated before the execution, as always.
@@ -3116,14 +3293,17 @@ pub fn prove_block_levels(
         // A format that argues local lookups proves a proof of its own kind
         // (it carries every group's local argue), held as either kind.
         let prove_base = || {
+            let early: Option<crate::block_whir::StatementObserver<'_>> =
+                statement_early_on.then_some(&observe_early);
             if format.local_lookups() {
-                crate::block_whir::prove_block_whir_local_observed_led(
+                crate::block_whir::prove_block_whir_local_observed_early(
                     elf,
                     input,
                     base_options,
                     format,
                     options,
                     &observe,
+                    early,
                     &on_group,
                     None,
                 )
@@ -3132,13 +3312,14 @@ pub fn prove_block_levels(
                     (proof.with_local(Some(local)), stamps)
                 })
             } else {
-                crate::block_whir::prove_block_whir_observed_groups(
+                crate::block_whir::prove_block_whir_observed_early(
                     elf,
                     input,
                     base_options,
                     format,
                     options,
                     &observe,
+                    early,
                     &on_group,
                 )
                 .map(|(proof, stamps)| (proof.with_local(None), stamps))
@@ -3213,6 +3394,7 @@ pub fn prove_block_levels(
     times.builder_end = builder_end.get().copied();
     times.builder_whole_pool = whole_pool_note.get().copied().flatten();
     times.validated_after_fill = after_fill_wait.get().copied();
+    times.early = early_note.get().copied();
     let (
         planned,
         emitted,

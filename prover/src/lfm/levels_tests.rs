@@ -58,6 +58,14 @@ fn streamed_options() -> crate::block_whir::BlockOptions {
     options
 }
 
+/// [`streamed_options`] with the chunks laid out off the packer's thread, as
+/// the block lays them out: where the base can state its statement early.
+fn pipelined_options() -> crate::block_whir::BlockOptions {
+    let mut options = streamed_options();
+    options.layout_workers = 2;
+    options
+}
+
 /// Level 1's BLAKE3 plan, as a verifier derives it (prepared roots on the
 /// host).
 fn b3_plan<L>(elf: &[u8], proof: &BlockWhirProof<L>, format: &BlockFormat) -> WhirBlockPlan {
@@ -835,6 +843,8 @@ struct ChainSteps {
     waves_in_order: bool,
     /// `LAMBDA_VM_LEVELS_PLAN_LEAN`.
     plan_lean: bool,
+    /// `LAMBDA_VM_LEVELS_STATEMENT_EARLY`.
+    statement_early: bool,
 }
 
 /// The levels' chain steps forced as given (the first two on this thread,
@@ -845,7 +855,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
     use super::levels::{
         prove_block_levels, set_commit_next_early_for_test, set_fill_parts_for_test,
         set_next_beside_for_test, set_packs_beside_for_test, set_plan_lean_for_test,
-        set_waves_in_order_for_test,
+        set_statement_early_for_test, set_waves_in_order_for_test,
     };
     use super::wlfm::set_columns_tiled_for_test;
     struct Restore;
@@ -858,6 +868,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             set_next_beside_for_test(None);
             set_waves_in_order_for_test(None);
             set_plan_lean_for_test(None);
+            set_statement_early_for_test(None);
         }
     }
     let ChainSteps {
@@ -868,6 +879,7 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         next_beside,
         waves_in_order,
         plan_lean,
+        statement_early,
     } = steps;
 
     assert!(
@@ -886,12 +898,17 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
         set_next_beside_for_test(Some(next_beside));
         set_waves_in_order_for_test(Some(waves_in_order));
         set_plan_lean_for_test(Some(plan_lean));
+        set_statement_early_for_test(Some(statement_early));
         prove_block_levels(
             &elf,
             &[],
             &opts,
             &format,
-            &streamed_options(),
+            &if statement_early {
+                pipelined_options()
+            } else {
+                streamed_options()
+            },
             WlfmFamily::B3,
             LevelStop::DEFAULT,
             true,
@@ -918,6 +935,18 @@ fn driven_under_chain_steps(steps: ChainSteps) -> super::levels::LevelsRun {
             run.plan.chip_loads().0.is_empty(),
             "the driver's plan measured nothing"
         );
+    }
+    match (statement_early, run.times.early) {
+        (false, early) => assert!(early.is_none(), "off: no early statement came"),
+        (true, Some(note)) => {
+            println!("LEVELS EARLY STATEMENT NOTE: {note:?} · level 1 emitted at {:.3}", run.times.emitted);
+            // Nothing of level 1 published before the final statement came.
+            assert!(
+                run.times.emitted >= note.confirmed_at,
+                "level 1's program published before the statement was confirmed: {note:?}"
+            );
+        }
+        (true, None) => panic!("on: no early statement came"),
     }
     let reference = measured.as_ref().unwrap_or(&run.plan);
     let held = derive_levels(reference, WlfmFamily::B3, false).expect("the levels derive");
@@ -1130,6 +1159,7 @@ fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
         next_beside: true,
         waves_in_order: true,
         plan_lean: false,
+        statement_early: false,
     });
     assert!(run.times.next_commit.is_some_and(|c| c.early));
     assert!(run.times.next_stream.is_some_and(|s| s.prebuilt.is_some()));
@@ -1150,6 +1180,122 @@ fn the_blake3_driver_with_its_plan_lean_proves_the_same_level_bytes() {
     });
     assert!(run.proofs.len() >= 2, "level 2 over the lean level 1");
     assert_eq!(run.times.plan_split[5], 0.0, "no probe ran");
+}
+
+/// ★ Level 1's program made from the base's early statement
+/// (`LAMBDA_VM_LEVELS_STATEMENT_EARLY`), confirmed against the final one, is
+/// the same program: a small BLAKE3 block driven with the knob on proves each
+/// level's bytes as [`prove_levels`] does, the early program was used, and
+/// nothing of level 1 was published before the final statement came. With
+/// the plan lean too, the same. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an
+/// untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels four times; box tier, deterministic grind"]
+fn the_blake3_driver_with_its_statement_early_proves_the_same_level_bytes() {
+    for plan_lean in [false, true] {
+        let before = super::levels::early_mismatches();
+        let run = driven_under_chain_steps(ChainSteps {
+            statement_early: true,
+            plan_lean,
+            ..ChainSteps::default()
+        });
+        let note = run.times.early.expect("an early statement came");
+        assert!(note.used, "plan lean {plan_lean}: the early program was used");
+        assert_eq!(super::levels::early_mismatches(), before, "no mismatch");
+        assert!(run.proofs.len() >= 2, "level 2 over level 1");
+    }
+}
+
+/// ★ Each wrong early statement ends in today's path: a unit's rows doubled,
+/// the replay one table short, the early roots' first word changed, the early
+/// public output changed. Level 1 is made again from the final statement,
+/// proves each level's bytes as [`prove_levels`] does, and exactly one
+/// mismatch is counted. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels eight times; box tier, deterministic grind"]
+fn a_wrong_early_statement_falls_back_to_the_final_ones_bytes() {
+    use crate::block_whir::{EarlyFault, set_early_fault_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_early_fault_for_test(EarlyFault::None);
+        }
+    }
+    let _restore = Restore;
+    for fault in [
+        EarlyFault::DoubledRows,
+        EarlyFault::ShortReplay,
+        EarlyFault::RootWord,
+        EarlyFault::PublicOutput,
+    ] {
+        set_early_fault_for_test(fault);
+        let before = super::levels::early_mismatches();
+        let run = driven_under_chain_steps(ChainSteps {
+            statement_early: true,
+            ..ChainSteps::default()
+        });
+        set_early_fault_for_test(EarlyFault::None);
+        let note = run.times.early.expect("an early statement came");
+        assert!(!note.used, "{fault:?}: the early program was not used");
+        assert_eq!(
+            super::levels::early_mismatches(),
+            before + 1,
+            "{fault:?}: one mismatch counted"
+        );
+        println!("LEVELS EARLY FAULT {fault:?}: fell back, the same level bytes");
+    }
+}
+
+/// ★ The base's early statement is its final one: small blocks' streamed
+/// bases (local lookups, BLAKE3) proved with an early observer hand it the
+/// statement and the prepared roots the final observer gets, field for field,
+/// before the final one comes; every table's rows were told as stated (no
+/// miss).
+#[test]
+#[ignore = "proves three small BLAKE3 blocks' bases; box tier"]
+fn the_early_statement_is_the_final_one() {
+    type Seen = std::sync::Mutex<Vec<(&'static str, String, Vec<crate::block_whir::PreparedRoots>)>>;
+    let format = b3_format();
+    let opts = ProofOptions::default_test_options();
+    let misses = crate::tables::trace_builder::rows_misses();
+    for name in ["test_commit_4", "all_instructions_64", "test_keccak_multi"] {
+        let elf = crate::test_utils::asm_elf_bytes(name);
+        let seen: Seen = std::sync::Mutex::new(Vec::new());
+        let note = |kind: &'static str| {
+            let seen = &seen;
+            move |s: crate::block_whir::BlockStatement<'_>, roots: &[crate::block_whir::PreparedRoots]| {
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((kind, format!("{:?}", s.to_owned()), roots.to_vec()));
+            }
+        };
+        let (fin, early) = (note("final"), note("early"));
+        crate::base_only::with_blake3_levels(|| {
+            crate::block_whir::prove_block_whir_local_observed_early(
+                &elf,
+                &[],
+                &opts,
+                &format,
+                &pipelined_options(),
+                &fin,
+                Some(&early),
+                &|_| {},
+                None,
+            )
+        })
+        .expect("the BLAKE3 base proves");
+        let seen = seen.into_inner().unwrap_or_else(|e| e.into_inner());
+        let kinds: Vec<&str> = seen.iter().map(|s| s.0).collect();
+        assert_eq!(kinds, ["early", "final"], "{name}: early first, then final");
+        assert_eq!(seen[0].1, seen[1].1, "{name}: the statement, field for field");
+        assert_eq!(seen[0].2, seen[1].2, "{name}: the prepared roots");
+        println!("EARLY STATEMENT {name}: confirmed");
+    }
+    assert_eq!(
+        crate::tables::trace_builder::rows_misses(),
+        misses,
+        "a table built at other rows than stated"
+    );
 }
 
 /// ★ A level plan derived without measuring emits the measured plan's
@@ -2238,7 +2384,7 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
     let p = t.plan_split;
     println!(
         "RTA LEVEL1 PLAN: frame {:.3}s · local {:.3}s · prepared {:.3}s · costs {:.3}s · receivers {:.3}s · \
-         probes {:.3}s · plan lean {} · stacks by card {}",
+         probes {:.3}s · plan lean {} · stacks by card {} · statement early {}",
         p[0],
         p[1],
         p[2],
@@ -2246,8 +2392,29 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
         p[4],
         p[5],
         super::levels::plan_lean(),
-        super::levels::stacks_by_card()
+        super::levels::stacks_by_card(),
+        super::levels::statement_early()
     );
+    match t.early {
+        Some(e) => println!(
+            "RTA LEVEL1 EARLY: statement at {:.3}s · planned and emitted at {:.3}s · confirmed at {:.3}s · \
+             waited {:.3}s · {} · mismatches {}",
+            e.stated_at,
+            e.made_at,
+            e.confirmed_at,
+            e.waited,
+            if e.used { "used" } else { "NOT USED" },
+            super::levels::early_mismatches()
+        ),
+        None => println!(
+            "RTA LEVEL1 EARLY: {}",
+            if super::levels::statement_early() {
+                "none came"
+            } else {
+                "off"
+            }
+        ),
+    }
     let c = t.compile_split;
     println!(
         "RTA LEVEL1 COMPILE: multiplicities {:.3}s · rows {:.3}s · join {:.3}s",
