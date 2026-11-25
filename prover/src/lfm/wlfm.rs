@@ -1686,7 +1686,9 @@ impl WlfmPrebuild {
     }
 
     /// The build: every prepared stack committed where `place` says, the
-    /// coverage rule checked, and the program's identity over the roots.
+    /// coverage rule checked, and under [`WlfmPrep::Stacked`] the program's
+    /// identity over the roots (under [`WlfmPrep::Evaluated`] the preparation
+    /// settled it).
     pub fn commit(self, place: StackPlace) -> Result<WlfmBuild, String> {
         let t = std::time::Instant::now();
         let WlfmPrebuild {

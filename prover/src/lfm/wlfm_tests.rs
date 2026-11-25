@@ -23,8 +23,8 @@ use super::hash::HasherKind;
 use super::wlfm::{
     WLFM_B4_QUERIES, WLFM_B16_STACK, WLFM_B64_STACK, WlfmBuild, WlfmHash, WlfmLevers, WlfmPrep,
     WlfmProof, WlfmRate, absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under,
-    check_coverage, execute_and_fill_unmerged, prove_wlfm, prove_wlfm_traces, test_format,
-    verify_wlfm, verify_wlfm_with, wlfm_config, wlfm_config_under,
+    check_coverage, execute_and_fill_unmerged, prepare_wlfm, prove_wlfm, prove_wlfm_traces,
+    test_format, verify_wlfm, verify_wlfm_with, wlfm_config, wlfm_config_under, wlfm_program_id,
 };
 use super::word::LfmWord;
 
@@ -507,7 +507,9 @@ fn the_coverage_rule_refuses_every_unbound_plan() {
 /// table's prefix at its AIR's count and no prepared stack; its proof carries
 /// no prepared opening, is smaller, and verifies; it is another identity than
 /// the stacked build, and each binding's proof is refused by the other's
-/// artifacts, as is the evaluated proof with a stacked opening added.
+/// artifacts, as is the evaluated proof with a stacked opening added. The
+/// evaluated identity, settled at the preparation rather than the commit, is
+/// its recomputation over the built artifacts and the prepared value.
 #[test]
 fn the_evaluated_binding_round_trips_with_no_prepared_chain_and_is_another_identity() {
     let _unground = test_format::set(None);
@@ -527,6 +529,30 @@ fn the_evaluated_binding_round_trips_with_no_prepared_chain_and_is_another_ident
         );
         assert!(a.counts.iter().any(|&c| c > 0), "the fixture has prefixes");
         assert_ne!(a.program_id, stacked.artifacts.program_id);
+        // The commit's own check of the evaluated identity is a debug
+        // assertion, compiled out of a release run: this is the release check.
+        assert_eq!(
+            a.program_id,
+            wlfm_program_id(a),
+            "the evaluated identity is its recomputation at {rate:?}"
+        );
+        let prepared = prepare_wlfm(
+            &program,
+            HASHER,
+            rate,
+            WlfmLevers::with_prep(WlfmPrep::Evaluated),
+        )
+        .unwrap_or_else(|e| panic!("the evaluated preparation: {e}"));
+        assert_eq!(
+            prepared.artifacts().program_id,
+            a.program_id,
+            "the prepared identity is the built one at {rate:?}"
+        );
+        assert_eq!(
+            stacked.artifacts.program_id,
+            wlfm_program_id(&stacked.artifacts),
+            "the stacked identity is its recomputation at {rate:?}"
+        );
         let proof = prove(&program, &evaluated);
         assert!(proof.prepared.is_empty(), "no prepared opening");
         verify_wlfm(a, &proof, &proof.public_words)
