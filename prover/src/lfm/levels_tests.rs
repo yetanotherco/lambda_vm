@@ -1284,7 +1284,18 @@ fn the_blake3_driver_with_its_waves_in_order_proves_the_same_level_bytes() {
 /// took. The level groups the second driver proved.
 #[cfg(feature = "cuda")]
 fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
-    use super::levels::prove_block_levels;
+    driven_under_levels_split_stacks(setting, false)
+}
+
+/// [`driven_under_levels_split`], with `by_card` every level's stacks held
+/// and each committed on its group's card (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`)
+/// instead of retired; the second card's ledger is empty again at the end.
+#[cfg(feature = "cuda")]
+fn driven_under_levels_split_stacks(
+    setting: math_cuda::device::TwoCardSplit,
+    by_card: bool,
+) -> u64 {
+    use super::levels::{prove_block_levels, set_stacks_by_card_for_test};
     use math_cuda::device::{
         TwoCardSplit, set_two_card_levels_for_test, set_two_card_split_for_test,
     };
@@ -1293,6 +1304,7 @@ fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
         fn drop(&mut self) {
             set_two_card_levels_for_test(None);
             set_two_card_split_for_test(None);
+            set_stacks_by_card_for_test(None);
         }
     }
     assert!(
@@ -1321,9 +1333,14 @@ fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
     let before = stark::multilinear_block::split_second_groups();
     // Every level's stacks retired: a held stack pins its group to card 0, and
     // a small block's levels would hold theirs (the same bytes either way).
+    // By card: held, each on its group's card.
+    set_stacks_by_card_for_test(Some(by_card));
     let run = {
-        let _retired =
-            super::levels::set_stacks_for_test(Some(super::wlfm::StackPlace::CardRetired));
+        let _retired = super::levels::set_stacks_for_test(Some(if by_card {
+            super::wlfm::StackPlace::Card
+        } else {
+            super::wlfm::StackPlace::CardRetired
+        }));
         prove_block_levels(
             &elf,
             &[],
@@ -1339,7 +1356,17 @@ fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
     };
     let second = stark::multilinear_block::split_second_groups() - before;
     let declined = multilinear::gpu::cross_card_declines() - declines;
+    if by_card {
+        let ledger = multilinear::gpu::in_second_role(multilinear::gpu::ledger_reserved);
+        println!(
+            "LEVELS STACKS BY CARD: the second card's ledger after the levels {:.2} GiB",
+            ledger as f64 / (1u64 << 30) as f64
+        );
+        assert_eq!(ledger, 0, "the second card's stacks and promises let go");
+    }
+    set_stacks_by_card_for_test(Some(false));
     set_two_card_levels_for_test(Some(TwoCardSplit::Off));
+    let by = if by_card { ", stacks by card" } else { "" };
     let held = {
         let _held = super::levels::set_stacks_for_test(Some(super::wlfm::StackPlace::Card));
         derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
@@ -1351,14 +1378,14 @@ fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
         let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
         assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
         println!(
-            "LEVELS TWO-CARD ({setting:?}) IDENTITY level {}: {} B equal",
+            "LEVELS TWO-CARD ({setting:?}{by}) IDENTITY level {}: {} B equal",
             k + 1,
             a.len()
         );
     }
     println!(
-        "LEVELS TWO-CARD ({setting:?}): {second} level group(s) proved by the second driver · cross-card \
-         declines {declined}"
+        "LEVELS TWO-CARD ({setting:?}{by}): {second} level group(s) proved by the second driver · \
+         cross-card declines {declined}"
     );
     assert_eq!(declined, 0, "a store was read from the other card");
     second
@@ -1390,6 +1417,36 @@ fn the_blake3_driver_with_its_levels_split_on_card_1_proves_the_same_level_bytes
         assert_eq!(split_placement().ordinal, 1, "the second driver on card 1");
         driven_under_levels_split(TwoCardSplit::Auto)
     };
+    assert!(second > 0, "no level group proved on card 1");
+}
+
+/// ★ Card, run alone, deterministic grind. Every level's stacks held and
+/// each committed on its group's card (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`),
+/// the levels' split forced on one card (a second backend of card 0): each
+/// level proves the bytes of one card with its stacks held on card 0, the
+/// second driver proved level groups, no store was read across, and the
+/// second backend's ledger is empty after the levels.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: proves a small BLAKE3 block and its levels twice; run alone, deterministic grind"]
+fn the_blake3_driver_with_its_stacks_by_card_forced_on_one_card_proves_the_same_level_bytes() {
+    let second =
+        driven_under_levels_split_stacks(math_cuda::device::TwoCardSplit::Forced, true);
+    assert!(second > 0, "no level group proved by the second driver");
+}
+
+/// ★ Two cards, run alone, deterministic grind. The same with the levels'
+/// second driver on card 1: held stacks committed there, their groups proved
+/// there, each level the bytes of one card.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "two cards: proves a small BLAKE3 block and its levels twice; run alone, deterministic grind"]
+fn the_blake3_driver_with_its_stacks_by_card_on_card_1_proves_the_same_level_bytes() {
+    use math_cuda::device::{TwoCardSplit, card_count, split_placement};
+    assert!(card_count() >= 2, "needs two cards, saw {}", card_count());
+    math_cuda::device::set_two_card_levels_for_test(Some(TwoCardSplit::Auto));
+    assert_eq!(split_placement().ordinal, 1, "the second driver on card 1");
+    let second = driven_under_levels_split_stacks(TwoCardSplit::Auto, true);
     assert!(second > 0, "no level group proved on card 1");
 }
 
@@ -2193,14 +2250,15 @@ fn print_level_chains(t: &super::levels::LevelsTimes, l1_prove_from: f64) {
     let p = t.plan_split;
     println!(
         "RTA LEVEL1 PLAN: frame {:.3}s · local {:.3}s · prepared {:.3}s · costs {:.3}s · receivers {:.3}s · \
-         probes {:.3}s · plan lean {}",
+         probes {:.3}s · plan lean {} · stacks by card {}",
         p[0],
         p[1],
         p[2],
         p[3],
         p[4],
         p[5],
-        super::levels::plan_lean()
+        super::levels::plan_lean(),
+        super::levels::stacks_by_card()
     );
     let c = t.compile_split;
     println!(

@@ -322,3 +322,143 @@ fn a_level_with_its_stacks_held_stays_on_card_0_under_the_split() {
     );
     assert_eq!(bytes(&split), bytes(&one), "held: the same bytes");
 }
+
+/// The probe level's stacks held (`StackPlace::Card`), each group's stack
+/// committed on the card `assign` picks from the groups' prices
+/// ([`super::wlfm::WlfmPrebuild::commit_on`]; `None`: today's commit), and
+/// proved streamed with phase B split over two drivers on the host or not:
+/// the build, the cards the stacks were given, the prove's answer and each
+/// group's (card, polynomials).
+#[allow(clippy::type_complexity)]
+fn held_by_card(
+    assign: Option<&dyn Fn(&[u64]) -> Vec<u8>>,
+    split_on_host: bool,
+) -> (
+    WlfmBuild,
+    Option<Vec<u8>>,
+    Result<WlfmProof, String>,
+    Vec<(u8, usize)>,
+) {
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    let pre = super::wlfm::prepare_wlfm(
+        &level,
+        hasher,
+        WlfmRate::Two,
+        WlfmLevers::with_family(WlfmFamily::B3),
+    )
+    .expect("the W-LFM host part");
+    let cards = assign.map(|f| f(&pre.group_prices()));
+    let built = pre
+        .commit_on(StackPlace::Card, cards.clone())
+        .expect("the W-LFM build");
+    let filled = execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+    let _on_host = OnHost;
+    set_levels_split_on_host_for_test(split_on_host);
+    let _ = take_wlfm_stamps();
+    let proof = prove_wlfm_traces_as(&built, filled, true, WlfmProving::Streamed);
+    let groups: Vec<(u8, usize)> = take_wlfm_stamps()
+        .map(|s| s.groups.iter().map(|g| (g.card, g.polys)).collect())
+        .unwrap_or_default();
+    (built, cards, proof, groups)
+}
+
+/// The driver's assignment: longest first over the groups' prices.
+fn by_price(prices: &[u64]) -> Vec<u8> {
+    stark::phase_b_split::assign_cards(prices, &[])
+}
+
+/// Every group's stack on card 1.
+fn all_on_card_1(prices: &[u64]) -> Vec<u8> {
+    vec![1; prices.len()]
+}
+
+/// ★ With each held stack committed on its group's card
+/// (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`), a level whose stacks are all held
+/// splits over two drivers where it otherwise stays on card 0: every group
+/// with its stack on card 1 is argued by the second driver and every other by
+/// the first, the program's identity (hashed over the stacks in group order)
+/// and the proof's bytes are the one-card level's, and the proof verifies.
+/// Every stack on card 1 too: the first driver then argues none.
+#[test]
+fn stacks_held_by_card_split_the_level_with_the_same_bytes() {
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let (one_built, _, one, one_groups) = held_by_card(None, true);
+    let one = one.expect("the held level proves");
+    assert!(
+        cards(&one_groups).iter().all(|&c| c == 0),
+        "held, today: every group on card 0"
+    );
+    for assign in [&by_price as &dyn Fn(&[u64]) -> Vec<u8>, &all_on_card_1] {
+        let (built, stacks, two, groups) = held_by_card(Some(assign), true);
+        let stacks = stacks.expect("cards given");
+        let two = two.expect("the level held by card proves");
+        assert!(stacks.contains(&1), "a stack on card 1: {stacks:?}");
+        assert_eq!(
+            cards(&groups),
+            stacks,
+            "each group argued on its stack's card"
+        );
+        assert_eq!(
+            built.artifacts.program_id, one_built.artifacts.program_id,
+            "the program's identity over the stacks in group order"
+        );
+        verify_wlfm(&built.artifacts, &two, &two.public_words).expect("verifies");
+        assert_eq!(bytes(&two), bytes(&one), "the stacks by card moved a byte");
+    }
+}
+
+/// A held stack on card 1 whose level is not split (the split not asked, as
+/// when the second card was marked failed after the commit) is a clean error
+/// of the level's prove, never a panic or a proof.
+#[test]
+fn a_stack_held_on_card_1_without_the_split_is_a_clean_error() {
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let proved = std::panic::catch_unwind(|| held_by_card(Some(&by_price), false).2);
+    match proved {
+        Ok(Err(e)) => assert!(e.contains("second card"), "the error says why: {e}"),
+        Ok(Ok(_)) => panic!("a stack held on card 1 proved without the split"),
+        Err(_) => panic!("the prove panicked"),
+    }
+}
+
+/// The second card failing in its stack commits (a test's fault before its
+/// first stack, and before its second, after one was made there; every stack
+/// given to card 1): every stack is committed on card 0 (the one made there
+/// turned back into its columns first), and the level proves the one-card
+/// level's bytes with every group on card 0.
+#[test]
+fn a_second_card_fault_in_the_stack_commits_commits_them_on_card_0() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::wlfm::set_second_stack_fault_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let (one_built, _, one, _) = held_by_card(None, true);
+    let one = one.expect("the held level proves");
+    for at in [0usize, 1] {
+        super::wlfm::set_second_stack_fault_for_test(Some(at));
+        let (built, stacks, proof, groups) = held_by_card(Some(&all_on_card_1), true);
+        super::wlfm::set_second_stack_fault_for_test(None);
+        assert!(
+            stacks.is_some_and(|s| s.len() > at),
+            "fault at {at}: a stack there to fault"
+        );
+        let proof = proof.unwrap_or_else(|e| panic!("fault at {at}: the level proves: {e}"));
+        assert!(
+            cards(&groups).iter().all(|&c| c == 0),
+            "fault at {at}: every stack on card 0, so every group: {groups:?}"
+        );
+        assert_eq!(
+            built.artifacts.program_id, one_built.artifacts.program_id,
+            "fault at {at}: the same roots"
+        );
+        assert_eq!(bytes(&proof), bytes(&one), "fault at {at}: the same bytes");
+    }
+}

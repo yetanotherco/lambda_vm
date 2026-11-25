@@ -1163,10 +1163,87 @@ fn narrow_pack_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// A prepared level committed where [`stack_place`] puts it.
+/// A prepared level committed where [`stack_place`] puts it; under
+/// [`STACKS_BY_CARD_ENV`] (with the levels' split ready and the stacks on a
+/// card) each group's stack on the card its group is assigned to
+/// ([`stark::phase_b_split::assign_cards`] of [`WlfmPrebuild::group_prices`]).
 pub(crate) fn commit_level(pre: WlfmPrebuild, level: usize) -> Result<WlfmBuild, String> {
     let place = stack_place(pre.prepared_cells(), level, stacks_forced()?);
-    pre.commit(place)
+    let cards = (place != StackPlace::Host && stacks_by_card_acts())
+        .then(|| stark::phase_b_split::assign_cards(&pre.group_prices(), &[]))
+        .filter(|cards| cards.contains(&1));
+    if let Some(cards) = &cards {
+        let cells = pre.prepared_cells_by_group();
+        let mut by_card = [(0u64, 0usize); 2];
+        for (g, &c) in cards.iter().enumerate() {
+            let at = &mut by_card[usize::from(c.min(1))];
+            let cells = cells.get(g).copied().unwrap_or(0);
+            at.0 += cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
+            at.1 += usize::from(cells > 0);
+        }
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "LEVELS STACKS level {level} by card (LAMBDA_VM_LEVELS_STACKS_BY_CARD): card 0 {:.2} GiB in \
+             {} stacks · card 1 {:.2} GiB in {} stacks · {}",
+            gib(by_card[0].0),
+            by_card[0].1,
+            gib(by_card[1].0),
+            by_card[1].1,
+            match place {
+                StackPlace::Card => "held",
+                _ => "retired",
+            }
+        );
+    }
+    pre.commit_on(place, cards)
+}
+
+/// `LAMBDA_VM_LEVELS_STACKS_BY_CARD=1`: under the levels' split
+/// (`LAMBDA_VM_TWO_CARD_LEVELS`, its second card ready), a level's groups are
+/// assigned to the two cards before its prepared stacks are committed, each
+/// stack is committed on its group's card (both cards at once), and phase B
+/// argues and opens each group whose stack is held on the card that holds it.
+/// Where a held stack otherwise pins its group to card 0, a level whose stacks
+/// are all held then splits too. The same roots on either card: the same
+/// proofs. Off by default (and for any word but `1`). Read once a process;
+/// a test's override is the process's (level 2's commit runs on a thread of
+/// its own).
+pub const STACKS_BY_CARD_ENV: &str = "LAMBDA_VM_LEVELS_STACKS_BY_CARD";
+
+/// A test's [`stacks_by_card`], process wide (0 the knob, 1 off, 2 on).
+static STACKS_BY_CARD_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests only: [`stacks_by_card`] forced for the process (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_stacks_by_card_for_test(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    STACKS_BY_CARD_FOR_TEST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`STACKS_BY_CARD_ENV`] is on (or a test's override).
+pub fn stacks_by_card() -> bool {
+    match STACKS_BY_CARD_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(STACKS_BY_CARD_ENV).ok().as_deref())
+    })
+}
+
+/// Whether [`stacks_by_card`] acts: the knob on, the levels' split on and its
+/// second card ready.
+fn stacks_by_card_acts() -> bool {
+    stacks_by_card()
+        && multilinear::gpu::two_card_levels_on()
+        && multilinear::gpu::two_card_split_ready()
 }
 
 /// Whether a chain whose last level (its `count`-th) built `last` goes on.
@@ -1665,6 +1742,11 @@ fn card_settle_on(at: &str, trim: bool) -> Option<CardReading> {
     } else {
         multilinear::gpu::settle_card_untrimmed()
     };
+    // Under the stacks by card the second card takes a level's stacks: it is
+    // drained (and read) at the same points, before its first stack.
+    if stacks_by_card_acts() {
+        second_card_settle(at, trim);
+    }
     let (pool_used, pool_peak, free, total) = reading?;
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     // Said as it happens, so a run that fails later still shows it.
@@ -1684,6 +1766,31 @@ fn card_settle_on(at: &str, trim: bool) -> Option<CardReading> {
         free,
         total,
     })
+}
+
+/// [`card_settle_on`] on the second card, in its role: drained (trimmed when
+/// `trim`) and read, printed as the second card's.
+fn second_card_settle(at: &str, trim: bool) {
+    multilinear::gpu::in_second_role(|| {
+        let reading = if trim {
+            multilinear::gpu::settle_card()
+        } else {
+            multilinear::gpu::settle_card_untrimmed()
+        };
+        if let Some((pool_used, pool_peak, free, total)) = reading {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "LEVELS CARD {at} (second card): pool {:.2} GiB (peak before {:.2}) · free {:.2} of \
+                 {:.2} GiB · ledger {:.2} of {:.2} GiB promised",
+                gib(pool_used),
+                gib(pool_peak),
+                gib(free),
+                gib(total),
+                gib(multilinear::gpu::ledger_reserved()),
+                gib(multilinear::gpu::reserve_budget())
+            );
+        }
+    });
 }
 
 /// `LAMBDA_VM_LEVELS_SETTLE_LATE=1`: at the base's end the driver reads the
