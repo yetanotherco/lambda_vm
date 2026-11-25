@@ -5711,6 +5711,10 @@ pub(crate) struct Deviations {
     /// not fit it (`Some(true)`), or at BITWISE's arrival (`Some(false)`),
     /// instead of the knob ([`close_before_bitwise`]).
     pub close_before_bitwise: Option<bool>,
+    /// The sliding finish starts the late families' tables first
+    /// (`Some(true)`) or in hand-on order (`Some(false)`), instead of the knob
+    /// ([`finish_late_first`]).
+    pub finish_late_first: Option<bool>,
     /// KECCAK_RND's tables handed out during the windows (`Some(true)`) or
     /// built at the finish (`Some(false)`), instead of the knob
     /// ([`stream_keccak_rnd_records`]).
@@ -7549,6 +7553,29 @@ const CLOSE_BEFORE_BITWISE_ENV: &str = "LAMBDA_VM_CLOSE_BEFORE_BITWISE";
 /// `LAMBDA_VM_CLOSE_BEFORE_BITWISE` (off by default). The group would close at
 /// BITWISE's arrival all the same, so the groups and the proof's bytes are the
 /// same; the group's commit runs beside BITWISE's build instead of after it.
+/// `LAMBDA_VM_FINISH_LATE_FIRST`: unset, empty or `0` (the default) starts
+/// the sliding finish's tables in the order they are handed on; `1` starts
+/// the tables of the families whose rows are known only once built (LT, MUL,
+/// DVRM, BRANCH, BYTEWISE) first, so their heights, which the early
+/// statement waits for, are told sooner. The same tables handed on in the
+/// same order: the same groups and proof. Anything else refuses the prove.
+const FINISH_LATE_FIRST_ENV: &str = "LAMBDA_VM_FINISH_LATE_FIRST";
+
+/// Whether the finish starts the late families' tables first: `deviation`,
+/// or [`FINISH_LATE_FIRST_ENV`].
+fn finish_late_first(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => match std::env::var(FINISH_LATE_FIRST_ENV).ok().as_deref().map(str::trim) {
+            None | Some("" | "0") => Ok(false),
+            Some("1") => Ok(true),
+            Some(v) => Err(Error::Prover(format!(
+                "{FINISH_LATE_FIRST_ENV}={v}: 0 (the default: in hand-on order) or 1 (late families first)"
+            ))),
+        },
+    }
+}
+
 fn close_before_bitwise(deviation: Option<bool>) -> Result<bool, Error> {
     match deviation {
         Some(on) => Ok(on),
@@ -10000,6 +10027,12 @@ fn prove_streamed(
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let pages_first = pages_first(deviations.pages_first)?;
+        let late_first = finish_late_first(deviations.finish_late_first)?;
+        if late_first {
+            eprintln!(
+                "BLOCK FINISH LATE FIRST: the late families' tables start first ({FINISH_LATE_FIRST_ENV})"
+            );
+        }
         eprintln!(
             "★ BLOCK COMMIT ENCODES: {} ({})",
             if multilinear::gpu::serial_encodes() {
@@ -10528,6 +10561,9 @@ fn prove_streamed(
                 }
                 if pages_first {
                     builder = builder.pages_first();
+                }
+                if late_first {
+                    builder = builder.late_rows_first();
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);

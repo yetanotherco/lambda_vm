@@ -1449,6 +1449,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The late families' tables started first when the finish slides
+    /// ([`StreamSkip::late_first`]): the same tables, handed on in the same
+    /// order.
+    pub fn late_rows_first(mut self) -> Self {
+        self.emitted.late_first = true;
+        self
+    }
+
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables counted
     /// from each table's rows as it is built, phase 4 beside the rest's builds
     /// and BITWISE handed on last ([`StreamSkip::bitwise_from_tables`]), when

@@ -1305,6 +1305,46 @@ fn the_early_statement_is_the_final_one() {
     );
 }
 
+/// ★ The finish starting its late families' tables first
+/// (`LAMBDA_VM_FINISH_LATE_FIRST`) proves the same base: small blocks proved
+/// streamed and pipelined with the knob on and off, each proof's bytes equal.
+/// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves two small blocks' bases twice; box tier, deterministic grind"]
+fn the_finish_starting_its_late_tables_first_proves_the_same_base_bytes() {
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = at_blowup_4(small_format());
+    let opts = ProofOptions::default_test_options();
+    for name in ["test_commit_4", "all_instructions_64"] {
+        let elf = crate::test_utils::asm_elf_bytes(name);
+        let prove = |late: bool| {
+            let deviations = crate::block_whir::Deviations {
+                finish_late_first: Some(late),
+                ..Default::default()
+            };
+            let (proof, _) = crate::block_whir::prove_block_whir_observed_with(
+                &elf,
+                &[],
+                &opts,
+                &format,
+                &pipelined_options(),
+                &deviations,
+                &|_, _| {},
+            )
+            .expect("the base proves");
+            rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .expect("serializes")
+                .to_vec()
+        };
+        let (off, on) = (prove(false), prove(true));
+        assert!(off == on, "{name}: the late families started first moved a byte");
+        println!("FINISH LATE FIRST IDENTITY {name}: {} B equal", on.len());
+    }
+}
+
 /// ★ A level plan derived without measuring emits the measured plan's
 /// program: the same instructions, addresses, arena schema, column groups and
 /// leaf marks, the same costs and partition, over two small BLAKE3 blocks;
