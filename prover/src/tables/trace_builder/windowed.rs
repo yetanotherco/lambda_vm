@@ -1631,9 +1631,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         logs: &[Log],
         gate: &super::gate::ByteGate,
         keep: bool,
-        on_header: impl FnOnce(
-            super::RestHeader,
-        ) -> Result<(RestSink<'s>, Option<RowsSink<'s>>), Error>,
+        on_header: impl FnOnce(super::RestHeader) -> Result<(RestSink<'s>, Option<RowsSink<'s>>), Error>,
     ) -> Result<Option<super::RestRegen>, Error> {
         let slide = self.slide_rest;
         let Finishing {
@@ -1700,7 +1698,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             &mut *send,
             keep,
             slide,
-            rows.as_mut().map(|r| &mut **r as &mut dyn FnMut(super::RowsNote)),
+            rows.as_mut()
+                .map(|r| &mut **r as &mut dyn FnMut(super::RowsNote)),
         )
     }
 

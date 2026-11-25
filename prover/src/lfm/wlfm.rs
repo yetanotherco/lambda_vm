@@ -1369,7 +1369,9 @@ fn commit_by_card<H: WhirHash>(
             .into_iter()
             .map(|(k, stack)| commit_one::<H>(stack, config, place).map(|p| (k, p)))
             .collect();
-        let on1 = worker.join().map_err(|_| "the second card's stack commits panicked");
+        let on1 = worker
+            .join()
+            .map_err(|_| "the second card's stack commits panicked");
         (on0, on1)
     });
     let mut out = on0?;

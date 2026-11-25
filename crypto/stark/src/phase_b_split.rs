@@ -465,7 +465,10 @@ mod tests {
         );
         // One held on card 1, none free: two cards, the pins honoured.
         let held1 = [Some(1), Some(0), Some(0)];
-        assert_eq!(plan_cards(Some(&free[..]), on, &prices, &held1), Ok(vec![1, 0, 0]));
+        assert_eq!(
+            plan_cards(Some(&free[..]), on, &prices, &held1),
+            Ok(vec![1, 0, 0])
+        );
         // A kept group is card 0's even with a stack on card 1.
         assert_eq!(
             plan_cards(Some(&[true, false, false][..]), on, &prices, &held1),

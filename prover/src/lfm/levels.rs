@@ -3270,7 +3270,9 @@ pub fn prove_block_levels(
                     };
                     if let Some(why) = &why {
                         EARLY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!("LEVELS EARLY STATEMENT: not used ({why}); made from the final one");
+                        eprintln!(
+                            "LEVELS EARLY STATEMENT: not used ({why}); made from the final one"
+                        );
                     }
                     let _ = early_note_ref.set(EarlyNote {
                         stated_at,

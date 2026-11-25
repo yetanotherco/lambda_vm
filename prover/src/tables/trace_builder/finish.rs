@@ -4687,8 +4687,7 @@ fn slide_units(
                                     )))
                                 });
                             let secs = t.elapsed().as_secs_f64();
-                            let _ =
-                                tx.send((position, number, family, rows, est_now, table, secs));
+                            let _ = tx.send((position, number, family, rows, est_now, table, secs));
                         });
                         building += 1;
                         building_bytes = building_bytes.saturating_add(est_now);
