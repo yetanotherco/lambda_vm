@@ -168,9 +168,10 @@ pub struct UploadOnce {
 /// thread.
 #[derive(Clone, Debug, Default)]
 pub struct GroupStamps {
-    /// The card phase B proved the group on: 0, or 1 under the two-card split
-    /// ([`BlockCommitted::with_two_card_split`]).
+    /// The logical card that proved the group in phase B.
     pub card: u8,
+    /// The logical card that committed the group in phase A.
+    pub commit_card: u8,
     pub tables: usize,
     pub polys: usize,
     pub cells: usize,
@@ -2197,6 +2198,8 @@ where
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
+    /// Backend holding this stack. A retired stack can be opened anywhere.
+    pub card: usize,
     /// The group whose fork opens it.
     pub group: usize,
     /// The tables it settles, in stack order: each table's position in the
@@ -2674,6 +2677,99 @@ where
         Ok(block)
     }
 
+    /// A level's groups committed one per card at a time, keeping each
+    /// group's original index for the commit-time transcript.
+    pub fn commit_level_indexed<H, T>(
+        tables: Vec<CommittedTable<'a, F, E>>,
+        sizes: &[usize],
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        cards: &[usize],
+        assignment: &[usize],
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        let expected = tables.len();
+        let mut tables = tables.into_iter();
+        let mut jobs = Vec::with_capacity(sizes.len());
+        for &size in sizes {
+            let group: Vec<_> = tables.by_ref().take(size).collect();
+            if group.len() != size || size == 0 {
+                return Err(MlError::QueryCountMismatch {
+                    expected: size,
+                    got: group.len(),
+                });
+            }
+            jobs.push(group);
+        }
+        if tables.len() != 0
+            || sizes.len() != assignment.len()
+            || cards.is_empty()
+            || assignment.iter().any(|&lane| lane >= cards.len())
+        {
+            return Err(MlError::QueryCountMismatch {
+                expected,
+                got: expected - tables.len(),
+            });
+        }
+        let entered = Instant::now();
+        let parts = phase_b_split::commit_indexed(
+            jobs,
+            cards,
+            assignment,
+            |card, g, group| {
+                let mut part = Self::commit_groups_with::<H, T>(
+                    std::iter::once(group),
+                    config,
+                    drop_levels,
+                    narrow,
+                    false,
+                    None,
+                    None,
+                    &CsProbe::default(),
+                    None,
+                    None,
+                    g,
+                )
+                .inspect_err(|err| {
+                    if matches!(err, MlError::DeviceFailed { .. }) {
+                        multilinear::gpu::mark_indexed_card_failed(
+                            card,
+                            "its level committer failed",
+                        );
+                    }
+                })?;
+                part.stamps[0].committed_at = entered.elapsed().as_secs_f64();
+                part.stamps[0].commit_card = card as u8;
+                Ok(part)
+            },
+            |card| {
+                multilinear::gpu::mark_indexed_card_failed(card, "its level committer panicked");
+                MlError::DeviceFailed {
+                    stage: "indexed level commit",
+                }
+            },
+        )?;
+        let mut parts = parts.into_iter();
+        let mut block = parts.next().ok_or(MlError::QueryCountMismatch {
+            expected: 1,
+            got: 0,
+        })?;
+        for mut part in parts {
+            block.tables.append(&mut part.tables);
+            block.sizes.append(&mut part.sizes);
+            block.groups.append(&mut part.groups);
+            block.roots.append(&mut part.roots);
+            block.stamps.append(&mut part.stamps);
+            block.spilled.append(&mut part.spilled);
+            block.ood.append(&mut part.ood);
+        }
+        Ok(block)
+    }
+
     /// Phase A over whatever groups arrive, in arrival order, until the
     /// producer stops: the groups (and so their sizes) are the prover's, and the
     /// statement carries them. Each group's wait for its tables is stamped, and
@@ -2785,6 +2881,7 @@ where
                 &probe,
                 None,
                 local.as_ref(),
+                0,
             );
         };
         let (block, close_wait) = std::thread::scope(|scope| {
@@ -2800,6 +2897,7 @@ where
                 &probe,
                 Some(&lane),
                 local.as_ref(),
+                0,
             );
             // Phase A's loop ended: the job under way finishes, the rest go.
             let closing = Instant::now();
@@ -2841,6 +2939,7 @@ where
         probe: &CsProbe,
         lane: Option<&zc_lane::ZcLane<'a, F, E>>,
         local: Option<&LocalPhaseA>,
+        first_group: usize,
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
@@ -2852,8 +2951,7 @@ where
         let probing = probe.mode == CsProbeMode::AfterCommit && upload_ahead && batched;
         // What this phase A commits of joint runs, and streams of them, and
         // how many commits fell back to the host.
-        let runs_from = multilinear::gpu::joint_runs();
-        let host_from = multilinear::gpu::host_fallbacks();
+        let (runs_from, _, host_from) = multilinear::gpu::commit_counters();
         let mut tables = Vec::new();
         let mut ood = Vec::new();
         let mut spilled: Vec<Option<Arc<Parked>>> = Vec::new();
@@ -2943,7 +3041,7 @@ where
                 });
             }
             sizes.push(size);
-            let group_index = sizes.len() - 1;
+            let group_index = first_group + sizes.len() - 1;
             if !upload_ahead && let Some(packed) = packing.take() {
                 install_and_spill(
                     packed,
@@ -2964,10 +3062,9 @@ where
             stamp.polys = layout.num_polys();
             stamp.commit_base = multilinear::gpu::ledger_reserved();
             stamp.commit_pool_before = multilinear::gpu::pool_reserved_now();
-            let runs_before = multilinear::gpu::joint_runs();
-            let not_held_before = multilinear::gpu::streamed_not_held();
+            let (runs_before, not_held_before, fallbacks_before) =
+                multilinear::gpu::commit_counters();
             stamp.commit_priced = multilinear::stacked_eval::commit_card_bytes(&layout, config);
-            let fallbacks_before = multilinear::gpu::host_fallbacks();
             multilinear::gpu::reset_reserved_window();
             // The probe reads the group's columns where the commit read them:
             // its tables point at the store until the commit's scope ends.
@@ -3171,17 +3268,16 @@ where
             ood.push(committed.ood);
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
             stamp.commit_pool_after = multilinear::gpu::pool_reserved_now();
-            let runs = multilinear::gpu::joint_runs();
+            let (runs, not_held, fallbacks) = multilinear::gpu::commit_counters();
             stamp.joint_runs = [
                 runs.0.saturating_sub(runs_before.0),
                 runs.1.saturating_sub(runs_before.1),
                 runs.2.saturating_sub(runs_before.2),
             ];
-            stamp.commit_streamed_not_held = multilinear::gpu::streamed_not_held()
+            stamp.commit_streamed_not_held = not_held
                 .since(not_held_before)
                 .add_back(multilinear::stacked_eval::round0_trees(stamp.polys, config).len());
-            stamp.commit_host_fallbacks =
-                multilinear::gpu::host_fallbacks().saturating_sub(fallbacks_before);
+            stamp.commit_host_fallbacks = fallbacks.saturating_sub(fallbacks_before);
             if let Some(lane) = lane {
                 lane.note_growth(stamp.commit_reserved.saturating_sub(stamp.commit_base));
             }
@@ -3269,13 +3365,13 @@ where
         // `host commits`: `multilinear::gpu::host_fallbacks` over phase A, a
         // process-wide counter (another commit made meanwhile counts too, and
         // without a card every commit is a host commit).
-        let runs = multilinear::gpu::joint_runs();
+        let (runs, _, host_fallbacks) = multilinear::gpu::commit_counters();
         eprintln!(
             "BLOCK COMMIT LEAVES STREAMED: {} of {} joint runs committed to be retired ({} joint runs committed) · host commits {}",
             runs.2.saturating_sub(runs_from.2),
             runs.1.saturating_sub(runs_from.1),
             runs.0.saturating_sub(runs_from.0),
-            multilinear::gpu::host_fallbacks().saturating_sub(host_from),
+            host_fallbacks.saturating_sub(host_from),
         );
         Ok(Self {
             tables,
@@ -3798,22 +3894,24 @@ where
                     run
                 })
                 .collect();
-            Some(std::thread::spawn(move || {
-                let t = Instant::now();
-                let packed: Vec<Option<multilinear::narrow::NarrowColumns>> = runs
-                    .into_iter()
-                    .map(|run| {
-                        run.and_then(|(first, width)| {
-                            multilinear::gpu::pack_resident(&store, first, width)
+            Some(std::thread::spawn(multilinear::gpu::inherit_card(
+                move || {
+                    let t = Instant::now();
+                    let packed: Vec<Option<multilinear::narrow::NarrowColumns>> = runs
+                        .into_iter()
+                        .map(|run| {
+                            run.and_then(|(first, width)| {
+                                multilinear::gpu::pack_resident(&store, first, width)
+                            })
                         })
-                    })
-                    .collect();
-                if let Some(mem) = mem {
-                    let ready = packed.iter().flatten().map(|p| p.data().len()).sum();
-                    mem.packed_ready.fetch_add(ready, Relaxed);
-                }
-                (packed, t.elapsed().as_secs_f64())
-            }))
+                        .collect();
+                    if let Some(mem) = mem {
+                        let ready = packed.iter().flatten().map(|p| p.data().len()).sum();
+                        mem.packed_ready.fetch_add(ready, Relaxed);
+                    }
+                    (packed, t.elapsed().as_secs_f64())
+                },
+            )))
         }
         (Narrowing::Host, _) => {
             let t = Instant::now();
@@ -5013,21 +5111,22 @@ pub fn split_second_groups() -> u64 {
     SPLIT_SECOND_GROUPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Runs `f`, card `lane`'s openings: the second card's inside their own pool
-/// ([`multilinear::gpu::on_second_card_openings`]), card 0's here.
-fn on_lane_openings<R: Send>(lane: usize, f: impl FnOnce() -> R + Send) -> R {
-    if lane == 1 {
+/// Openings never wait for work submitted to their own argument pool.
+fn on_lane_openings<R: Send>(indexed: bool, card: usize, f: impl FnOnce() -> R + Send) -> R {
+    if indexed {
+        multilinear::gpu::on_indexed_card(card, true, f)
+    } else if card == 1 {
         multilinear::gpu::on_second_card_openings(f)
     } else {
         f()
     }
 }
 
-/// Runs `f`, card `lane`'s upload (no parallel iterator in it): on this thread
-/// in the second card's role ([`multilinear::gpu::in_second_role`]), card 0's
-/// here.
-fn on_lane_upload<R>(lane: usize, f: impl FnOnce() -> R) -> R {
-    if lane == 1 {
+/// Bind the plain upload thread to the same backend as its driver.
+fn on_lane_upload<R>(indexed: bool, card: usize, f: impl FnOnce() -> R) -> R {
+    if indexed {
+        multilinear::gpu::in_indexed_card(card, f)
+    } else if card == 1 {
         multilinear::gpu::in_second_role(f)
     } else {
         f()
@@ -5252,65 +5351,113 @@ where
     let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let forks: Vec<usize> = (0..n).map(fork_of).collect();
 
-    // ★ THE TWO-CARD SPLIT (`LAMBDA_VM_TWO_CARD_SPLIT`): each group proves on
-    // its own fork of the post-roots transcript and its share is put back by
-    // group index, so the groups split over two cards prove the same bytes.
-    // Card 0 keeps what is tied to it: the caller's groups (rebuilt in phase
-    // B, each class in its order) and a held prepared stack (its codewords
-    // where phase A left them). One card when the knob is off, the second
-    // card is not ready, or fewer than two groups are free of a pin.
-    // The plan: each group's card, or one card and why. A spill is no reason
-    // for one card (a parked table comes back under its own lock, per group),
-    // nor a local argue begun in phase A (host data). Pinned to card 0: the
-    // caller's groups and a held prepared stack's.
-    let plan: Result<Vec<u8>, &'static str> = match &two_card_split {
-        None => Err("not asked by the caller"),
-        Some(_) if !split_on_host && !two_card_knob.on() => Err("the knob is off"),
-        Some(_) if !split_on_host && !multilinear::gpu::two_card_split_ready() => {
-            Err("the second card is not ready")
+    // Placement is computed after the canonical transcript front is bound.
+    // Legacy split callers keep their old admission rule and placement.
+    let explicit = if two_card_split.is_some() && !split_on_host {
+        multilinear::gpu::indexed_cards().map_err(|why| {
+            eprintln!("[gpu] {why}");
+            MlError::DeviceFailed {
+                stage: "phase B topology",
+            }
+        })?
+    } else {
+        None
+    };
+    let indexed = explicit.is_some();
+    let mut pins = vec![None; n];
+    if let Some(keep) = &two_card_split {
+        for (g, pin) in pins.iter_mut().enumerate() {
+            if keep.get(g).copied().unwrap_or(true) {
+                *pin = Some(0);
+            }
         }
-        Some(keep) => {
-            let prices: Vec<u64> = (0..n)
-                .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
-                .collect();
-            let pinned: Vec<bool> = (0..n)
-                .map(|g| keep.get(g).copied().unwrap_or(true) || prepared_is_held(prepared, g))
-                .collect();
-            if pinned.iter().filter(|&&p| !p).count() < 2 {
-                Err("fewer than two groups free of a pin")
-            } else {
-                let card = phase_b_split::assign_cards(&prices, &pinned);
-                if card.contains(&1) {
-                    Ok(card)
+    }
+    for p in prepared {
+        if matches!(&p.commitment, PreparedCommitment::Held(_)) {
+            if pins[p.group].is_some_and(|card| card != p.card) {
+                return Err(MlError::DeviceFailed {
+                    stage: "conflicting prepared stack affinity",
+                });
+            }
+            pins[p.group] = Some(p.card);
+        }
+    }
+    let pinned_count = pins.iter().flatten().count();
+    let prices = || {
+        (0..n)
+            .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
+            .collect::<Vec<_>>()
+    };
+    let declines_before = multilinear::gpu::cross_card_declines();
+    let (cards, card) = if let Some(cards) = explicit {
+        let lane_pins = pins
+            .iter()
+            .map(|pin| {
+                pin.map(|card| {
+                    cards
+                        .iter()
+                        .position(|&id| id == card)
+                        .ok_or(MlError::DeviceFailed {
+                            stage: "prepared or regeneration owner unavailable",
+                        })
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let assignment = phase_b_split::assign_indexed(&prices(), &lane_pins, cards.len()).ok_or(
+            MlError::DeviceFailed {
+                stage: "indexed phase B placement",
+            },
+        )?;
+        (cards, assignment)
+    } else {
+        if pins.iter().flatten().any(|&card| card != 0) {
+            return Err(MlError::DeviceFailed {
+                stage: "prepared stack owner unavailable",
+            });
+        }
+        let plan = match &two_card_split {
+            None => Err("not asked by the caller"),
+            Some(_) if !split_on_host && !two_card_knob.on() => Err("the knob is off"),
+            Some(_) if !split_on_host && !multilinear::gpu::two_card_split_ready() => {
+                Err("the second card is not ready")
+            }
+            Some(_) if n - pinned_count < 2 => Err("fewer than two groups free of a pin"),
+            Some(_) => {
+                let assignment = phase_b_split::assign_indexed(&prices(), &pins, 2)
+                    .expect("legacy pins are on card 0");
+                if assignment.contains(&1) {
+                    Ok(assignment)
                 } else {
                     Err("no group for the second card")
                 }
             }
+        };
+        match plan {
+            Ok(assignment) => (vec![0, 1], assignment),
+            Err(why) => {
+                if two_card_split.is_some() {
+                    match two_card_knob {
+                        TwoCardKnob::Split => eprintln!("BLOCK TWO-CARD PHASE B: off ({why})"),
+                        TwoCardKnob::Levels => {
+                            eprintln!("BLOCK TWO-CARD LEVEL PHASE B: off ({why})")
+                        }
+                    }
+                }
+                (vec![0], vec![0; n])
+            }
         }
     };
-    let pinned_count = match (&two_card_split, &plan) {
-        (Some(keep), Ok(_)) => (0..n)
-            .filter(|&g| keep.get(g).copied().unwrap_or(true) || prepared_is_held(prepared, g))
-            .count(),
-        _ => 0,
-    };
-    if let (Some(_), Err(why)) = (&two_card_split, &plan) {
-        match two_card_knob {
-            TwoCardKnob::Split => eprintln!("BLOCK TWO-CARD PHASE B: off ({why})"),
-            TwoCardKnob::Levels => eprintln!("BLOCK TWO-CARD LEVEL PHASE B: off ({why})"),
-        }
-    }
-    let split_card = plan.ok();
-    let declines_before = multilinear::gpu::cross_card_declines();
-    let lanes = if split_card.is_some() { 2 } else { 1 };
-    let card = split_card.unwrap_or_else(|| vec![0; n]);
-    let queue = std::sync::Mutex::new(phase_b_split::TurnQueue::new(order, card.clone()));
+    let lanes = cards.len();
+    let queue = std::sync::Mutex::new(
+        phase_b_split::TurnQueue::new(order, card.clone(), lanes).ok_or(MlError::DeviceFailed {
+            stage: "invalid phase B placement",
+        })?,
+    );
     let abort = std::sync::atomic::AtomicBool::new(false);
-    // Each driver's place in phase B's order at its latest turn.
-    let places = [
-        std::sync::atomic::AtomicUsize::new(usize::MAX),
-        std::sync::atomic::AtomicUsize::new(usize::MAX),
-    ];
+    let places: Vec<_> = (0..lanes)
+        .map(|_| std::sync::atomic::AtomicUsize::new(usize::MAX))
+        .collect();
 
     // Each card's own state: its groups' tables and spill slots, stamps,
     // retired stacks, claims and begun local argues, by group (another card's
@@ -5361,7 +5508,7 @@ where
         let mut retired = retired;
         let mut ood = ood;
         for (g, (tables_g, spilled_g)) in table_slices.into_iter().zip(spill_slices).enumerate() {
-            let lane = &mut lane_ins[usize::from(card[g].min(1)).min(lanes - 1)];
+            let lane = &mut lane_ins[card[g]];
             lane.tables[g] = Some(tables_g);
             lane.spilled[g] = Some(spilled_g);
             lane.stamps[g] = std::mem::take(&mut stamps[g]);
@@ -5383,6 +5530,7 @@ where
             mut ood,
             mut local_started,
         } = lane_in;
+        let card_id = cards[lane];
         // Each group's share, by group, assembled in group order at the end.
         let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
         let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
@@ -5398,7 +5546,7 @@ where
         // groups open where they argue): the groups opened on the openings' card
         // (counted after their openings ran there, a fallback to card 0 not), and
         // those kept on card 0 (a held prepared stack).
-        let openings_move = lane == 0 && multilinear::gpu::two_card_openings();
+        let openings_move = card_id == 0 && multilinear::gpu::two_card_openings();
         let mut two_card = (0usize, 0usize);
         let opened_on_own = std::sync::atomic::AtomicUsize::new(0);
         // Of those, the groups whose compact upload on the openings' card was
@@ -5428,6 +5576,7 @@ where
                 let Some(turn) = queue.begin(lane) else {
                     break;
                 };
+                places[lane].store(turn.turn, Relaxed);
                 if let Some(rest) = reorder.and_then(|reorder| reorder(turn.place, &turn.view)) {
                     let got = rest.len();
                     if let Err(expected) = queue.rerank(rest) {
@@ -5436,10 +5585,8 @@ where
                 }
                 (turn.group, turn.turn, queue.claim_next(lane))
             };
-            // The place this driver is at, for the error of the lower place.
-            places[lane.min(1)].store(p, std::sync::atomic::Ordering::Relaxed);
             stamps[g].start_b = entered.elapsed().as_secs_f64();
-            stamps[g].card = lane as u8;
+            stamps[g].card = card_id as u8;
             if sched {
                 let now = thread_schedstat();
                 if let (Some((then, h)), Some(now)) = (turn_sched, now) {
@@ -5566,68 +5713,77 @@ where
             let (argue_result, argue_end, next_store, joined, opened, open_paid) =
                 std::thread::scope(|scope| {
                     let uploader = next.map(|next| {
-                        scope.spawn(move || on_lane_upload(lane, move || upload_group(next)))
+                        scope.spawn(move || {
+                            on_lane_upload(indexed, card_id, move || upload_group(next))
+                        })
                     });
                     let opener = prev.as_mut().zip(prev_tables).map(|(earlier, its_tables)| {
                         scope.spawn(move || {
-                            on_lane_openings(lane, move || -> Result<Opened<F, E>, MlError> {
-                                // Every stream this thread draws is a background one,
-                                // so the argue's kernels are dispatched first.
-                                let _background = multilinear::gpu::background_streams();
-                                if let Some(stall) = overlap_faults.open_stall {
-                                    std::thread::sleep(stall);
-                                }
-                                #[cfg(any(test, feature = "test-utils"))]
-                                if overlap_faults.open_panics == Some(earlier.place) {
-                                    panic!("a test's opening thread panics");
-                                }
-                                let fails = overlap_faults.open_fails == Some(earlier.place);
-                                let (opened, stacked) = if prev_on_own_card {
-                                    let opened = multilinear::gpu::on_openings_card(|| {
-                                        // The group's columns once more, compact
-                                        // (records filled and narrow columns
-                                        // widened on the openings' card, into its
-                                        // ledger), so its openings open from the
-                                        // stack as on card 0. A card that declines
-                                        // leaves the host's columns: the same
-                                        // bytes, slower, and counted.
-                                        earlier.store = upload_group(its_tables);
-                                        if earlier.store.is_none() {
-                                            second_declined_ref
+                            on_lane_openings(
+                                indexed,
+                                card_id,
+                                move || -> Result<Opened<F, E>, MlError> {
+                                    // Every stream this thread draws is a background one,
+                                    // so the argue's kernels are dispatched first.
+                                    let _background = multilinear::gpu::background_streams();
+                                    if let Some(stall) = overlap_faults.open_stall {
+                                        std::thread::sleep(stall);
+                                    }
+                                    #[cfg(any(test, feature = "test-utils"))]
+                                    if overlap_faults.open_panics == Some(earlier.place) {
+                                        panic!("a test's opening thread panics");
+                                    }
+                                    let fails = overlap_faults.open_fails == Some(earlier.place);
+                                    let (opened, stacked) = if prev_on_own_card {
+                                        let opened = multilinear::gpu::on_openings_card(|| {
+                                            // The group's columns once more, compact
+                                            // (records filled and narrow columns
+                                            // widened on the openings' card, into its
+                                            // ledger), so its openings open from the
+                                            // stack as on card 0. A card that declines
+                                            // leaves the host's columns: the same
+                                            // bytes, slower, and counted.
+                                            earlier.store = upload_group(its_tables);
+                                            if earlier.store.is_none() {
+                                                second_declined_ref.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            open_group::<F, E, T, H>(
+                                                earlier, its_tables, prepared, deviations, config,
+                                                false, fails,
+                                            )
+                                        });
+                                        if opened.is_ok()
+                                            && multilinear::gpu::openings_on_own_backend()
+                                        {
+                                            opened_on_own_ref
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            TWO_CARD_OPENED
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                        opened
+                                    } else {
                                         open_group::<F, E, T, H>(
                                             earlier, its_tables, prepared, deviations, config,
                                             false, fails,
                                         )
+                                    }?;
+                                    on_group(GroupOpened {
+                                        group: earlier.group,
+                                        roots: roots_ref,
+                                        commit_ood: answers_ref,
+                                        argue: earlier.argue.as_ref(),
+                                        local: earlier.local.as_ref(),
+                                        tables: &earlier.proofs,
+                                        opening: &opened.opening,
+                                        prepared: opened.prepared.as_ref(),
                                     });
-                                    if opened.is_ok() && multilinear::gpu::openings_on_own_backend()
-                                    {
-                                        opened_on_own_ref
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        TWO_CARD_OPENED
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    opened
-                                } else {
-                                    open_group::<F, E, T, H>(
-                                        earlier, its_tables, prepared, deviations, config, false,
-                                        fails,
-                                    )
-                                }?;
-                                on_group(GroupOpened {
-                                    group: earlier.group,
-                                    roots: roots_ref,
-                                    commit_ood: answers_ref,
-                                    argue: earlier.argue.as_ref(),
-                                    local: earlier.local.as_ref(),
-                                    tables: &earlier.proofs,
-                                    opening: &opened.opening,
-                                    prepared: opened.prepared.as_ref(),
-                                });
-                                drop(stacked);
-                                Ok(opened)
-                            })
+                                    drop(stacked);
+                                    Ok(opened)
+                                },
+                            )
                         })
                     });
                     let argue_result = (|| -> Result<(), MlError> {
@@ -6055,69 +6211,65 @@ where
         })
     };
 
-    // Card 0's driver on this thread; the second card's, under the split, on
-    // a thread of its own inside the second card's pool. A failed driver
-    // stops the other at its next turn; the failure itself is the answer.
-    let mut lane_ins = lane_ins.into_iter();
-    let first = lane_ins.next().ok_or(MlError::QueryCountMismatch {
-        expected: lanes,
-        got: 0,
-    })?;
-    let second = lane_ins.next();
-    let (out0, out1) = std::thread::scope(|scope| {
-        let drive = &drive;
-        let abort = &abort;
-        let other = second.map(|lane_in| {
-            scope.spawn(move || {
-                let out = multilinear::gpu::on_second_card(move || drive(1, lane_in));
-                if out.is_err() {
-                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                out
-            })
-        });
-        let out0 = drive(0, first);
-        if out0.is_err() {
-            abort.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        let out1 = other.map(|handle| {
-            handle.join().unwrap_or(Err(MlError::DeviceFailed {
-                stage: "the second card's phase B",
-            }))
-        });
-        (out0, out1)
-    });
-    let is_abort =
-        |e: &MlError| matches!(e, MlError::DeviceFailed { stage } if *stage == OTHER_CARD_FAILED);
-    let outs: Vec<LaneOut<F, E>> = match (out0, out1) {
-        (Ok(a), None) => vec![a],
-        (Ok(a), Some(Ok(b))) => vec![a, b],
-        (Err(e), None) => return Err(e),
-        (Err(e), Some(Ok(_))) => return Err(e),
-        (Ok(_), Some(Err(e))) => {
-            if !split_on_host && matches!(e, MlError::DeviceFailed { .. }) && !is_abort(&e) {
-                multilinear::gpu::mark_second_failed("its phase-B driver failed");
+    // Join every driver before releasing shared records and stacks. Keep
+    // the earliest real error, even if a different driver saw cancellation.
+    let run = |lane, input| {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if indexed {
+                multilinear::gpu::on_indexed_card(cards[lane], false, || drive(lane, input))
+            } else if lane == 1 {
+                multilinear::gpu::on_second_card(|| drive(lane, input))
+            } else {
+                drive(lane, input)
             }
-            return Err(e);
+        }))
+        .unwrap_or(Err(MlError::DeviceFailed {
+            stage: "phase B driver panicked",
+        }));
+        if out.is_err() {
+            abort.store(true, Relaxed);
         }
-        (Err(e0), Some(Err(e1))) => {
-            // A driver's own failure over the other's stop; of two failures,
-            // the one at the lower place in phase B's order.
-            if !split_on_host && matches!(e1, MlError::DeviceFailed { .. }) && !is_abort(&e1) {
-                multilinear::gpu::mark_second_failed("its phase-B driver failed");
-            }
-            let (p0, p1) = (
-                places[0].load(std::sync::atomic::Ordering::Relaxed),
-                places[1].load(std::sync::atomic::Ordering::Relaxed),
-            );
-            return Err(match (is_abort(&e0), is_abort(&e1)) {
-                (true, false) => e1,
-                (false, true) => e0,
-                _ if p1 < p0 => e1,
-                _ => e0,
-            });
-        }
+        out
     };
+    let results = std::thread::scope(|scope| {
+        let mut inputs = lane_ins.into_iter().enumerate();
+        let (lane, first) = inputs.next().expect("at least one phase B driver");
+        let workers: Vec<_> = inputs
+            .map(|(lane, input)| scope.spawn(move || run(lane, input)))
+            .collect();
+        std::iter::once(run(lane, first))
+            .chain(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("driver panics are caught")),
+            )
+            .collect::<Vec<_>>()
+    });
+    let mut outs = Vec::with_capacity(lanes);
+    let mut errors = Vec::new();
+    for (lane, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(out) => outs.push(out),
+            Err(e) => {
+                let cancelled =
+                    matches!(&e, MlError::DeviceFailed { stage } if *stage == OTHER_CARD_FAILED);
+                if !cancelled && !split_on_host && matches!(&e, MlError::DeviceFailed { .. }) {
+                    if indexed {
+                        multilinear::gpu::mark_indexed_card_failed(
+                            cards[lane],
+                            "its phase-B driver failed",
+                        );
+                    } else if lane == 1 {
+                        multilinear::gpu::mark_second_failed("its phase-B driver failed");
+                    }
+                }
+                errors.push(((cancelled, places[lane].load(Relaxed), lane), e));
+            }
+        }
+    }
+    if let Some((_, error)) = errors.into_iter().min_by_key(|(order, _)| *order) {
+        return Err(error);
+    }
 
     // Each group's share and stamps back from the card that proved it.
     let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
@@ -6132,9 +6284,7 @@ where
     // budget).
     let mut lane_summary: Vec<(usize, usize, f64, f64, u64, u64)> = Vec::with_capacity(outs.len());
     for (lane, mut out) in outs.into_iter().enumerate() {
-        let mine: Vec<usize> = (0..n)
-            .filter(|&g| usize::from(card[g].min(1)).min(lanes - 1) == lane)
-            .collect();
+        let mine: Vec<usize> = (0..n).filter(|&g| card[g] == lane).collect();
         let (mut argue_s, mut cells) = (0.0f64, 0usize);
         let (mut first, mut last) = (f64::INFINITY, 0.0f64);
         for &g in &mine {
@@ -6166,7 +6316,12 @@ where
             out.budget,
         ));
     }
-    if lanes == 2 {
+    if indexed {
+        eprintln!(
+            "BLOCK INDEXED PHASE B: {lane_summary:?} on cards {cards:?} · pinned {pinned_count}"
+        );
+    }
+    if !indexed && lanes == 2 {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let card = |c: usize| {
             lane_summary.get(c).map_or(String::new(), |&(groups, cells, argue, span, most, budget)| {

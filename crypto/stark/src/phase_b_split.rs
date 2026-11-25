@@ -1,5 +1,4 @@
-//! Phase B's groups over two cards (`LAMBDA_VM_TWO_CARD_SPLIT`): which card
-//! proves which group, and the order each card takes its own groups in.
+//! Placement and turn order for groups proved on local cards.
 //!
 //! Each group proves on its own fork of the post-roots transcript and its
 //! share of the proof is put back by group index, so any partition of the
@@ -16,38 +15,129 @@ pub fn split_price(cells: u64, tables: usize) -> u64 {
     cells.saturating_add((tables as u64) << 20)
 }
 
-/// Each group's card, 0 or 1: the groups `pinned` to card 0 first (counted in
-/// its load), then the rest by longest-processing-time first — by price,
-/// descending, ties to the lower group — each to the card with the smaller
-/// load, ties to card 0. Deterministic in `prices` and `pinned` alone.
-pub fn assign_cards(prices: &[u64], pinned: &[bool]) -> Vec<u8> {
-    let n = prices.len();
-    let mut card = vec![0u8; n];
-    let mut load = [0u128; 2];
-    for (g, &price) in prices.iter().enumerate() {
-        if pinned.get(g).copied().unwrap_or(false) {
-            load[0] += u128::from(price);
+/// Stable largest-first placement with load seeded by pinned groups.
+pub fn assign_indexed(prices: &[u64], pins: &[Option<usize>], lanes: usize) -> Option<Vec<usize>> {
+    if lanes == 0 || prices.len() != pins.len() {
+        return None;
+    }
+    let mut cards = vec![0; prices.len()];
+    let mut loads = vec![0u128; lanes];
+    let mut free = Vec::new();
+    for (g, (&price, &pin)) in prices.iter().zip(pins).enumerate() {
+        if let Some(card) = pin {
+            *loads.get_mut(card)? += u128::from(price);
+            cards[g] = card;
+        } else {
+            free.push(g);
         }
     }
-    let mut free: Vec<usize> = (0..n)
-        .filter(|&g| !pinned.get(g).copied().unwrap_or(false))
-        .collect();
-    free.sort_by(|&a, &b| prices[b].cmp(&prices[a]).then(a.cmp(&b)));
+    free.sort_by_key(|&g| (std::cmp::Reverse(prices[g]), g));
     for g in free {
-        let c = usize::from(load[1] < load[0]);
-        card[g] = c as u8;
-        load[c] += u128::from(prices[g]);
+        let (card, _) = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|&(i, &load)| (load, i))?;
+        cards[g] = card;
+        loads[card] += u128::from(prices[g]);
     }
-    card
+    Some(cards)
 }
 
-/// Each card's summed price under `card`.
-pub fn card_loads(prices: &[u64], card: &[u8]) -> [u128; 2] {
-    let mut load = [0u128; 2];
-    for (g, &c) in card.iter().enumerate() {
-        load[usize::from(c.min(1))] += u128::from(prices[g]);
+/// The legacy two-card placement, with pins on card 0.
+pub fn assign_cards(prices: &[u64], pinned: &[bool]) -> Vec<usize> {
+    let pins: Vec<_> = (0..prices.len())
+        .map(|g| pinned.get(g).copied().unwrap_or(false).then_some(0))
+        .collect();
+    assign_indexed(prices, &pins, 2).expect("legacy pins are on card 0")
+}
+
+#[cfg(test)]
+fn card_loads(prices: &[u64], cards: &[usize]) -> [u128; 2] {
+    let mut loads = [0; 2];
+    for (&price, &card) in prices.iter().zip(cards) {
+        loads[card] += u128::from(price);
     }
-    load
+    loads
+}
+
+/// Commit one group at a time per assigned card. The result is in input
+/// index order. A failure cancels unstarted work and all workers are joined
+/// before any error is returned.
+pub fn commit_indexed<T: Send, R: Send, E: Send>(
+    jobs: Vec<T>,
+    cards: &[usize],
+    assignment: &[usize],
+    commit: impl Fn(usize, usize, T) -> Result<R, E> + Sync,
+    failed: impl Fn(usize) -> E,
+) -> Result<Vec<R>, E> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let count = jobs.len();
+    assert_eq!(count, assignment.len());
+    let mut lanes: Vec<Vec<_>> = cards.iter().map(|_| Vec::new()).collect();
+    for ((g, job), &lane) in jobs.into_iter().enumerate().zip(assignment) {
+        lanes[lane].push((g, job));
+    }
+    let cancel = AtomicBool::new(false);
+    let results = std::thread::scope(|scope| {
+        let workers: Vec<_> = cards
+            .iter()
+            .copied()
+            .zip(lanes)
+            .filter(|(_, jobs)| !jobs.is_empty())
+            .map(|(card, jobs)| {
+                let (cancel, commit) = (&cancel, &commit);
+                let first = jobs[0].0;
+                let worker = scope.spawn(move || {
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        multilinear::gpu::on_indexed_card(card, false, || {
+                            let mut done = Vec::with_capacity(jobs.len());
+                            for (g, job) in jobs {
+                                if cancel.load(Relaxed) {
+                                    break;
+                                }
+                                match commit(card, g, job) {
+                                    Ok(result) => done.push((g, result)),
+                                    Err(err) => return Err((g, err)),
+                                }
+                            }
+                            Ok(done)
+                        })
+                    }));
+                    if !matches!(&run, Ok(Ok(_))) {
+                        cancel.store(true, Relaxed);
+                    }
+                    run
+                });
+                (card, first, worker)
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|(card, first, worker)| match worker.join() {
+                Ok(Ok(result)) => result,
+                _ => Err((first, failed(card))),
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut slots: Vec<_> = (0..count).map(|_| None).collect();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(done) => {
+                for (g, result) in done {
+                    slots[g] = Some(result);
+                }
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    if let Some((_, err)) = errors.into_iter().min_by_key(|(g, _)| *g) {
+        return Err(err);
+    }
+    Ok(slots
+        .into_iter()
+        .map(|slot| slot.expect("each indexed commit finished"))
+        .collect())
 }
 
 /// The groups still to come in phase B, shared by the cards' drivers: each
@@ -63,11 +153,11 @@ pub struct TurnQueue {
     /// Groups whose turn started, in that order.
     started: Vec<usize>,
     /// Each card's claimed next group.
-    claimed: [Option<usize>; 2],
+    claimed: Vec<Option<usize>>,
     /// Groups neither started nor claimed, in phase B's order.
     rest: Vec<usize>,
     /// Each group's card.
-    card: Vec<u8>,
+    card: Vec<usize>,
 }
 
 /// A card's turn: its group; how many turns started before it, over both
@@ -84,25 +174,36 @@ pub struct Turn {
 
 impl TurnQueue {
     /// Phase B's `order` over cards `card` (one per group).
-    pub fn new(order: &[usize], card: Vec<u8>) -> Self {
-        Self {
+    pub fn new(order: &[usize], card: Vec<usize>, lanes: usize) -> Option<Self> {
+        let mut seen = vec![false; card.len()];
+        if lanes == 0
+            || order.len() != card.len()
+            || card.iter().any(|&lane| lane >= lanes)
+            || order.iter().any(|&g| {
+                seen.get_mut(g)
+                    .is_none_or(|seen| std::mem::replace(seen, true))
+            })
+        {
+            return None;
+        }
+        Some(Self {
             started: Vec::with_capacity(order.len()),
-            claimed: [None, None],
+            claimed: vec![None; lanes],
             rest: order.to_vec(),
             card,
-        }
+        })
     }
 
     fn is_mine(&self, lane: usize, g: usize) -> bool {
-        usize::from(self.card.get(g).copied().unwrap_or(0).min(1)) == lane
+        self.card[g] == lane
     }
 
     /// Card `lane`'s next turn, `None` when it has no group left: its claimed
     /// group, else the first of the order that is its own. The view is the
-    /// groups started, the other card's claimed group, this group, then the
+    /// groups started, the other cards' claimed groups, this group, then the
     /// rest: the hook may re-rank only the rest.
     pub fn begin(&mut self, lane: usize) -> Option<Turn> {
-        let g = match self.claimed[lane].take() {
+        let g = match self.claimed.get_mut(lane)?.take() {
             Some(g) => g,
             None => {
                 let at = self.rest.iter().position(|&g| self.is_mine(lane, g))?;
@@ -111,7 +212,7 @@ impl TurnQueue {
         };
         let turn = self.started.len();
         let mut view = self.started.clone();
-        view.extend(self.claimed[1 - lane]);
+        view.extend(self.claimed.iter().flatten().copied());
         let place = view.len();
         view.push(g);
         view.extend_from_slice(&self.rest);
@@ -146,6 +247,9 @@ impl TurnQueue {
     /// Card `lane` claims its next group: the first of the rest that is its
     /// own, taken out of the rest.
     pub fn claim_next(&mut self, lane: usize) -> Option<usize> {
+        if let Some(g) = *self.claimed.get(lane)? {
+            return Some(g);
+        }
         let at = self.rest.iter().position(|&g| self.is_mine(lane, g))?;
         let g = self.rest.remove(at);
         self.claimed[lane] = Some(g);
@@ -172,7 +276,7 @@ mod tests {
         order: &[usize],
         hook: &Hook<'_>,
     ) -> Vec<(usize, usize, Vec<usize>, Option<usize>)> {
-        let mut q = TurnQueue::new(order, vec![0; order.len()]);
+        let mut q = TurnQueue::new(order, vec![0; order.len()], 1).unwrap();
         let mut out = Vec::new();
         while let Some(turn) = q.begin(0) {
             if let Some(rest) = hook(turn.place, &turn.view) {
@@ -235,14 +339,14 @@ mod tests {
             vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 0],
             vec![1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
         ] {
-            let mut q = TurnQueue::new(&order, card.clone());
+            let mut q = TurnQueue::new(&order, card.clone(), 2).unwrap();
             let mut taken: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
             let mut turns = Vec::new();
             for &lane in &script {
                 if let Some(turn) = q.begin(lane) {
                     turns.push(turn.turn);
                     assert_eq!(turn.view[turn.place], turn.group);
-                    assert_eq!(usize::from(card[turn.group]), lane);
+                    assert_eq!(card[turn.group], lane);
                     taken[lane].push(turn.group);
                     q.claim_next(lane);
                 }
@@ -253,11 +357,7 @@ mod tests {
                     taken.push(turn.group);
                     q.claim_next(lane);
                 }
-                let own: Vec<usize> = order
-                    .iter()
-                    .copied()
-                    .filter(|&g| usize::from(card[g]) == lane)
-                    .collect();
+                let own: Vec<usize> = order.iter().copied().filter(|&g| card[g] == lane).collect();
                 assert_eq!(*taken, own, "card {lane} under {script:?}");
             }
             let mut all = q.started().to_vec();
@@ -277,7 +377,7 @@ mod tests {
     fn a_claimed_group_is_out_of_the_hooks_reach() {
         let order = [0usize, 1, 2, 3, 4, 5];
         let card = vec![0, 1, 0, 1, 0, 1];
-        let mut q = TurnQueue::new(&order, card);
+        let mut q = TurnQueue::new(&order, card, 2).unwrap();
         let t0 = q.begin(0).expect("card 0's first");
         assert_eq!((t0.group, t0.place), (0, 0));
         assert_eq!(q.claim_next(0), Some(2));
@@ -296,12 +396,37 @@ mod tests {
     }
 
     #[test]
+    fn four_cards_keep_all_claims_outside_the_rerankable_suffix() {
+        let prices = [3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1];
+        let mut pins = [None; 12];
+        pins[0] = Some(3);
+        pins[1] = Some(2);
+        let cards = assign_indexed(&prices, &pins, 4).expect("valid pins");
+        assert_eq!(cards, [3, 2, 0, 1, 0, 1, 2, 3, 0, 1, 2, 3]);
+        let order: Vec<_> = (0..prices.len()).collect();
+        let mut queue = TurnQueue::new(&order, cards.clone(), 4).unwrap();
+        for lane in 0..3 {
+            queue.begin(lane).unwrap();
+            let claimed = queue.claim_next(lane).unwrap();
+            assert_eq!(queue.claim_next(lane), Some(claimed));
+        }
+        let turn = queue.begin(3).unwrap();
+        assert_eq!(turn.view, [2, 3, 1, 4, 5, 6, 0, 7, 8, 9, 10, 11]);
+        assert_eq!(turn.place, 6);
+        queue.rerank(vec![11, 10, 9, 8, 7]).unwrap();
+        assert_eq!(queue.begin(0).unwrap().group, 4);
+        assert!(TurnQueue::new(&[0, 0], vec![0, 0], 4).is_none());
+        assert!(TurnQueue::new(&[0], vec![4], 4).is_none());
+        assert!(assign_indexed(&[1], &[Some(4)], 4).is_none());
+    }
+
+    #[test]
     fn the_assignment_is_deterministic_and_ties_go_to_card_0() {
         let prices = [10u64, 10, 10, 10];
         let a = assign_cards(&prices, &[false; 4]);
         assert_eq!(a, vec![0, 1, 0, 1], "equal prices alternate, card 0 first");
         assert_eq!(assign_cards(&prices, &[false; 4]), a);
-        assert_eq!(assign_cards(&[], &[]), Vec::<u8>::new());
+        assert_eq!(assign_cards(&[], &[]), Vec::<usize>::new());
         assert_eq!(assign_cards(&[7], &[false]), vec![0]);
     }
 

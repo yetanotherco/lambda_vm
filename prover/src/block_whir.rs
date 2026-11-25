@@ -6960,6 +6960,7 @@ pub(crate) fn prove_traces(
             .iter()
             .zip(&borrowed)
             .map(|(p, columns)| multilinear_block::BlockPrepared {
+                card: 0,
                 group: p.group,
                 tables: p.tables.clone(),
                 commitment: (&p.commitment).into(),
@@ -10961,6 +10962,7 @@ fn prove_streamed(
             .iter()
             .zip(&borrowed)
             .map(|(p, columns)| multilinear_block::BlockPrepared {
+                card: 0,
                 group: p.group,
                 tables: p.tables.clone(),
                 commitment: (&p.commitment).into(),

@@ -384,3 +384,120 @@ fn of_two_failures_the_answer_is_a_failure_not_a_stop() {
         Ok(_) => panic!("proved with two failures"),
     }
 }
+
+/// Run separately with LAMBDA_VM_CARDS set to one, two or four ordinals.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone with an explicit card list"]
+fn indexed_cards_assemble_shuffled_phase_b() {
+    let topology = multilinear::gpu::indexed_cards()
+        .expect("configured backends initialize")
+        .expect("set LAMBDA_VM_CARDS");
+    let argue = ArgueFormat::PerTable;
+    let keep = [false; SIZES.len()];
+    let (serial, baseline) = prove_split(
+        argue,
+        PhaseBOverlap::Off,
+        &in_order(),
+        true,
+        Split::None,
+        &keep,
+        OverlapFaults::default(),
+    );
+    let reversed: Vec<_> = in_order().into_iter().rev().collect();
+    let (shuffled, pieces) = prove_split(
+        argue,
+        PhaseBOverlap::On,
+        &reversed,
+        true,
+        Split::OptedIn,
+        &keep,
+        OverlapFaults::default(),
+    );
+    let shuffled = shuffled.expect("indexed drivers prove");
+    let mut ran: Vec<_> = cards(&shuffled).into_iter().map(usize::from).collect();
+    ran.sort_unstable();
+    ran.dedup();
+    assert_eq!(ran, topology);
+    assert_ne!(
+        pieces.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
+        in_order()
+    );
+    assert_eq!(sorted(pieces), sorted(baseline));
+    assert_eq!(
+        bytes(&shuffled),
+        bytes(&serial.expect("serial reference proves"))
+    );
+    verify(argue, &shuffled).expect("verifies");
+}
+
+/// Run with four aliases and retention disabled, in its own process because
+/// this test intentionally quarantines a card.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone with four aliases"]
+fn indexed_driver_error_joins_and_releases_its_work() {
+    use multilinear::gpu;
+    let topology = gpu::indexed_cards().unwrap().expect("set LAMBDA_VM_CARDS");
+    assert_eq!(topology.len(), 4);
+    let held = || {
+        topology
+            .iter()
+            .map(|&card| gpu::in_indexed_card(card, gpu::ledger_reserved))
+            .collect::<Vec<_>>()
+    };
+    let before = held();
+    let (result, _) = prove_split(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::On,
+        &in_order(),
+        true,
+        Split::OptedIn,
+        &[false; SIZES.len()],
+        OverlapFaults {
+            argue_fails: Some(0),
+            ..OverlapFaults::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(MlError::DeviceFailed {
+            stage: "a test's failed argue"
+        })
+    ));
+    assert_eq!(held(), before, "every driver's promises have been returned");
+    assert_eq!(gpu::indexed_cards().unwrap().unwrap().len(), 3);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone with four aliases"]
+fn indexed_commit_error_drops_peer_receipts() {
+    use multilinear::gpu;
+    let cards = gpu::indexed_cards().unwrap().expect("set LAMBDA_VM_CARDS");
+    assert_eq!(cards.len(), 4);
+    let held = || {
+        cards
+            .iter()
+            .map(|&card| gpu::in_indexed_card(card, gpu::ledger_reserved))
+            .collect::<Vec<_>>()
+    };
+    let before = held();
+    let all_started = std::sync::Barrier::new(cards.len());
+    let result = crate::phase_b_split::commit_indexed(
+        vec![(); cards.len()],
+        &cards,
+        &[0, 1, 2, 3],
+        |_, g, ()| {
+            let room = gpu::reserve_room(1 << 20);
+            all_started.wait();
+            if g == 1 {
+                return Err("a test's failed commit");
+            }
+            room.ok_or("card refused the test reservation")
+        },
+        |_| "a committer panicked",
+    );
+    assert!(matches!(result, Err("a test's failed commit")));
+    assert_eq!(held(), before, "every lane's receipt has been released");
+}

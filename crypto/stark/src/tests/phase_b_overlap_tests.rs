@@ -288,6 +288,7 @@ pub(super) fn prove_block_with<Hh: WhirHash>(
         .enumerate()
         .zip(&borrowed)
         .map(|((k, (group, tables)), columns)| BlockPrepared {
+            card: 0,
             group: *group,
             tables: tables.to_vec(),
             commitment: if retired {
