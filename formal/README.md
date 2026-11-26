@@ -399,9 +399,11 @@ ensemble over all six chips, and `modelChannels_unique_names` is its `unique_cha
 
 ## The DVRM ensemble
 
-`Ensembles/DvrmStaged.lean` is eight components: the five providers of the
-static lookups DVRM's dependency cone needs, and the chips LT, MUL and DVRM. It
-is the only user of `Ensemble.tableSoundness_of_stagedOn` in either repository.
+`Ensembles/DvrmStaged.lean` is nine components: the five providers of the
+static lookups DVRM's dependency cone needs, the chips LT, MUL and DVRM, and
+`aluConsumer`, a counted consumer of the `ALU` bus that stands in for the CPU.
+It is the only user of `Ensemble.tableSoundness_of_stagedRequirementsOn` in
+either repository.
 
 DVRM is the first chip that both receives and owes on one bus. It pulls `ALU`
 three times, once for an `LT` comparison (`|r| < |d|`) and twice for `MUL`
@@ -414,15 +416,18 @@ of its messages, and the class is read off `flags`, the fifth element of an
 complement, where the `LT` and `MUL` answers live. The nine entries of
 `finished` end with `stageQuery` and then `stageDivrem`.
 
-The `staged` premise is 27 obligations, nine stages for each of the three
-chips. Five of each chip's nine are buses it does not require, and are vacuous.
+The `staged` premise is nine stages for each of the three chips and the
+consumer. Five of each chip's nine are buses it does not require, and are
+vacuous; the consumer requires only `ALU`, where its one pull is a count of one
+whatever has finished before.
 
 The chain behind `dvrm_stageDivrem` is the content; the rest is plumbing. If
 `muQ ≠ 0` then `mu ≠ 0`, so the counted pulls are active; `ZERO` answers, which
 is what makes `overflow` a bit; with `IS_BIT signed` that fixes
-`signQ = signed·(1 − overflow)`, so the flag byte of the three `ALU` pulls is
-`7 + 32·signed + 64·signQ ∈ {7, 39, 71, 103}`, which does not meet
-`divremFlags`. The pulls are therefore in the query class, which has already
+`signQ = signed·(1 − overflow)`, so the flag bytes of the three `ALU` pulls
+are the literal `4` of the `LT` comparison and `7 + 32·signed + 64·signQ`, plus
+`128` for the high half, of the two `MUL` products: `{7, 39, 71, 103}` and
+`{135, 167, 199, 231}`, none of which meets `divremFlags`. The pulls are therefore in the query class, which has already
 finished, and soundness at the row gives the guarantee of the push. If
 `muQ = 0` the push is suppressed and nothing is owed, which is where the case
 split goes.
@@ -433,7 +438,7 @@ multiplicities come in three kinds: `mu = muQ + muR`, bounded by its own
 sign flags, with which each `NEG` template pulls `ZERO` twice. The chip does not
 constrain those flags to be bits. They are bits because `MSB16` returned them.
 
-`dvrm_rows_correct` is what the ensemble is for. The eight components assume
+`dvrm_rows_correct` is what the ensemble is for. The nine components assume
 nothing, so `component_rows_correct` discharges `witness.Assumptions` rather
 than leaving it to the caller, and the conclusion is about rows: for any witness
 whose constraints hold, whose channels carry few enough interactions for the
@@ -449,13 +454,19 @@ same static tables. Every `LT` row of this ensemble carries the comparison bit
 its operands determine, and every `MUL` row holds the low and high halves of the
 128-bit product of its two operands, each read as signed or unsigned by its own
 flag. **Every chip of this ensemble concludes about its rows, and no component
-assumes anything** — with one caveat the ensemble does not close: it carries no
-consumer of the `ALU` bus, so whether those three conclusions are about live rows
-or hold vacuously turns on what a balanced witness does to an unmatched push. See
-"What is intentionally not proven".
+assumes anything.**
+
+The consumer is what keeps the three from being vacuous. `Balanced` is
+`LogUpBalanced`, every message summing to zero, and `InteractionsFit` keeps the
+sums from wrapping, so a `DIVREM` push nobody pulls forces `muQ` and `muR` to
+zero; then DVRM's own pulls are off, the `LT` and `MUL` pushes they matched go
+unmatched too, and every row spec's `μ ≠ 0` guard is false.
 
 All three are stated about this ensemble, which asks all of `LT`, `MUL` and
-`DVRM` to balance together. The narrower statement, about one chip and its own
+`DVRM` to balance together, among these nine tables only. A prover trace
+balances each bus over every table that touches it, the CPU and the other chips
+included, so a statement about such a trace needs the ensemble that holds all of
+them. The narrower statement, about one chip and its own
 providers alone, still needs `LtStaged` to move off the providers that assume
 their own answers.
 
@@ -484,21 +495,17 @@ Scope limits, not bugs. Each is also noted where it applies.
 - **The lookups a row makes are assumed, not proven.** Every chip theorem is
   about one row, given that each range check or lookup the row pulls is
   answered correctly. Nothing discharges that for the whole system:
-  `eq_rows_correct` is trivially true because no ALU consumer is modelled, the
-  ensembles this branch adds prove `Ensemble.TableSoundness` from providers
-  that assume their own answers, and SHIFT has no ensemble. A negative
+  `eq_rows_correct` is trivially true because no ALU consumer is modelled,
+  `LtStaged` proves `Ensemble.TableSoundness` from providers that assume their
+  own answers, `DvrmStaged` concludes only about witnesses of its own nine
+  tables, and SHIFT has no ensemble. A negative
   multiplicity in an unmodelled table that shares `IS_HALF` (the bug PR #1016
   fixed) leaves every theorem and `lean_diff` green.
-- **`lt_rows_correct` exists now, in `DvrmStaged`, and its force is an open
-  question.** `Ensembles/DvrmStaged.lean` states it for LT and `mul_rows_correct`
-  for MUL alongside `dvrm_rows_correct`. But that ensemble instantiates no
-  consumer of the `ALU` bus, and DVRM is the only component that pushes `DIVREM`
-  messages, so nothing pulls them. If a balanced witness forces an unmatched
-  push's multiplicity to zero, as it does elsewhere in this model, then
-  `muQ + muR = 0` on every DVRM row, the guards of all three row specs are false
-  and the three theorems are vacuous. This has not been checked against Clean's
-  `Balance.logUpUpTo` and `Balanced` semantics; until it is, read the three as
-  unconfirmed. `LtStaged` has the same gap and says so in its docstring.
+- **`DvrmStaged`'s `ALU` consumer is a stand-in.** `aluConsumer` pulls any
+  `ALU` message once and stands for the CPU, which is not modelled. It is what
+  lets `dvrm_rows_correct`, `lt_rows_correct` and `mul_rows_correct` speak about
+  active rows; what the CPU itself pulls, and with which multiplicity, is not
+  checked.
 - **The Lean BITWISE table is compared with Rust on 656 sampled rows.** The
   loop over all 2^20 rows compares `generate_bitwise_row` with a Rust
   transcription of `Bitwise.row`, not with Lean.

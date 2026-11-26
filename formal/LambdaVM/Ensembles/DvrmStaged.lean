@@ -13,16 +13,18 @@ public import Clean.Air.StagedChannels
 /-!
 # The DVRM ensemble
 
-Eight components: the five providers of the static lookups DVRM's dependency cone needs, and
-the three chips LT, MUL and DVRM.
+Nine components: the five providers of the static lookups DVRM's dependency cone needs, the
+three chips LT, MUL and DVRM, and a consumer of the `ALU` bus standing in for the CPU. Without
+the consumer nothing pulls the `DIVREM` messages, a balanced witness sends every `DVRM`
+multiplicity to zero, and the row theorems at the end hold only of switched-off rows.
 
 DVRM is the first chip that both receives and owes on the same bus. It pulls `ALU` three times,
 once for a `LT` comparison (`|r| < |d|`) and twice for `MUL` products (`d·q = n − r`), and pushes
 `ALU` twice with its own `DIVREM` results. Ordering whole channels cannot express that: `ALU`
 would have to be finished both before and after DVRM. Ordering *stages* can, a stage being a
 channel together with a class of its messages, so the `DIVREM` messages are finished after the
-`LT` and `MUL` ones. That is what `Ensemble.tableSoundness_of_stagedRequirementsOn` is for, and this is its
-only user in either repo.
+`LT` and `MUL` ones. That is what `Ensemble.tableSoundness_of_stagedRequirementsOn` is for,
+and this is its only user in either repo.
 
 The two classes are read off the `flags` field of the message, which carries the `alu_op`
 descriptor: `opselDIVREM = 8` for what DVRM pushes, `opselLT = 4` and `opselMUL = 7` for what it
@@ -59,6 +61,10 @@ def mulComponent : Component (F p) where
 def dvrmComponent : Component (F p) where
   circuit := DVRM.circuit
   generation := demandOnAlu _
+
+/-- The stand-in for the CPU: one counted pull of any `ALU` message per row, so that the `DIVREM`
+pushes have a puller. It assumes nothing, and its one requirement is a count of one. -/
+abbrev aluConsumer : Component (F p) := LtStaged.countedConsumerComponent Alu.channel
 
 @[circuit_norm] lemma ltComponent_circuit : ltComponent.circuit = LT.circuit := rfl
 @[circuit_norm] lemma mulComponent_circuit : mulComponent.circuit = MUL.circuit := rfl
@@ -119,10 +125,12 @@ def ensemble : Ensemble (F p) unit where
     , countedPushStaticComponent Bitwise.msb16Table
     , countedPushStaticComponent Bitwise.isB20Table
     , countedPushStaticComponent Bitwise.zeroTable
-    , ltComponent, mulComponent, dvrmComponent ]
+    , ltComponent, mulComponent, dvrmComponent
+    , aluConsumer ]
   unique_names := by
     simp [circuit_norm, pushStaticComponent, countedPushStaticComponent, pushStatic,
       countedPushStatic, ltComponent, mulComponent, dvrmComponent, LT.circuit, MUL.circuit,
+      aluConsumer, LtStaged.countedConsumerComponent, LtStaged.countedConsumer, Alu.channel,
       DVRM.circuit, Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table,
       Bitwise.isB20Table, Bitwise.zeroTable]
   -- the model's bus list, which is what `Buses/Canonical.lean` checks the chips against. Two
@@ -131,12 +139,12 @@ def ensemble : Ensemble (F p) unit where
   channels := Buses.modelChannels
   unique_channel_names := Buses.modelChannels_unique_names
   -- the three chips are exactly what `model_channels_agree` says; the five providers push one
-  -- bus each and pull none
+  -- bus each and pull none; the consumer pulls and owes on `ALU` only
   tables_channels := by
     intro table h
     simp only [List.mem_cons, List.not_mem_nil, or_false] at h
     obtain ⟨hlt, -, -, -, hmul, hdvrm⟩ := Buses.model_channels_agree
-    rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
     -- the five providers push one bus each and pull none
     iterate 5
       simp only [GeneralFormalCircuit.channels, pushStaticComponent_channelsWithGuarantees,
@@ -148,6 +156,10 @@ def ensemble : Ensemble (F p) unit where
     · exact hlt
     · exact hmul
     · exact hdvrm
+    -- the consumer, on `Alu.channelC` alone
+    · simp only [GeneralFormalCircuit.channels, LtStaged.countedConsumerComponent_guarantees,
+        LtStaged.countedConsumerComponent_requirements]
+      simp [Buses.modelChannels]
   verifier_channels := by simp [circuit_norm]
 
 /-! ## The two classes of `ALU` messages
@@ -789,17 +801,46 @@ theorem dvrm_staged : dvrmComponent.StagedRequirementsOn finished := by
       List.mem_cons, List.not_mem_nil, or_false, not_or]
     and_intros <;> channel_ne
 
+/-- The consumer's nine obligations. Its only requirement is on `ALU`, that its one pull is a
+count of one, which holds whatever is finished before; the seven other stages are buses it does
+not require. -/
+theorem consumer_staged :
+    (aluConsumer : Component (F p)).StagedRequirementsOn finished := by
+  have alu : ∀ (cls : Array (F p) → Bool) (earlier : List (Stage (F p))),
+      (aluConsumer : Component (F p)).RequirementsAfterOn
+        { channel := Alu.channelC, cls } earlier := by
+    intro cls earlier
+    have h : (aluConsumer : Component (F p)).RequirementsAfter Alu.channelC [] := by
+      rintro table h_comp - constraints guarantees row hrow
+      cases table
+      simp only at h_comp
+      subst h_comp
+      simp only [Component.channelRequirements_iff]
+      simp [circuit_norm, Component.rowOperations, aluConsumer,
+        LtStaged.countedConsumerComponent, LtStaged.countedConsumer]
+      exact countUpTo_one
+    rintro table h_comp assumptions constraints - i h_i -
+    have := h table h_comp assumptions constraints (by simp)
+    rw [Table.channelRequirements_iff_forall] at this
+    exact this i h_i
+  refine ⟨alu _ _, alu _ _, ?_, ?_, ?_, ?_, ?_, ?_, ?_, trivial⟩
+  all_goals
+    refine Component.requirementsAfterOn_of_not_mem _ ?_
+    simp only [LtStaged.countedConsumerComponent_requirements, List.mem_cons, List.not_mem_nil,
+      or_false]
+    channel_ne
+
 /-- Every table of the ensemble meets its spec.
 
-This is the first use of `Ensemble.tableSoundness_of_stagedRequirementsOn` anywhere: ordering whole channels
-cannot hold this ensemble, because `DVRM` both pulls from `ALU` and pushes to it, so the bus
-would have to be finished before itself. Splitting it by message class breaks the cycle, and
+This is the first use of `Ensemble.tableSoundness_of_stagedRequirementsOn` anywhere: ordering
+whole channels cannot hold this ensemble, because `DVRM` both pulls from `ALU` and pushes to it,
+so the bus would have to be finished before itself. Splitting it by message class breaks the cycle, and
 nothing else in the model needed that until `DVRM` arrived. -/
 theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
   apply Ensemble.tableSoundness_of_stagedRequirementsOn finished rfl finished_channels covered consistent
   intro component h
   simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-  rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
   · exact stagedRequirementsOn_of_no_guarantees
       (pushStaticComponent_channelsWithGuarantees _) _
   iterate 4
@@ -808,12 +849,17 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
   · exact lt_staged
   · exact mul_staged
   · exact dvrm_staged
+  · exact consumer_staged
 
 /-- Table soundness, read at one component: if the constraints of every table hold, every
 channel has few enough interactions for the balance check, and every channel balances, then
-every row of every table of component `c` meets `c`'s spec. The eight components assume
+every row of every table of component `c` meets `c`'s spec. The nine components assume
 nothing, so the ensemble's `Assumptions` are free. The three theorems below are this one read at
-`DVRM`, `LT` and `MUL`. -/
+`DVRM`, `LT` and `MUL`.
+
+The witness is one of *this* ensemble: its buses balance among these nine tables. A prover trace
+balances each bus over every table that touches it, the CPU and the other chips included, so a
+statement about such a trace needs the ensemble that holds all of them. -/
 theorem component_rows_correct {c : Component (F p)}
     (witness : EnsembleWitness ensemble)
     (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
@@ -826,7 +872,7 @@ theorem component_rows_correct {c : Component (F p)}
     simp only [ensemble, circuit_norm, List.mem_cons, List.not_mem_nil, or_false] at hmem
     obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
     simp only at hmem
-    rcases hmem with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> trivial
+    rcases hmem with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> trivial
   have hspec := (tableSoundness witness hassume hc hfit hb).2
   intro table htable hcomp row hrow
   have := hspec table htable row hrow
