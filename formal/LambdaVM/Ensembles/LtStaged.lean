@@ -53,27 +53,14 @@ def countedProvider (N : ℕ) (channel : Channel (F p) Message) :
     simp_all
   completeness := by circuit_proof_start
 
-/-- A consumer row: pulls `value` once. The mirror of `provider`, and unlike it it assumes
-nothing — a pull gains the channel's guarantee instead of owing it, so this stand-in costs the
-ensemble no honesty. It stands for the chip that would consume these messages.
+/-- A consumer row: pulls `value` once on `channel.counted N`. It stands for the chip that would
+consume these messages. A pull gains the channel's guarantee instead of owing it, so this stand-in
+costs the ensemble no honesty, and its range requirement (`μ = 0` or `1 ≤ μ ≤ N`) is a count of
+one, discharged outright with no byte check of its own.
 
 Without a consumer the channel carries only pushes, and a balanced witness has to send every
 multiplicity on it to zero; every row spec guarded by `μ ≠ 0` would then hold vacuously and the
 ensemble theorem would say nothing about rows. -/
-def consumer (channel : Channel (F p) Message) :
-    GeneralFormalCircuit (F p) Message unit where
-  name := channel.name ++ "-consumer"
-  main value := channel.pull value
-  Spec _ _ _ := True
-  soundness := by circuit_proof_start
-  -- The honest prover pulls a message the channel really answers. This is a *prover* assumption:
-  -- it is what completeness may assume, not something soundness gets for free, which is exactly
-  -- how a consumer differs from `provider`.
-  ProverAssumptions value data _ := channel.Guarantees value data
-  completeness := by circuit_proof_start; simp_all
-
-/-- The same on `channel.counted N`: a single pull, so its range requirement (`μ = 0` or
-`1 ≤ μ ≤ N`) is discharged outright, with no byte check of its own. -/
 def countedConsumer (N : ℕ) (hN : 1 ≤ N) (channel : Channel (F p) Message) :
     GeneralFormalCircuit (F p) Message unit where
   name := channel.name ++ "-consumer"
@@ -141,34 +128,36 @@ def ltComponent : Component (F p) where
 @[circuit_norm] lemma ltComponent_requirements :
     ltComponent.circuit.channelsWithRequirements = [Alu.channelC, IsHalfC, Msb16C] := rfl
 
-def consumerComponent (channel : Channel (F p) Message) : Component (F p) where
-  circuit := consumer channel
+def countedConsumerComponent (channel : Channel (F p) Message) : Component (F p) where
+  circuit := countedConsumer muMax (by simp [muMax]) channel
   generation := demandOn channel _
 
-@[circuit_norm] lemma consumerComponent_guarantees (channel : Channel (F p) Message) :
-    (consumerComponent channel).circuit.channelsWithGuarantees = [channel.toRaw] := rfl
-@[circuit_norm] lemma consumerComponent_requirements (channel : Channel (F p) Message) :
-    (consumerComponent channel).circuit.channelsWithRequirements = [] := rfl
+@[circuit_norm] lemma countedConsumerComponent_guarantees (channel : Channel (F p) Message) :
+    (countedConsumerComponent channel).circuit.channelsWithGuarantees =
+      [channel.counted muMax] := rfl
+@[circuit_norm] lemma countedConsumerComponent_requirements (channel : Channel (F p) Message) :
+    (countedConsumerComponent channel).circuit.channelsWithRequirements =
+      [channel.counted muMax] := rfl
 
 /-- Finishing order, newest first. -/
 def finished : List (RawChannel (F p)) :=
   [Alu.channelC, Msb16C, IsHalfC, Bitwise.AreBytes.toRaw]
 
-/-- The LT ensemble: three providers and LT. It carries no consumer of the ALU bus, so that bus
-holds only LT's pushes, a balanced witness forces every `μ` to zero, and `LT.RowSpec` — guarded
-by `μ ≠ 0` — holds vacuously on every row.
+/-- The LT ensemble: three providers, LT, and a consumer of the ALU bus. Without the consumer
+the bus carries only LT's pushes, a balanced witness forces every `μ` to zero, and `LT.RowSpec`
+— guarded by `μ ≠ 0` — holds vacuously on every row.
 
-A consumer cannot be added here any more. Since every ALU interaction moved to `Alu.channelC`,
-it would have to pull there, and a counted pull owes the range obligation on that channel while
-also gaining its guarantee: ordering whole channels cannot place a component that both pulls and
-is finished by the same bus. That needs `tableSoundness_of_stagedRequirementsOn`, and the
-ensemble that has it is `DvrmStaged`, whose `lt_rows_correct` is what states LT's rows. -/
+The consumer pulls `Alu.channelC`, the same counted channel LT pushes on. Its one requirement
+there is a count of one, which holds without relying on any guarantee, so it is met whatever the
+finishing order. -/
 def ensemble : Ensemble (F p) unit where
   tables := [providerComponent Bitwise.AreBytes, countedProviderComponent muMax Bitwise.IsHalf,
-    countedProviderComponent muMax Bitwise.Msb16, ltComponent]
+    countedProviderComponent muMax Bitwise.Msb16, ltComponent,
+    countedConsumerComponent Alu.channel]
   unique_names := by
     simp [providerComponent, countedProviderComponent, ltComponent, provider,
-      countedProvider, LT.circuit, Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16,
+      countedProvider, countedConsumerComponent, countedConsumer, LT.circuit, Bitwise.AreBytes,
+      Bitwise.IsHalf, Bitwise.Msb16,
       Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table, Alu.channel,
       StaticLookupChannel.toChannel]
   channels := finished
@@ -178,8 +167,11 @@ def ensemble : Ensemble (F p) unit where
   tables_channels := by
     intro table h
     simp only [List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl <;>
-      simp only [GeneralFormalCircuit.channels, providerComponent_guarantees, providerComponent_requirements, countedProviderComponent_guarantees, countedProviderComponent_requirements, ltComponent_guarantees, ltComponent_requirements] <;>
+    rcases h with rfl | rfl | rfl | rfl | rfl <;>
+      simp only [GeneralFormalCircuit.channels, providerComponent_guarantees,
+        providerComponent_requirements, countedProviderComponent_guarantees,
+        countedProviderComponent_requirements, ltComponent_guarantees, ltComponent_requirements,
+        countedConsumerComponent_guarantees, countedConsumerComponent_requirements] <;>
       simp [finished, IsHalfC, Msb16C]
   verifier_channels := by simp [circuit_norm]
 
@@ -217,9 +209,9 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
   apply Ensemble.tableSoundness_of_stagedRequirements finished rfl (List.Subset.refl _)
   · intro component h
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl <;>
+    rcases h with rfl | rfl | rfl | rfl | rfl <;>
       simp only [providerComponent_guarantees, countedProviderComponent_guarantees,
-        ltComponent_guarantees] <;>
+        ltComponent_guarantees, countedConsumerComponent_guarantees] <;>
       simp [finished, IsHalfC, Msb16C]
   · intro c hc
     show c.ConsistentUpTo muMax
@@ -227,7 +219,7 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
     rcases hc with rfl | rfl | rfl | rfl <;> infer_instance
   · intro component h
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl | rfl
     -- the providers pull nothing
     iterate 3
       exact Component.stagedRequirements_of_forall fun _ _ _ =>
@@ -244,6 +236,22 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
       simp only [ltComponent_requirements, List.mem_cons, List.not_mem_nil, or_false, not_or]
       refine ⟨fun h => ?_, fun h => ?_, fun h => ?_⟩ <;> have := congrArg RawChannel.name h <;>
         simp [circuit_norm, IsHalfC, Msb16C, Alu.channel, Bitwise.AreBytes, Bitwise.IsHalf,
+          Bitwise.Msb16, Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table,
+          StaticLookupChannel.toChannel] at this
+    -- the consumer: its one pull on ALU is a count of one, met without any guarantee
+    refine ⟨?_, ?_, ?_, ?_, trivial⟩
+    · rintro table h_comp - constraints guarantees row hrow
+      cases table
+      simp only at h_comp
+      subst h_comp
+      simp only [Component.channelRequirements_iff]
+      simp [circuit_norm, Component.rowOperations, countedConsumerComponent, countedConsumer]
+      exact countUpTo_one
+    all_goals
+      apply Component.requirementsAfter_of_not_mem
+      simp only [countedConsumerComponent_requirements, List.mem_cons, List.not_mem_nil, or_false]
+      intro h; have := congrArg RawChannel.name h
+      simp [circuit_norm, IsHalfC, Msb16C, Alu.channel, Bitwise.AreBytes, Bitwise.IsHalf,
           Bitwise.Msb16, Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table,
           StaticLookupChannel.toChannel] at this
 

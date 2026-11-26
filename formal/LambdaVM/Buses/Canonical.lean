@@ -44,8 +44,7 @@ def modelChannels : List (RawChannel (F p)) :=
 /-- What an ensemble over all six chips would have to discharge as `unique_channel_names`.
 Decided on the names, which are strings; no channel is ever compared to another. -/
 theorem modelChannels_unique_names : (modelChannels.map (·.name)).Nodup := by
-  decide   -- fallback, if a name does not reduce in the kernel:
-           -- `simp only [modelChannels, List.map_cons, List.map_nil, circuit_norm]; decide`
+  decide
 
 /-- The canonical channel for a bus name, if the model has one. -/
 def busOf (name : String) : Option (RawChannel (F p)) :=
