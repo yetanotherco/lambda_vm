@@ -247,10 +247,14 @@ multiplicity is a requirement the row cannot meet.
 the channel LT pulls on — that one is the fork's `Channel.counted`, whose
 semantics differ; see the comparison at the end of this section.
 
-- `counted N channel` grants the guarantee to a pull of `1, …, N` and charges
-  every other nonzero interaction, mirroring `Channel.toRaw`. `pullIf`/`emit`
-  are the circuit operations, with `ExplicitCircuits` instances so elaboration
-  works.
+- `countedCharged N channel` grants the guarantee to a pull of `1, …, N` and
+  charges every other nonzero interaction, mirroring `Channel.toRaw`.
+  `Counted.pullIf`/`Counted.emit` are its circuit operations, with
+  `ExplicitCircuits` instances so elaboration works. The name keeps it apart from
+  the fork's `Channel.counted`, which this model also pulls on and which treats an
+  out-of-range pull differently; the table at the end of this section is the
+  comparison. Clean has its own `Channel.pullIf`, named below, and they are not
+  the same function.
 - `exists_push_of_pull` and `consistent` are Clean's lemmas for this channel.
   Their balance premise is `N · length < char F`. Clean's `BalancedInteractions`
   carries no length bound of its own: the bound is the `fits` of the `Balance`
@@ -282,13 +286,15 @@ Counted pulls in the LT model need two things Clean main lacks:
 
 The model takes both from the `yetanotherco/clean` fork, pinned in
 `lakefile.toml` by sha at
-[`73309694`](https://github.com/yetanotherco/clean/commit/73309694ae33279094597f7f3f819fb8a3439620)
-— by sha, not by branch name, so the pin survives the branch being renamed or
-deleted once the upstream PRs land. That is Clean main `f3abad7c` plus three
-commits, and four review fixes answering the audit of them: `Balance.logUpUpTo N` with
-`RawChannel.ConsistentUpTo N`, the typed `Channel.counted N`, and
-`Ensemble.tableSoundness_of_stagedRequirements` / `_stagedRequirementsOn` (soundness by finishing
-order of channels, and of message classes within a channel). On top of it:
+[`8552c7a1`](https://github.com/yetanotherco/clean/commit/8552c7a10dac340de34bfff9e19a6967ed3b1bba)
+— by sha, not by branch name, so the pin survives the branch moving, being
+renamed or deleted once the upstream PRs land. That sha is the merge putting the
+counted-pulls work onto the fork's `pr-base-upstream-main`, where the fork's PRs
+land; its two parents are the upstream mirror `a985c76c` and `e30c5c44`, the work
+itself: `Balance.logUpUpTo N` with `RawChannel.ConsistentUpTo N`, the typed
+`Channel.counted N`, and `Ensemble.tableSoundness_of_stagedRequirements` /
+`_stagedRequirementsOn` (soundness by finishing order of channels, and of
+message classes within a channel). On top of it:
 
 - `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ`, bounded by
   its own pull of `ARE_BYTES[μ, 0]`, exactly as `lt.rs`.
@@ -362,13 +368,13 @@ or a counted analogue of it, behind LT's three range checks, and this branch
 has neither. What `LtStaged` does establish is that the staged finishing order
 admits counted pulls, which is what it was written for.
 
-`Channels/Counted.lean` above predates the fork, and its `counted` is a different
-channel from the fork's, not a copy. They part on what a pull of an out-of-range
-multiplicity costs:
+`Channels/Counted.lean` above predates the fork, and its `countedCharged` is a
+different channel from the fork's, not a copy. They part on what a pull of an
+out-of-range multiplicity costs:
 
 | | out-of-range pull |
 |---|---|
-| this file | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
+| this file (`countedCharged`) | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
 | the fork (`Channel.counted`) | `mult = 0 ∨ CountUpTo N mult` — forbidden: a range obligation the row must discharge |
 
 LT is on the fork's. This file's channel has one consumer,
@@ -380,11 +386,16 @@ Moving LT onto the counted channel has one structural cost: **LT cannot share an
 ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
 (`name := channel.name`), so `Bitwise.IsHalf.counted muMax`, which `Tables/Lt.lean`
 pulls, and `Bitwise.IsHalf.toRaw`, which `Tables/Eq.lean` and `Tables/Shift.lean`
-pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, and
-`Ensemble.unique_channel_names` rejects a `tables` list holding both. `MSB16` is
-the same. A combined ensemble would have to put EQ and SHIFT on the counted
-channel too, at `N = 1`; the pinned fork has no lemma collapsing `Channel.counted
-1` to the plain channel, so that is a proof obligation, not a rename. No ensemble
+pull through Clean's `Channel.pullIf`, are two different `RawChannel`s both
+called `IS_HALF`, and `Ensemble.unique_channel_names` rejects a `tables` list
+holding both. `MSB16` is
+the same. A combined ensemble would have to put EQ and SHIFT on the *same*
+counted channel LT uses, at `N = 255`. Dropping them onto `Channel.counted 1`
+would not do: it keeps the base name too, so it collides with `Channel.counted
+255` for exactly the reason above, and the pinned fork has no lemma collapsing it
+to the plain channel either. EQ and SHIFT reach the channel through Clean's
+`Channel.pullIf`, so moving them is a proof obligation about their rows, not a
+rename. No ensemble
 here needs it yet: `LtStaged` holds LT only.
 
 ## What is intentionally not proven
@@ -454,7 +465,8 @@ Clean itself is compiled from source; only the modules we import are built.
 - Clean's circuit inference does not unfold user-defined `Circuit` helpers. A
   helper used inside a `main` needs an `ExplicitCircuit` instance, bridged to
   its body with `ExplicitCircuit.of_eq rfl (by infer_explicit_circuit)`.
-- A conditional interaction (`pullIf cond`) is only lawful when the same circuit
-  constrains `cond` to be boolean: Clean requires every pull to carry
+- A conditional interaction (Clean's `Channel.pullIf cond`) is only lawful when
+  the same circuit constrains `cond` to be boolean: Clean requires every pull to
+  carry
   multiplicity `0` or `1`, and a pull outside `{0, 1}` is a requirement the
   circuit cannot discharge at lawfulness.

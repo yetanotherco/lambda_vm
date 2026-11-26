@@ -78,8 +78,8 @@ abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
 abbrev Msb16C : RawChannel (F p) := Bitwise.Msb16.counted muMax
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
-  -- μ : Byte, as in lt.rs: ARE_BYTES[μ, 0]. `spec/src/lt.toml` agrees since this PR, which
-  -- types μ as a Byte and adds its IS_BYTE range check.
+  -- μ : Byte, as in lt.rs: ARE_BYTES[μ, 0], and as `spec/src/lt.toml` declares it -- the spec
+  -- types μ as a Byte and range-checks it with `IS_BYTE` (`lt:c:range_mu`).
   Bitwise.AreBytes.pull (r.mu, 0)
   -- range: IS_HALF[lhs[1]], IS_HALF[rhs[1]], IS_BIT<signed>, IS_BIT<invert>
   Bitwise.IsHalf.pullUpTo muMax r.mu r.lhs1
