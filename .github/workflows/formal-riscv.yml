@@ -1,0 +1,84 @@
+name: Formal RISC-V equivalence
+
+# formal-riscv depends on ../formal and ../sail-riscv-lean by path, so a change in either can
+# break its proofs: build it whenever any of the three changes.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "formal/**"
+      - "formal-riscv/**"
+      - "sail-riscv-lean/**"
+      - ".github/workflows/formal-riscv.yml"
+  pull_request:
+    paths:
+      - "formal/**"
+      - "formal-riscv/**"
+      - "sail-riscv-lean/**"
+      - ".github/workflows/formal-riscv.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lean:
+    name: Lean build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: formal-riscv
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install elan
+        env:
+          ELAN_VERSION: v4.2.4
+          ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+        run: |
+          cd "$(mktemp -d)"
+          curl -sSfL "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" -o elan.tar.gz
+          echo "${ELAN_SHA256}  elan.tar.gz" | sha256sum -c -
+          tar xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # formal-riscv has its own lake-manifest.json: it must use formal/'s toolchain and the same
+      # Mathlib, Clean, etc., or formal/ is built here against other versions than in formal.yml.
+      - name: Versions match formal/
+        run: |
+          diff ../formal/lean-toolchain lean-toolchain
+          q='.packages[] | select(.type == "git") | "\(.name) \(.rev)"'
+          join <(jq -r "$q" ../formal/lake-manifest.json | sort) <(jq -r "$q" lake-manifest.json | sort) \
+            | awk '$2 != $3 { print "rev differs from formal/:", $1, $2, $3; bad = 1 } END { exit bad }'
+
+      # Clean, CompPoly and lean-sail (`Sail`) are compiled from source; Mathlib and its
+      # dependencies come from `lake exe cache get`. The Sail model is the slowest part to build
+      # (`InstsEnd` takes minutes): the key starts with what invalidates it (toolchain, manifest,
+      # model) and ends with the sources of formal/ and formal-riscv, so a change in those
+      # restores the closest entry, Lake rebuilds what changed, and a new entry is saved.
+      - name: Cache Lake builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            formal-riscv/.lake/build
+            formal-riscv/.lake/packages/Clean
+            formal-riscv/.lake/packages/CompPoly
+            formal-riscv/.lake/packages/Sail
+            formal/.lake/build
+            sail-riscv-lean/.lake/build
+          key: lake-riscv-${{ hashFiles('formal-riscv/lean-toolchain', 'formal-riscv/lake-manifest.json', 'sail-riscv-lean/LeanRV64D.lean', 'sail-riscv-lean/LeanRV64D/**') }}-${{ hashFiles('formal/lakefile.toml', 'formal/LambdaVM.lean', 'formal/LambdaVM/**', 'formal-riscv/lakefile.toml', 'formal-riscv/RiscvEquiv.lean', 'formal-riscv/RiscvEquiv/**') }}
+          restore-keys: lake-riscv-${{ hashFiles('formal-riscv/lean-toolchain', 'formal-riscv/lake-manifest.json', 'sail-riscv-lean/LeanRV64D.lean', 'sail-riscv-lean/LeanRV64D/**') }}-
+
+      - name: Fetch Mathlib binaries
+        run: lake exe cache get
+
+      # No --wfail: the generated model has a known warning (unused `termination_by` in
+      # LeanRV64D/Vmem.lean).
+      - name: Build
+        run: lake build

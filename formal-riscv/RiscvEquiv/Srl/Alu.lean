@@ -1,0 +1,26 @@
+import RiscvEquiv.Srl.Bridge
+import RiscvEquiv.AluBus
+
+/-!
+# SRL: what the CPU learns from the ALU bus is Sail's result
+
+Same shape as `Sll/Alu.lean`, at the flags of `SRL`: `direction = 1`, so the flag byte is
+`opsel(SHIFT) + 64`.
+-/
+
+namespace RiscvEquiv
+
+open LambdaVM
+
+/-- An ALU message with the flags of `SRL` (`opsel = SHIFT`, `word = 0`, `signed = 0`,
+`direction = 1`) carries Sail's `SRL` result. -/
+theorem srl_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
+    (hflags : m.flags.val = opselSHIFT + 64)
+    (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
+    (hb : dword m.in2Lo m.in2Hi % 64 = b.toNat % 64) :
+    dword m.outLo m.outHi = (srlPure a b).toNat := by
+  rw [srlPure_toNat]
+  exact shift_alu m hg 0 1 (by norm_num) (by norm_num) (by simpa using hflags)
+    _ b ha hb
+
+end RiscvEquiv
