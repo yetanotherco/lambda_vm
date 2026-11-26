@@ -288,14 +288,13 @@ fn commit_pair_off_pool<P: Sync, T: Send>(
     commit: &(dyn Fn(&P) -> Result<T, Error> + Sync),
 ) -> Result<Vec<T>, Error> {
     // The second polynomial's thread works in this thread's device role
-    // (the openings' card under the two-card openings).
-    #[cfg(feature = "cuda")]
-    let role = math_cuda::device::current_role();
+    // (the openings' card under the two-card openings, the second card in its
+    // commit lane) and counts on its card.
+    let here = crate::gpu::card_here();
     std::thread::scope(|scope| {
         let second = pair.get(1).map(|p| {
             scope.spawn(move || {
-                #[cfg(feature = "cuda")]
-                let _role = math_cuda::device::enter_role(role);
+                let _card = here.enter();
                 commit(p)
             })
         });

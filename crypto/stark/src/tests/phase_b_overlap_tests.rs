@@ -43,7 +43,7 @@ use crate::proof::options::ProofOptions;
 use crate::traits::AIR;
 
 type FE = FieldElement<Fp>;
-type Air = AirWithBuses<Fp, Ext, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
+pub(super) type Air = AirWithBuses<Fp, Ext, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
 pub(super) type H = KeccakWhir;
 
 /// The example's three tables (CPU, ADD, MUL), this many times over: the bus
@@ -76,7 +76,7 @@ pub(super) fn config_for(argue: ArgueFormat, group: GroupFold) -> ChainConfig {
     }
 }
 
-fn airs() -> [Air; 3] {
+pub(super) fn airs() -> [Air; 3] {
     let options = ProofOptions::default_test_options();
     [
         new_cpu_air_with_lookup(&options),
@@ -125,7 +125,7 @@ fn num_vars(t: usize) -> usize {
     columns()[kind(t)][0].len().trailing_zeros() as usize
 }
 
-fn tables(airs: &[Air; 3]) -> Vec<CommittedTable<'_, Fp, Ext>> {
+pub(super) fn tables(airs: &[Air; 3]) -> Vec<CommittedTable<'_, Fp, Ext>> {
     let columns = columns();
     (0..3 * COPIES)
         .map(|t| {

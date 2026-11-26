@@ -336,6 +336,90 @@ const GROUP_COMMIT_ROOM: u64 = 19 << 30;
 /// every place, so the same proofs: a prover's choice, never a format.
 pub const STACKS_ENV: &str = "LAMBDA_VM_LEVELS_STACKS";
 
+/// `LAMBDA_VM_LEVELS_COMMITS_BY_CARD=1`: under the levels' split
+/// (`LAMBDA_VM_TWO_CARD_LEVELS`, its second card ready), each level's phase A
+/// commits its groups on two cards. With stacks by card, it uses the stack
+/// assignment. Otherwise the first free lane takes the next group. The
+/// lanes' results are put back by group index
+/// ([`stark::multilinear_block::BlockCommitted::commit_on_lanes`]). The roots
+/// block is absorbed once, in group order, in phase B: the same proofs. Unset,
+/// empty or `0`: off (one lane). Read once a process. A test override applies
+/// to the process because level 2 proves on a thread of its own.
+pub const COMMITS_BY_CARD_ENV: &str = "LAMBDA_VM_LEVELS_COMMITS_BY_CARD";
+
+/// What [`COMMITS_BY_CARD_ENV`] says: on or off; any other word is an error.
+pub fn parse_commits_by_card(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(format!("{COMMITS_BY_CARD_ENV} must be 0 or 1, got `{v}`")),
+    }
+}
+
+/// A test's phase-A lanes for every level's prove, process wide
+/// ([`set_commits_by_card_for_test`]); `None`: the knob.
+static LANES_FOR_TEST: std::sync::Mutex<Option<stark::multilinear_block::PhaseALanes>> =
+    std::sync::Mutex::new(None);
+
+/// Tests only: every level's phase-A lanes for the process, whatever the
+/// knob says (`None` restores the knob).
+#[doc(hidden)]
+pub fn set_commits_by_card_for_test(lanes: Option<stark::multilinear_block::PhaseALanes>) {
+    *LANES_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) = lanes;
+}
+
+thread_local! {
+    /// A test's phase-A lanes for the levels proved on this thread
+    /// ([`set_commits_by_card_on_thread_for_test`]), before the process's.
+    static LANES_ON_THREAD: std::cell::RefCell<Option<stark::multilinear_block::PhaseALanes>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: the phase-A lanes of every level proved on this thread
+/// (`None` restores the process's).
+#[doc(hidden)]
+pub fn set_commits_by_card_on_thread_for_test(
+    lanes: Option<stark::multilinear_block::PhaseALanes>,
+) {
+    LANES_ON_THREAD.with(|cell| *cell.borrow_mut() = lanes);
+}
+
+/// A level's phase-A lanes: the levels' knob asked for when
+/// [`COMMITS_BY_CARD_ENV`] is on (it acts only with the levels' split on and
+/// its second card ready), else one lane, nothing asked; a test's lanes
+/// first (this thread's, then the process's).
+pub(crate) fn phase_a_lanes() -> Result<stark::multilinear_block::PhaseALanes, String> {
+    if let Some(lanes) = LANES_ON_THREAD.with(|cell| cell.borrow().clone()) {
+        return Ok(lanes);
+    }
+    if let Some(lanes) = LANES_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return Ok(lanes);
+    }
+    static ON: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    let on = ON
+        .get_or_init(|| parse_commits_by_card(std::env::var(COMMITS_BY_CARD_ENV).ok().as_deref()))
+        .clone()?;
+    Ok(match on {
+        true => stark::multilinear_block::PhaseALanes {
+            knob: Some(stark::multilinear_block::TwoCardKnob::Levels),
+            ..Default::default()
+        },
+        false => stark::multilinear_block::PhaseALanes::default(),
+    })
+}
+
+/// Whether the levels' commits by card act: asked for, the levels' split on
+/// and its second card ready.
+fn commits_by_card_acts() -> bool {
+    phase_a_lanes().is_ok_and(|lanes| lanes.knob.is_some())
+        && multilinear::gpu::two_card_levels_on()
+        && multilinear::gpu::two_card_split_ready()
+}
+
 /// What [`STACKS_ENV`] says: `None` for `auto`; nonsense is an error.
 pub fn parse_stacks(value: Option<&str>) -> Result<Option<StackPlace>, String> {
     match value.map(str::trim) {
@@ -1879,9 +1963,8 @@ fn card_settle_on(at: &str, trim: bool) -> Option<CardReading> {
     } else {
         multilinear::gpu::settle_card_untrimmed()
     };
-    // Under the stacks by card the second card takes a level's stacks: it is
-    // drained (and read) at the same points, before its first stack.
-    if stacks_by_card_acts() {
+    // Both commit paths share one drain and ledger reading per backend.
+    if stacks_by_card_acts() || commits_by_card_acts() {
         second_card_settle(at, trim);
     }
     let (pool_used, pool_peak, free, total) = reading?;
@@ -1906,7 +1989,7 @@ fn card_settle_on(at: &str, trim: bool) -> Option<CardReading> {
 }
 
 /// [`card_settle_on`] on the second card, in its role: drained (trimmed when
-/// `trim`) and read, printed as the second card's.
+/// `trim`) and read, under a distinct marker for ledger readers.
 fn second_card_settle(at: &str, trim: bool) {
     multilinear::gpu::in_second_role(|| {
         let reading = if trim {
@@ -1917,8 +2000,8 @@ fn second_card_settle(at: &str, trim: bool) {
         if let Some((pool_used, pool_peak, free, total)) = reading {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             eprintln!(
-                "LEVELS CARD {at} (second card): pool {:.2} GiB (peak before {:.2}) · free {:.2} of \
-                 {:.2} GiB · ledger {:.2} of {:.2} GiB promised",
+                "LEVELS SECOND CARD {at}: pool {:.2} GiB (peak before {:.2}) · free {:.2} of {:.2} \
+                 GiB · ledger {:.2} of {:.2} GiB promised",
                 gib(pool_used),
                 gib(pool_peak),
                 gib(free),
@@ -3094,6 +3177,15 @@ pub fn prove_block_levels(
     };
     card_pad_bytes()?;
     card_budget_pct()?;
+    let lanes = phase_a_lanes()?;
+    eprintln!(
+        "LEVELS COMMITS BY CARD ({COMMITS_BY_CARD_ENV}): {}",
+        match (lanes.knob.is_some(), lanes.on_host) {
+            (_, true) => "on, two lanes on the host (a test)",
+            (true, false) => "on (acts with the levels' split on and its second card ready)",
+            (false, false) => "off",
+        }
+    );
     let _pad = PadRelease;
     let _budget = BudgetRelease;
     let peak_reset = reset_peak_rss();

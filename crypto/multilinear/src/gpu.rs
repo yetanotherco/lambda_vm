@@ -14,6 +14,124 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// A process-wide count kept apart by card: slot 0 for card 0's work, slot 1
+/// for the second card's ([`counter_slot`]). Read whole ([`Self::total`]) by
+/// every reader that read the one counter it replaces, or by the calling
+/// thread's card ([`Self::here`]) by a reader that brackets work on one card
+/// while the other card works too (phase A's commit lanes).
+pub(crate) struct ByCard([AtomicU64; 2]);
+
+impl ByCard {
+    pub(crate) const fn new() -> Self {
+        Self([AtomicU64::new(0), AtomicU64::new(0)])
+    }
+
+    pub(crate) fn add(&self, n: u64) {
+        self.0[counter_slot()].fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.0[0]
+            .load(Ordering::Relaxed)
+            .saturating_add(self.0[1].load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn here(&self) -> u64 {
+        self.0[counter_slot()].load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.0[0].store(0, Ordering::Relaxed);
+        self.0[1].store(0, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    /// The counter slot a thread counts in when set ([`counted_as_second`], and
+    /// [`in_second_role`] without a device build), whatever its device role.
+    static LANE_SLOT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// The slot the calling thread's counts go to ([`ByCard`]): its card's
+/// (`math_cuda::device::current_slot`: 1 in the second card's role, else 0),
+/// unless a slot was set for the thread ([`counted_as_second`]).
+pub(crate) fn counter_slot() -> usize {
+    if let Some(slot) = LANE_SLOT.with(core::cell::Cell::get) {
+        return slot.min(1);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::current_slot().min(1)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
+/// Puts a thread's [`LANE_SLOT`] back when dropped.
+struct LaneSlotGuard(Option<usize>);
+
+impl Drop for LaneSlotGuard {
+    fn drop(&mut self) {
+        LANE_SLOT.with(|c| c.set(self.0));
+    }
+}
+
+fn enter_lane_slot(slot: Option<usize>) -> LaneSlotGuard {
+    LaneSlotGuard(LANE_SLOT.with(|c| c.replace(slot)))
+}
+
+/// Tests only: runs `f` with this thread's counts kept as the second card's
+/// ([`ByCard`]) and its device role unchanged: a second commit lane on the
+/// host (no second card), so its counts are told apart from the first's.
+#[doc(hidden)]
+pub fn counted_as_second<R>(f: impl FnOnce() -> R) -> R {
+    let _slot = enter_lane_slot(Some(1));
+    f()
+}
+
+/// This thread's device role and counter slot, for a thread it starts: the
+/// role is per thread and not inherited ([`math_cuda::device::backend`]), so
+/// a thread that does device work for this one enters it first
+/// ([`Self::enter`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CardHere {
+    #[cfg(feature = "cuda")]
+    role: math_cuda::device::DeviceRole,
+    slot: Option<usize>,
+}
+
+/// The calling thread's [`CardHere`].
+pub fn card_here() -> CardHere {
+    CardHere {
+        #[cfg(feature = "cuda")]
+        role: math_cuda::device::current_role(),
+        slot: LANE_SLOT.with(core::cell::Cell::get),
+    }
+}
+
+/// The role and slot of a [`CardHere`] while it lives; the thread's own back
+/// when dropped.
+#[must_use = "the role lasts while the guard lives"]
+pub struct CardGuard {
+    #[cfg(feature = "cuda")]
+    _role: math_cuda::device::RoleGuard,
+    _slot: LaneSlotGuard,
+}
+
+impl CardHere {
+    /// This thread works in the role (and counts in the slot) until the guard
+    /// drops.
+    pub fn enter(self) -> CardGuard {
+        CardGuard {
+            #[cfg(feature = "cuda")]
+            _role: math_cuda::device::enter_role(self.role),
+            _slot: enter_lane_slot(self.slot),
+        }
+    }
+}
+
 /// Successful device commits of a stacked polynomial.
 static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// ★ Commits that asked the device and got nothing, and encoded on the host.
@@ -26,7 +144,10 @@ static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// codeword and a host node array for the rest of the proof, so a card that
 /// fills near the end of an epoch turns into gigabytes of host memory and a
 /// utilisation figure that looks like a scheduling problem.
-static HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+///
+/// Kept by card ([`ByCard`]): a commit counts on the card of the thread that
+/// made it, and [`host_fallbacks`] is the sum over both.
+static HOST_FALLBACKS: ByCard = ByCard::new();
 /// ★ Commits the device was ASKED for and answered with an error — the part of
 /// [`host_fallbacks`] that is not a policy decline (the size threshold, the
 /// kill switch): a refused reservation (`CUDA_ERROR_OUT_OF_MEMORY`), a failed
@@ -207,7 +328,14 @@ pub fn commit_calls() -> u64 {
 }
 
 pub fn host_fallbacks() -> u64 {
-    HOST_FALLBACKS.load(Ordering::Relaxed)
+    HOST_FALLBACKS.total()
+}
+
+/// [`host_fallbacks`] made on the calling thread's card only
+/// ([`counter_slot`]): what a commit lane reads around its own commit while
+/// another lane commits on the other card.
+pub fn host_fallbacks_here() -> u64 {
+    HOST_FALLBACKS.here()
 }
 
 pub fn commit_errors() -> u64 {
@@ -326,7 +454,7 @@ mod serial_encodes_tests {
 /// Called where a commit gives up on the device. Counts in non-cuda builds
 /// too, where every commit takes that path and the number is the commit count.
 pub(crate) fn note_host_fallback() {
-    HOST_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    HOST_FALLBACKS.add(1);
 }
 
 pub fn sumcheck_calls() -> u64 {
@@ -844,7 +972,7 @@ pub(crate) fn note_room_sized(turn_sized: bool) {
 
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
-    HOST_FALLBACKS.store(0, Ordering::Relaxed);
+    HOST_FALLBACKS.reset();
     COMMIT_ERRORS.store(0, Ordering::Relaxed);
     TREE_COMMIT_ERRORS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
@@ -1506,8 +1634,11 @@ pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Without a device build the role is the host's; the counts go to the second
+/// card's slot ([`ByCard`]), so a second commit lane's are its own.
 #[cfg(not(feature = "cuda"))]
 pub fn in_second_role<R>(f: impl FnOnce() -> R) -> R {
+    let _slot = enter_lane_slot(Some(1));
     f()
 }
 
@@ -9857,9 +9988,9 @@ pub fn arm_streamed_gap_probe(bytes: u64) -> StreamedGapProbe {
 /// commitment is built ([`note_streamed_not_held`]), so a run whose streamed
 /// tree is given up after the card built it (its root not read back: the run
 /// commits batched) counts nowhere here.
-static STREAMED_BYTES: AtomicU64 = AtomicU64::new(0);
-static STREAMED_CODEWORDS: AtomicU64 = AtomicU64::new(0);
-static STREAMED_RUNS: AtomicU64 = AtomicU64::new(0);
+static STREAMED_BYTES: ByCard = ByCard::new();
+static STREAMED_CODEWORDS: ByCard = ByCard::new();
+static STREAMED_RUNS: ByCard = ByCard::new();
 
 /// The streamed joint commits' counters ([`STREAMED_BYTES`]): a window's
 /// difference ([`Self::since`]) is one group's, and [`Self::add_back`] what
@@ -9911,9 +10042,18 @@ impl StreamedNotHeld {
 /// [`StreamedNotHeld`] so far, process-wide.
 pub fn streamed_not_held() -> StreamedNotHeld {
     StreamedNotHeld {
-        bytes: STREAMED_BYTES.load(Ordering::Relaxed),
-        codewords: STREAMED_CODEWORDS.load(Ordering::Relaxed),
-        runs: STREAMED_RUNS.load(Ordering::Relaxed),
+        bytes: STREAMED_BYTES.total(),
+        codewords: STREAMED_CODEWORDS.total(),
+        runs: STREAMED_RUNS.total(),
+    }
+}
+
+/// [`streamed_not_held`] on the calling thread's card only ([`ByCard::here`]).
+pub fn streamed_not_held_here() -> StreamedNotHeld {
+    StreamedNotHeld {
+        bytes: STREAMED_BYTES.here(),
+        codewords: STREAMED_CODEWORDS.here(),
+        runs: STREAMED_RUNS.here(),
     }
 }
 
@@ -9932,12 +10072,9 @@ pub(crate) fn note_streamed_not_held(blocks: usize, log_elements: usize, transie
     #[cfg(feature = "cuda")]
     {
         let promise = math_cuda::whir::codeword_promise(transient);
-        STREAMED_BYTES.fetch_add(
-            streamed_run_bytes(blocks, log_elements, promise),
-            Ordering::Relaxed,
-        );
-        STREAMED_CODEWORDS.fetch_add(blocks as u64, Ordering::Relaxed);
-        STREAMED_RUNS.fetch_add(1, Ordering::Relaxed);
+        STREAMED_BYTES.add(streamed_run_bytes(blocks, log_elements, promise));
+        STREAMED_CODEWORDS.add(blocks as u64);
+        STREAMED_RUNS.add(1);
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (blocks, log_elements, transient);
@@ -9951,6 +10088,17 @@ pub fn joint_streamed_builds() -> u64 {
 
 #[cfg(not(feature = "cuda"))]
 pub fn joint_streamed_builds() -> u64 {
+    0
+}
+
+/// [`joint_streamed_builds`] on the calling thread's card only.
+#[cfg(feature = "cuda")]
+pub fn joint_streamed_builds_here() -> u64 {
+    math_cuda::whir::joint_streamed_builds_on(counter_slot())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn joint_streamed_builds_here() -> u64 {
     0
 }
 
@@ -9981,13 +10129,13 @@ pub fn streamed_joint_leaves() -> bool {
 
 /// Joint runs committed: all of them, and those committed to be retired
 /// before they are opened (`crate::stacked_eval::StackedCommitment::commit_to_retire`).
-static JOINT_RUNS: AtomicU64 = AtomicU64::new(0);
-static JOINT_RUNS_TO_RETIRE: AtomicU64 = AtomicU64::new(0);
+static JOINT_RUNS: ByCard = ByCard::new();
+static JOINT_RUNS_TO_RETIRE: ByCard = ByCard::new();
 
 pub(crate) fn note_joint_run(retired: bool) {
-    JOINT_RUNS.fetch_add(1, Ordering::Relaxed);
+    JOINT_RUNS.add(1);
     if retired {
-        JOINT_RUNS_TO_RETIRE.fetch_add(1, Ordering::Relaxed);
+        JOINT_RUNS_TO_RETIRE.add(1);
     }
 }
 
@@ -9996,9 +10144,18 @@ pub(crate) fn note_joint_run(retired: bool) {
 /// (`BLOCK COMMIT LEAVES STREAMED`).
 pub fn joint_runs() -> (u64, u64, u64) {
     (
-        JOINT_RUNS.load(Ordering::Relaxed),
-        JOINT_RUNS_TO_RETIRE.load(Ordering::Relaxed),
+        JOINT_RUNS.total(),
+        JOINT_RUNS_TO_RETIRE.total(),
         joint_streamed_builds(),
+    )
+}
+
+/// [`joint_runs`] made on the calling thread's card only ([`ByCard::here`]).
+pub fn joint_runs_here() -> (u64, u64, u64) {
+    (
+        JOINT_RUNS.here(),
+        JOINT_RUNS_TO_RETIRE.here(),
+        joint_streamed_builds_here(),
     )
 }
 
@@ -10764,5 +10921,64 @@ mod tests {
         let unwound = std::panic::catch_unwind(|| prefer_hand_back(true, || panic!("unwinds")));
         assert!(unwound.is_err());
         assert!(!get());
+    }
+}
+
+#[cfg(test)]
+mod counts_by_card_tests {
+    use super::{
+        card_here, counted_as_second, host_fallbacks, host_fallbacks_here, joint_runs_here,
+        note_host_fallback, note_joint_run,
+    };
+
+    /// ★ A commit lane's counts are its own card's: work counted in the
+    /// second card's slot reads in that slot's `_here` and in the process's
+    /// total, never in the first slot; a thread started from a lane counts in
+    /// the lane's slot once it enters the lane's [`card_here`], and in card
+    /// 0's without it. (The only test in this crate that counts in the second
+    /// slot, so its readings there are exact.)
+    #[test]
+    fn a_second_lanes_counts_are_its_own() {
+        counted_as_second(|| {
+            let (fallbacks, runs, total) =
+                (host_fallbacks_here(), joint_runs_here(), host_fallbacks());
+            note_host_fallback();
+            note_host_fallback();
+            note_joint_run(true);
+            assert_eq!(
+                host_fallbacks_here() - fallbacks,
+                2,
+                "two host commits here"
+            );
+            assert!(host_fallbacks() - total >= 2, "and in the total");
+            let now = joint_runs_here();
+            assert_eq!(
+                (now.0 - runs.0, now.1 - runs.1),
+                (1, 1),
+                "one run, to be retired"
+            );
+            let here = card_here();
+            let before = host_fallbacks_here();
+            std::thread::spawn(move || {
+                let _card = here.enter();
+                note_host_fallback();
+            })
+            .join()
+            .expect("the lane's thread");
+            assert_eq!(
+                host_fallbacks_here() - before,
+                1,
+                "a started thread in the lane's slot"
+            );
+            let before = host_fallbacks_here();
+            std::thread::spawn(note_host_fallback)
+                .join()
+                .expect("a plain thread");
+            assert_eq!(
+                host_fallbacks_here() - before,
+                0,
+                "a plain thread counts on card 0, not here"
+            );
+        });
     }
 }

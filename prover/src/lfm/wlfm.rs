@@ -1049,6 +1049,8 @@ pub enum WlfmProving {
 pub struct WlfmBuild {
     pub artifacts: WlfmArtifacts,
     stacks: WlfmStacks,
+    /// The planned stack placement by group, also used by the level's phase-A lanes.
+    stack_cards: Option<Vec<u8>>,
     /// Where the prepared stacks were committed, and the build's seconds: the
     /// host's part (the stacks' columns) and the commits'.
     place: StackPlace,
@@ -2004,6 +2006,7 @@ impl WlfmPrebuild {
         Ok(WlfmBuild {
             artifacts,
             stacks: committed,
+            stack_cards: cards.filter(|cards| cards.contains(&1)),
             place,
             secs: (secs, t.elapsed().as_secs_f64()),
             released: false,
@@ -2612,24 +2615,12 @@ pub(crate) fn prove_wlfm_traces_observed(
         return Err("a build whose prover half was let go proves no more".into());
     }
     match &build.stacks {
-        WlfmStacks::P1(stacks) => prove_traces_under::<WlfmHash>(
-            &build.artifacts,
-            stacks,
-            &build.chip_prefixes,
-            filled,
-            check_prefix,
-            proving,
-            on_group,
-        ),
-        WlfmStacks::B3(stacks) => prove_traces_under::<WlfmB3Hash>(
-            &build.artifacts,
-            stacks,
-            &build.chip_prefixes,
-            filled,
-            check_prefix,
-            proving,
-            on_group,
-        ),
+        WlfmStacks::P1(stacks) => {
+            prove_traces_under::<WlfmHash>(build, stacks, filled, check_prefix, proving, on_group)
+        }
+        WlfmStacks::B3(stacks) => {
+            prove_traces_under::<WlfmB3Hash>(build, stacks, filled, check_prefix, proving, on_group)
+        }
     }
 }
 
@@ -2710,14 +2701,14 @@ pub fn take_wlfm_stamps() -> Option<WlfmStamps> {
 }
 
 fn prove_traces_under<H: WhirHash>(
-    artifacts: &WlfmArtifacts,
+    build: &WlfmBuild,
     stacks: &[WlfmPrepared<H>],
-    held_prefixes: &[Option<std::sync::Arc<NarrowPrefix>>],
     filled: LfmFilled,
     check_prefix: bool,
     proving: WlfmProving,
     on_group: WlfmObserver<'_>,
 ) -> Result<WlfmProof, String> {
+    let artifacts = &build.artifacts;
     if artifacts.family.hash_name() != H::NAME {
         return Err(format!(
             "a {:?} build's stacks under {}",
@@ -2751,7 +2742,7 @@ fn prove_traces_under<H: WhirHash>(
     // packed here from the stacks when the build holds none.
     let mut prefix_pack = 0f64;
     let mut prefix = |table: usize| -> Result<std::sync::Arc<NarrowPrefix>, String> {
-        if let Some(Some(p)) = held_prefixes.get(table) {
+        if let Some(Some(p)) = build.chip_prefixes.get(table) {
             return Ok(std::sync::Arc::clone(p));
         }
         let t = std::time::Instant::now();
@@ -2910,8 +2901,23 @@ fn prove_traces_under<H: WhirHash>(
         &artifacts.program_id,
         &public_words,
     );
-    let block = match proving {
-        WlfmProving::Held => BlockCommitted::commit::<H, H::Sponge>(
+    let (lanes, shared_cards) = match proving {
+        WlfmProving::Held => (None, false),
+        WlfmProving::Streamed => {
+            use stark::multilinear_block::{LanePolicy, TwoCardKnob};
+            let mut lanes = super::levels::phase_a_lanes()?;
+            let cards = build
+                .stack_cards
+                .as_ref()
+                .filter(|_| lanes.knob == Some(TwoCardKnob::Levels));
+            if let Some(cards) = cards {
+                lanes.policy = LanePolicy::Fixed(cards.clone());
+            }
+            (Some(lanes), cards.is_some())
+        }
+    };
+    let block = match &lanes {
+        None => BlockCommitted::commit::<H, H::Sponge>(
             tables,
             &artifacts.sizes,
             config,
@@ -2919,19 +2925,22 @@ fn prove_traces_under<H: WhirHash>(
             Narrowing::Wide,
             false,
         ),
-        WlfmProving::Streamed => {
+        Some(lanes) => {
             let options = crate::block_whir::BlockOptions::production();
-            BlockCommitted::commit::<H, H::Sponge>(
+            // ★ THE LEVELS' COMMITS BY CARD (`LAMBDA_VM_LEVELS_COMMITS_BY_CARD`):
+            // phase A's groups on two commit lanes, one a card, put back by
+            // group index: the same block. One lane, as before, unless asked.
+            BlockCommitted::commit_on_lanes::<H, H::Sponge>(
                 tables,
                 &artifacts.sizes,
                 config,
                 crate::block_whir::tree_drop_for_chain(config),
                 options.narrow,
                 options.upload_ahead && uploads_beside(stacks),
+                lanes,
             )
             .map(|b| {
-                b.with_phase_b_overlap(phase_b_overlap(stacks))
-                    .with_phase_b_upload_beside(uploads_beside(stacks))
+                b.with_phase_b_commit_cards(shared_cards)
                     .with_phase_b_overlap_planned(overlap_planned())
                     .with_prepared_upload_once(upload_once())
                     .with_overlap_priced_resident(overlap_resident())
@@ -2944,7 +2953,7 @@ fn prove_traces_under<H: WhirHash>(
                 // level's phase B groups over two cards, each group on its own
                 // fork of the post-roots transcript, its share put back by group
                 // index: the same proof. A group with a held prepared stack
-                // stays on card 0 (`block_prove_in_order`). Off, nothing asked.
+                // stays on its card (`block_prove_in_order`). Off, nothing asked.
                 let groups = artifacts.sizes.len();
                 match levels_split_on_host_for_test() {
                     true => {
@@ -2963,20 +2972,73 @@ fn prove_traces_under<H: WhirHash>(
     .map_err(|e| format!("{e:?}"))?;
     let phase_a = t_a.elapsed().as_secs_f64();
     let t_b = std::time::Instant::now();
+    // Phase A may have replayed the second lane on card 0 and disabled its
+    // backend. Recover any held prepared stacks from their original columns.
+    let recover = shared_cards
+        && stacks
+            .iter()
+            .any(|p| p.card == 1 && matches!(p.hold, PreparedHold::Held(_)))
+        && !multilinear::gpu::two_card_split_ready();
+    let block = if lanes.is_some() && !recover {
+        block
+            .with_phase_b_overlap(phase_b_overlap(stacks))
+            .with_phase_b_upload_beside(uploads_beside(stacks))
+    } else {
+        block
+    };
     let borrowed: Vec<Vec<&multilinear::mle::Mle<F>>> = stacks
         .iter()
         .map(|p| multilinear::stacking::borrow(&p.columns))
         .collect();
+    // Retire each recovered stack as soon as it is committed to leave room
+    // for phase B. The program ID already binds its original roots.
+    let mut recovered = std::collections::BTreeMap::new();
+    if recover {
+        let drop = crate::block_whir::tree_drop_for_chain(config);
+        for (p, columns) in stacks.iter().zip(&borrowed) {
+            if p.card != 1 || !matches!(p.hold, PreparedHold::Held(_)) {
+                continue;
+            }
+            let retired = multilinear::stacked_eval::StackedCommitment::<F, H>::commit_to_retire(
+                p.layout().clone(),
+                columns,
+                None,
+                config,
+                &|| {},
+            )
+            .and_then(|commitment| commitment.retire(drop, config))
+            .map_err(|e| {
+                format!(
+                    "group {}: recovering its prepared stack on card 0: {e:?}",
+                    p.group
+                )
+            })?;
+            if retired.roots() != p.roots {
+                return Err(format!("group {}: recovered prepared roots moved", p.group));
+            }
+            recovered.insert(p.group, retired);
+        }
+        eprintln!(
+            "LEVELS STACKS: recovered {} held stack(s) on card 0",
+            recovered.len()
+        );
+    }
     let openings: Vec<BlockPrepared<'_, F, H>> = stacks
         .iter()
         .zip(&borrowed)
-        .map(|(p, columns)| BlockPrepared {
-            group: p.group,
-            tables: p.tables.clone(),
-            commitment: p.commitment(),
-            columns,
-            packed: p.packed.as_ref(),
-            card: p.card,
+        .map(|(p, columns)| {
+            let (commitment, card) = match recovered.get(&p.group) {
+                Some(stack) => (PreparedCommitment::Retired(stack), 0),
+                None => (p.commitment(), p.card),
+            };
+            BlockPrepared {
+                group: p.group,
+                tables: p.tables.clone(),
+                commitment,
+                columns,
+                packed: p.packed.as_ref(),
+                card,
+            }
         })
         .collect();
     let order: Vec<usize> = (0..artifacts.sizes.len()).collect();

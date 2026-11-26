@@ -3434,12 +3434,24 @@ pub fn commit_joint(
     ))
 }
 
-/// Streamed joint trees built ([`commit_joint_streamed`]), for tests.
-static JOINT_STREAMED_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Streamed joint trees built ([`commit_joint_streamed`]), for tests: by the
+/// slot of the building thread's backend ([`crate::device::current_slot`]).
+static JOINT_STREAMED_BUILDS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
-/// How many joint trees were built one codeword at a time.
+/// How many joint trees were built one codeword at a time, on either card.
 pub fn joint_streamed_builds() -> u64 {
-    JOINT_STREAMED_BUILDS.load(Ordering::Relaxed)
+    JOINT_STREAMED_BUILDS[0]
+        .load(Ordering::Relaxed)
+        .saturating_add(JOINT_STREAMED_BUILDS[1].load(Ordering::Relaxed))
+}
+
+/// [`joint_streamed_builds`] by threads working for `slot`'s backend (0 card
+/// 0's, 1 the second's; a larger slot reads the second's).
+pub fn joint_streamed_builds_on(slot: usize) -> u64 {
+    JOINT_STREAMED_BUILDS[slot.min(1)].load(Ordering::Relaxed)
 }
 
 /// The order of [`commit_joint_streamed`]'s steps, over any codeword `C` and
@@ -3716,7 +3728,7 @@ pub fn commit_joint_streamed(
     stream.synchronize()?;
     // Counted once the root is home: a run whose read-back fails commits
     // batched, and is not a streamed build.
-    JOINT_STREAMED_BUILDS.fetch_add(1, Ordering::Relaxed);
+    JOINT_STREAMED_BUILDS[crate::device::current_slot().min(1)].fetch_add(1, Ordering::Relaxed);
     let mut root = [0u8; 32];
     root.copy_from_slice(&head);
     Ok((

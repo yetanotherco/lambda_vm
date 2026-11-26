@@ -171,6 +171,9 @@ pub struct GroupStamps {
     /// The card phase B proved the group on: 0, or 1 under the two-card split
     /// ([`BlockCommitted::with_two_card_split`]).
     pub card: u8,
+    /// The commit lane phase A committed the group on: 0, or 1 for the second
+    /// card's lane ([`BlockCommitted::commit_on_lanes`]).
+    pub commit_card: u8,
     pub tables: usize,
     pub polys: usize,
     pub cells: usize,
@@ -576,7 +579,10 @@ pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
     )
 }
 
+mod phase_a_lanes;
 mod zc_lane;
+
+pub use phase_a_lanes::{LanePolicy, PhaseALanes};
 #[doc(hidden)]
 pub use zc_lane::{
     LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, local_lane_lines, merge_probe_lines,
@@ -2561,6 +2567,9 @@ where
     /// `LAMBDA_VM_TWO_CARD_SPLIT` ([`Self::with_two_card_split`]), each group
     /// marked `true` kept on card 0; `None` unless set here: one card.
     two_card_split: Option<Vec<bool>>,
+    /// For levels whose stack placement also assigned the phase-A lanes,
+    /// phase B uses that same assignment.
+    phase_b_commit_cards: bool,
     /// The knob that lets [`Self::two_card_split`] act: the base's
     /// (`LAMBDA_VM_TWO_CARD_SPLIT`) unless a level opted in under its own
     /// ([`Self::with_two_card_levels`]).
@@ -2780,7 +2789,7 @@ where
             .flatten();
         let Some(lane) = lane else {
             return Self::commit_groups_with::<H, T>(
-                groups,
+                groups.into_iter().enumerate(),
                 config,
                 drop_levels,
                 narrow,
@@ -2790,12 +2799,14 @@ where
                 &probe,
                 None,
                 local.as_ref(),
-            );
+                None,
+            )
+            .map(|(block, _)| block);
         };
         let (block, close_wait) = std::thread::scope(|scope| {
             let worker = scope.spawn(|| lane.run::<T>());
             let block = Self::commit_groups_with::<H, T>(
-                groups,
+                groups.into_iter().enumerate(),
                 config,
                 drop_levels,
                 narrow,
@@ -2805,7 +2816,9 @@ where
                 &probe,
                 Some(&lane),
                 local.as_ref(),
-            );
+                None,
+            )
+            .map(|(block, _)| block);
             // Phase A's loop ended: the job under way finishes, the rest go.
             let closing = Instant::now();
             lane.close();
@@ -2833,10 +2846,17 @@ where
     }
 
     /// [`Self::commit_groups_probed`]'s phase A, with the lane's handle when
-    /// it runs.
+    /// it runs, over groups fed with their indexes (each group's place in the
+    /// block, which its commit-time point is drawn for); returns the block of
+    /// the groups committed here and their indexes, in the order committed.
+    ///
+    /// `commit_lane`: one of phase A's commit lanes
+    /// ([`Self::commit_on_lanes`]) and its number. A lane reads its counters
+    /// on its own card, prints no phase-A line of its own, and the second
+    /// lane hands every group it holds back to the feed when it fails.
     #[allow(clippy::too_many_arguments)]
     fn commit_groups_with<H, T>(
-        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        groups: impl IntoIterator<Item = (usize, Vec<CommittedTable<'a, F, E>>)>,
         config: &ChainConfig,
         drop_levels: multilinear::whir_commit::TreeDrop,
         narrow: Narrowing,
@@ -2846,7 +2866,8 @@ where
         probe: &CsProbe,
         lane: Option<&zc_lane::ZcLane<'a, F, E>>,
         local: Option<&LocalPhaseA>,
-    ) -> Result<Self, MlError>
+        commit_lane: Option<(&phase_a_lanes::LaneFeed<'a, F, E>, u8)>,
+    ) -> Result<(Self, Vec<usize>), MlError>
     where
         H: WhirHash,
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
@@ -2859,6 +2880,26 @@ where
         // how many commits fell back to the host.
         let runs_from = multilinear::gpu::joint_runs();
         let host_from = multilinear::gpu::host_fallbacks();
+        // A commit lane brackets each commit with its own card's counters: the
+        // process-wide ones would count the other lane's commits beside it.
+        let on_card = commit_lane.is_some();
+        let joint_runs = || match on_card {
+            true => multilinear::gpu::joint_runs_here(),
+            false => multilinear::gpu::joint_runs(),
+        };
+        let streamed_not_held = || match on_card {
+            true => multilinear::gpu::streamed_not_held_here(),
+            false => multilinear::gpu::streamed_not_held(),
+        };
+        let host_fallbacks = || match on_card {
+            true => multilinear::gpu::host_fallbacks_here(),
+            false => multilinear::gpu::host_fallbacks(),
+        };
+        // The thread's device role, handed on to the committer and packer
+        // threads it starts (a no-op in the main role).
+        let here = multilinear::gpu::card_here();
+        // Each group's index, in the order committed here.
+        let mut indexes: Vec<usize> = Vec::new();
         let mut tables = Vec::new();
         let mut ood = Vec::new();
         let mut spilled: Vec<Option<Arc<Parked>>> = Vec::new();
@@ -2881,8 +2922,33 @@ where
         // The next group, taken and uploaded beside this group's commit.
         let mut ahead: Option<Ahead<'a, F, E>> = None;
         let mut exhausted = false;
+        // The second commit lane fails (R4 of the lanes): every group it holds
+        // goes back to the feed with its index (the group in hand, the group
+        // taken ahead, every group committed here, a pack under way joined
+        // first), for card 0 to commit; then the error. Any other caller
+        // returns the error as it is.
+        macro_rules! fail {
+            ($err:expr, $in_hand:expr) => {{
+                let err = $err;
+                if let Some((feed, 1)) = commit_lane {
+                    let mut back: Vec<(usize, Vec<CommittedTable<'a, F, E>>)> = $in_hand;
+                    if let Some(next) = ahead.take() {
+                        back.push((next.index, next.group));
+                    }
+                    if let Some(packed) = packing.take() {
+                        packed.install(&mut tables, &mut stamps, None);
+                    }
+                    let mut held = std::mem::take(&mut tables).into_iter();
+                    for (&g, &size) in indexes.iter().zip(&sizes).take(stamps.len()) {
+                        back.push((g, held.by_ref().take(size).collect()));
+                    }
+                    feed.hand_back(back);
+                }
+                return Err(err);
+            }};
+        }
         loop {
-            let (mut group, mut stamp, store, wide) = match ahead.take() {
+            let (index, mut group, mut stamp, store, wide) = match ahead.take() {
                 Some(next) => {
                     // A memory log: the group taken ahead is now the one in
                     // its commit.
@@ -2911,14 +2977,14 @@ where
                             store
                         }
                     };
-                    (next.group, stamp, store, next.wide)
+                    (next.index, next.group, stamp, store, next.wide)
                 }
                 None => {
                     if exhausted {
                         break;
                     }
                     let waited = Instant::now();
-                    let Some(group) = incoming.next() else {
+                    let Some((index, group)) = incoming.next() else {
                         break;
                     };
                     let mut stamp = GroupStamps {
@@ -2937,18 +3003,25 @@ where
                     let store = upload_for_commit(&group);
                     stamp.upload_a = t.elapsed().as_secs_f64();
                     stamp.upload_paid = stamp.upload_a;
-                    (group, stamp, store, wide)
+                    (index, group, stamp, store, wide)
                 }
             };
             let size = group.len();
             if size == 0 {
-                return Err(MlError::QueryCountMismatch {
-                    expected: 1,
-                    got: 0,
-                });
+                fail!(
+                    MlError::QueryCountMismatch {
+                        expected: 1,
+                        got: 0,
+                    },
+                    vec![(index, group)]
+                );
             }
             sizes.push(size);
-            let group_index = sizes.len() - 1;
+            indexes.push(index);
+            // The index the group was fed with: its place in the block,
+            // whichever lane commits it.
+            let group_index = index;
+            stamp.commit_card = commit_lane.map_or(0, |(_, lane)| lane);
             if !upload_ahead && let Some(packed) = packing.take() {
                 install_and_spill(
                     packed,
@@ -2965,14 +3038,28 @@ where
                 .map(|t| (t.num_committed_columns(), t.num_vars()))
                 .collect();
             stamp.cells = shapes.iter().map(|&(w, n)| w << n).sum();
-            let layout = global_layout(&shapes, config.format.stack)?;
+            let layout = match global_layout(&shapes, config.format.stack) {
+                Ok(layout) => layout,
+                Err(e) => fail!(e, vec![(index, group)]),
+            };
             stamp.polys = layout.num_polys();
+            // A test's fault: the second lane fails before its k-th commit.
+            if let Some((feed, 1)) = commit_lane
+                && feed.fault_at(stamps.len())
+            {
+                fail!(
+                    MlError::DeviceFailed {
+                        stage: "a test's fault in the second commit lane"
+                    },
+                    vec![(index, group)]
+                );
+            }
             stamp.commit_base = multilinear::gpu::ledger_reserved();
             stamp.commit_pool_before = multilinear::gpu::pool_reserved_now();
-            let runs_before = multilinear::gpu::joint_runs();
-            let not_held_before = multilinear::gpu::streamed_not_held();
+            let runs_before = joint_runs();
+            let not_held_before = streamed_not_held();
             stamp.commit_priced = multilinear::stacked_eval::commit_card_bytes(&layout, config);
-            let fallbacks_before = multilinear::gpu::host_fallbacks();
+            let fallbacks_before = host_fallbacks();
             multilinear::gpu::reset_reserved_window();
             // The probe reads the group's columns where the commit read them:
             // its tables point at the store until the commit's scope ends.
@@ -2998,6 +3085,7 @@ where
                     let columns = &columns;
                     let (group_ref, next_came) = (&group, &next_came);
                     let committer = scope.spawn(move || {
+                        let _card = here.enter();
                         let signal = move || {
                             let _ = room_tx.send(());
                         };
@@ -3081,7 +3169,7 @@ where
                     let next = incoming.next();
                     let arrived = Instant::now();
                     next_came.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let next = next.map(|group| {
+                    let next = next.map(|(index, group)| {
                         let wide = mem.as_ref().map_or(0, |mem| {
                             let held = group.iter().map(held_bytes).sum();
                             mem.ahead.fetch_add(held, Relaxed);
@@ -3096,6 +3184,7 @@ where
                             wide,
                             t.elapsed().as_secs_f64(),
                             Instant::now(),
+                            index,
                         )
                     });
                     let (committed, commit_end, probe_stamp, probe_end, begun) = committer
@@ -3118,13 +3207,14 @@ where
                             commit_end.saturating_duration_since(started).as_secs_f64();
                         stamp
                     });
-                    let next = next.map(|(group, store, wide, upload, uploaded)| {
+                    let next = next.map(|(group, store, wide, upload, uploaded, index)| {
                         // What the committer waited for once its commit ended:
                         // the group's arrival, then the rest of its upload —
                         // never more than the upload (a commit that ended before
                         // the upload began paid all of it, and no more).
                         let ready = arrived.max(commit_end);
                         Ahead {
+                            index,
                             group,
                             store,
                             wide,
@@ -3159,7 +3249,6 @@ where
                 }
                 committed
             };
-            let committed = committed?;
             drop(columns);
             drop(handles);
             if probe_on_card {
@@ -3167,6 +3256,10 @@ where
                     table.clear_resident();
                 }
             }
+            let committed = match committed {
+                Ok(committed) => committed,
+                Err(e) => fail!(e, vec![(index, group)]),
+            };
             roots.extend(committed.roots);
             let retired = committed.retired;
             stamp.commit = committed.commit;
@@ -3176,17 +3269,16 @@ where
             ood.push(committed.ood);
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
             stamp.commit_pool_after = multilinear::gpu::pool_reserved_now();
-            let runs = multilinear::gpu::joint_runs();
+            let runs = joint_runs();
             stamp.joint_runs = [
                 runs.0.saturating_sub(runs_before.0),
                 runs.1.saturating_sub(runs_before.1),
                 runs.2.saturating_sub(runs_before.2),
             ];
-            stamp.commit_streamed_not_held = multilinear::gpu::streamed_not_held()
+            stamp.commit_streamed_not_held = streamed_not_held()
                 .since(not_held_before)
                 .add_back(multilinear::stacked_eval::round0_trees(stamp.polys, config).len());
-            stamp.commit_host_fallbacks =
-                multilinear::gpu::host_fallbacks().saturating_sub(fallbacks_before);
+            stamp.commit_host_fallbacks = host_fallbacks().saturating_sub(fallbacks_before);
             if let Some(lane) = lane {
                 lane.note_growth(stamp.commit_reserved.saturating_sub(stamp.commit_base));
             }
@@ -3210,21 +3302,20 @@ where
             }
             // Which tables were committed wide (a packer's, from here on).
             let was_wide: Vec<bool> = group.iter().map(|t| t.compact_bytes().is_none()).collect();
-            packing =
-                narrow_group(&mut group, store, narrow, &mut stamp, mem.clone()).map(|handle| {
-                    Packing {
-                        first_table: tables.len(),
-                        group: stamps.len(),
-                        wide: group
-                            .iter()
-                            .zip(&was_wide)
-                            .filter(|&(_, &w)| w)
-                            .map(|(t, _)| wide_bytes(t))
-                            .sum(),
-                        was_wide: was_wide.clone(),
-                        handle,
-                    }
-                });
+            packing = narrow_group(&mut group, store, narrow, &mut stamp, mem.clone(), here).map(
+                |handle| Packing {
+                    first_table: tables.len(),
+                    group: stamps.len(),
+                    wide: group
+                        .iter()
+                        .zip(&was_wide)
+                        .filter(|&(_, &w)| w)
+                        .map(|(t, _)| wide_bytes(t))
+                        .sum(),
+                    was_wide: was_wide.clone(),
+                    handle,
+                },
+            );
             if let Some(mem) = &mem {
                 mem.committing.fetch_sub(wide, Relaxed);
                 mem.tree_tops.fetch_add(stamp.tree_bytes, Relaxed);
@@ -3273,16 +3364,12 @@ where
         }
         // `host commits`: `multilinear::gpu::host_fallbacks` over phase A, a
         // process-wide counter (another commit made meanwhile counts too, and
-        // without a card every commit is a host commit).
-        let runs = multilinear::gpu::joint_runs();
-        eprintln!(
-            "BLOCK COMMIT LEAVES STREAMED: {} of {} joint runs committed to be retired ({} joint runs committed) · host commits {}",
-            runs.2.saturating_sub(runs_from.2),
-            runs.1.saturating_sub(runs_from.1),
-            runs.0.saturating_sub(runs_from.0),
-            multilinear::gpu::host_fallbacks().saturating_sub(host_from),
-        );
-        Ok(Self {
+        // without a card every commit is a host commit). A commit lane's
+        // phase A prints it once for both lanes.
+        if commit_lane.is_none() {
+            print_leaves_streamed(runs_from, host_from);
+        }
+        let block = Self {
             tables,
             sizes,
             groups: retired_groups,
@@ -3309,9 +3396,11 @@ where
             }),
             local_started,
             two_card_split: None,
+            phase_b_commit_cards: false,
             two_card_knob: TwoCardKnob::Split,
             split_on_host: false,
-        })
+        };
+        Ok((block, indexes))
     }
 
     /// Phase B argues each group's local lookups on the group's own
@@ -3344,11 +3433,17 @@ where
     /// A recursion level's phase B may split its groups over two cards, as
     /// [`Self::with_two_card_split`] lets the base's, under the levels' own
     /// knob `LAMBDA_VM_TWO_CARD_LEVELS` (the base's knob plays no part). A
-    /// group with a held prepared stack stays on card 0. Off unless set here.
+    /// group with a held prepared stack stays on its card. Off unless set here.
     /// The proof is the same.
     pub fn with_two_card_levels(mut self, keep_on_card_0: Vec<bool>) -> Self {
         self.two_card_split = Some(keep_on_card_0);
         self.two_card_knob = TwoCardKnob::Levels;
+        self
+    }
+
+    /// Reuse phase A's card assignments in phase B while both cards are active.
+    pub fn with_phase_b_commit_cards(mut self, on: bool) -> Self {
+        self.phase_b_commit_cards = on;
         self
     }
 
@@ -3478,6 +3573,13 @@ where
         &self.sizes
     }
 
+    /// Each group's commit-time point, in group order: drawn from the group's
+    /// own transcript over its index, layout and roots ([`commit_ood_point`]).
+    #[doc(hidden)]
+    pub fn commit_points(&self) -> Vec<FieldElement<E>> {
+        self.ood.iter().map(|claims| claims.z0.clone()).collect()
+    }
+
     pub fn tables(&self) -> &[CommittedTable<'a, F, E>] {
         &self.tables
     }
@@ -3563,6 +3665,8 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    /// The group's index, as it was fed.
+    index: usize,
     group: Vec<CommittedTable<'a, F, E>>,
     store: Store,
     /// Its columns at eight bytes a cell (counted only for a memory log).
@@ -3570,6 +3674,20 @@ where
     upload: f64,
     wait_paid: f64,
     upload_paid: f64,
+}
+
+/// Phase A's line after its last commit: the joint runs committed, streamed
+/// into their leaves and committed to be retired, and the host commits, since
+/// `runs_from` and `host_from` (process-wide counters).
+fn print_leaves_streamed(runs_from: (u64, u64, u64), host_from: u64) {
+    let runs = multilinear::gpu::joint_runs();
+    eprintln!(
+        "BLOCK COMMIT LEAVES STREAMED: {} of {} joint runs committed to be retired ({} joint runs committed) · host commits {}",
+        runs.2.saturating_sub(runs_from.2),
+        runs.1.saturating_sub(runs_from.1),
+        runs.0.saturating_sub(runs_from.0),
+        multilinear::gpu::host_fallbacks().saturating_sub(host_from),
+    );
 }
 
 /// A group committed and retired ([`commit_and_retire`]).
@@ -3778,6 +3896,7 @@ fn narrow_group<F, E>(
     narrow: Narrowing,
     stamp: &mut GroupStamps,
     mem: Option<Arc<BlockMem>>,
+    here: multilinear::gpu::CardHere,
 ) -> Option<std::thread::JoinHandle<Packed>>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -3803,7 +3922,9 @@ where
                     run
                 })
                 .collect();
+            // The packer reads the store on its card: in the committer's role.
             Some(std::thread::spawn(move || {
+                let _card = here.enter();
                 let t = Instant::now();
                 let packed: Vec<Option<multilinear::narrow::NarrowColumns>> = runs
                     .into_iter()
@@ -5188,6 +5309,7 @@ where
         local,
         mut local_started,
         two_card_split,
+        phase_b_commit_cards,
         two_card_knob,
         split_on_host,
     } = committed;
@@ -5299,7 +5421,15 @@ where
     let prices: Vec<u64> = (0..n)
         .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
         .collect();
-    let plan = phase_b_split::plan_cards(two_card_split.as_deref(), on, &prices, &held);
+    let commit_cards =
+        (phase_b_commit_cards && stamps.iter().any(|s| s.commit_card == 1)).then(|| {
+            stamps
+                .iter()
+                .map(|s| Some(s.commit_card))
+                .collect::<Vec<_>>()
+        });
+    let pins = commit_cards.as_deref().unwrap_or(&held);
+    let plan = phase_b_split::plan_cards(two_card_split.as_deref(), on, &prices, pins);
     // A stack held on card 1 is opened there or nowhere: from card 0's
     // driver it cannot be read.
     if plan.is_err() && held.contains(&Some(1)) {
@@ -5311,7 +5441,7 @@ where
         (Some(keep), Ok(_)) => {
             let pin = |g: usize, c: u8| match keep.get(g).copied().unwrap_or(true) {
                 true => c == 0,
-                false => held[g] == Some(c),
+                false => pins[g] == Some(c),
             };
             [
                 (0..n).filter(|&g| pin(g, 0)).count(),

@@ -1895,6 +1895,415 @@ fn the_blake3_driver_with_all_three_early_knobs_preserves_the_chain() {
     .expect("the independently derived verifier accepts the final proof");
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone with commits by card, deterministic grind and fixed trace hash"]
+fn the_blake3_driver_with_stacks_and_commits_by_card_preserves_the_chain() {
+    use super::levels::{
+        COMMITS_BY_CARD_ENV, prove_block_levels, set_commits_by_card_for_test,
+        set_stacks_by_card_for_test, set_stacks_for_test, verify_block_levels_under,
+    };
+    use math_cuda::device::{
+        TwoCardSplit, backend, second_backend_started, set_two_card_levels_for_test,
+        set_two_card_split_for_test,
+    };
+    use stark::multilinear_block::PhaseALanes;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_commits_by_card_for_test(None);
+            set_stacks_by_card_for_test(None);
+            set_two_card_levels_for_test(None);
+            set_two_card_split_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let _options = super::wlfm::test_format::set_driver_options();
+    let _stacks = set_stacks_for_test(Some(StackPlace::Card));
+    assert!(crypto::grinding::deterministic());
+    assert_eq!(
+        std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(std::env::var(COMMITS_BY_CARD_ENV).as_deref(), Ok("1"));
+    set_two_card_split_for_test(Some(TwoCardSplit::Off));
+    set_two_card_levels_for_test(Some(TwoCardSplit::Forced));
+    assert!(multilinear::gpu::two_card_split_ready());
+    let main = backend().expect("the main CUDA backend");
+    let second = second_backend_started().expect("the second CUDA backend");
+    let ledger = || (main.reserved_bytes(), second.reserved_bytes());
+    let baseline = ledger();
+    let declines = multilinear::gpu::cross_card_declines();
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let prove = |on: bool| {
+        set_stacks_by_card_for_test(Some(on));
+        set_commits_by_card_for_test((!on).then(PhaseALanes::default));
+        let run = prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &pipelined_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the block proves through level 2");
+        assert_eq!(run.proofs.len(), 2);
+        assert_eq!(run.times.early.map(|note| note.used), Some(true));
+        assert_eq!(
+            ledger(),
+            baseline,
+            "both ledgers released their reservations"
+        );
+        run
+    };
+    let off = prove(false);
+    let on = prove(true);
+    assert_eq!(multilinear::gpu::cross_card_declines(), declines);
+    for level in &on.times.stamps {
+        assert!(level.groups.iter().all(|g| g.commit_card == g.card));
+    }
+    assert!(
+        on.levels
+            .iter()
+            .zip(&on.times.stamps)
+            .any(|(level, stamps)| {
+                level
+                    .build
+                    .artifacts
+                    .stacks
+                    .iter()
+                    .any(|s| stamps.groups[s.group].commit_card == 1)
+            })
+    );
+    assert!(
+        off.times
+            .stamps
+            .iter()
+            .flat_map(|s| &s.groups)
+            .all(|g| g.commit_card == 0)
+    );
+
+    let base = |run: &super::levels::LevelsRun| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes")
+    };
+    let level = |proof: &super::wlfm::WlfmProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("serializes")
+    };
+    for (part, a, b) in [
+        ("base", base(&off), base(&on)),
+        ("L1", level(&off.proofs[0]), level(&on.proofs[0])),
+        ("L2", level(&off.proofs[1]), level(&on.proofs[1])),
+    ] {
+        assert!(a[..] == b[..], "{part}: the same proof bytes");
+        println!("STACKS AND COMMITS BY CARD {part}: {} B equal", a.len());
+    }
+    verify_block_levels_under(
+        &elf,
+        &opts,
+        &format,
+        on.base_proof.statement(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        &on.proofs[1],
+    )
+    .expect("the independently derived verifier accepts level 2");
+}
+
+/// The small BLAKE3 block driven with the levels' split at `setting` and each
+/// level's phase A on two commit lanes (`LAMBDA_VM_LEVELS_COMMITS_BY_CARD`, the
+/// second lane on the second card), against the same driver with one lane:
+/// its stacks retired (no upload beside a commit) and held (the next group
+/// uploaded beside each commit, on a committer thread), each lane taking the
+/// next group when free and alternating groups. Each level's proof bytes are
+/// one lane's. Check the planned groups, fixed lane assignment, second
+/// backend's ordinal and zero cross-card store declines. Print differences
+/// in the commit paths and return the second lane's group count.
+#[cfg(feature = "cuda")]
+fn driven_with_commits_by_card(setting: math_cuda::device::TwoCardSplit) -> usize {
+    use super::levels::{
+        prove_block_levels, set_commits_by_card_for_test, set_stacks_by_card_for_test,
+    };
+    use math_cuda::device::{
+        TwoCardSplit, backend, card_count, set_two_card_levels_for_test,
+        set_two_card_split_for_test, split_placement_for,
+    };
+    use stark::multilinear_block::{GroupStamps, LanePolicy, PhaseALanes, TwoCardKnob};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_commits_by_card_for_test(None);
+            set_stacks_by_card_for_test(None);
+            set_two_card_levels_for_test(None);
+            set_two_card_split_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let _restore = Restore;
+    set_stacks_by_card_for_test(Some(false));
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    set_two_card_split_for_test(Some(TwoCardSplit::Off));
+    set_two_card_levels_for_test(Some(setting));
+    assert!(
+        multilinear::gpu::two_card_levels_on(),
+        "the levels' split is on"
+    );
+    assert!(
+        multilinear::gpu::two_card_split_ready(),
+        "the levels' second driver is ready"
+    );
+    let expected = split_placement_for(setting, card_count());
+    let ordinal = multilinear::gpu::in_second_role(|| {
+        backend().expect("the second driver's backend").ordinal()
+    });
+    assert_eq!(ordinal, expected.ordinal, "the second driver's card");
+    let drive = |place: StackPlace, lanes: Option<PhaseALanes>| {
+        set_commits_by_card_for_test(Some(lanes.unwrap_or_default()));
+        let _place = super::levels::set_stacks_for_test(Some(place));
+        let declines = multilinear::gpu::cross_card_declines();
+        let errors = multilinear::gpu::commit_errors();
+        let run = prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level");
+        let declined = multilinear::gpu::cross_card_declines() - declines;
+        let refused = multilinear::gpu::commit_errors() - errors;
+        assert_eq!(run.proofs.len(), run.levels.len(), "one proof per level");
+        assert_eq!(
+            run.times.stamps.len(),
+            run.levels.len(),
+            "one stamp per level"
+        );
+        for (k, (stamp, level)) in run.times.stamps.iter().zip(&run.levels).enumerate() {
+            let planned_groups = &level.build.artifacts.sizes;
+            assert!(
+                stamp
+                    .groups
+                    .iter()
+                    .map(|g| g.tables)
+                    .eq(planned_groups.iter().copied()),
+                "level {}: the planned groups in order",
+                k + 1
+            );
+        }
+        let proofs: Vec<Vec<u8>> = run
+            .proofs
+            .iter()
+            .map(|p| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serializes")
+                    .to_vec()
+            })
+            .collect();
+        let stamps: Vec<Vec<GroupStamps>> =
+            run.times.stamps.iter().map(|s| s.groups.clone()).collect();
+        (proofs, stamps, declined, refused)
+    };
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    // Each lane's ledger budget, for the lines of a group whose path differs.
+    let budgets = [
+        multilinear::gpu::reserve_budget(),
+        multilinear::gpu::in_second_role(multilinear::gpu::reserve_budget),
+    ];
+    let ledger = |s: &GroupStamps| {
+        format!(
+            "lane {} ledger {:.2} → peak {:.2} of {:.2} GiB, priced {:.2} GiB, host commits {}, \
+             streamed runs {}",
+            s.commit_card,
+            gib(s.commit_base),
+            gib(s.commit_reserved),
+            gib(budgets[usize::from(s.commit_card.min(1))]),
+            gib(s.commit_priced),
+            s.commit_host_fallbacks,
+            s.joint_runs[2]
+        )
+    };
+    let mut on_second = 0usize;
+    for place in [StackPlace::CardRetired, StackPlace::Card] {
+        let (one, one_stamps, one_declined, one_refused) = drive(place, None);
+        assert_eq!(
+            one_declined, 0,
+            "{place:?}: one lane read a store across cards"
+        );
+        assert!(one_stamps.iter().flatten().all(|s| s.commit_card == 0));
+        assert!(
+            one_stamps.iter().any(|groups| groups.len() > 1),
+            "{place:?}: needs a level with at least two groups"
+        );
+        let alternating: Vec<u8> = (0..64).map(|g| (g % 2) as u8).collect();
+        for policy in [LanePolicy::NextFree, LanePolicy::Fixed(alternating)] {
+            let what = format!("{setting:?} {place:?} {policy:?}");
+            let lanes = PhaseALanes {
+                knob: Some(TwoCardKnob::Levels),
+                policy: policy.clone(),
+                ..PhaseALanes::default()
+            };
+            let (two, two_stamps, declined, refused) = drive(place, Some(lanes));
+            assert_eq!(declined, 0, "{what}: a store was read from the other card");
+            assert_eq!(two.len(), one.len(), "{what}: the levels");
+            for (k, (a, b)) in two.iter().zip(&one).enumerate() {
+                assert!(a == b, "{what}: level {} moved a byte", k + 1);
+                println!(
+                    "LEVELS COMMITS BY CARD ({what}) IDENTITY level {}: {} B equal",
+                    k + 1,
+                    a.len()
+                );
+            }
+            // Host commits one run made beyond the other, over every level.
+            let (mut host_beyond_one, mut host_beyond_two) = (0u64, 0u64);
+            for (k, (two, one)) in two_stamps.iter().zip(&one_stamps).enumerate() {
+                assert_eq!(two.len(), one.len(), "{what}: level {}'s groups", k + 1);
+                for (g, (a, b)) in two.iter().zip(one).enumerate() {
+                    let at = format!("{what}: level {} group {g} (lane {})", k + 1, a.commit_card);
+                    assert!(a.commit_card <= 1, "{at}: a lane past the second");
+                    if let LanePolicy::Fixed(cards) = &policy {
+                        assert_eq!(
+                            a.commit_card,
+                            cards.get(g).copied().unwrap_or(0),
+                            "{at}: planned commit lane"
+                        );
+                    }
+                    // What the group's layout fixes: the group at its index,
+                    // whichever lane committed it and whatever its card's
+                    // room.
+                    assert_eq!(
+                        (a.tables, a.polys, a.cells, a.commit_priced),
+                        (b.tables, b.polys, b.cells, b.commit_priced),
+                        "{at}: tables, polynomials, cells and priced bytes"
+                    );
+                    // The joint runs a group commits, and those committed to
+                    // be retired, are its layout's: one lane's on either
+                    // lane, counted on the lane's own card.
+                    assert_eq!(
+                        a.joint_runs[..2],
+                        b.joint_runs[..2],
+                        "{at}: joint runs committed and to be retired"
+                    );
+                    // The rest is the committing card's call. Whether a run
+                    // streams into its leaves: each codeword asks the lane's
+                    // ledger for its room, and a refusal commits the run
+                    // batched (the same tree). Within the group the two
+                    // counters must agree, on either run.
+                    for (s, run) in [(a, "two lanes"), (b, "one lane")] {
+                        assert!(
+                            s.joint_runs[2] <= s.joint_runs[1],
+                            "{at}: {run}: streamed runs {:?}",
+                            s.joint_runs
+                        );
+                        assert_eq!(
+                            s.joint_runs[2] > 0,
+                            s.commit_streamed_not_held > 0,
+                            "{at}: {run}: streamed runs {:?} against codeword bytes not held {}",
+                            s.joint_runs,
+                            s.commit_streamed_not_held
+                        );
+                    }
+                    // Fallback and room counters are for diagnosis.
+                    host_beyond_one += a
+                        .commit_host_fallbacks
+                        .saturating_sub(b.commit_host_fallbacks);
+                    host_beyond_two += b
+                        .commit_host_fallbacks
+                        .saturating_sub(a.commit_host_fallbacks);
+                    if a.joint_runs[2] != b.joint_runs[2]
+                        || a.commit_host_fallbacks != b.commit_host_fallbacks
+                    {
+                        println!(
+                            "LEVELS COMMITS BY CARD ({at}): path differs · two lanes: {} · one \
+                             lane: {}",
+                            ledger(a),
+                            ledger(b)
+                        );
+                    }
+                    // Tables packed narrow after the commit: packed from the
+                    // group's store on its card, so the card's room decides
+                    // (a store refused, or a pack the card declines, leaves a
+                    // table wide); never more than the group's tables.
+                    assert!(
+                        a.packed_tables <= a.tables,
+                        "{at}: packed {} of {} tables",
+                        a.packed_tables,
+                        a.tables
+                    );
+                    if a.packed_tables != b.packed_tables {
+                        println!(
+                            "LEVELS COMMITS BY CARD ({at}): tables packed {} against one lane's {}",
+                            a.packed_tables, b.packed_tables
+                        );
+                    }
+                    if a.commit_card == 1 {
+                        on_second += 1;
+                    }
+                }
+                let cards: Vec<u8> = two.iter().map(|s| s.commit_card).collect();
+                let packed: usize = two.iter().map(|s| s.packed_tables).sum();
+                let packed_one: usize = one.iter().map(|s| s.packed_tables).sum();
+                println!(
+                    "LEVELS COMMITS BY CARD ({what}) level {}: groups by lane {cards:?} · tables \
+                     packed {packed} (one lane {packed_one})",
+                    k + 1
+                );
+            }
+            println!(
+                "LEVELS COMMITS BY CARD ({what}): host commits beyond the other run: two lanes \
+                 {host_beyond_one} ({refused} device refusals), one lane {host_beyond_two} \
+                 ({one_refused} device refusals)"
+            );
+        }
+    }
+    println!(
+        "LEVELS COMMITS BY CARD ({setting:?}): {on_second} level group(s) committed by the second lane"
+    );
+    on_second
+}
+
+/// ★ Card, run alone, deterministic grind. Each level's phase A on two commit
+/// lanes forced on one card (the second lane on a second backend of card 0:
+/// its own streams, staging, ledger and pools) proves each level's bytes as
+/// one lane does, with one lane's layout counters group by group and each
+/// room-dependent path its own card's call, and the second lane committed
+/// level groups.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: proves a small BLAKE3 block and its levels six times; run alone, deterministic grind"]
+fn the_blake3_driver_with_its_level_commits_forced_on_one_card_proves_the_same_level_bytes() {
+    let second = driven_with_commits_by_card(math_cuda::device::TwoCardSplit::Forced);
+    assert!(second > 0, "no level group committed by the second lane");
+}
+
+/// ★ Two cards, run alone, deterministic grind. With two cards seen and the
+/// levels' knob at `auto`, the second commit lane runs on card 1 and each
+/// level proves the bytes of one lane.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "two cards: proves a small BLAKE3 block and its levels six times; run alone, deterministic grind"]
+fn the_blake3_driver_with_its_level_commits_on_card_1_proves_the_same_level_bytes() {
+    use math_cuda::device::{TwoCardSplit, card_count, split_placement};
+    assert!(card_count() >= 2, "needs two cards, saw {}", card_count());
+    math_cuda::device::set_two_card_levels_for_test(Some(TwoCardSplit::Auto));
+    assert_eq!(split_placement().ordinal, 1, "the second driver on card 1");
+    let second = driven_with_commits_by_card(TwoCardSplit::Auto);
+    assert!(second > 0, "no level group committed on card 1");
+}
+
 /// ★ Level 2 executed beside its own preparation
 /// (`LAMBDA_VM_LEVELS_NEXT_BESIDE`), alone and with its stacks committed
 /// early, is the same level: a small BLAKE3 block driven with the knob on

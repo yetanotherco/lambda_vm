@@ -591,3 +591,152 @@ fn a_cuda_stack_retirement_fault_replays_interleaved_stacks_on_card_0() {
         StackPlace::CardRetired,
     );
 }
+
+/// Restores this thread's levels' phase-A lanes when dropped.
+struct LanesOff;
+
+impl Drop for LanesOff {
+    fn drop(&mut self) {
+        super::levels::set_commits_by_card_on_thread_for_test(None);
+    }
+}
+
+/// The probe level, its prepared stacks at `place`, proved streamed with its
+/// phase A on `lanes` (one lane for `None`): the proof, verified, and each
+/// group's (commit lane, phase-B card).
+fn proved_on_lanes(
+    place: StackPlace,
+    lanes: Option<stark::multilinear_block::PhaseALanes>,
+) -> (WlfmProof, Vec<(u8, u8)>) {
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    let built = build_wlfm_placed(
+        &level,
+        hasher,
+        WlfmRate::Two,
+        WlfmLevers::with_family(WlfmFamily::B3),
+        place,
+    )
+    .expect("the W-LFM build");
+    let filled = execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+    let _off = LanesOff;
+    super::levels::set_commits_by_card_on_thread_for_test(lanes);
+    let _ = take_wlfm_stamps();
+    let proof = prove_wlfm_traces_as(&built, filled, true, WlfmProving::Streamed).expect("proves");
+    let groups = take_wlfm_stamps()
+        .expect("the prove's stamps")
+        .groups
+        .iter()
+        .map(|g| (g.commit_card, g.card))
+        .collect();
+    verify_wlfm(&built.artifacts, &proof, &proof.public_words).expect("verifies");
+    (proof, groups)
+}
+
+/// ★ A level's phase A on two commit lanes (on the host) proves the bytes of
+/// one lane, its prepared stacks retired (level 1's on a real block: no
+/// upload beside a commit) or held (level 2's: the next group uploaded
+/// beside each commit): every group on the lane the assignment gave it, each
+/// lane taking the next group when free, and the second lane failing before
+/// its first commit (its groups then committed on card 0).
+#[test]
+fn a_level_committed_on_two_lanes_proves_the_same_bytes() {
+    use stark::multilinear_block::{LanePolicy, PhaseALanes};
+    let _fast = test_format::set(Some(2));
+    // One stacked polynomial a group: a level of several groups.
+    let _groups = test_format::set_group_polys(1);
+    for place in [StackPlace::CardRetired, StackPlace::Card] {
+        let (one, one_groups) = proved_on_lanes(place, None);
+        let n = one_groups.len();
+        assert!(n >= 2, "{place:?}: a level of several groups");
+        assert!(
+            one_groups.iter().all(|g| g.0 == 0),
+            "{place:?}: one lane commits on card 0"
+        );
+        let alternating: Vec<u8> = (0..n).map(|g| (g % 2) as u8).collect();
+        let on_host = |policy: LanePolicy, fault: Option<usize>| PhaseALanes {
+            knob: None,
+            policy,
+            on_host: true,
+            fault,
+        };
+        for (what, lanes, want) in [
+            (
+                "alternating",
+                on_host(LanePolicy::Fixed(alternating.clone()), None),
+                Some(alternating.clone()),
+            ),
+            ("next free", on_host(LanePolicy::NextFree, None), None),
+            (
+                "the second lane failing",
+                on_host(LanePolicy::Fixed(alternating.clone()), Some(0)),
+                Some(vec![0; n]),
+            ),
+        ] {
+            let (two, groups) = proved_on_lanes(place, Some(lanes));
+            assert_eq!(bytes(&two), bytes(&one), "{place:?} {what}: a byte moved");
+            let commit_cards: Vec<u8> = groups.iter().map(|g| g.0).collect();
+            if let Some(want) = want {
+                assert_eq!(commit_cards, want, "{place:?} {what}: each group's lane");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: run alone in a fresh process with deterministic grind"]
+fn a_phase_a_fault_recovers_held_stacks_from_the_second_card() {
+    use math_cuda::device::{
+        TwoCardSplit, backend, second_backend_started, set_two_card_levels_for_test,
+        set_two_card_split_for_test,
+    };
+    use stark::multilinear_block::{PhaseALanes, TwoCardKnob};
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_two_card_levels_for_test(None);
+            set_two_card_split_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let _lanes = LanesOff;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    assert!(crypto::grinding::deterministic());
+    set_two_card_split_for_test(Some(TwoCardSplit::Off));
+    set_two_card_levels_for_test(Some(TwoCardSplit::Forced));
+    assert!(multilinear::gpu::two_card_split_ready());
+    let main = backend().expect("the main CUDA backend");
+    let second = second_backend_started().expect("the second CUDA backend");
+    let ledger = || (main.reserved_bytes(), second.reserved_bytes());
+    let before = ledger();
+    let declines = multilinear::gpu::cross_card_declines();
+
+    let (build, _, expected, _) = held_by_card(None, false);
+    let program_id = build.artifacts.program_id;
+    let expected = expected.expect("one card proves");
+    drop(build);
+    super::levels::set_commits_by_card_on_thread_for_test(Some(PhaseALanes {
+        knob: Some(TwoCardKnob::Levels),
+        fault: Some(1),
+        ..PhaseALanes::default()
+    }));
+    let (build, assignment, recovered, groups) = held_by_card(Some(&all_on_card_1), false);
+    assert!(assignment.is_some_and(|cards| cards.len() > 1));
+    assert!(!multilinear::gpu::two_card_split_ready());
+    assert_eq!(build.artifacts.program_id, program_id);
+    assert!(groups.iter().all(|g| g.0 == 0));
+    let recovered = recovered.expect("card 0 recovers the phase-A groups and prepared stacks");
+    verify_wlfm(&build.artifacts, &recovered, &recovered.public_words).expect("verifies");
+    drop(build);
+    let recovered = bytes(&recovered);
+    assert_eq!(recovered, bytes(&expected));
+    assert_eq!(ledger(), before);
+    assert_eq!(multilinear::gpu::cross_card_declines(), declines);
+    println!(
+        "PHASE A STACK RECOVERY: {} B equal, ledger {before:?}",
+        recovered.len()
+    );
+}
