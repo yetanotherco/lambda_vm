@@ -1,0 +1,24 @@
+# Read from the PR base branch by yetanotherco/actions pr_review_multi.yml.
+# All code gets the full reviewer set; the threat model sets the security focus.
+threat_model = "threat_model.md"
+low_risk = []
+
+# Generated Sail translation and other files that do not need a security review.
+ignore = [
+  "sail-riscv-lean/LeanRV64D/**",
+  "sail-riscv-lean/LeanRV64D.lean",
+  "bench_vs/**",
+  "**/*.elf",
+  "**/*.log",
+  "**/*.log/**",
+  "executor/programs/**/*.json",
+  "crypto/math-cuda/kernels/**/*.ptx",
+]
+
+# Additional test paths from the previous review configuration.
+test_globs = [
+  "executor/programs/asm/test_*",
+  "tooling/ethrex-tests/**",
+  "tooling/ethrex-fixtures/**",
+  "crypto/math/fuzz/**",
+]
