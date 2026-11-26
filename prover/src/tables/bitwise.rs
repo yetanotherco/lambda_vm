@@ -838,6 +838,12 @@ impl PartialEq for BitwiseHistogram {
 }
 
 impl BitwiseHistogram {
+    /// Exact multiplicities in lookup-family and row order.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn counts(&self) -> &[u64] {
+        &self.counters
+    }
+
     /// Allocate a zeroed histogram (80 MiB).
     // No `Default` impl on purpose: `new()` allocates 80 MiB, so a stray
     // `..Default::default()` / `#[derive(Default)]` must not silently do that.

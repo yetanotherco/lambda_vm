@@ -79,6 +79,10 @@ impl WorkerFault {
 }
 
 impl InprocWorkers {
+    pub fn count(self) -> usize {
+        self.count.get()
+    }
+
     pub fn from_env() -> Result<Option<Self>, String> {
         const ENV: &str = "LAMBDA_VM_CLUSTER";
         match std::env::var(ENV) {
@@ -94,7 +98,7 @@ impl InprocWorkers {
         self
     }
 
-    pub(crate) fn parse(value: &str) -> Result<Option<Self>, String> {
+    pub fn parse(value: &str) -> Result<Option<Self>, String> {
         match value.trim() {
             "" | "off" => Ok(None),
             value => value
@@ -117,6 +121,7 @@ pub(super) struct InprocRequest<F: IsField> {
     pub workers: InprocWorkers,
     pub statement: Vec<Vec<u8>>,
     pub preprocessed: Vec<Vec<Mle<F>>>,
+    pub owners: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -566,6 +571,7 @@ pub(super) struct Bound<F: IsField, E: IsField> {
 
 pub(super) fn bind_workers<F, E, T>(
     workers: InprocWorkers,
+    owners: Option<&[usize]>,
     statement: Vec<Vec<u8>>,
     expected: Vec<Committed<E>>,
     derived: Vec<Commitment>,
@@ -586,10 +592,15 @@ where
     #[cfg(test)]
     let fault = workers.fault;
     let workers = workers.count.get();
+    if owners.is_some_and(|owners| {
+        owners.len() != expected.len() || owners.iter().any(|&id| id >= workers)
+    }) {
+        return Err(protocol("invalid replica ownership"));
+    }
     let headers: Vec<_> = (0..expected.len())
         .map(|group| Header {
             attempt,
-            worker: group % workers,
+            worker: owners.map_or(group % workers, |owners| owners[group]),
             group,
         })
         .collect();
@@ -810,6 +821,7 @@ mod tests {
             InprocWorkers::parse(&format!("inproc:{workers}"))
                 .unwrap()
                 .unwrap(),
+            None,
             vec![vec![0x31, 0x32], vec![0x41, 0x42, 0x43]],
             (0..4).map(receipt).collect(),
             vec![[103; 32], [100; 32], [102; 32], [101; 32]],
@@ -905,6 +917,7 @@ mod tests {
         coordinator.append_bytes(b"different initial transcript");
         let bound = bind_workers::<F, E, _>(
             InprocWorkers::parse("inproc:2").unwrap().unwrap(),
+            None,
             Vec::new(),
             (0..4).map(receipt).collect(),
             Vec::new(),

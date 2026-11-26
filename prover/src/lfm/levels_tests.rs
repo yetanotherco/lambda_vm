@@ -2740,9 +2740,9 @@ fn rta_last_file(
     ok
 }
 
-/// Stage 2 byte gate for test_commit_4. The proof uses the same options and
-/// archive layout as the stage 1 BLAKE3 fixture, with one independent final
-/// verification. Run each driver setting in its own process.
+/// Archive gate for independently replayed test_commit_4. The proof uses the
+/// existing stage 1 BLAKE3 fixture settings. Run each worker count in a fresh
+/// process.
 #[test]
 #[ignore = "cluster archive gate: needs a real CUDA build"]
 fn cluster_stage2_test_commit_4() {
@@ -2781,6 +2781,10 @@ fn write_identity_files(run: &super::levels::LevelsRun, family: WlfmFamily) {
     let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") else {
         return;
     };
+    println!(
+        "CLUSTER ARCHIVE LOCAL PHASE A: {:.6}s",
+        run.base_stamps.phase_a
+    );
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).expect("proof output directory");
     let base = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("archive base");

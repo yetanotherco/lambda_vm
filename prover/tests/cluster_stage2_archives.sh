@@ -46,11 +46,16 @@ run_fixture() {
         echo "$fixture ($mode)"
         grep 'test result: ok. 1 passed' "$dir.log"
         if [[ "$mode" == local ]]; then
+            grep 'CLUSTER ARCHIVE LOCAL PHASE A:' "$dir.log"
             (cd "$dir" && sha256sum -c "$output/$fixture.sha256")
         else
             local workers
             workers=$(grep 'BLOCK CLUSTER INPROC: completed groups by worker' "$dir.log")
             echo "$workers"
+            grep 'BLOCK CLUSTER HANDOUT:' "$dir.log"
+            grep 'BLOCK CLUSTER REPLICA ' "$dir.log"
+            test "$(grep -c 'BLOCK CLUSTER REPLICA ' "$dir.log")" -eq "$mode"
+            grep -Eq 'BLOCK CLUSTER HANDOUT: .* · [1-9][0-9]* terminal' "$dir.log"
             python3 - "$fixture" "$mode" "${workers##*worker }" <<'PYTHON'
 import json
 import sys

@@ -580,7 +580,8 @@ impl RecordsFill<'_> {
     /// (whatever pieces they lie in): what [`Records::digest`] reads. A CPU
     /// table's DECODE rows are the program's, the same for every table: left
     /// out.
-    fn words(&self, mut each: impl FnMut(u64)) {
+    /// Canonical words of the ordered fill inputs, without segment boundaries.
+    pub fn words(&self, mut each: impl FnMut(u64)) {
         match self {
             Self::KeccakRnd { ops, skip } => {
                 each(0);

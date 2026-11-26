@@ -3416,6 +3416,56 @@ where
         })
     }
 
+    /// Commit an owned base group using its canonical index for commit-time OOD.
+    pub fn commit_replica_group<H, T>(
+        index: usize,
+        tables: Vec<CommittedTable<'a, F, E>>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        local: Option<LocalPhaseA>,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        Self::commit_groups_with::<H, T>(
+            std::iter::once(tables),
+            config,
+            drop_levels,
+            narrow,
+            false,
+            None,
+            None,
+            &CsProbe::default(),
+            None,
+            local.as_ref(),
+            index,
+        )
+    }
+
+    /// Reassemble the independently committed groups before the global draw.
+    pub fn assemble_replica_groups(groups: Vec<Option<Self>>) -> Result<Self, MlError> {
+        let missing = || MlError::ClusterProtocol("missing replica commitment");
+        let mut parts = groups.into_iter();
+        let mut block = parts.next().flatten().ok_or_else(missing)?;
+        for part in parts {
+            let mut part = part.ok_or_else(missing)?;
+            block.tables.append(&mut part.tables);
+            block.sizes.append(&mut part.sizes);
+            block.groups.append(&mut part.groups);
+            block.roots.append(&mut part.roots);
+            block.stamps.append(&mut part.stamps);
+            block.spilled.append(&mut part.spilled);
+            block.ood.append(&mut part.ood);
+            block.local_started.append(&mut part.local_started);
+            if let (Some(local), Some(other)) = (&mut block.local, &mut part.local) {
+                local.digests.append(&mut other.digests);
+            }
+        }
+        Ok(block)
+    }
+
     /// Route the base group's receipts, replay and results through logical
     /// workers. For this mode pass a fresh transcript to phase B, as the
     /// sealed plan includes the statement's original append calls. Supply
@@ -3426,10 +3476,21 @@ where
         statement: Vec<Vec<u8>>,
         preprocessed: Vec<Vec<Mle<F>>>,
     ) {
+        self.set_inproc_owners(workers, statement, preprocessed, None);
+    }
+
+    pub fn set_inproc_owners(
+        &mut self,
+        workers: InprocWorkers,
+        statement: Vec<Vec<u8>>,
+        preprocessed: Vec<Vec<Mle<F>>>,
+        owners: Option<Vec<usize>>,
+    ) {
         self.inproc = Some(InprocRequest {
             workers,
             statement,
             preprocessed,
+            owners,
         });
     }
 
@@ -5455,6 +5516,7 @@ where
                 .collect::<Result<_, _>>()?;
             let bound = inproc::bind_workers(
                 request.workers,
+                request.owners.as_deref(),
                 request.statement,
                 receipts,
                 derived,

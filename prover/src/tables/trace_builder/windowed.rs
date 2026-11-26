@@ -1552,6 +1552,14 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// not stream. The streamed chunks' slots hold empty placeholders;
     /// [`Traces::insert_streamed`] puts the chunks back.
     pub fn finish(self, logs: &[Log]) -> Result<Traces, Error> {
+        self.finish_with_bitwise(logs, None)
+    }
+
+    pub(crate) fn finish_with_bitwise(
+        self,
+        logs: &[Log],
+        bitwise_slot: Option<&super::BitwiseSlot>,
+    ) -> Result<Traces, Error> {
         let Finishing {
             ops,
             image,
@@ -1564,7 +1572,25 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             skip,
             pre,
-        } = self.finishing(logs)?;
+        } = self.finishing(logs, bitwise_slot)?;
+        if bitwise_slot.is_some() {
+            return super::finish::FinishPlan::new(
+                ops,
+                Some(&image),
+                &memory_state,
+                &register_init,
+                decode_trace,
+                &decode,
+                register_state,
+                &max_rows,
+                private_input,
+                true,
+                false,
+                &skip,
+                Some(pre),
+            )?
+            .emit_all_with_bitwise(bitwise_slot);
+        }
         build_traces(
             ops,
             Some(&image),
@@ -1599,7 +1625,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             Error,
         >,
     ) -> Result<(), Error> {
-        self.finish_streamed_keeping(logs, gate, false, on_header)
+        self.finish_streamed_keeping(logs, gate, false, None, on_header)
             .map(|_| ())
     }
 
@@ -1610,6 +1636,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         logs: &[Log],
         gate: &super::gate::ByteGate,
         keep: bool,
+        bitwise_slot: Option<&super::BitwiseSlot>,
         on_header: impl FnOnce(
             super::RestHeader,
         ) -> Result<
@@ -1630,7 +1657,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             mut skip,
             pre,
-        } = self.finishing(logs)?;
+        } = self.finishing(logs, bitwise_slot)?;
         // BITWISE's lookups from the tables need BITWISE last (the slide, with
         // the `parallel` feature) and only the streamed chunks' tails kept:
         // their full chunks were counted as they were handed out. They count
@@ -1677,12 +1704,18 @@ impl<'a> WindowedTraceBuilder<'a> {
                 return Err(e);
             }
         };
-        plan.emit_streamed_keeping(gate, &mut *send, keep, slide)
+        plan.emit_streamed_keeping(gate, &mut *send, keep, slide, bitwise_slot)
     }
 
     /// The run's last window collected and walked, and the run's lists
     /// assembled: what the table phase starts from.
-    fn finishing(mut self, logs: &[Log]) -> Result<Finishing<'a>, Error> {
+    fn finishing(
+        mut self,
+        logs: &[Log],
+        #[cfg_attr(not(feature = "parallel"), allow(unused_variables))] bitwise_slot: Option<
+            &super::BitwiseSlot,
+        >,
+    ) -> Result<Finishing<'a>, Error> {
         // Every handed-out chunk counted, wherever it was counted.
         self.join_handout_count()?;
         // The last window may halt: it is walked here, not by the `Walker`.
@@ -1725,6 +1758,10 @@ impl<'a> WindowedTraceBuilder<'a> {
             routed: None,
             times: None,
         };
+        #[cfg(feature = "parallel")]
+        if let Some(slot) = bitwise_slot {
+            slot.note_walk_end();
+        }
         super::build_stamps::mark("p0 last window");
         let Self {
             decode,
@@ -5538,7 +5575,179 @@ fn word_chunks(
     jobs
 }
 
+/// The ordered inputs of a streamed chunk, with deduplication already resolved
+/// where it changes the height or row order.
+#[cfg(feature = "parallel")]
+pub(crate) struct DeferredChunk {
+    data: DeferredChunkData,
+    pub(crate) rows: usize,
+    pub(crate) spans_parts: bool,
+}
+
+#[cfg(feature = "parallel")]
+enum DeferredChunkData {
+    Job(ChunkJob),
+    Lt(Vec<(super::LtOperation, u64)>),
+}
+
+#[cfg(feature = "parallel")]
+impl DeferredChunk {
+    pub(crate) fn materialize(self, form: TraceForm) -> Table {
+        match self.data {
+            DeferredChunkData::Job(job) => job.generate_as(form).trace,
+            DeferredChunkData::Lt(rows) => lt::lt_trace_of_rows(&rows, form),
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match &self.data {
+            DeferredChunkData::Job(job) => job.op_bytes(),
+            DeferredChunkData::Lt(rows) => super::vec_heap_bytes(rows),
+        }
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        use crypto::hash::blake3::chain::Blake3Std;
+        use digest::Digest;
+        use multilinear::records::TableRecords;
+        use std::fmt::Write;
+
+        // The walker already uses this field-by-field representation to check
+        // sampled re-walks. Feed one record at a time to ignore part boundaries.
+        struct Writer(Blake3Std);
+        impl Write for Writer {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.update(s.as_bytes());
+                Ok(())
+            }
+        }
+        impl Writer {
+            fn records<T: std::fmt::Debug>(&mut self, rows: impl IntoIterator<Item = T>) {
+                for row in rows {
+                    let _ = writeln!(self, "{row:?}");
+                }
+            }
+            fn fill(&mut self, fill: multilinear::records::RecordsFill<'_>) {
+                fill.words(|word| self.0.update(word.to_le_bytes()));
+            }
+        }
+        let mut digest = Writer(Blake3Std::new());
+        match &self.data {
+            DeferredChunkData::Lt(rows) => digest.records(rows),
+            DeferredChunkData::Job(job) => match &job.ops {
+                ChunkOps::Cpu(ops, _) => digest.records(ops.iter()),
+                ChunkOps::CpuInRow(ops, sides, _) => digest.records(ops.iter().zip(sides.iter())),
+                ChunkOps::CpuRecords { records, .. } => digest.fill(records.fill()),
+                ChunkOps::MemwRegister(rows) => digest.records(rows.iter()),
+                ChunkOps::MemwRegisterRecords(records) => digest.fill(records.fill()),
+                ChunkOps::MemwAligned(ops) => digest.records(ops.iter()),
+                ChunkOps::Memw(ops) => digest.records(ops.iter()),
+                ChunkOps::Load(ops) => digest.records(ops.iter()),
+                ChunkOps::Shift(ops) => digest.records(ops.iter()),
+                ChunkOps::Store(ops) => digest.records(ops),
+                ChunkOps::KeccakRnd {
+                    ops,
+                    skip,
+                    rows,
+                    records,
+                    fault,
+                } => {
+                    digest.records([(skip, rows, records, fault)]);
+                    digest.records(ops);
+                }
+                ChunkOps::MemLoad(rows) => digest.records(rows.iter()),
+                ChunkOps::MemStore(rows) => digest.records(rows.iter()),
+                ChunkOps::Word(rows) => match rows {
+                    WordFamilyChunk::Load8(r) => digest.records(r.iter()),
+                    WordFamilyChunk::Store8(r) => digest.records(r.iter()),
+                    WordFamilyChunk::LoadW(r) => digest.records(r.iter()),
+                    WordFamilyChunk::StoreW(r) => digest.records(r.iter()),
+                    WordFamilyChunk::Load2W(r) => digest.records(r.iter()),
+                    WordFamilyChunk::Store2W(r) => digest.records(r.iter()),
+                    WordFamilyChunk::MemwW(r) => digest.records(r.iter()),
+                },
+                ChunkOps::Rows(_) | ChunkOps::Lt(_) => unreachable!("already handled at handout"),
+            },
+        }
+        digest.0.finalize().into()
+    }
+}
+
 impl ChunkJob {
+    #[cfg(feature = "parallel")]
+    pub(crate) fn defer(self) -> DeferredChunk {
+        use multilinear::records::{RecordsFill, TableRecords};
+
+        let ops = self.op_count();
+        let spans_parts = match &self.ops {
+            ChunkOps::Cpu(ops, _) | ChunkOps::CpuInRow(ops, _, _) => ops.parts.len() > 1,
+            ChunkOps::CpuRecords { records, .. } => {
+                matches!(records.fill(), RecordsFill::Cpu { logs, .. } if logs.len() > 1)
+            }
+            ChunkOps::Lt(ops) => ops.parts.len() > 1,
+            _ => false,
+        };
+        let (data, rows) = match self.ops {
+            ChunkOps::Lt(rows) => {
+                let rows = super::super::types::dedup_rows_of(rows.iter());
+                let height = rows.len().next_power_of_two().max(4);
+                (DeferredChunkData::Lt(rows), height)
+            }
+            ChunkOps::KeccakRnd { rows, .. } => (DeferredChunkData::Job(self), rows),
+            // A listless CPU chunk has no spent operations. Its logs still
+            // carry every row of the chunk.
+            ChunkOps::CpuRecords { ref records, .. } => {
+                let rows = records.rows();
+                (DeferredChunkData::Job(self), rows)
+            }
+            _ => (DeferredChunkData::Job(self), ops.next_power_of_two().max(4)),
+        };
+        DeferredChunk {
+            data,
+            rows,
+            spans_parts,
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn keccak_local_counts(
+        &self,
+        form: super::super::keccak_rnd::KeccakRndForm,
+    ) -> Result<Option<super::super::local_bytes::LocalCounts>, Error> {
+        use super::super::local_bytes::{LocalCounts, count_keccak_rnd_rows};
+        let ChunkOps::KeccakRnd {
+            ops,
+            skip,
+            rows,
+            records,
+            fault,
+        } = &self.ops
+        else {
+            return Ok(None);
+        };
+        if !form.byte_lookups_local() {
+            return Ok(None);
+        }
+        let mut counts = LocalCounts::default();
+        let skip = skip + if *records { *fault } else { 0 };
+        count_keccak_rnd_rows(
+            ops.iter().map(|op| &op.input),
+            skip,
+            *rows,
+            form,
+            &mut counts,
+        )
+        .map_err(Error::Prover)?;
+        Ok(Some(counts))
+    }
+
+    /// This variant is already an unfilled record holder, and can hand out
+    /// its TraceTable representation without producing any columns.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn is_row_records(&self) -> bool {
+        matches!(self.ops, ChunkOps::Rows(_))
+    }
+
     /// The bytes its ops take on the heap.
     pub fn op_bytes(&self) -> usize {
         use super::vec_heap_bytes as b;
@@ -5797,6 +6006,69 @@ impl ChunkJob {
                 | ChunkOps::KeccakRnd { records: true, .. }
         )
     }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+#[test]
+fn deferred_lt_chunk_preserves_rows_and_dedup_across_windows() {
+    let op = |v| super::LtOperation::new(v, v + 1, false);
+    let first = Arc::new(vec![op(1), op(2), op(3)]);
+    let second = Arc::new(vec![op(1), op(4), op(2)]);
+    let job = |parts| ChunkJob {
+        table: StreamTable::Lt,
+        index: 0,
+        ops: ChunkOps::Lt(Segments { parts }),
+    };
+    let parts = || vec![(Arc::clone(&first), 0..3), (Arc::clone(&second), 0..3)];
+    let local = job(parts()).generate();
+    let replica = job(parts()).defer();
+    let contiguous = job(vec![(
+        Arc::new(first.iter().chain(second.iter()).cloned().collect()),
+        0..6,
+    )])
+    .defer();
+    assert!(replica.spans_parts);
+    assert_eq!(replica.rows, 4);
+    assert_eq!(replica.digest(), contiguous.digest());
+    let trace = replica.materialize(TraceForm::Wide);
+    assert_eq!(
+        trace.main_data_row_major(),
+        local.trace.main_data_row_major()
+    );
+}
+
+#[cfg(all(test, feature = "parallel"))]
+#[test]
+fn deferred_listless_cpu_chunk_uses_the_log_height() {
+    let elf = Elf::load(&crate::test_utils::asm_elf_bytes("test_commit_4")).unwrap();
+    let result = executor::vm::execution::Executor::new(&elf, Vec::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    let builder =
+        WindowedTraceBuilder::new(&elf, &[], &super::super::MaxRowsConfig::small()).unwrap();
+    let decode = Arc::new(CardDecode::new(Arc::clone(&builder.decode)).unwrap());
+    let logs = Arc::new(result.logs);
+    let records = CpuLogRecords::new(
+        Segments {
+            parts: vec![(Arc::clone(&logs), 0..4), (logs, 4..8)],
+        },
+        0,
+        decode,
+    )
+    .unwrap();
+    let job = ChunkJob {
+        table: StreamTable::Cpu,
+        index: 0,
+        ops: ChunkOps::CpuRecords {
+            records,
+            spent: Segments { parts: Vec::new() },
+        },
+    };
+    let replica = job.defer();
+    assert!(replica.spans_parts);
+    assert_eq!(replica.rows, 8);
+    assert_eq!(replica.materialize(TraceForm::Narrow).main_table.height, 8);
 }
 
 #[cfg(all(test, feature = "cuda", feature = "parallel"))]

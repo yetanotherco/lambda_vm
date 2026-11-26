@@ -1649,6 +1649,13 @@ impl<'a> FinishPlan<'a> {
     /// Phase 5: every table, as [`super::build_traces`] always built them, in
     /// one parallel scope; refused unless they are the ones the header counted.
     pub(super) fn emit_all(self) -> Result<Traces, Error> {
+        self.emit_all_with_bitwise(None)
+    }
+
+    pub(super) fn emit_all_with_bitwise(
+        self,
+        bitwise_slot: Option<&BitwiseSlot>,
+    ) -> Result<Traces, Error> {
         let Self {
             memory_state,
             register_init,
@@ -1949,10 +1956,8 @@ impl<'a> FinishPlan<'a> {
             )
         };
         let gen_bitwise = || {
-            let mut bitwise = bitwise::generate_bitwise_trace();
-            // Fill the MU columns (11..=20) from the accumulated histogram.
-            bitwise_histogram.fill_multiplicities(&mut bitwise);
-            packed_if(pack, bitwise)
+            let witness = BitwiseWitness::new(bitwise_histogram, pack, form);
+            witness.hand_out(bitwise_slot)
         };
         // Each CPU operation looks up the DECODE table once; padding rows look up
         // pc=1 (the CPU padding entry). When CPU is split, each chunk pads
@@ -2314,7 +2319,7 @@ impl<'a> FinishPlan<'a> {
         let stores = stores_slot.expect(PHASE5_RAN)?;
         let cpu32s = cpu32s_slot.expect(PHASE5_RAN)?;
         #[allow(unused_mut)]
-        let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
+        let mut bitwise = bitwise_slot.expect(PHASE5_RAN)?;
         #[allow(unused_mut)]
         let mut decode = decode_slot.expect(PHASE5_RAN);
         let copies = copies_slot.expect(PHASE5_RAN)?;
@@ -2428,6 +2433,117 @@ impl<'a> FinishPlan<'a> {
 }
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+/// The finish computes the full histogram while it still has the walk's
+/// lists. Its owner alone uses it to write the BITWISE trace.
+pub(crate) struct BitwiseWitness {
+    histogram: bitwise::BitwiseHistogram,
+    pack: bool,
+    form: TraceForm,
+    direct: bool,
+    tail: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct BitwiseSlot {
+    witness: std::sync::Mutex<Option<BitwiseWitness>>,
+    #[cfg(feature = "parallel")]
+    walk_end: std::sync::OnceLock<std::time::Instant>,
+}
+
+#[cfg(feature = "parallel")]
+impl BitwiseSlot {
+    pub(crate) fn note_walk_end(&self) {
+        let _ = self.walk_end.set(std::time::Instant::now());
+    }
+
+    pub(crate) fn walk_end(&self) -> Option<std::time::Instant> {
+        self.walk_end.get().copied()
+    }
+
+    pub(crate) fn take(&self) -> Result<BitwiseWitness, Error> {
+        self.witness
+            .lock()
+            .map_err(|_| Error::Prover("BITWISE handout lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| Error::Prover("replica did not hand out its BITWISE histogram".into()))
+    }
+}
+
+impl BitwiseWitness {
+    fn new(histogram: bitwise::BitwiseHistogram, pack: bool, form: TraceForm) -> Self {
+        Self {
+            histogram,
+            pack,
+            form,
+            direct: false,
+            tail: false,
+        }
+    }
+
+    fn hand_out(self, slot: Option<&BitwiseSlot>) -> Result<Table, Error> {
+        let Some(slot) = slot else {
+            return Ok(self.materialize());
+        };
+        let mut slot = slot
+            .witness
+            .lock()
+            .map_err(|_| Error::Prover("BITWISE handout lock poisoned".into()))?;
+        if slot.replace(self).is_some() {
+            return Err(Error::Prover("duplicate BITWISE handout".into()));
+        }
+        // A shape-only marker consumed by the cluster layouter. The actual
+        // data for this slot is the histogram above.
+        let mut marker = Table::new_main(Vec::new(), bitwise::cols::NUM_COLUMNS, 1);
+        marker.main_table.height = bitwise::NUM_ROWS;
+        Ok(marker)
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of_val(self.histogram.counts())
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn counts(&self) -> &[u64] {
+        self.histogram.counts()
+    }
+
+    pub(crate) fn materialize(self) -> Table {
+        materialize_bitwise(
+            &self.histogram,
+            self.pack,
+            self.form,
+            self.direct,
+            self.tail,
+        )
+    }
+}
+
+fn materialize_bitwise(
+    histogram: &bitwise::BitwiseHistogram,
+    pack: bool,
+    form: TraceForm,
+    direct: bool,
+    tail: bool,
+) -> Table {
+    if tail {
+        let bounds = crate::tables::gpack::row_bounds_at(
+            bitwise::NUM_ROWS,
+            1 << 16,
+            crate::tables::gpack::SPLIT_MAX_PARTS,
+        );
+        let trace = histogram.trace_as_rows(form, &bounds);
+        build_stamps::mark(&format!("p5 bitwise by {} row ranges", bounds.len() - 1));
+        return trace;
+    }
+    if direct && form == TraceForm::Narrow {
+        return histogram.trace_as(form);
+    }
+    let mut table = bitwise::generate_bitwise_trace();
+    histogram.fill_multiplicities(&mut table);
+    packed_if(pack, table)
+}
 
 /// A table of the rest, not yet built: building it is calling this.
 type Job<'a> = Box<dyn FnOnce() -> Result<Table, Error> + Send + 'a>;
@@ -2828,7 +2944,7 @@ impl<'a> FinishPlan<'a> {
     /// the units are the tables the header counted.
     #[cfg(test)]
     pub(super) fn units(self) -> Result<Vec<Unit<'a>>, Error> {
-        self.units_keeping(false).map(|(units, _, _)| units)
+        self.units_keeping(false, None).map(|(units, _, _)| units)
     }
 
     /// [`Self::units`], and with `keep` the lists KECCAK_RND's and LT's units
@@ -2839,6 +2955,7 @@ impl<'a> FinishPlan<'a> {
     pub(super) fn units_keeping(
         self,
         keep: bool,
+        bitwise_slot: Option<&'a BitwiseSlot>,
     ) -> Result<(Vec<Unit<'a>>, Option<RestRegen>, Option<Side<'a>>), Error> {
         use std::sync::Arc;
         let Self {
@@ -3016,19 +3133,13 @@ impl<'a> FinishPlan<'a> {
                         histogram
                     }
                 };
-                if bitwise_tail {
-                    // Written packed by row ranges at once, its digest for the
-                    // log taken beside: the same table.
-                    let bounds = crate::tables::gpack::row_bounds_at(
-                        bitwise::NUM_ROWS,
-                        1 << 16,
-                        crate::tables::gpack::SPLIT_MAX_PARTS,
-                    );
+                // Under the local tail path, keep the existing timed
+                // log digest alongside the row-range writer.
+                if bitwise_tail && bitwise_slot.is_none() {
                     let trace = std::thread::scope(|scope| {
                         scope.spawn(|| note_bitwise(&histogram, from));
-                        histogram.trace_as_rows(form, &bounds)
+                        materialize_bitwise(&histogram, pack, form, direct_bitwise, true)
                     });
-                    build_stamps::mark(&format!("p5 bitwise by {} row ranges", bounds.len() - 1));
                     #[cfg(test)]
                     if skip.finish_early.counted {
                         super::finish_early::note_bitwise_tail();
@@ -3036,12 +3147,14 @@ impl<'a> FinishPlan<'a> {
                     return Ok(trace);
                 }
                 note_bitwise(&histogram, from);
-                if direct_bitwise && form == TraceForm::Narrow {
-                    return Ok(histogram.trace_as(form));
+                BitwiseWitness {
+                    histogram,
+                    pack,
+                    form,
+                    direct: direct_bitwise,
+                    tail: bitwise_tail,
                 }
-                let mut table = bitwise::generate_bitwise_trace();
-                histogram.fill_multiplicities(&mut table);
-                Ok(packed_if(pack, table))
+                .hand_out(bitwise_slot)
             }),
         });
         {
@@ -4100,13 +4213,14 @@ impl<'a> FinishPlan<'a> {
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
         keep: bool,
         slide: bool,
+        bitwise_slot: Option<&'a BitwiseSlot>,
     ) -> Result<Option<RestRegen>, Error> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
         let keccak_rnd_first = slide && self.header.keccak_rnd_first;
         let pages_first = slide && self.header.pages_first;
         let ecdas_form = self.skip.ecdas_form;
-        let (units, regen, side) = match self.units_keeping(keep) {
+        let (units, regen, side) = match self.units_keeping(keep, bitwise_slot) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };

@@ -60,6 +60,7 @@ use crate::{
 use stark::config::CommitmentHash;
 use stark::proof::options::{BaseFormat, CapPolicy};
 
+mod cluster;
 mod memlog;
 pub mod regen;
 
@@ -5630,6 +5631,8 @@ pub(crate) enum LocalBytesFault {
 /// default is an honest prover.
 #[derive(Default)]
 pub(crate) struct Deviations {
+    #[cfg(test)]
+    pub(crate) replica_fault: Option<cluster::Fault>,
     /// Leave the first KECCAK_RND table out of the proof — its rows, its
     /// argument and its count — as a prover hiding an instance would. The
     /// first, because it holds real rounds: a table of padding rows alone
@@ -6628,6 +6631,11 @@ fn prove_block_whir_body(
         )?;
         return Ok((proof, stamps));
     }
+    if inproc.is_some() {
+        return Err(Error::Prover(
+            "cluster witness replay needs the windowed build (`window_log2`)".into(),
+        ));
+    }
     // The lean stream is the windowed build's: asked for, refused here,
     // never ignored; unset, the whole-run build runs the full stream.
     if deviations.exec_stream_lean.map_or_else(
@@ -7006,7 +7014,14 @@ fn prove_traces_with_cluster(
                         })
                         .collect::<Result<Vec<_>, Error>>()?;
                     busy += t.elapsed().as_secs_f64();
-                    if tx.send(CommitAssignment { index, tables }).is_err() {
+                    if tx
+                        .send(CommitAssignment {
+                            index,
+                            tables,
+                            witness: Vec::new(),
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -7630,7 +7645,7 @@ fn keccak_rnd_positions(counts: &TableCounts, names: &[&str]) -> Result<Vec<usiz
 
 /// A table before the run's AIR order exists: a streamed chunk, or a table of
 /// the final build by its AIR index.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {
     Streamed(StreamTable, usize),
     Air(usize),
@@ -7639,19 +7654,47 @@ enum Key {
     Local(usize),
 }
 
-/// A table of the final build, laid out: its AIR index, shape and table, and
-/// its local sends' counts ([`local_counts_under`]).
-type Placed<'a> = (
-    usize,
-    (usize, usize),
-    CommittedTable<'a, F, E>,
-    Option<LocalCounts>,
-);
+/// The local pipeline lays tables out ahead of the packer. Replica handout
+/// keeps the witness in its builder representation until ownership is known.
+#[allow(clippy::large_enum_variant)] // Keep the local handout allocation-free.
+enum HandoutTable<'a> {
+    Ready(CommittedTable<'a, F, E>),
+    Witness(Box<cluster::WitnessTable<'a>>),
+}
 
-/// The phase-A committer's local assignment. The witness stays in-process.
+impl<'a> From<CommittedTable<'a, F, E>> for HandoutTable<'a> {
+    fn from(table: CommittedTable<'a, F, E>) -> Self {
+        Self::Ready(table)
+    }
+}
+
+impl<'a> HandoutTable<'a> {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Ready(table) => memlog::table_bytes(table),
+            Self::Witness(table) => table.bytes(),
+        }
+    }
+
+    fn put_into(
+        self,
+        ready: &mut Vec<CommittedTable<'a, F, E>>,
+        witness: &mut Vec<cluster::WitnessTable<'a>>,
+    ) {
+        match self {
+            Self::Ready(table) => ready.push(table),
+            Self::Witness(table) => witness.push(*table),
+        }
+    }
+}
+
+/// A table of the final build, its place, shape and local sends.
+type Placed<'a> = (usize, (usize, usize), HandoutTable<'a>, Option<LocalCounts>);
+
 struct CommitAssignment<'a> {
     index: usize,
     tables: Vec<CommittedTable<'a, F, E>>,
+    witness: Vec<cluster::WitnessTable<'a>>,
 }
 
 struct CommitAssignments<'r, 'a> {
@@ -7698,8 +7741,9 @@ impl CommitAssignments<'_, '_> {
 /// stacked polynomials, and sends each group to phase A as it closes. With
 /// [`Self::own`], KECCAK_RND's streamed chunks are packed apart, in groups of
 /// their own ([`OwnGroups`]).
-struct Packer<'a> {
+struct Packer<'a, 'p> {
     open: Vec<CommittedTable<'a, F, E>>,
+    witness: Vec<cluster::WitnessTable<'a>>,
     open_shapes: Vec<(usize, usize)>,
     open_keys: Vec<Key>,
     group_keys: Vec<Vec<Key>>,
@@ -7714,12 +7758,13 @@ struct Packer<'a> {
     start: Instant,
     closed_at: Vec<f64>,
     blocked: f64,
+    replicated: bool,
     /// A memory log, and the open group's bytes in it.
-    ledger: Option<&'a memlog::Ledger>,
+    ledger: Option<&'p memlog::Ledger>,
     open_bytes: usize,
     /// KECCAK_RND's streamed chunks' own open group, when they are packed
     /// apart (`None`: packed with the others).
-    own: Option<OwnGroups<'a>>,
+    own: Option<OwnGroups<'a, 'p>>,
     /// Told ahead of BITWISE ([`close_before_bitwise`]).
     close_ahead: Option<std::sync::Arc<CloseAhead>>,
     /// Under local lookups: each group with a local sender closes with its
@@ -7788,8 +7833,9 @@ impl LocalPack<'_> {
 /// ([`own_keccak_rnd_groups`]): its open group, the hand-out place of each
 /// table of either open group, and the regeneration recorder told each closed
 /// group's places, since the groups then close out of hand-out order.
-struct OwnGroups<'a> {
+struct OwnGroups<'a, 'p> {
     open: Vec<CommittedTable<'a, F, E>>,
+    witness: Vec<cluster::WitnessTable<'a>>,
     shapes: Vec<(usize, usize)>,
     keys: Vec<Key>,
     places: Vec<Option<usize>>,
@@ -7798,10 +7844,10 @@ struct OwnGroups<'a> {
     main_places: Vec<Option<usize>>,
     /// The streamed chunks placed so far: the next one's hand-out place.
     placed: usize,
-    recorder: Option<&'a regen::Recorder>,
+    recorder: Option<&'p regen::Recorder>,
 }
 
-impl<'a> Packer<'a> {
+impl<'a> Packer<'a, '_> {
     /// A group closes, and goes to the card, when the next table would take
     /// it past its polynomial budget. Under [`Self::own`] a KECCAK_RND chunk
     /// joins its own open group, which closes by the same rule, and is closed
@@ -7810,9 +7856,10 @@ impl<'a> Packer<'a> {
         &mut self,
         key: Key,
         shape: (usize, usize),
-        table: CommittedTable<'a, F, E>,
+        table: impl Into<HandoutTable<'a>>,
         counts: Option<LocalCounts>,
     ) -> Result<(), Error> {
+        let table = table.into();
         if counts.is_some() && self.local.is_none() {
             return Err(Error::Prover(
                 "a local sender outside the format's local lookups".into(),
@@ -7831,7 +7878,7 @@ impl<'a> Packer<'a> {
                 let polys = stark::multilinear_table::global_layout(&own.shapes, self.cap)
                     .map_err(|e| Error::Prover(format!("{e:?}")))?
                     .num_polys();
-                if polys > self.max_polys && !own.open.is_empty() {
+                if polys > self.max_polys && !own.keys.is_empty() {
                     self.close_own()?;
                 }
                 let own = self.own.as_mut().expect("packed apart");
@@ -7839,7 +7886,7 @@ impl<'a> Packer<'a> {
                     own.shapes.push(shape);
                 }
                 let bytes = self.ledger.map_or(0, |ledger| {
-                    let bytes = memlog::table_bytes(&table);
+                    let bytes = table.bytes();
                     ledger
                         .open
                         .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -7851,14 +7898,14 @@ impl<'a> Packer<'a> {
                     local.add(true, counts)?;
                 }
                 let own = self.own.as_mut().expect("packed apart");
-                own.open.push(table);
+                table.put_into(&mut own.open, &mut own.witness);
                 own.keys.push(key);
                 own.places.push(place);
                 return Ok(());
             }
             // The rest begins: KECCAK_RND's open group goes first, so every
             // streamed chunk is committed before the rest's first table.
-            if matches!(key, Key::Air(_)) && !own.open.is_empty() {
+            if matches!(key, Key::Air(_)) && !own.keys.is_empty() {
                 self.close_own()?;
             }
         }
@@ -7866,13 +7913,13 @@ impl<'a> Packer<'a> {
         let polys = stark::multilinear_table::global_layout(&self.open_shapes, self.cap)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
             .num_polys();
-        if polys > self.max_polys && !self.open.is_empty() {
+        if polys > self.max_polys && !self.open_keys.is_empty() {
             self.open_shapes.clear();
             self.open_shapes.push(shape);
             self.close()?;
         }
         if let Some(ledger) = self.ledger {
-            let bytes = memlog::table_bytes(&table);
+            let bytes = table.bytes();
             // A table of the run's AIR order comes from the rest's layout.
             if let Key::Air(_) = key {
                 ledger
@@ -7888,7 +7935,7 @@ impl<'a> Packer<'a> {
         if let (Some(counts), Some(local)) = (counts, self.local.as_mut()) {
             local.add(false, counts)?;
         }
-        self.open.push(table);
+        table.put_into(&mut self.open, &mut self.witness);
         self.open_keys.push(key);
         if let Some(own) = self.own.as_mut() {
             own.main_places.push(place);
@@ -7906,13 +7953,13 @@ impl<'a> Packer<'a> {
         let Some(&(after, shape)) = ahead.last.get() else {
             return Ok(());
         };
-        if after != k || self.open.is_empty() {
+        if after != k || self.open_keys.is_empty() {
             return Ok(());
         }
         if past_budget(&self.open_shapes, shape, self.cap, self.max_polys)? {
             eprintln!(
                 "BLOCK PACKER: the open group ({} tables) closed before BITWISE, which would not fit it",
-                self.open.len()
+                self.open_keys.len()
             );
             self.open_shapes.clear();
             self.close()?;
@@ -7925,6 +7972,7 @@ impl<'a> Packer<'a> {
 
     fn close(&mut self) -> Result<(), Error> {
         let mut tables = std::mem::take(&mut self.open);
+        let mut witness = std::mem::take(&mut self.witness);
         let mut keys = std::mem::take(&mut self.open_keys);
         let mut bytes = std::mem::take(&mut self.open_bytes);
         let mut places = self
@@ -7932,63 +7980,47 @@ impl<'a> Packer<'a> {
             .as_mut()
             .map(|own| std::mem::take(&mut own.main_places));
         let counts = self.local.as_mut().and_then(|local| local.open.take());
-        self.close_local(counts, &mut tables, &mut keys, &mut bytes, places.as_mut())?;
-        self.send(tables, keys, bytes, places)
+        self.close_local(
+            counts,
+            &mut tables,
+            &mut witness,
+            &mut keys,
+            &mut bytes,
+            places.as_mut(),
+        )?;
+        self.send(tables, witness, keys, bytes, places)
     }
 
     /// A group with a local sender closed with its LOCAL_BYTES table over
     /// `counts`, its last table (key [`Key::Local`]); nothing without counts.
+    #[allow(clippy::too_many_arguments)]
     fn close_local(
         &mut self,
         counts: Option<LocalCounts>,
         tables: &mut Vec<CommittedTable<'a, F, E>>,
+        witness: &mut Vec<cluster::WitnessTable<'a>>,
         keys: &mut Vec<Key>,
         bytes: &mut usize,
         places: Option<&mut Vec<Option<usize>>>,
     ) -> Result<(), Error> {
-        let (Some(mut counts), Some(local)) = (counts, self.local.as_mut()) else {
+        let (Some(counts), Some(local)) = (counts, self.local.as_mut()) else {
             return Ok(());
         };
-        let mut trace = match local.fault {
-            LocalBytesFault::None => counts.trace(),
-            LocalBytesFault::OneMoreReceived => {
-                counts.are_bytes[local_bytes::row_of(1, 2)] += 1;
-                counts.trace()
-            }
-            LocalBytesFault::WrongUnusedXor => {
-                let row = counts.xor.iter().position(|&m| m == 0).ok_or_else(|| {
-                    Error::Prover("every LOCAL_BYTES row is an XOR lookup's".to_string())
-                })?;
-                let mut columns = local_bytes::preprocessed_columns();
-                columns[local_bytes::cols::XOR][row] += FieldElement::<F>::one();
-                for column in [&counts.are_bytes, &counts.and, &counts.xor] {
-                    columns.push(
-                        column
-                            .iter()
-                            .map(|&m| FieldElement::<F>::from(u64::from(m)))
-                            .collect(),
-                    );
-                }
-                stark::trace::TraceTable::from_columns_main(columns, 1)
-            }
+        let shape = (local_bytes::cols::NUM_COLUMNS, local_bytes::LOG_ROWS);
+        let table = if self.replicated {
+            cluster::WitnessTable::local(local.made, local.air, shape, counts, local.fault)
+        } else {
+            let (mut trace, check) = local_trace(counts, local.fault)?;
+            table_of_checked(local.air, &mut trace, shape, true, check)?.into()
         };
-        // A test's wrong fixed column is committed as it stands (the
-        // verifier's check is what refuses it).
-        let table = table_of_checked(
-            local.air,
-            &mut trace,
-            (local_bytes::cols::NUM_COLUMNS, local_bytes::LOG_ROWS),
-            true,
-            local.fault != LocalBytesFault::WrongUnusedXor,
-        )?;
         if let Some(ledger) = self.ledger {
-            let b = memlog::table_bytes(&table);
+            let b = table.bytes();
             ledger
                 .open
                 .fetch_add(b, std::sync::atomic::Ordering::Relaxed);
             *bytes += b;
         }
-        tables.push(table);
+        table.put_into(tables, witness);
         keys.push(Key::Local(local.made));
         local.made += 1;
         if let Some(places) = places {
@@ -8003,6 +8035,7 @@ impl<'a> Packer<'a> {
             return Ok(());
         };
         let mut tables = std::mem::take(&mut own.open);
+        let mut witness = std::mem::take(&mut own.witness);
         let mut keys = std::mem::take(&mut own.keys);
         let mut bytes = std::mem::take(&mut own.bytes);
         let mut places = std::mem::take(&mut own.places);
@@ -8011,11 +8044,12 @@ impl<'a> Packer<'a> {
         self.close_local(
             counts,
             &mut tables,
+            &mut witness,
             &mut keys,
             &mut bytes,
             Some(&mut places),
         )?;
-        self.send(tables, keys, bytes, Some(places))
+        self.send(tables, witness, keys, bytes, Some(places))
     }
 
     /// One group to phase A: its tables, keys and ledger bytes, and under
@@ -8024,6 +8058,7 @@ impl<'a> Packer<'a> {
     fn send(
         &mut self,
         tables: Vec<CommittedTable<'a, F, E>>,
+        witness: Vec<cluster::WitnessTable<'a>>,
         keys: Vec<Key>,
         bytes: usize,
         places: Option<Vec<Option<usize>>>,
@@ -8063,6 +8098,7 @@ impl<'a> Packer<'a> {
             .send(CommitAssignment {
                 index: reached - 1,
                 tables,
+                witness,
             })
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
@@ -8073,14 +8109,46 @@ impl<'a> Packer<'a> {
     /// back every group's tables, when each closed and the seconds spent
     /// waiting on phase A.
     fn finish(mut self) -> Result<Packed, Error> {
-        if self.own.as_ref().is_some_and(|own| !own.open.is_empty()) {
+        if self.own.as_ref().is_some_and(|own| !own.keys.is_empty()) {
             self.close_own()?;
         }
-        if !self.open.is_empty() {
+        if !self.open_keys.is_empty() {
             self.close()?;
         }
         Ok((self.group_keys, self.closed_at, self.blocked))
     }
+}
+
+fn local_trace(
+    mut counts: LocalCounts,
+    fault: LocalBytesFault,
+) -> Result<(TraceTable<F, E>, bool), Error> {
+    let trace = match fault {
+        LocalBytesFault::None => counts.trace(),
+        LocalBytesFault::OneMoreReceived => {
+            counts.are_bytes[local_bytes::row_of(1, 2)] += 1;
+            counts.trace()
+        }
+        LocalBytesFault::WrongUnusedXor => {
+            let row = counts.xor.iter().position(|&m| m == 0).ok_or_else(|| {
+                Error::Prover("every LOCAL_BYTES row is an XOR lookup's".to_string())
+            })?;
+            let mut columns = local_bytes::preprocessed_columns();
+            columns[local_bytes::cols::XOR][row] += FieldElement::<F>::one();
+            for column in [&counts.are_bytes, &counts.and, &counts.xor] {
+                columns.push(
+                    column
+                        .iter()
+                        .map(|&m| FieldElement::<F>::from(u64::from(m)))
+                        .collect(),
+                );
+            }
+            stark::trace::TraceTable::from_columns_main(columns, 1)
+        }
+    };
+
+    // The injected bad fixed column is checked by the verifier.
+    Ok((trace, fault != LocalBytesFault::WrongUnusedXor))
 }
 
 /// Every group's tables, when each group closed, and the seconds the packer
@@ -8092,7 +8160,7 @@ type LaidChunk<'a> = (
     StreamTable,
     usize,
     (usize, usize),
-    CommittedTable<'a, F, E>,
+    HandoutTable<'a>,
     Option<LocalCounts>,
 );
 
@@ -8101,6 +8169,7 @@ type LaidChunk<'a> = (
 fn lay_out_chunk<'a>(
     airs: &'a StreamAirs,
     job: ChunkJob,
+    replicated: bool,
     ledger: Option<&memlog::Ledger>,
     recorder: Option<&regen::Recorder>,
 ) -> Result<LaidChunk<'a>, Error> {
@@ -8112,6 +8181,19 @@ fn lay_out_chunk<'a>(
         ledger.laying.fetch_add(ops, Relaxed);
         ops
     });
+    if replicated && !job.is_row_records() {
+        let (table, index) = (job.table, job.index);
+        let counts = job.keccak_local_counts(airs.keccak_rnd_form)?;
+        let job = job.defer();
+        let air = airs.of_chunk(table, index, job.rows)?;
+        let shape = (air.trace_layout().0, job.rows.trailing_zeros() as usize);
+        if let Some(ledger) = ledger {
+            ledger.laying.fetch_sub(ops, Relaxed);
+        }
+        let witness =
+            cluster::WitnessTable::chunk(Key::Streamed(table, index), air, shape, job, airs.form);
+        return Ok((table, index, shape, witness, counts));
+    }
     let mut chunk = job.generate_as(airs.form);
     // A chunk held as its records is never dropped: it has no recipe to
     // digest for.
@@ -8135,6 +8217,21 @@ fn lay_out_chunk<'a>(
     // it. Written packed (G-pack): laid out narrow from its packed columns,
     // with no transposition.
     let air = airs.of_chunk(chunk.table, chunk.index, height)?;
+    if replicated {
+        let key = Key::Streamed(chunk.table, chunk.index);
+        let counts = cluster::local_counts(airs.keccak_rnd_form, air, &chunk.trace)?;
+        if let Some(ledger) = ledger {
+            ledger.laying.fetch_sub(rows, Relaxed);
+        }
+        return Ok((
+            chunk.table,
+            chunk.index,
+            shape,
+            cluster::WitnessTable::trace(key, air, shape, chunk.trace, true),
+            counts,
+        ));
+    }
+
     let table = if chunk.trace.records_main().is_some() {
         table_of_records(air, &mut chunk.trace, shape)
     } else if chunk.trace.narrow_main().is_some() {
@@ -8148,15 +8245,15 @@ fn lay_out_chunk<'a>(
     // Its local sends counted here, on the layout worker.
     let table = table?;
     let counts = airs.local_counts(&table)?;
-    Ok((chunk.table, chunk.index, shape, table, counts))
+    Ok((chunk.table, chunk.index, shape, table.into(), counts))
 }
 
 /// The streamed chunks, packed in arrival order: the packer, each chunk's
 /// shape, the seconds laying them out (summed over threads) and when the last
 /// was placed; and the rest's tables it packed as they were laid out, by AIR
 /// index (a streamed rest's).
-struct StreamLaid<'a> {
-    packer: Packer<'a>,
+struct StreamLaid<'a, 'p> {
+    packer: Packer<'a, 'p>,
     shapes: Vec<(StreamTable, usize, (usize, usize))>,
     chunks: f64,
     placed_at: f64,
@@ -8172,12 +8269,12 @@ type RestDone<'a> = (usize, f64, Result<Placed<'a>, Error>);
 
 /// Each chunk laid out and packed on this thread as it arrives; hands back
 /// the run once it is built.
-fn stream_inline<'a>(
+fn stream_inline<'a, 'p>(
     brx: std::sync::mpsc::Receiver<Built>,
     airs: &'a StreamAirs,
-    mut packer: Packer<'a>,
+    mut packer: Packer<'a, 'p>,
     recorder: Option<&regen::Recorder>,
-) -> Result<(StreamLaid<'a>, Box<Traces>), Error> {
+) -> Result<(StreamLaid<'a, 'p>, Box<Traces>), Error> {
     let mut shapes = Vec::new();
     let mut chunks = 0.0;
     let ledger = packer.ledger;
@@ -8187,7 +8284,7 @@ fn stream_inline<'a>(
                 let (seq, kind) = (shapes.len(), job.table);
                 let t = Instant::now();
                 let (table, index, shape, laid, counts) =
-                    lay_out_chunk(airs, *job, ledger, recorder)?;
+                    lay_out_chunk(airs, *job, packer.replicated, ledger, recorder)?;
                 head_log::chunk_laid(seq, stream_base(kind), t);
                 chunks += t.elapsed().as_secs_f64();
                 shapes.push((table, index, shape));
@@ -8312,21 +8409,22 @@ impl Drop for ClosePermits<'_> {
 /// unbounded: the rest is already in memory, or held under the gate, and a
 /// full channel would park the rayon threads phase A's commits need.
 #[allow(clippy::too_many_arguments)]
-fn stream_pipelined<'a, R>(
+fn stream_pipelined<'a, 'p, R>(
     brx: std::sync::mpsc::Receiver<Built>,
     airs: &'a StreamAirs,
-    mut packer: Packer<'a>,
+    mut packer: Packer<'a, 'p>,
     workers: usize,
     ahead: Option<usize>,
-    gate: Option<&'a crate::tables::trace_builder::gate::ByteGate>,
+    gate: Option<&crate::tables::trace_builder::gate::ByteGate>,
     recorder: Option<&regen::Recorder>,
     waits: Option<&ProducerWaits>,
     rest: impl FnOnce(RestIn, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
-) -> Result<(StreamLaid<'a>, R), Error> {
+) -> Result<(StreamLaid<'a, 'p>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
     let permits = ahead.map(|k| Permits::new(k + 1));
     let permits = permits.as_ref();
     let ledger = packer.ledger;
+    let replicated = packer.replicated;
     std::thread::scope(|scope| {
         let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Box<ChunkJob>)>(workers);
         let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
@@ -8362,7 +8460,7 @@ fn stream_pipelined<'a, R>(
                         return;
                     };
                     let (kind, t) = (job.table, Instant::now());
-                    let laid = lay_out_chunk(airs, *job, ledger, recorder);
+                    let laid = lay_out_chunk(airs, *job, replicated, ledger, recorder);
                     head_log::chunk_laid(seq, stream_base(kind), t);
                     if dtx.send((seq, t.elapsed().as_secs_f64(), laid)).is_err() {
                         return;
@@ -8375,7 +8473,7 @@ fn stream_pipelined<'a, R>(
         drop(jrx);
         drop(dtx);
         let (rtx, rrx) = std::sync::mpsc::channel::<RestDone<'a>>();
-        let placer = scope.spawn(move || -> Result<StreamLaid<'a>, Error> {
+        let placer = scope.spawn(move || -> Result<StreamLaid<'a, 'p>, Error> {
             let _close = ClosePermits(permits);
             let _stop = gate.map(|gate| {
                 crate::tables::trace_builder::gate::StopGate(gate, "the packer stopped")
@@ -8552,6 +8650,8 @@ fn lay_out_rest<'a>(
     budget: Option<usize>,
     ledger: Option<&memlog::Ledger>,
     cpu_rows: usize,
+    replicated: bool,
+    bitwise_slot: Option<&crate::tables::trace_builder::BitwiseSlot>,
 ) -> Result<RestLaid<'a>, Error> {
     let t = Instant::now();
     let at = || start.elapsed().as_secs_f64();
@@ -8636,32 +8736,44 @@ fn lay_out_rest<'a>(
             trace.main_table.height.trailing_zeros() as usize,
         );
         let rows = ledger.map_or(0, |_| memlog::rows_bytes(trace));
-        let laid = if let Some(records) = trace.records_main() {
-            use std::sync::atomic::Ordering::Relaxed;
-            records_tables.fetch_add(1, Relaxed);
-            records_bytes.fetch_add(records.bytes(), Relaxed);
-            table_of_records(air, trace, shape)
-        } else if let Some(packed) = trace.narrow_main() {
-            use std::sync::atomic::Ordering::Relaxed;
-            narrow_tables.fetch_add(1, Relaxed);
-            narrow_bytes.fetch_add(packed.data().len(), Relaxed);
-            table_of_narrow(air, trace, shape)
+        let laid = if replicated {
+            if let Some(slot) = bitwise_slot.filter(|_| i == 0) {
+                cluster::WitnessTable::bitwise(air, shape, slot)
+                    .map(|table| (i, shape, table, None))
+            } else {
+                cluster::local_counts(format.keccak_rnd, air, trace).map(|counts| {
+                    let trace =
+                        std::mem::replace(trace, TraceTable::from_columns_main(Vec::new(), 1));
+                    let table = cluster::WitnessTable::trace(Key::Air(i), air, shape, trace, true);
+                    (i, shape, table, counts)
+                })
+            }
         } else {
-            table_of(air, trace, shape, true)
-        }
-        .and_then(|table| {
-            let counts = local_counts_under(format.keccak_rnd, &table)?;
-            Ok((i, shape, table, counts))
-        });
+            if let Some(records) = trace.records_main() {
+                use std::sync::atomic::Ordering::Relaxed;
+                records_tables.fetch_add(1, Relaxed);
+                records_bytes.fetch_add(records.bytes(), Relaxed);
+                table_of_records(air, trace, shape)
+            } else if let Some(packed) = trace.narrow_main() {
+                use std::sync::atomic::Ordering::Relaxed;
+                narrow_tables.fetch_add(1, Relaxed);
+                narrow_bytes.fetch_add(packed.data().len(), Relaxed);
+                table_of_narrow(air, trace, shape)
+            } else {
+                table_of(air, trace, shape, true)
+            }
+            .and_then(|table| {
+                let counts = local_counts_under(format.keccak_rnd, &table)?;
+                Ok((i, shape, table.into(), counts))
+            })
+        };
         if let Ok(mut laid_at) = laid_at.lock() {
             laid_at.push((i, start.elapsed().as_secs_f64()));
         }
         if let (Some(ledger), Ok((_, _, table, _))) = (ledger, &laid) {
             use std::sync::atomic::Ordering::Relaxed;
             ledger.rest.fetch_sub(rows, Relaxed);
-            ledger
-                .rest_laid
-                .fetch_add(memlog::table_bytes(table), Relaxed);
+            ledger.rest_laid.fetch_add(table.bytes(), Relaxed);
         }
         if let Ok(mut timed) = timed.lock() {
             timed.push((i, t.elapsed().as_secs_f64()));
@@ -8837,6 +8949,8 @@ fn lay_out_rest_streamed<'a>(
     ecdas: crate::tables::ecdas::EcdasForm,
     page_run_log2: u8,
     close_ahead: Option<std::sync::Arc<CloseAhead>>,
+    replicated: bool,
+    bitwise_slot: Option<&crate::tables::trace_builder::BitwiseSlot>,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -8926,40 +9040,52 @@ fn lay_out_rest_streamed<'a>(
             trace.main_table.height.trailing_zeros() as usize,
         );
         let rows = memlog::rows_bytes(&trace);
-        let laid = if let Some(records) = trace.records_main() {
-            // Never dropped, so never one phase B builds again.
-            records_tables += 1;
-            records_bytes += records.bytes();
-            table_of_records(air, &mut trace, shape)
-        } else if let Some(packed) = trace.narrow_main() {
-            narrow_tables += 1;
-            narrow_bytes += packed.data().len();
-            // A table phase B can build again from the kept lists (N3): its
-            // place among the rest's, before the packer places it.
-            if let (Some(recorder), Some((family, j))) = (
-                recorder,
-                crate::tables::trace_builder::RegenFamily::of_air(air.name()),
-            ) {
-                recorder.rest_tag(k, family, j);
+        let laid = if replicated {
+            if let Some(slot) = bitwise_slot.filter(|_| position == 0) {
+                cluster::WitnessTable::bitwise(air, shape, slot)
+                    .map(|table| (position, shape, table, None))
+            } else {
+                cluster::local_counts(keccak_rnd, air, &trace).map(|counts| {
+                    let table =
+                        cluster::WitnessTable::trace(Key::Air(position), air, shape, trace, true);
+                    (position, shape, table, counts)
+                })
             }
-            table_of_narrow(air, &mut trace, shape)
         } else {
-            table_of(air, &mut trace, shape, true)
+            let table = if let Some(records) = trace.records_main() {
+                // Never dropped, so never one phase B builds again.
+                records_tables += 1;
+                records_bytes += records.bytes();
+                table_of_records(air, &mut trace, shape)
+            } else if let Some(packed) = trace.narrow_main() {
+                narrow_tables += 1;
+                narrow_bytes += packed.data().len();
+                // A table phase B can build again from the kept lists (N3): its
+                // place among the rest's, before the packer places it.
+                if let (Some(recorder), Some((family, j))) = (
+                    recorder,
+                    crate::tables::trace_builder::RegenFamily::of_air(air.name()),
+                ) {
+                    recorder.rest_tag(k, family, j);
+                }
+                table_of_narrow(air, &mut trace, shape)
+            } else {
+                table_of(air, &mut trace, shape, true)
+            };
+
+            table.and_then(|table| {
+                let counts = local_counts_under(keccak_rnd, &table)?;
+                Ok((position, shape, table.into(), counts))
+            })
         };
         let secs = t.elapsed().as_secs_f64();
         timed.push((position, secs));
         laid_at.push((position, at()));
-        if let (Some(ledger), Ok(table)) = (ledger, &laid) {
+        if let (Some(ledger), Ok((_, _, table, _))) = (ledger, &laid) {
             ledger.rest.fetch_sub(rows, Relaxed);
-            ledger
-                .rest_laid
-                .fetch_add(memlog::table_bytes(table), Relaxed);
+            ledger.rest_laid.fetch_add(table.bytes(), Relaxed);
         }
         // A packer that stopped has its own error to report.
-        let laid = laid.and_then(|table| {
-            let counts = local_counts_under(keccak_rnd, &table)?;
-            Ok((position, shape, table, counts))
-        });
         let _ = sink.send((k, secs, laid));
         k += 1;
     };
@@ -9198,6 +9324,21 @@ struct Laid {
     streamed_air: Vec<(StreamTable, usize, usize)>,
 }
 
+impl Laid {
+    fn statement<'a>(&'a self, table_num_vars: &'a [u8]) -> BlockStatement<'a> {
+        BlockStatement {
+            table_num_vars,
+            runtime_page_ranges: &self.runtime_page_ranges,
+            table_counts: &self.table_counts,
+            public_output: &self.public_output,
+            num_private_input_pages: self.num_private_input_pages,
+            groups: &self.groups,
+            fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
+        }
+    }
+}
+
 /// The block's proof with the build streamed into phase A: a builder thread
 /// collects the run in windows of `window` cycles ([`WindowedTraceBuilder`])
 /// and hands each full chunk over as it completes; a layout thread lays each
@@ -9221,28 +9362,76 @@ fn prove_streamed(
     lead: Option<&PhaseBLead>,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof<LocalArgues>, Error> {
-    // G-pack writes the streamed chunks packed when the groups are held
-    // narrow; they are then laid out narrow, as the finish's packed tables.
-    let stream_form = if options.gpack && options.narrow != multilinear_block::Narrowing::Wide {
-        TraceForm::Narrow
-    } else {
-        TraceForm::Wide
+    let airs = cluster::HostAirs::new(opts, format, options);
+    let replica_airs;
+    let pass = match inproc {
+        Some(workers) if !deviations.host_only => {
+            replica_airs = (0..workers.count())
+                .map(|_| cluster::HostAirs::new(opts, format, options))
+                .collect::<Vec<_>>();
+            cluster::Pass::Coordinator {
+                workers,
+                airs: &replica_airs,
+            }
+        }
+        _ => cluster::Pass::Local,
     };
+    match prove_streamed_on_host(
+        program,
+        elf_bytes,
+        private_inputs,
+        window,
+        opts,
+        format,
+        options,
+        deviations,
+        pass,
+        &airs,
+        on_statement,
+        on_group,
+        lead,
+        stamps,
+    )? {
+        cluster::Run::Proof(proof) => Ok(proof),
+        cluster::Run::Worker(_) => unreachable!("the coordinator has the proof"),
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum StreamPhaseA<'a> {
+    Local(Result<cluster::Committed<'a>, multilinear::Error>),
+    Drained(Drained),
+    Plan(Result<cluster::Plan, Error>),
+    Owned(Result<cluster::Owned<'a>, Error>),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_streamed_on_host<'a>(
+    program: &Elf,
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    window: usize,
+    opts: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+    pass: cluster::Pass<'a, '_>,
+    airs: &'a cluster::HostAirs,
+    on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
+    stamps: &mut BlockStamps,
+) -> Result<cluster::Run<'a>, Error> {
+    let replicated = !matches!(pass, cluster::Pass::Local);
+    let is_worker = matches!(pass, cluster::Pass::Worker { .. });
+    let bitwise_slot = replicated.then(crate::tables::trace_builder::BitwiseSlot::default);
+    let bitwise_slot = bitwise_slot.as_ref();
+    let stream_airs = &airs.stream;
+    let stream_form = stream_airs.form;
     gpack::reset_counts();
-    // A new block: no memory pressure seen yet (`alloc_purge`).
     crate::alloc_purge::clear_memory_pressure();
-    // The tables filled from their records over the whole prove: phase A's
-    // commits and phase B's arguments alike.
     let fills_before = multilinear::records::fills();
     let times_before = multilinear::records::upload_times();
-    let stream_airs = StreamAirs::new(
-        opts,
-        stream_form,
-        options.max_rows.cpu,
-        format.keccak_rnd,
-        format.memw_aligned,
-        format.registers,
-    );
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed. The disk store's knob, which used to
     // turn it off, refuses the prove when set.
@@ -9348,8 +9537,11 @@ fn prove_streamed(
     // Live regeneration parks and drops a streamed chunk held as its records
     // like any chunk, phase B rebuilding its packed columns checked by its
     // records' digest; a test may keep such chunks on the host instead.
-    let keep_records = deviations.records_keep.unwrap_or(false);
-    let regen_recorder = regen::recorder(regen_mode, stream_form == TraceForm::Narrow)
+    let keep_records =
+        deviations.records_keep.unwrap_or(false) || (replicated && regen_mode.live());
+    let regen_recorder = (!replicated)
+        .then(|| regen::recorder(regen_mode, stream_form == TraceForm::Narrow))
+        .flatten()
         .map(|recorder| {
             if keep_records {
                 recorder.keep_records()
@@ -9429,10 +9621,10 @@ fn prove_streamed(
     // Set at the finish's end: until then an early start's window holds only
     // its frontier, so the regenerator does not rebuild beside the finish.
     let early_paced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
+    let run_airs = &airs.run;
     // The KECCAK_RND tables' AIRs the streamed rest lays them out with while
     // the run's set is built beside them ([`rest_airs_beside`]).
-    let rest_keccak_airs: std::sync::OnceLock<Vec<crate::VmAir>> = std::sync::OnceLock::new();
+    let rest_keccak_airs = &airs.early;
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
     // shape) is built when the shapes are known, and must agree on those.
@@ -9447,7 +9639,9 @@ fn prove_streamed(
         crate::tables::trace_builder::keccak_rnd_arrivals::arm(1 << options.keccak_rnd_rows_log2);
     }
     head_log::begin(start, deviations.head_log.map_or_else(head_log::knob, Ok)?);
-    set_up_card();
+    if !is_worker {
+        set_up_card();
+    }
     // A memory log (`BlockOptions::memlog`): its sampler runs until the
     // function returns.
     let logged = options.memlog.then(|| memlog::Ledger::new(start));
@@ -10363,7 +10557,7 @@ fn prove_streamed(
                     // while the finish still runs; until the finish's end its
                     // window holds only its frontier.
                     start_early();
-                    let emitted = builder.finish_streamed_keeping(&last, rest_gate, keep, |header| {
+                    let emitted = builder.finish_streamed_keeping(&last, rest_gate, keep, bitwise_slot, |header| {
                         let (tx, rx) = std::sync::mpsc::channel();
                         btx.send(Built::Stream(Box::new(RestStream {
                             header,
@@ -10435,7 +10629,7 @@ fn prove_streamed(
                         rest_regen,
                     ));
                 }
-                let built_rest = builder.finish(&last);
+                let built_rest = builder.finish_with_bitwise(&last, bitwise_slot);
                 if let Some(ledger) = ledger {
                     crate::tables::trace_builder::build_stamps::set_hook(None);
                     ledger.builder.store(0, Relaxed);
@@ -10480,15 +10674,13 @@ fn prove_streamed(
 
             // One closed group waits for phase A; the packer holds the next.
             let (gtx, grx) = std::sync::mpsc::sync_channel(1);
-            let stream_airs = &stream_airs;
-            let run_airs = &run_airs;
-            let rest_keccak_airs = &rest_keccak_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("layout");
                 }
                 let packer = Packer {
                     open: Vec::new(),
+                    witness: Vec::new(),
                     open_shapes: Vec::new(),
                     open_keys: Vec::new(),
                     group_keys: Vec::new(),
@@ -10499,10 +10691,12 @@ fn prove_streamed(
                     start,
                     closed_at: Vec::new(),
                     blocked: 0.0,
+                    replicated,
                     ledger,
                     open_bytes: 0,
                     own: own_groups.then(|| OwnGroups {
                         open: Vec::new(),
+                        witness: Vec::new(),
                         shapes: Vec::new(),
                         keys: Vec::new(),
                         places: Vec::new(),
@@ -10532,11 +10726,13 @@ fn prove_streamed(
                         format,
                         run_airs,
                         start,
-                        inline,
+                        inline && !is_worker,
                         sink,
                         options.rest_layout_bytes,
                         ledger,
                         options.max_rows.cpu,
+                        replicated,
+                        bitwise_slot,
                     ),
                     RestIn::Stream(stream) => lay_out_rest_streamed(
                         stream,
@@ -10558,6 +10754,8 @@ fn prove_streamed(
                         format.ecdas,
                         format.page_runs(),
                         close_ahead.clone(),
+                        replicated,
+                        bitwise_slot,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -10638,6 +10836,7 @@ fn prove_streamed(
                 marks.push(("groups closed", start.elapsed().as_secs_f64()));
                 let prepared = match prepared {
                     Some(prepared) => prepared,
+                    None if is_worker => Vec::new(),
                     None => {
                         let prepared = prepared_tables(airs, &page_configs, format)?;
                         marks.push(("prepared", start.elapsed().as_secs_f64()));
@@ -10738,57 +10937,114 @@ fn prove_streamed(
 
             // A memory log: a group leaves the channel as the committer takes
             // it.
-            let mut groups = CommitAssignments::from(&grx);
-            let block = if deviations.host_only {
-                // The trace alone: each closed group counted and dropped as
-                // it comes, nothing committed.
-                let mut drained = Drained {
-                    groups: 0,
-                    tables: 0,
-                    cells: 0,
-                    at: 0.0,
-                };
-                for group in &mut groups {
-                    drained.groups += 1;
-                    drained.tables += group.len();
-                    drained.cells += group
-                        .iter()
-                        .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
-                        .sum::<u64>();
-                }
-                drained.at = start.elapsed().as_secs_f64();
-                Err(drained)
-            } else {
-                let block = BlockCommitted::commit_groups_probed::<
-                    H,
-                    <H as multilinear::whir_hash::WhirHash>::Sponge,
-                >(
-                    (&mut groups).inspect(|group| {
-                        if let Some(ledger) = ledger {
-                            ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
-                        }
-                    }),
-                    &commit_config,
-                    options.drop_levels,
-                    options.narrow,
-                    options.upload_ahead,
-                    ledger.map(|ledger| ledger.block.clone()),
-                    spill.clone(),
-                    // A measurement, off unless asked: the proof is the same.
-                    cs_probe.clone(),
-                    // Under local lookups: each group's digests and local
-                    // challenges right after its commit, and the lane's local
-                    // argues when it is on.
-                    format
-                        .local_lookups()
-                        .then(|| multilinear_block::LocalPhaseA {
-                            buses: local_bytes::LOCAL_BUSES.to_vec(),
-                            lane: local_lane,
-                            binding: stark::multilinear_table::batched::LocalBinding::ALL,
-                        }),
-                );
-                Ok(groups.finish(block))
+            let local = || {
+                format
+                    .local_lookups()
+                    .then(|| multilinear_block::LocalPhaseA {
+                        buses: local_bytes::LOCAL_BUSES.to_vec(),
+                        lane: local_lane,
+                        binding: stark::multilinear_table::batched::LocalBinding::ALL,
+                    })
             };
+            let take_witness = || {
+                grx.iter().inspect(|group: &CommitAssignment<'_>| {
+                    if let Some(ledger) = ledger {
+                        let bytes = group.witness.iter().map(cluster::WitnessTable::bytes).sum();
+                        ledger.sent.fetch_sub(bytes, Relaxed);
+                    }
+                })
+            };
+            let block = match pass {
+                cluster::Pass::Coordinator { workers, .. } => StreamPhaseA::Plan(
+                    cluster::Plan::collect(take_witness(), workers.count(), format.prepared),
+                ),
+                cluster::Pass::Worker { id, plan } => StreamPhaseA::Owned(plan.read(
+                    id,
+                    take_witness(),
+                    |group| {
+                        let tables = group
+                            .witness
+                            .into_iter()
+                            .map(cluster::WitnessTable::materialize)
+                            .collect::<Result<_, _>>()?;
+                        BlockCommitted::commit_replica_group::<
+                            H,
+                            <H as multilinear::whir_hash::WhirHash>::Sponge,
+                        >(
+                            group.index,
+                            tables,
+                            &commit_config,
+                            options.drop_levels,
+                            options.narrow,
+                            local(),
+                        )
+                        .map_err(|e| {
+                            Error::Prover(format!(
+                                "cluster replica {id} group {}: {e:?}",
+                                group.index
+                            ))
+                        })
+                    },
+                    #[cfg(test)]
+                    deviations.replica_fault,
+                )),
+                cluster::Pass::Local if deviations.host_only => {
+                    let mut groups = CommitAssignments::from(&grx);
+
+                    // The trace alone: each closed group counted and dropped as
+                    // it comes, nothing committed.
+                    let mut drained = Drained {
+                        groups: 0,
+                        tables: 0,
+                        cells: 0,
+                        at: 0.0,
+                    };
+                    for group in &mut groups {
+                        drained.groups += 1;
+                        drained.tables += group.len();
+                        drained.cells += group
+                            .iter()
+                            .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
+                            .sum::<u64>();
+                    }
+                    drained.at = start.elapsed().as_secs_f64();
+                    StreamPhaseA::Drained(drained)
+                }
+                cluster::Pass::Local => {
+                    let mut groups = CommitAssignments::from(&grx);
+                    let block = BlockCommitted::commit_groups_probed::<
+                        H,
+                        <H as multilinear::whir_hash::WhirHash>::Sponge,
+                    >(
+                        (&mut groups).inspect(|group| {
+                            if let Some(ledger) = ledger {
+                                ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
+                            }
+                        }),
+                        &commit_config,
+                        options.drop_levels,
+                        options.narrow,
+                        options.upload_ahead,
+                        ledger.map(|ledger| ledger.block.clone()),
+                        spill.clone(),
+                        // A measurement, off unless asked: the proof is the same.
+                        cs_probe.clone(),
+                        // Under local lookups: each group's digests and local
+                        // challenges right after its commit, and the lane's local
+                        // argues when it is on.
+                        local(),
+                    );
+                    StreamPhaseA::Local(groups.finish(block))
+                }
+            };
+            // Finish draining after a replica refusal so its channel cannot
+            // mask the mismatch with a secondary layout/finish error.
+            if matches!(
+                block,
+                StreamPhaseA::Owned(Err(_)) | StreamPhaseA::Plan(Err(_))
+            ) {
+                for _ in take_witness() {}
+            }
             drop(grx);
             (block, builder.join(), layout.join(), executor.join())
         });
@@ -10827,7 +11083,7 @@ fn prove_streamed(
         stamps.windows = window_stamps;
         stamps.build_marks = finish_marks;
         stamps.producer = waits.stamps();
-        let laid =
+        let mut laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
         if stream_keccak_rnd {
             // Where the streamed KECCAK_RND tables went: each group's count.
@@ -10863,9 +11119,103 @@ fn prove_streamed(
                     .join(",")
             );
         }
-        let block = match block {
-            Ok(block) => block,
-            Err(drained) => {
+        let calls = || {
+            let heights: Vec<_> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
+            block_statement_calls(
+                laid.statement(&heights),
+                &tag,
+                elf_bytes,
+                &format.chain_config(&laid.shapes),
+                format.memory,
+            )
+            .map_err(Error::Prover)
+        };
+        let mut owners = None;
+        let inproc = match pass {
+            cluster::Pass::Coordinator { workers, .. } => Some(workers),
+            _ => None,
+        };
+        let mut block = match block {
+            StreamPhaseA::Local(block) => block.map_err(|e| Error::Prover(format!("{e:?}")))?,
+            StreamPhaseA::Owned(owned) => {
+                let cluster::Pass::Worker { id, plan } = pass else {
+                    unreachable!()
+                };
+                let owned = owned?;
+                if calls()? != plan.statement {
+                    return Err(Error::Prover(format!(
+                        "cluster replica {id} disagrees on the block statement"
+                    )));
+                }
+                let exe_cpu = stamps.executor.usage.map_or(0.0, |u| u.user + u.system);
+                let walked_at = bitwise_slot
+                    .and_then(crate::tables::trace_builder::BitwiseSlot::walk_end)
+                    .ok_or_else(|| {
+                        Error::Prover(format!("cluster replica {id} did not finish its walk"))
+                    })?
+                    .duration_since(start)
+                    .as_secs_f64();
+                eprintln!(
+                    "BLOCK CLUSTER REPLICA {id}: {} windows · execute {:.6}s own / {:.6} CPU-s · walk {:.6} summed thread-s · execute+walk wall {walked_at:.6}s · finish at {finished:.6}s · owned {} groups",
+                    stamps.executor.windows,
+                    stamps.executor.run,
+                    exe_cpu,
+                    stamps.windows.walk,
+                    owned.len(),
+                );
+                return Ok(cluster::Run::Worker(owned));
+            }
+            StreamPhaseA::Plan(plan) => {
+                let cluster::Pass::Coordinator { workers, airs } = pass else {
+                    unreachable!()
+                };
+                let mut plan = plan?;
+                plan.statement = calls()?;
+                eprintln!(
+                    "BLOCK CLUSTER HANDOUT: {} groups · {} spanning windows · {} terminal · owners {:?}",
+                    plan.owners.len(),
+                    plan.spanning_groups,
+                    plan.terminal_groups,
+                    plan.owners,
+                );
+                let mut parts: Vec<_> = (0..plan.owners.len()).map(|_| None).collect();
+                for (id, airs) in airs.iter().enumerate() {
+                    let program =
+                        Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+                    let mut worker_stamps = BlockStamps::default();
+                    let cluster::Run::Worker(owned) = prove_streamed_on_host(
+                        &program,
+                        elf_bytes,
+                        private_inputs,
+                        window,
+                        opts,
+                        format,
+                        options,
+                        deviations,
+                        cluster::Pass::Worker { id, plan: &plan },
+                        airs,
+                        &|_, _| {},
+                        &|_| {},
+                        None,
+                        &mut worker_stamps,
+                    )?
+                    else {
+                        unreachable!("a replica returns owned groups")
+                    };
+                    for (index, committed) in owned {
+                        if parts[index].replace(committed).is_some() {
+                            return Err(Error::Prover(format!(
+                                "duplicate replica commitment for group {index}"
+                            )));
+                        }
+                    }
+                }
+                debug_assert_eq!(workers.count(), airs.len());
+                owners = Some(plan.owners);
+                BlockCommitted::assemble_replica_groups(parts)
+                    .map_err(|e| Error::Prover(format!("{e:?}")))?
+            }
+            StreamPhaseA::Drained(drained) => {
                 stamps.build = finished;
                 stamps.streamed = (windows_done, streamed);
                 stamps.prep = laid.busy;
@@ -10878,7 +11228,6 @@ fn prove_streamed(
                 )));
             }
         };
-        let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));
         }
@@ -11069,16 +11418,8 @@ fn prove_streamed(
         }
         let table_num_vars: Vec<u8> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
-        let statement = BlockStatement {
-            table_num_vars: &table_num_vars,
-            runtime_page_ranges: &laid.runtime_page_ranges,
-            table_counts: &laid.table_counts,
-            public_output: &laid.public_output,
-            num_private_input_pages: laid.num_private_input_pages,
-            groups: &laid.groups,
-            fused_memory: laid.fused_memory,
-            word_memory: laid.word_memory,
-        };
+        let prepared_columns = std::mem::take(&mut laid.prepared);
+        let statement = laid.statement(&table_num_vars);
         let replay = block_phase_b_statement(
             inproc,
             &mut transcript,
@@ -11089,7 +11430,7 @@ fn prove_streamed(
             format.memory,
         )?;
         let (prepared, tampered, derive) =
-            prover_prepared::<H>(laid.prepared, &laid.groups, &config, deviations)?;
+            prover_prepared::<H>(prepared_columns, &laid.groups, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
         if let Some(ledger) = ledger {
             ledger.line("prepared committed");
@@ -11275,7 +11616,7 @@ fn prove_streamed(
                     (format.local_lookups() && i < laid.shapes.len()).then_some(local_air)
                 })
             })?;
-            block.set_inproc(workers, statement, fixed);
+            block.set_inproc_owners(workers, statement, fixed, owners);
         }
         let (proof, argues, prepared_openings, groups, commit_ood, local_argues) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
@@ -11566,7 +11907,7 @@ fn prove_streamed(
             ledger.report();
             stamps.mem_terms = ledger.terms();
         }
-        Ok(BlockWhirProof {
+        Ok(cluster::Run::Proof(BlockWhirProof {
             proof,
             table_num_vars,
             runtime_page_ranges: laid.runtime_page_ranges,
@@ -11580,7 +11921,7 @@ fn prove_streamed(
             fused_memory: laid.fused_memory,
             word_memory: laid.word_memory,
             local: local_argues,
-        })
+        }))
     })
 }
 
@@ -14316,6 +14657,7 @@ mod packer_tests {
         let pack = |out: std::sync::mpsc::SyncSender<_>| -> Vec<Vec<usize>> {
             let mut packer = Packer {
                 open: Vec::new(),
+                witness: Vec::new(),
                 open_shapes: Vec::new(),
                 open_keys: Vec::new(),
                 group_keys: Vec::new(),
@@ -14326,6 +14668,7 @@ mod packer_tests {
                 start: Instant::now(),
                 closed_at: Vec::new(),
                 blocked: 0.0,
+                replicated: false,
                 ledger: None,
                 open_bytes: 0,
                 own: None,

@@ -327,7 +327,7 @@ fn streamed_keeping(
     let mut out = Vec::new();
     let mut placed = 0usize;
     let regen = builder
-        .finish_streamed_keeping(last, &gate, keep, |_| {
+        .finish_streamed_keeping(last, &gate, keep, None, |_| {
             Ok(Box::new(|emitted: Emitted| {
                 if emitted.table.is_some() {
                     gate.release(placed);
