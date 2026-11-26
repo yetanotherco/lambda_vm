@@ -2132,12 +2132,13 @@ fn the_phase_b_overlap_readout_names_its_transitions() {
             ..GroupStamps::default()
         },
     ];
+    // The trim count is process-wide. Supply it alongside the synthetic stamps.
     let on = block_whir::BlockStamps {
         groups: groups.clone(),
         phase_b_overlap: true,
         ..Default::default()
     }
-    .report();
+    .report_with_device_trims(Some(0));
     assert!(on.contains("encode 0.010 open 0.090 paid 0.020\n"), "{on}");
     assert!(
         on.contains("+ one upload helper + one opening helper\n"),
@@ -2175,14 +2176,14 @@ fn the_phase_b_overlap_readout_names_its_transitions() {
         background_readbacks: (5887, 0, 3 << 20),
         ..Default::default()
     }
-    .report();
+    .report_with_device_trims(Some(7));
     assert!(
         pinned.contains("BLOCK PHASE-B OVERLAP: pinned · transitions overlapped 2 of 2"),
         "{pinned}"
     );
     assert!(
         pinned.contains(
-            "· trims 0 · the openings' read-backs pinned 5887 / pageable 0 (3.0 MiB pinned)\n"
+            "· trims 7 · the openings' read-backs pinned 5887 / pageable 0 (3.0 MiB pinned)\n"
         ),
         "{pinned}"
     );
@@ -2190,7 +2191,7 @@ fn the_phase_b_overlap_readout_names_its_transitions() {
         groups,
         ..Default::default()
     }
-    .report();
+    .report_with_device_trims(Some(0));
     assert!(off.contains("encode 0.010 open 0.090\n"), "{off}");
     assert!(off.contains("+ one upload helper\n"), "{off}");
     assert!(!off.contains(" measured"), "{off}");

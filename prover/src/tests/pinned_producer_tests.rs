@@ -38,6 +38,29 @@ fn row_major(columns: &[Vec<u64>]) -> Vec<u64> {
 
 #[test]
 fn every_packer_writes_into_page_locked_memory_and_the_upload_reads_the_same_words() {
+    const CHILD: &str = "LAMBDA_VM_PINNED_PRODUCER_TEST_CHILD";
+    const TEST: &str = "tests::pinned_producer_tests::every_packer_writes_into_page_locked_memory_and_the_upload_reads_the_same_words";
+
+    // Both the pool size and the locked pool live for the process.
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            result.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "{TEST} in a child:\n{stdout}\n{stderr}"
+        );
+        eprint!("{stderr}");
+        return;
+    }
+
     if math_cuda::device::backend().is_err() {
         eprintln!("PINNED POOL TEST: SKIPPED, no device");
         return;

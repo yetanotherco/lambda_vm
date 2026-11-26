@@ -3686,6 +3686,10 @@ impl ProducerWaits {
 impl BlockStamps {
     /// One line a group and a total, `BLOCK …` prefixed, for a box log.
     pub fn report(&self) -> String {
+        self.report_with_device_trims(None)
+    }
+
+    pub(crate) fn report_with_device_trims(&self, device_trims: Option<u64>) -> String {
         let sum = |f: fn(&GroupStamps) -> f64| self.groups.iter().map(f).sum::<f64>();
         let polys: usize = self.groups.iter().map(|g| g.polys).sum();
         let tree: usize = self.groups.iter().map(|g| g.tree_bytes).sum();
@@ -4010,7 +4014,7 @@ impl BlockStamps {
             multilinear::gpu::open_host_reencodes().1,
             multilinear::gpu::open_host_reencodes().2,
         ));
-        out.push_str(&self.overlap_line());
+        out.push_str(&self.overlap_line(device_trims));
         if self.phase_b_sched {
             out.push_str(&self.sched_line());
         }
@@ -4217,7 +4221,7 @@ impl BlockStamps {
         )
     }
 
-    fn overlap_line(&self) -> String {
+    fn overlap_line(&self, device_trims: Option<u64>) -> String {
         let beside = || self.groups.iter().filter(|g| g.overlapped);
         let alone = || self.groups.iter().filter(|g| !g.overlapped);
         // Summed from +0.0: an empty f64 sum is -0.0, which prints a sign.
@@ -4255,7 +4259,7 @@ impl BlockStamps {
             self.groups.iter().map(|g| g.argue).sum::<f64>(),
             peak >> 20,
             multilinear::gpu::reserve_budget() >> 20,
-            multilinear::gpu::device_trims(),
+            device_trims.unwrap_or_else(multilinear::gpu::device_trims),
             if self.phase_b_overlap {
                 let (pinned, pageable, bytes) = self.background_readbacks;
                 format!(
