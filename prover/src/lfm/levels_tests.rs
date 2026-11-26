@@ -721,6 +721,65 @@ fn the_blake3_driver_with_its_program_fast_proves_the_same_level_bytes() {
     }
 }
 
+/// Compare the full serialized base and every recursion proof at each pool size.
+#[test]
+#[ignore = "proves a small BLAKE3 block six times; run alone with deterministic grind and fixed trace hash"]
+fn the_blake3_driver_on_each_program_pool_proves_the_same_bytes() {
+    use super::levels::{PROGRAM_POOL_FOR_TEST, prove_block_levels, set_program_fast_for_test};
+    assert!(crypto::grinding::deterministic());
+    assert_eq!(
+        std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
+        Ok("1")
+    );
+    let _serial = super::device_permit::serial_for_test();
+    let _options = super::wlfm::test_format::set_driver_options();
+    let _fast = set_program_fast_for_test(true);
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let options = streamed_options();
+    let proof_bytes = |threads| {
+        PROGRAM_POOL_FOR_TEST.set(Some(threads));
+        let run = prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &options,
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        );
+        PROGRAM_POOL_FOR_TEST.set(None);
+        let run = run.expect("the small block proves through level 2");
+        assert_eq!(run.proofs.len(), 2);
+        assert!(run.times.validated_beside.is_some());
+        assert!(run.times.builder_end.is_some());
+        let base = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes");
+        let levels: Vec<_> = run
+            .proofs
+            .iter()
+            .map(|p| rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("serializes"))
+            .collect();
+        (base, levels)
+    };
+    let (base, levels) = proof_bytes(0);
+    for threads in [1, 2, 4, 6, 8] {
+        let (other_base, other_levels) = proof_bytes(threads);
+        assert!(base[..] == other_base[..], "pool size {threads}: base");
+        for (i, (a, b)) in levels.iter().zip(&other_levels).enumerate() {
+            assert!(a[..] == b[..], "pool size {threads}: level {}", i + 1);
+        }
+        println!(
+            "LEVELS PROGRAM POOL IDENTITY: {threads} threads · base {} B · levels {} and {} B equal",
+            base.len(),
+            levels[0].len(),
+            levels[1].len(),
+        );
+    }
+}
+
 /// ★ Level 1 filled on its own thread beside the stacks' commit
 /// (`LAMBDA_VM_LEVELS_FILL_BESIDE`) is the same fill and the same proofs: a
 /// small BLAKE3 block driven with the knob on proves each level's bytes as

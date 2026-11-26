@@ -469,6 +469,53 @@ pub fn program_fast() -> bool {
 #[cfg(test)]
 static PROGRAM_FAST_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
+/// `LAMBDA_VM_LEVELS_PROGRAM_POOL=<threads>`: run level 1's parallel host
+/// work beside the base on a dedicated pool of this size. Unset or `0` uses
+/// the existing pools. The base and the later levels keep their own scheduling.
+pub const PROGRAM_POOL_ENV: &str = "LAMBDA_VM_LEVELS_PROGRAM_POOL";
+
+fn parse_program_pool(word: Option<&str>) -> Result<usize, String> {
+    match word.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(word) => word.parse().map_err(|_| {
+            format!("{PROGRAM_POOL_ENV}={word:?}: expected a thread count (0 or greater)")
+        }),
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PROGRAM_POOL_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn program_pool() -> Result<Option<rayon::ThreadPool>, String> {
+    #[cfg(test)]
+    let threads = PROGRAM_POOL_FOR_TEST
+        .get()
+        .map_or_else(|| knob_word(PROGRAM_POOL_ENV, parse_program_pool), Ok)?;
+    #[cfg(not(test))]
+    let threads = knob_word(PROGRAM_POOL_ENV, parse_program_pool)?;
+    if threads == 0 {
+        return Ok(None);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("levels-program-{i}"))
+        .build()
+        .map(Some)
+        .map_err(|e| format!("{PROGRAM_POOL_ENV}={threads}: {e}"))
+}
+
+fn on_program_pool<R: Send>(
+    pool: Option<&rayon::ThreadPool>,
+    work: impl FnOnce() -> R + Send,
+) -> R {
+    match pool {
+        Some(pool) => pool.install(work),
+        None => work(),
+    }
+}
+
 /// `LAMBDA_VM_LEVELS_BESIDE_NICE=1`: the host work the driver runs beside the
 /// base's phase B that level 1's execution does not wait for (its stacks'
 /// columns prepared on the host, [`prepare_level`], and the validator beside
@@ -917,31 +964,36 @@ pub(crate) fn prepare_level_beside_as(
     levers: WlfmLevers,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
-    prepare_level_watching(program, levers, rounds, None).map(|(pre, _)| pre)
+    prepare_level_watching(program, levers, rounds, None, None).map(|(pre, _)| pre)
 }
 
 /// [`prepare_level_beside_as`], watching `base_returned` when given
 /// ([`super::wlfm::BUILDER_WHOLE_POOL_ENV`]): raised, the columns not yet
 /// made and the packs go to the whole pool. The same prebuild, and what the
 /// watch did.
-pub(crate) fn prepare_level_watching(
+fn prepare_level_watching(
     program: &LfmProgram,
     levers: WlfmLevers,
     rounds: Option<u8>,
     base_returned: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    program_pool: Option<&rayon::ThreadPool>,
 ) -> Result<(WlfmPrebuild, Option<super::wlfm::WholePoolNote>), String> {
     // On the thread that runs the prepare (a pool's worker under the beside
     // pool): the watch and its note are that thread's.
     let run = move || {
         let _watch = base_returned.map(super::wlfm::watch_base);
         let _ = super::wlfm::take_whole_pool_note();
-        let pre = prepare_level_as(program, levers, rounds)?;
+        let pre = prepare_level_packs_as(
+            program,
+            levers,
+            rounds,
+            packs_beside(),
+            program_pool.is_some(),
+        )?;
         Ok((pre, super::wlfm::take_whole_pool_note()))
     };
-    match beside_nice().then(beside_pool).flatten() {
-        Some(pool) => pool.install(run),
-        None => run(),
-    }
+    let pool = program_pool.or_else(|| beside_nice().then(beside_pool).flatten());
+    on_program_pool(pool, run)
 }
 
 /// A test's [`program_fast`] for every thread until the guard drops.
@@ -1124,7 +1176,7 @@ pub(crate) fn prepare_level_as(
     levers: WlfmLevers,
     rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
-    prepare_level_packs_as(program, levers, rounds, packs_beside())
+    prepare_level_packs_as(program, levers, rounds, packs_beside(), false)
 }
 
 /// [`prepare_level`] with its two packs made at once under `beside`
@@ -1136,7 +1188,7 @@ pub(crate) fn prepare_level_packs(
     rounds: Option<u8>,
     beside: bool,
 ) -> Result<WlfmPrebuild, String> {
-    prepare_level_packs_as(program, level_levers(family), rounds, beside)
+    prepare_level_packs_as(program, level_levers(family), rounds, beside, false)
 }
 
 /// [`prepare_level_as`] with its two packs made at once under `beside`
@@ -1144,11 +1196,12 @@ pub(crate) fn prepare_level_packs(
 /// on their pool from a thread of their own, both read the stacks' columns
 /// and write nothing the other reads; then both installed. The same
 /// prebuild. Only when both are made; otherwise as today.
-pub(crate) fn prepare_level_packs_as(
+fn prepare_level_packs_as(
     program: &LfmProgram,
     levers: WlfmLevers,
     rounds: Option<u8>,
     beside: bool,
+    on_dedicated_pool: bool,
 ) -> Result<WlfmPrebuild, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, levers, rounds)?;
@@ -1161,19 +1214,21 @@ pub(crate) fn prepare_level_packs_as(
         super::wlfm::note_whole_pool_packs(packs_whole);
     }
     if beside && super::wlfm::chip_records() && super::wlfm::narrow_commit() {
-        let (prefixes, packs) = std::thread::scope(|scope| {
-            let pre = &pre;
-            let packs = scope.spawn(move || match pack_pool() {
-                Some(pool) => pool.install(|| pre.narrow_packs_made()),
-                None => pre.narrow_packs_made(),
-            });
-            let prefixes = pre.chip_prefixes_made();
-            // A pack that panics panics here, as it would in series.
-            let packs = packs
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (prefixes, packs)
-        });
+        let (prefixes, packs) = if on_dedicated_pool && pack_pool().is_none() {
+            // A fresh std thread would send these packs to the global pool.
+            rayon::join(|| pre.chip_prefixes_made(), || pre.narrow_packs_made())
+        } else {
+            std::thread::scope(|scope| {
+                let pre = &pre;
+                let packs =
+                    scope.spawn(move || on_program_pool(pack_pool(), || pre.narrow_packs_made()));
+                let prefixes = pre.chip_prefixes_made();
+                let packs = packs
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (prefixes, packs)
+            })
+        };
         pre.install_chip_prefixes(prefixes?);
         pre.install_narrow_packs(packs);
         return Ok(pre);
@@ -3021,6 +3076,8 @@ pub fn prove_block_levels(
                 .into(),
         );
     }
+    let pool = program_pool()?;
+    let pool = pool.as_ref();
     // What the process freed before this block (an earlier block, its
     // verification) goes back to the OS first, so the peak this block's base
     // reads starts from what is live, not from pages the allocator keeps.
@@ -3181,8 +3238,13 @@ pub fn prove_block_levels(
                 // The whole-pool watch's note of the prebuild kept.
                 let note = std::cell::Cell::new(None);
                 let pre = prepare_as_level(stop, 1, last, family, |levers| {
-                    let (pre, n) =
-                        prepare_level_watching(program, levers, rounds, base_returned_ref.clone())?;
+                    let (pre, n) = prepare_level_watching(
+                        program,
+                        levers,
+                        rounds,
+                        base_returned_ref.clone(),
+                        pool,
+                    )?;
                     note.set(n);
                     Ok(pre)
                 })?;
@@ -3196,31 +3258,32 @@ pub fn prove_block_levels(
             let beside_check = program_fast();
             // The plan and the program from a statement and its roots.
             let make = |statement: &crate::block_whir::OwnedBlockStatement,
-                        roots: &[crate::block_whir::PreparedRoots]|
-             -> Result<Made, String> {
-                let plan = level_plan_measured(
-                    elf_ref,
-                    opts_ref,
-                    format_ref,
-                    statement.view(),
-                    family,
-                    Some(roots),
-                    !plan_lean_on,
-                )?;
-                let planned = now();
-                let plan_split = super::whir_block::take_plan_split();
-                let (program, marks, (walk, compiled)) =
-                    plan.closed_block_program_marked_timed(beside_check)?;
-                let compile_split = super::compiler::take_compile_split();
-                Ok(Made {
-                    plan,
-                    planned,
-                    plan_split,
-                    program,
-                    marks,
-                    walk,
-                    compiled,
-                    compile_split,
+                        roots: &[crate::block_whir::PreparedRoots]| {
+                on_program_pool(pool, || -> Result<Made, String> {
+                    let plan = level_plan_measured(
+                        elf_ref,
+                        opts_ref,
+                        format_ref,
+                        statement.view(),
+                        family,
+                        Some(roots),
+                        !plan_lean_on,
+                    )?;
+                    let planned = now();
+                    let plan_split = super::whir_block::take_plan_split();
+                    let (program, marks, (walk, compiled)) =
+                        plan.closed_block_program_marked_timed(beside_check)?;
+                    let compile_split = super::compiler::take_compile_split();
+                    Ok(Made {
+                        plan,
+                        planned,
+                        plan_split,
+                        program,
+                        marks,
+                        walk,
+                        compiled,
+                        compile_split,
+                    })
                 })
             };
             let first = srx.recv().map_err(|_| "the prover never stated")?;
@@ -3325,15 +3388,19 @@ pub fn prove_block_levels(
             }
             let mut placed = super::placement::Placement::default();
             let execute_from = now();
-            let mut ex = StreamedExecution::new_pieced_in_order(
-                program,
-                arena_pieces,
-                &hasher,
-                lean_beside,
-                bucket_waves(),
-                setup_fast(),
-                waves_in_order_on,
-            )
+            // The driver and lean fill keep their channel waits off the
+            // workers. Only active work is installed in the pool.
+            let mut ex = on_program_pool(pool, || {
+                StreamedExecution::new_pieced_in_order(
+                    program,
+                    arena_pieces,
+                    &hasher,
+                    lean_beside,
+                    bucket_waves(),
+                    setup_fast(),
+                    waves_in_order_on,
+                )
+            })
             .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landing = Level1Landing {
                 setup: now() - execute_from,
@@ -3346,7 +3413,7 @@ pub fn prove_block_levels(
                 let fill = scope.spawn(move || {
                     let mut fill = super::b3l_tables::LeanFillBeside::new(program);
                     for wave in rx {
-                        fill.feed(&wave);
+                        on_program_pool(pool, || fill.feed(&wave));
                     }
                     let stats = fill.stats();
                     (fill.finish(), stats)
@@ -3379,7 +3446,8 @@ pub fn prove_block_levels(
                     .ok_or("no front")?;
                     held[0].set(front).map_err(|_| "the front landed twice")?;
                     let at = now();
-                    ex.land_piece(0, held[0].get().ok_or("the front")?)
+                    let words = held[0].get().ok_or("the front")?;
+                    on_program_pool(pool, || ex.land_piece(0, words))
                         .map_err(|e| format!("level 1's front: {e:?}"))?;
                     landing.front = (at, now() - at);
                     hand_on_lean(&mut ex, lean_tx.as_ref());
@@ -3414,7 +3482,8 @@ pub fn prove_block_levels(
                         let _ = super::placement::take_jobs();
                     }
                     let t = std::time::Instant::now();
-                    ex.land_piece(i, held[i].get().ok_or("a piece")?)
+                    let words = held[i].get().ok_or("a piece")?;
+                    on_program_pool(pool, || ex.land_piece(i, words))
                         .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
                     hand_on_lean(&mut ex, lean_tx.as_ref());
                     if base_end_ref.get().is_none() {
@@ -3465,7 +3534,8 @@ pub fn prove_block_levels(
                 None => None,
             };
             // Under the knob, level 1 filled here, beside the stacks' commit
-            // the driver makes at the base's end.
+            // the driver makes at the base's end. Phase B has closed the
+            // parts channel, so this final fill can use the global pool.
             let execution = if fill_beside_on {
                 let split = execution.split;
                 let (prefilled, lean) = match lean {
