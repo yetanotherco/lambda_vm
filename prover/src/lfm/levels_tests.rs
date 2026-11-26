@@ -839,7 +839,8 @@ fn the_blake3_driver_with_level_2_streamed_proves_the_same_level_bytes() {
     }
 }
 
-/// The levels' chain steps a driver test forces.
+/// The levels' chain steps a driver test forces. Unselected steps are
+/// disabled to isolate the step under test.
 #[derive(Clone, Copy, Debug, Default)]
 struct ChainSteps {
     /// `LAMBDA_VM_LEVELS_FILL_PARTS`.
@@ -1170,7 +1171,7 @@ fn an_inadmissible_level_1_is_refused_with_its_validator_before_or_after_the_fil
     }
 }
 
-/// Every chain step on at once: the same level bytes.
+/// The chain steps used to overlap level preparation: the same level bytes.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
 fn the_blake3_driver_under_every_chain_step_proves_the_same_level_bytes() {
@@ -1430,8 +1431,8 @@ fn the_finish_starting_its_late_tables_first_proves_the_same_base_bytes() {
 /// ★ A level plan derived without measuring emits the measured plan's
 /// program: the same instructions, addresses, arena schema, column groups and
 /// leaf marks, the same costs and partition, over two small BLAKE3 blocks;
-/// only its chip rows are empty. A prover's plan measures unless the knob
-/// says not to; a verifier's always does, knob or not.
+/// only its chip rows are empty. A prover's plan with prepared roots is lean
+/// by default. A verifier's plan always measures.
 #[test]
 #[ignore = "proves two small BLAKE3 blocks' bases; box tier"]
 fn a_lean_level_plan_emits_the_measured_plans_program() {
@@ -1556,8 +1557,9 @@ fn driven_under_levels_split(setting: math_cuda::device::TwoCardSplit) -> u64 {
 }
 
 /// [`driven_under_levels_split`], with `by_card` every level's stacks held
-/// and each committed on its group's card (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`)
-/// instead of retired; the second card's ledger is empty again at the end.
+/// and each committed on its group's card by default
+/// (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`). The retired control turns the knob off.
+/// The second card's ledger is empty again at the end.
 #[cfg(feature = "cuda")]
 fn driven_under_levels_split_stacks(
     setting: math_cuda::device::TwoCardSplit,
@@ -1602,7 +1604,8 @@ fn driven_under_levels_split_stacks(
     // Every level's stacks retired: a held stack pins its group to card 0, and
     // a small block's levels would hold theirs (the same bytes either way).
     // By card: held, each on its group's card.
-    set_stacks_by_card_for_test(Some(by_card));
+    set_stacks_by_card_for_test(if by_card { None } else { Some(false) });
+    assert_eq!(super::levels::stacks_by_card(), by_card);
     let run = {
         let _retired = super::levels::set_stacks_for_test(Some(if by_card {
             super::wlfm::StackPlace::Card
@@ -1717,7 +1720,8 @@ fn the_blake3_driver_with_its_stacks_by_card_on_card_1_proves_the_same_level_byt
     assert!(second > 0, "no level group proved on card 1");
 }
 
-/// The three knobs together preserve the base and both recursion proofs.
+/// The three level defaults preserve the base and both recursion proofs
+/// when compared with the opt-outs.
 /// Forced split exercises both CUDA backends on a single physical card.
 #[cfg(feature = "cuda")]
 #[test]
@@ -1757,10 +1761,11 @@ fn the_blake3_driver_with_all_three_early_knobs_preserves_the_chain() {
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = ProofOptions::default_test_options();
     let options = pipelined_options();
-    let prove = |on| {
-        set_statement_early_for_test(Some(on));
-        set_plan_lean_for_test(Some(on));
-        set_stacks_by_card_for_test(Some(on));
+    let prove = |setting: Option<bool>| {
+        set_statement_early_for_test(setting);
+        set_plan_lean_for_test(setting);
+        set_stacks_by_card_for_test(setting);
+        let on = setting.is_none();
         let before = super::whir_block::plan_probes_for_test();
         let run = prove_block_levels(
             &elf,
@@ -1789,15 +1794,15 @@ fn the_blake3_driver_with_all_three_early_knobs_preserves_the_chain() {
         );
         run
     };
-    let off = prove(false);
-    let on = prove(true);
+    let default = prove(None);
+    let off = prove(Some(false));
     let base_bytes = |run: &super::levels::LevelsRun| {
         rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes")
     };
-    let (a, b) = (base_bytes(&off), base_bytes(&on));
+    let (a, b) = (base_bytes(&off), base_bytes(&default));
     assert!(a[..] == b[..], "the same base proof bytes");
     println!("ALL THREE KNOBS base: {} B equal", a.len());
-    for (level, (a, b)) in off.proofs.iter().zip(&on.proofs).enumerate() {
+    for (level, (a, b)) in off.proofs.iter().zip(&default.proofs).enumerate() {
         let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
         let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
         assert!(a[..] == b[..], "level {} proof bytes", level + 1);
@@ -1807,10 +1812,10 @@ fn the_blake3_driver_with_all_three_early_knobs_preserves_the_chain() {
         &elf,
         &opts,
         &format,
-        on.base_proof.statement(),
+        default.base_proof.statement(),
         WlfmFamily::B3,
         LevelStop::DEFAULT,
-        on.proofs.last().expect("the last level"),
+        default.proofs.last().expect("the last level"),
     )
     .expect("the independently derived verifier accepts the final proof");
 }

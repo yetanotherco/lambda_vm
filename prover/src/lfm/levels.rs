@@ -612,13 +612,12 @@ pub fn commit_next_early() -> bool {
     .unwrap_or_else(super::wlfm_knobs::two_cards)
 }
 
-/// `LAMBDA_VM_LEVELS_PLAN_LEAN=1`: level 1's plan, made by the prover from its
+/// `LAMBDA_VM_LEVELS_PLAN_LEAN`: level 1's plan, made by the prover from its
 /// own prepared roots, skips measuring each group's chip rows by emitting it
 /// alone ([`WhirBlockPlan::chip_loads`]): a level's leaf count is fixed at
 /// one, so nothing reads them. The program is emitted once, over every
-/// group, either way: the same proofs. A verifier's plan measures whatever
-/// this says. Off by default (and for any word but `1`). Read once a process,
-/// on the driver's thread.
+/// group, either way: the same proofs. A verifier's plan always measures.
+/// On by default, `0` turns it off. Read once a process, on the driver's thread.
 pub const PLAN_LEAN_ENV: &str = "LAMBDA_VM_LEVELS_PLAN_LEAN";
 
 std::thread_local! {
@@ -640,11 +639,11 @@ pub fn plan_lean() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(PLAN_LEAN_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(PLAN_LEAN_ENV).ok().as_deref())
     })
 }
 
-/// `LAMBDA_VM_LEVELS_STATEMENT_EARLY=1`: the base predicts its statement
+/// `LAMBDA_VM_LEVELS_STATEMENT_EARLY`: the base predicts its statement
 /// once every table's shape is known, before its last commits
 /// (`block_whir::prove_block_whir_local_observed_early`), and level 1 makes
 /// its plan and program from the prediction while phase A ends. They are used
@@ -653,8 +652,8 @@ pub fn plan_lean() -> bool {
 /// statement, as without the knob. Nothing of level 1 is published before.
 /// The same program from an equal statement: the same proofs. Acts only
 /// where level 1 runs beside the base with its program validated beside its
-/// execution. Off by default (and for any word but `1`). Read once a
-/// process, on the driver's thread.
+/// execution. On by default, `0` turns it off. Read once a process, on the
+/// driver's thread.
 pub const STATEMENT_EARLY_ENV: &str = "LAMBDA_VM_LEVELS_STATEMENT_EARLY";
 
 std::thread_local! {
@@ -676,7 +675,7 @@ pub fn statement_early() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(STATEMENT_EARLY_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(STATEMENT_EARLY_ENV).ok().as_deref())
     })
 }
 
@@ -1281,14 +1280,14 @@ pub(crate) fn commit_level(pre: WlfmPrebuild, level: usize) -> Result<WlfmBuild,
     pre.commit_on(place, cards)
 }
 
-/// `LAMBDA_VM_LEVELS_STACKS_BY_CARD=1`: under the levels' split
+/// `LAMBDA_VM_LEVELS_STACKS_BY_CARD`: under the levels' split
 /// (`LAMBDA_VM_TWO_CARD_LEVELS`, its second card ready), a level's groups are
 /// assigned to the two cards before its prepared stacks are committed, each
 /// stack is committed on its group's card (both cards at once), and phase B
 /// argues and opens each group whose stack is held on the card that holds it.
 /// Where a held stack otherwise pins its group to card 0, a level whose stacks
 /// are all held then splits too. The same roots on either card: the same
-/// proofs. Off by default (and for any word but `1`). Read once a process;
+/// proofs. On by default, `0` turns it off. Read once a process;
 /// a test's override is the process's (level 2's commit runs on a thread of
 /// its own).
 pub const STACKS_BY_CARD_ENV: &str = "LAMBDA_VM_LEVELS_STACKS_BY_CARD";
@@ -1317,7 +1316,7 @@ pub fn stacks_by_card() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(STACKS_BY_CARD_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(STACKS_BY_CARD_ENV).ok().as_deref())
     })
 }
 
