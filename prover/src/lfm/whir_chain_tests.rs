@@ -503,6 +503,50 @@ fn the_chain_executes_on_a_proof_the_host_accepts() {
     }
 }
 
+#[test]
+fn cluster_stage2_arena_refuses_bad_round_counts_and_missing_successors() {
+    let f = fixture(6, 3, 0);
+    let encode = |proof| {
+        let mut words = Vec::new();
+        // The same encoder is used for the group's main and prepared stacks.
+        super::whir_block::push_chains(&mut words, &proof, 1, &f.shape)
+    };
+    let stacked = |chain| multilinear::stacked_eval::StackedProof { polys: vec![chain] };
+    assert!(encode(stacked(f.proof.clone())).is_ok());
+
+    let mut extra = f.proof.clone();
+    extra.rounds.push(extra.rounds[0].clone());
+    assert!(
+        encode(stacked(extra))
+            .unwrap_err()
+            .contains("rounds, expected")
+    );
+
+    let mut short = f.proof.clone();
+    short.rounds.pop().unwrap();
+    assert!(
+        encode(stacked(short))
+            .unwrap_err()
+            .contains("rounds, expected")
+    );
+
+    let mut missing_root = f.proof.clone();
+    missing_root.rounds[0].next_root.take().unwrap();
+    assert!(
+        encode(stacked(missing_root))
+            .unwrap_err()
+            .contains("missing successor root")
+    );
+
+    let mut missing_ood = f.proof;
+    missing_ood.rounds[0].ood_value.take().unwrap();
+    assert!(
+        encode(stacked(missing_ood))
+            .unwrap_err()
+            .contains("missing out-of-domain value")
+    );
+}
+
 /// ★ The tamper arm: three halves, five sites.
 ///
 /// ⚠ Run at a REAL grind width, and the reason is a catch this arm made on

@@ -2930,6 +2930,13 @@ pub fn try_push_round_words(
     shape: &ChainShape,
     proof: &ChainProof<GoldilocksField, GoldilocksExtension>,
 ) -> Result<(), String> {
+    if proof.rounds.len() != shape.rounds() {
+        return Err(format!(
+            "chain has {} rounds, expected {}",
+            proof.rounds.len(),
+            shape.rounds()
+        ));
+    }
     for (r, round) in proof.rounds.iter().enumerate() {
         for sc in &round.sumcheck {
             for e in &sc.evaluations {
@@ -2964,14 +2971,16 @@ pub fn try_push_round_words(
             push_openings(words, shape, round, true, current);
         }
         if let Some(next_depth) = shape.next_depth(r) {
-            push_node(
-                words,
-                round.next_root.as_ref().expect("a successor root"),
-                shape.digest_words,
-            );
-            words.push(ext_word(
-                round.ood_value.as_ref().expect("an out-of-domain value"),
-            ));
+            let root = round
+                .next_root
+                .as_ref()
+                .ok_or_else(|| format!("round {r}: missing successor root"))?;
+            let ood = round
+                .ood_value
+                .as_ref()
+                .ok_or_else(|| format!("round {r}: missing out-of-domain value"))?;
+            push_node(words, root, shape.digest_words);
+            words.push(ext_word(ood));
             // The round form opens no successor: its round carries its cap.
             if shape.whir() {
                 continue;
