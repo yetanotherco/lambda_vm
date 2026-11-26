@@ -2740,6 +2740,42 @@ fn rta_last_file(
     ok
 }
 
+/// Stage 2 byte gate for test_commit_4. The proof uses the same options and
+/// archive layout as the stage 1 BLAKE3 fixture, with one independent final
+/// verification. Run each driver setting in its own process.
+#[test]
+#[ignore = "cluster archive gate: needs a real CUDA build"]
+fn cluster_stage2_test_commit_4() {
+    use super::levels::{prove_block_levels, verify_block_levels_under};
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &streamed_options(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
+    .expect("the BLAKE3 fixture proves");
+    assert_eq!(run.proofs.len(), 2);
+    verify_block_levels_under(
+        &elf,
+        &opts,
+        &format,
+        run.base_proof.statement(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        run.proofs.last().expect("last level"),
+    )
+    .expect("the verifier derives its own plan and accepts the last level");
+    write_identity_files(&run, WlfmFamily::B3);
+}
+
 /// Opt-in byte gate shared by the small fixture and the real-block harness.
 fn write_identity_files(run: &super::levels::LevelsRun, family: WlfmFamily) {
     let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") else {

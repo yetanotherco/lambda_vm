@@ -627,3 +627,79 @@ fn indexed_commit_error_drops_peer_receipts() {
     assert!(matches!(result, Err("a test's failed commit")));
     assert_eq!(held(), before, "every lane's receipt has been released");
 }
+
+#[test]
+fn inproc_driver_reverses_phase_b_and_releases_work_on_error() {
+    use crate::multilinear_block::InprocWorkers;
+    use multilinear::gpu;
+    use rkyv::{rancor::Error, to_bytes};
+
+    let workers = InprocWorkers::parse("inproc:4").unwrap().unwrap();
+    let order: Vec<_> = in_order().into_iter().rev().collect();
+    let config = config(ArgueFormat::PerTable);
+    let prove = |remote, faults| {
+        prove_block_with::<H>(
+            &config,
+            PhaseBOverlap::Off,
+            &order,
+            faults,
+            &|block| {
+                if remote {
+                    block.set_inproc(workers, Vec::new());
+                }
+            },
+            None,
+            true,
+            None,
+        )
+    };
+    let before = gpu::ledger_reserved();
+    let (failed, observed) = prove(
+        true,
+        OverlapFaults {
+            // At least one earlier group completed and sent a GroupDone.
+            open_fails: Some(2),
+            ..OverlapFaults::default()
+        },
+    );
+    assert!(matches!(failed, Err(MlError::DeviceFailed { .. })));
+    assert!(observed.is_empty());
+    if gpu::reserve_budget() > before && !gpu::columns_disabled() {
+        let peak = gpu::reserved_window_peak();
+        assert!(peak > before, "the failed turn had a live CUDA reservation");
+        eprintln!("Cluster cancellation CUDA reservation peaked at {peak} bytes");
+    }
+    assert_eq!(
+        gpu::ledger_reserved(),
+        before,
+        "the failed attempt released its leases"
+    );
+
+    let (local, observed_local) = prove(false, OverlapFaults::default());
+    let (remote, observed_remote) = prove(true, OverlapFaults::default());
+    let local = local.unwrap();
+    let remote = remote.unwrap();
+    assert_eq!(sorted(observed_local), sorted(observed_remote));
+    assert_eq!(
+        to_bytes::<Error>(&remote.0).unwrap().as_slice(),
+        to_bytes::<Error>(&local.0).unwrap().as_slice()
+    );
+    assert_eq!(
+        to_bytes::<Error>(&remote.1).unwrap().as_slice(),
+        to_bytes::<Error>(&local.1).unwrap().as_slice()
+    );
+    assert_eq!(
+        to_bytes::<Error>(&remote.2).unwrap().as_slice(),
+        to_bytes::<Error>(&local.2).unwrap().as_slice()
+    );
+    assert_eq!(
+        to_bytes::<Error>(&remote.4).unwrap().as_slice(),
+        to_bytes::<Error>(&local.4).unwrap().as_slice()
+    );
+    verify(ArgueFormat::PerTable, &remote).unwrap();
+    assert_eq!(
+        gpu::ledger_reserved(),
+        before,
+        "the fresh attempt released its leases"
+    );
+}
