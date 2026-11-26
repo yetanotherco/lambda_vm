@@ -1,6 +1,6 @@
 //! One attempt per worker process, with one TCP connection per endpoint.
 //! Deploy the same executable and proof settings to every host on a private
-//! network. Topology tokens establish peer identity; the link carries the
+//! network. Topology tokens authenticate peers and frames. The link carries
 //! private input in plaintext.
 
 use super::wire::{self, Attempt, Connection, Digest32, Kind, Reader};
@@ -13,11 +13,11 @@ use std::{
     cell::RefCell,
     fs::File,
     io::{self, Read},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::Duration,
@@ -29,6 +29,9 @@ type Parts = GroupParts<F, E>;
 
 const ELF_LIMIT: usize = 64 << 20;
 const INPUT_LIMIT: usize = 128 << 20;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const FINISH_TIMEOUT: Duration = Duration::from_secs(1);
+const WATCHDOG_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Endpoint {
@@ -44,14 +47,20 @@ struct Endpoint {
 /// coordinator 127.0.0.1:48000
 /// worker 127.0.0.1:48001 0 <64 hex digits>
 /// worker 127.0.0.1:48002 0,1 <64 hex digits>
-/// deadlines-ms 10000 120000 120000
+/// deadlines-ms 5000 30000 30000
 /// fallback local
 /// ```
 ///
 /// The coordinator dials the workers. Its address identifies it in the
 /// handshake. Worker copies may replace every other token with `-`.
-/// Deadlines apply to startup, commit and opening respectively.
-/// Fallback defaults to off.
+/// The optional `deadlines-ms` line sets startup, commit and opening limits
+/// (defaults: 5 s, 30 s and 30 s). Set larger limits for larger workloads.
+/// Workers allow at most one second per handshake within startup. The final
+/// acknowledgement is best effort, with at most one second to collect it.
+/// Fallback defaults to off and retries cluster failures locally.
+/// Worker hosts need memory for their replicated witness build. Cluster
+/// replay disables live regeneration and always admits record-backed tables.
+/// Use a private network or a tunnel if the input needs confidentiality.
 #[derive(Clone)]
 pub struct Topology {
     coordinator: SocketAddr,
@@ -148,9 +157,9 @@ impl Topology {
             ));
         }
         let (startup, commit, open) = deadlines.unwrap_or((
-            Duration::from_secs(10),
-            Duration::from_secs(120),
-            Duration::from_secs(120),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
         ));
         Ok(Self {
             coordinator,
@@ -289,7 +298,10 @@ pub(crate) fn with_settings<T>(
 #[derive(Clone)]
 enum Placement {
     Local,
-    Tcp(Arc<Topology>),
+    Tcp {
+        topology: Arc<Topology>,
+        failed: bool,
+    },
 }
 
 thread_local! {
@@ -304,7 +316,7 @@ type Dispatch = (
 pub(in crate::block_whir) fn dispatch() -> Result<Dispatch, Error> {
     let topology = match DISPATCH.with(|slot| slot.borrow().clone()) {
         Some(Placement::Local) => return Ok((None, None)),
-        Some(Placement::Tcp(topology)) => Some(topology),
+        Some(Placement::Tcp { topology, .. }) => Some(topology),
         None => None,
     };
     let inproc = multilinear_block::InprocWorkers::from_env().map_err(Error::Prover)?;
@@ -319,19 +331,38 @@ pub(in crate::block_whir) fn dispatch() -> Result<Dispatch, Error> {
 /// Run a complete proving entry point on this thread. On a configured
 /// fallback the first invocation has returned and its observers and sockets
 /// have been dropped before a fresh invocation starts with local placement.
-pub fn coordinate<T, E>(topology: &Topology, prove: impl Fn() -> Result<T, E>) -> Result<T, E> {
+pub fn coordinate<T, E: std::fmt::Display>(
+    topology: &Topology,
+    prove: impl Fn() -> Result<T, E>,
+) -> Result<T, E> {
     struct Reset(Option<Placement>);
     impl Drop for Reset {
         fn drop(&mut self) {
             DISPATCH.with(|slot| slot.replace(self.0.take()));
         }
     }
-    let previous =
-        DISPATCH.with(|slot| slot.replace(Some(Placement::Tcp(Arc::new(topology.clone())))));
+    let previous = DISPATCH.with(|slot| {
+        slot.replace(Some(Placement::Tcp {
+            topology: Arc::new(topology.clone()),
+            failed: false,
+        }))
+    });
     let reset = Reset(previous);
     let result = prove();
-    if result.is_err() && topology.fallback {
-        eprintln!("CLUSTER TCP: starting a fresh local attempt");
+    let cluster_failed = DISPATCH.with(|slot| {
+        matches!(
+            slot.borrow().as_ref(),
+            Some(Placement::Tcp { failed: true, .. })
+        )
+    });
+    if let Err(error) = &result
+        && topology.fallback
+        && cluster_failed
+    {
+        static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+        eprintln!("CLUSTER TCP: {error}");
+        let count = FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("CLUSTER TCP: starting a fresh local attempt (fallback {count})");
         DISPATCH.with(|slot| slot.replace(Some(Placement::Local)));
         return prove();
     }
@@ -348,6 +379,71 @@ struct Start {
     input_len: usize,
     elf_hash: Digest32,
     input_hash: Digest32,
+}
+
+// These are local ceilings for the streamed production posture. In
+// particular, peer-supplied sizes never authorize a larger worker allocation.
+fn validate_options(options: &BlockOptions) -> WireResult<usize> {
+    let window = options
+        .window_log2
+        .filter(|&log| log <= BLOCK_WINDOW_LOG2)
+        .ok_or_else(|| wire::invalid("Start window_log2 exceeds worker limits"))?;
+    let rows = &options.max_rows;
+    if [
+        rows.cpu,
+        rows.memw,
+        rows.memw_aligned,
+        rows.dvrm,
+        rows.mul,
+        rows.lt,
+        rows.shift,
+        rows.load,
+        rows.branch,
+        rows.memw_register,
+        rows.eq,
+        rows.bytewise,
+        rows.store,
+        rows.cpu32,
+        rows.mem_load,
+        rows.mem_store,
+    ]
+    .into_iter()
+    .any(|rows| !(1..=BLOCK_MAX_ROWS).contains(&rows))
+    {
+        return Err(wire::invalid("Start max_rows exceeds worker limits"));
+    }
+    if [
+        (options.keccak_rnd_rows_log2, BLOCK_KECCAK_RND_ROWS_LOG2),
+        (options.ecdas_rows_log2, BLOCK_ECDAS_ROWS_LOG2),
+        (options.keccak_rows_log2, BLOCK_KECCAK_ROWS_LOG2),
+        (options.ecsm_rows_log2, BLOCK_ECSM_ROWS_LOG2),
+        (options.copy_rows_log2, BLOCK_COPY_ROWS_LOG2),
+    ]
+    .into_iter()
+    .any(|(log, max)| log > max)
+    {
+        return Err(wire::invalid("Start table cut exceeds worker limits"));
+    }
+    if options.layout_workers > BLOCK_LAYOUT_WORKERS
+        || options
+            .layout_ahead
+            .is_some_and(|ahead| ahead > BLOCK_LAYOUT_AHEAD)
+        || options.layout_workers > 0
+            && (options.layout_ahead.is_none() || options.rest_layout_bytes.is_none())
+        || options
+            .rest_layout_bytes
+            .is_some_and(|bytes| !(1..=BLOCK_REST_LAYOUT_BYTES).contains(&bytes))
+        || options
+            .rest_build_bytes
+            .is_some_and(|bytes| !(1..=BLOCK_REST_BUILD_BYTES).contains(&bytes))
+        || options.drop_levels.device > 32
+        || options.drop_levels.host > 32
+    {
+        return Err(wire::invalid(
+            "Start layout or tree options exceed worker limits",
+        ));
+    }
+    Ok(1 << window)
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -372,7 +468,16 @@ struct GroupReply {
     parts: Parts,
 }
 
+pub(in crate::block_whir) fn mark_failed() {
+    DISPATCH.with(|slot| {
+        if let Some(Placement::Tcp { failed, .. }) = slot.borrow_mut().as_mut() {
+            *failed = true;
+        }
+    });
+}
+
 fn fail(error: impl std::fmt::Display) -> Error {
+    mark_failed();
     Error::Prover(format!("cluster TCP: {error}"))
 }
 
@@ -405,20 +510,24 @@ fn read_input(
 }
 
 fn send_input(
-    socket: &TcpStream,
+    socket: &Connection,
     deadline: Instant,
     attempt: Attempt,
     input: &[u8],
 ) -> WireResult<()> {
     for chunk in input.chunks(wire::INPUT_CHUNK) {
-        wire::send(socket, deadline, attempt, Kind::Input, &chunk.to_vec())?;
+        socket.send(deadline, attempt, Kind::Input, &chunk.to_vec())?;
     }
     Ok(())
 }
 
-fn disconnect(peers: &[Connection]) {
-    for peer in peers {
-        let _ = peer.0.shutdown(Shutdown::Both);
+struct CloseOnDrop<'a>(&'a [Connection]);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        for peer in self.0 {
+            peer.close();
+        }
     }
 }
 
@@ -464,17 +573,16 @@ fn start_peers(
             .map(|(id, endpoint)| {
                 scope.spawn(move || {
                     let run = || {
-                        let socket = Connection(connect(endpoint.address, deadline)?);
-                        wire::authenticate(
-                            &socket.0,
+                        let socket = wire::authenticate(
+                            connect(endpoint.address, deadline)?,
                             deadline,
                             endpoint.token.as_ref().unwrap(),
                             &topology.context(id, &profile)?,
                             true,
                         )?;
-                        wire::send(&socket.0, deadline, attempt, Kind::Start, start)?;
-                        send_input(&socket.0, deadline, attempt, elf)?;
-                        send_input(&socket.0, deadline, attempt, input)?;
+                        socket.send(deadline, attempt, Kind::Start, start)?;
+                        send_input(&socket, deadline, attempt, elf)?;
+                        send_input(&socket, deadline, attempt, input)?;
                         Ok(socket)
                     };
                     run().map_err(|why: io::Error| {
@@ -575,7 +683,7 @@ impl Phase<'_> {
     /// on a different connection or reset the phase's absolute deadline.
     fn run(
         &self,
-        request: impl Fn(&TcpStream, Instant) -> WireResult<()> + Sync,
+        request: impl Fn(&Connection, Instant) -> WireResult<()> + Sync,
         mut admit: impl FnMut(usize, Kind, &AlignedVec) -> WireResult<()>,
     ) -> WireResult<()> {
         enum Event {
@@ -586,13 +694,14 @@ impl Phase<'_> {
         let deadline = Instant::now() + self.duration;
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(0);
+            let mut close = CloseOnDrop(self.peers);
             let request = &request;
             for (id, peer) in self.peers.iter().enumerate() {
                 let tx = tx.clone();
                 scope.spawn(move || {
-                    let mut read = Reader::new(&peer.0);
-                    let mut run = || {
-                        request(&peer.0, deadline)?;
+                    let run = || {
+                        request(peer, deadline)?;
+                        let mut read = peer.reader();
                         loop {
                             let kinds = [self.reply, self.end, Kind::Witness];
                             let kinds = if self.reply == Kind::Committed {
@@ -610,9 +719,10 @@ impl Phase<'_> {
                             }
                         }
                     };
-                    let event = match run() {
-                        Ok(()) => Event::Done,
-                        Err(error) => Event::Failed(error),
+                    let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                        Ok(Ok(())) => Event::Done,
+                        Ok(Err(error)) => Event::Failed(error),
+                        Err(_) => Event::Failed(wire::invalid("peer I/O thread panicked")),
                     };
                     let _ = tx.send((id, event));
                 });
@@ -639,8 +749,8 @@ impl Phase<'_> {
                 }
                 Ok(())
             })();
-            if result.is_err() {
-                disconnect(self.peers);
+            if result.is_ok() {
+                close.0 = &[];
             }
             drop(rx);
             result
@@ -781,9 +891,7 @@ pub(in crate::block_whir) fn prove<H: multilinear::whir_hash::WhirHash>(
     };
     commit
         .run(
-            |socket, deadline| {
-                wire::write_frame(socket, deadline, Kind::Assign, attempt, &assignment)
-            },
+            |socket, deadline| socket.write_frame(deadline, Kind::Assign, attempt, &assignment),
             |id, kind, bytes| {
                 if kind == Kind::Witness {
                     if witnesses[id] || bytes[..] != expected_witness {
@@ -871,7 +979,7 @@ pub(in crate::block_whir) fn prove<H: multilinear::whir_hash::WhirHash>(
     let mut completed = vec![0; peers.len()];
     let mut result_bytes = 0;
     open.run(
-        |socket, deadline| wire::write_frame(socket, deadline, Kind::Bind, attempt, &sealed),
+        |socket, deadline| socket.write_frame(deadline, Kind::Bind, attempt, &sealed),
         |id, _, bytes| {
             result_bytes += bytes.len();
             if result_bytes > 512 << 20 {
@@ -945,19 +1053,18 @@ pub(in crate::block_whir) fn prove<H: multilinear::whir_hash::WhirHash>(
             local.push(parts.local.unwrap_or_default());
         }
     }
-    Phase {
-        name: "finish",
-        reply: Kind::Finish,
-        end: Kind::Finish,
-        duration: topology.startup,
-        peers,
-        attempt,
-    }
-    .run(
-        |socket, deadline| wire::write_frame(socket, deadline, Kind::Finish, attempt, &[]),
-        |_, _, _| Ok(()),
-    )
-    .map_err(fail)?;
+    let finish_deadline = Instant::now() + topology.startup.min(FINISH_TIMEOUT);
+    std::thread::scope(|scope| {
+        for (id, peer) in peers.iter().enumerate() {
+            scope.spawn(move || {
+                let result = peer.write_frame(finish_deadline, Kind::Finish, attempt, &[])
+                    .and_then(|()| peer.reader().receive(finish_deadline, Some(attempt), &[Kind::Finish]));
+                if let Err(error) = result {
+                    eprintln!("CLUSTER TCP: worker {id} missing Finish acknowledgement, continuing to proof verification: {error}");
+                }
+            });
+        }
+    });
     eprintln!("BLOCK CLUSTER TCP: completed groups by worker {completed:?}");
     stamps.phase_b = begin.elapsed().as_secs_f64();
     stamps.tables = laid.shapes.len();
@@ -985,7 +1092,7 @@ pub(in crate::block_whir) fn prove<H: multilinear::whir_hash::WhirHash>(
 }
 
 pub(in crate::block_whir) struct Worker<'a> {
-    socket: &'a TcpStream,
+    socket: &'a Connection,
     attempt: Attempt,
     id: usize,
     cards: Vec<usize>,
@@ -995,6 +1102,7 @@ pub(in crate::block_whir) struct Worker<'a> {
     bind: Mutex<mpsc::Receiver<WireResult<AlignedVec>>>,
     finished: Mutex<mpsc::Receiver<WireResult<()>>>,
     cancelled: &'a AtomicBool,
+    watchdog: mpsc::Sender<(&'static str, Instant)>,
 }
 
 impl Worker<'_> {
@@ -1041,6 +1149,22 @@ impl Worker<'_> {
         #[cfg(test)]
         {
             fault_pause("commit");
+            if fault_is("panic") {
+                eprintln!(
+                    "CLUSTER TEST PANIC {:?}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                panic!("injected worker panic");
+            }
+            if fault_is("card-hang") {
+                // This runs on the card path and never returns to a cancellation check.
+                multilinear::gpu::on_indexed_card(self.card(plan, 0), false, || {
+                    fault_pause("card-hang")
+                });
+            }
             if fault_is("timeout") {
                 while !self.cancelled.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(10));
@@ -1057,14 +1181,9 @@ impl Worker<'_> {
         } else {
             witness
         };
-        wire::write_frame(
-            self.socket,
-            self.commit_deadline,
-            Kind::Witness,
-            self.attempt,
-            &witness,
-        )
-        .map_err(fail)?;
+        self.socket
+            .write_frame(self.commit_deadline, Kind::Witness, self.attempt, &witness)
+            .map_err(fail)?;
         for (group, committed) in owned {
             self.check_cancelled()?;
             while stacks.peek().is_some_and(|stack| stack.group < group) {
@@ -1101,53 +1220,36 @@ impl Worker<'_> {
             }
             #[cfg(test)]
             if fault_is("stale") {
-                wire::send(
-                    self.socket,
-                    self.commit_deadline,
-                    [255; 16],
-                    Kind::Committed,
-                    &reply,
-                )
-                .map_err(fail)?;
+                self.socket
+                    .send(self.commit_deadline, [255; 16], Kind::Committed, &reply)
+                    .map_err(fail)?;
             }
-            wire::send(
-                self.socket,
-                self.commit_deadline,
-                self.attempt,
-                Kind::Committed,
-                &reply,
-            )
-            .map_err(fail)?;
+            self.socket
+                .send(self.commit_deadline, self.attempt, Kind::Committed, &reply)
+                .map_err(fail)?;
             #[cfg(test)]
             if fault_is("duplicate") {
-                wire::send(
-                    self.socket,
-                    self.commit_deadline,
-                    self.attempt,
-                    Kind::Committed,
-                    &reply,
-                )
-                .map_err(fail)?;
+                self.socket
+                    .send(self.commit_deadline, self.attempt, Kind::Committed, &reply)
+                    .map_err(fail)?;
             }
             private.push((committed, prepared, card, reply));
         }
         drop(stacks);
-        wire::write_frame(
-            self.socket,
-            self.commit_deadline,
-            Kind::CommittedAll,
-            self.attempt,
-            &[],
-        )
-        .map_err(fail)?;
+        self.socket
+            .write_frame(self.commit_deadline, Kind::CommittedAll, self.attempt, &[])
+            .map_err(fail)?;
+        let bind_deadline = self.commit_deadline + self.startup;
+        let _ = self.watchdog.send(("bind", bind_deadline));
         let bind_bytes = self
             .bind
             .lock()
             .unwrap()
-            .recv_timeout(wire::remaining(self.commit_deadline + self.startup).map_err(fail)?)
+            .recv_timeout(wire::remaining(bind_deadline).map_err(fail)?)
             .map_err(fail)?
             .map_err(fail)?;
         let deadline = Instant::now() + self.open;
+        let _ = self.watchdog.send(("open", deadline));
         let bind: Bind = wire::decode(&bind_bytes).map_err(fail)?;
         let mut post = H::sponge();
         if bind.plan.statement != plan.statement
@@ -1226,36 +1328,38 @@ impl Worker<'_> {
             } else {
                 parts
             };
-            wire::send(
-                self.socket,
-                deadline,
-                self.attempt,
-                Kind::Result,
-                &GroupReply {
-                    group,
-                    descriptor,
-                    plan: bind.digest,
-                    parts,
-                },
-            )
-            .map_err(fail)?;
+            self.socket
+                .send(
+                    deadline,
+                    self.attempt,
+                    Kind::Result,
+                    &GroupReply {
+                        group,
+                        descriptor,
+                        plan: bind.digest,
+                        parts,
+                    },
+                )
+                .map_err(fail)?;
         }
-        wire::write_frame(self.socket, deadline, Kind::OpenedAll, self.attempt, &[])
+        self.socket
+            .write_frame(deadline, Kind::OpenedAll, self.attempt, &[])
             .map_err(fail)?;
+        let finish_deadline = deadline + self.startup;
+        let _ = self.watchdog.send(("finish", finish_deadline));
         self.finished
             .lock()
             .unwrap()
-            .recv_timeout(self.startup + self.open)
+            .recv_timeout(wire::remaining(finish_deadline).map_err(fail)?)
             .map_err(fail)?
             .map_err(fail)?;
-        wire::write_frame(
-            self.socket,
-            Instant::now() + self.startup,
-            Kind::Finish,
-            self.attempt,
-            &[],
-        )
-        .map_err(fail)?;
+        #[cfg(test)]
+        if fault_is("no-finish") {
+            return Ok(());
+        }
+        self.socket
+            .write_frame(finish_deadline, Kind::Finish, self.attempt, &[])
+            .map_err(fail)?;
         Ok(())
     }
 }
@@ -1280,8 +1384,42 @@ fn fault_pause(name: &str) {
     }
 }
 
-/// Serve a single proof attempt. Start a fresh worker process for each retry.
-/// Launch with the configured LAMBDA_VM_CARDS before CUDA initializes.
+fn watch_deadline(
+    socket: &Connection,
+    cancelled: &AtomicBool,
+    deadlines: mpsc::Receiver<(&'static str, Instant)>,
+    mut phase: &'static str,
+    mut deadline: Instant,
+) {
+    loop {
+        match deadlines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(next) => (phase, deadline) = next,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+        }
+    }
+    cancelled.store(true, Ordering::Relaxed);
+    socket.close();
+    eprintln!("CLUSTER TCP: worker {phase} deadline expired");
+    // Ordinary cancellation unwinds the attempt and drops its card allocations.
+    // If the task is stuck in a driver call, exit so the OS and driver can reclaim them.
+    let grace = Instant::now() + WATCHDOG_GRACE;
+    loop {
+        match deadlines.recv_timeout(grace.saturating_duration_since(Instant::now())) {
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!("CLUSTER TCP: worker still blocked after {phase} deadline, exiting");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Serve a single authenticated proof attempt. Start a fresh worker process
+/// for each retry. Launch with the configured LAMBDA_VM_CARDS before CUDA
+/// initializes. A stuck worker process exits after the phase deadline and a
+/// one-second grace period.
 pub fn serve(
     topology: &Topology,
     id: usize,
@@ -1309,42 +1447,39 @@ pub fn serve(
     listener.set_nonblocking(true).map_err(fail)?;
     let deadline = Instant::now() + topology.startup;
     let socket = loop {
+        let left = wire::remaining(deadline).map_err(fail)?;
         match listener.accept() {
-            Ok((socket, _)) => break Connection(socket),
+            Ok((stream, _)) => {
+                let handshake = stream.set_nonblocking(false).and_then(|()| {
+                    wire::authenticate(
+                        stream,
+                        deadline.min(Instant::now() + HANDSHAKE_TIMEOUT),
+                        token,
+                        &context,
+                        false,
+                    )
+                });
+                match handshake {
+                    Ok(socket) => break socket,
+                    Err(error) => eprintln!("CLUSTER TCP: worker {id} rejected handshake: {error}"),
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(
-                    wire::remaining(deadline)
-                        .map_err(fail)?
-                        .min(Duration::from_millis(10)),
-                );
+                std::thread::sleep(left.min(Duration::from_millis(10)));
             }
             Err(e) => return Err(fail(e)),
         }
     };
-    wire::authenticate(&socket.0, deadline, token, &context, false).map_err(fail)?;
-    let socket = &socket.0;
-    let mut reader = Reader::new(socket);
+    let socket = &socket;
+    let mut reader = socket.reader();
     let (attempt, _, bytes) = reader
         .receive(deadline, None, &[Kind::Start])
         .map_err(fail)?;
-    let start: Start = wire::decode(&bytes).map_err(fail)?;
+    let (start, window, elf, inputs) = receive_start(&mut reader, deadline, attempt, &bytes)
+        .inspect_err(|error| report_error(socket, attempt, error))?;
     let settings: Arc<[_]> = start.settings.into();
-    if settings.len() != BUILD_SETTINGS.len() {
-        return Err(fail("invalid build settings"));
-    }
     let options = &start.options;
-    let window = options
-        .window_log2
-        .and_then(|w| 1usize.checked_shl(w.try_into().ok()?))
-        .ok_or_else(|| fail("cluster witness replay needs a valid window_log2"))?;
-    if start.elf_len == 0 || start.elf_len > ELF_LIMIT || start.input_len > INPUT_LIMIT {
-        return Err(fail("ELF or private input exceeds cluster limits"));
-    }
-    let elf = read_input(&mut reader, deadline, attempt, start.elf_len).map_err(fail)?;
-    let inputs = read_input(&mut reader, deadline, attempt, start.input_len).map_err(fail)?;
-    if hash(&elf) != start.elf_hash || hash(&inputs) != start.input_hash {
-        return Err(fail("input digests disagree"));
-    }
     let (_, _, assignment) = reader
         .receive(
             Instant::now() + topology.commit,
@@ -1364,6 +1499,9 @@ pub fn serve(
     drop(assignment);
     let cancelled = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let _close = CloseOnDrop(std::slice::from_ref(socket));
+        let (watchdog, deadlines) = mpsc::channel();
+        scope.spawn(|| watch_deadline(socket, &cancelled, deadlines, "commit", commit_deadline));
         let (btx, bind) = mpsc::sync_channel(1);
         let (ftx, finished) = mpsc::sync_channel(1);
         let cancelled = &cancelled;
@@ -1410,10 +1548,18 @@ pub fn serve(
                 bind: Mutex::new(bind),
                 finished: Mutex::new(finished),
                 cancelled,
+                watchdog,
             };
             let program = Elf::load(&elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
             let mut airs = HostAirs::new(opts, format, options);
-            airs.stream.trace_seed = Some(start.trace_seed);
+            let trace_seed = start.trace_seed;
+            #[cfg(test)]
+            let trace_seed = if fault_is("ignore-seed") {
+                [0; 16]
+            } else {
+                trace_seed
+            };
+            airs.stream.trace_seed = Some(trace_seed);
             let run = || {
                 prove_streamed_on_host(
                     &program,
@@ -1445,24 +1591,109 @@ pub fn serve(
             }
         };
         let result = with_settings(Some(settings), run);
-        if let Err(e) = &result {
-            let reason: String = e.to_string().chars().take(960).collect();
-            let _ = wire::send(
-                socket,
-                Instant::now() + Duration::from_millis(100),
-                attempt,
-                Kind::Error,
-                &reason,
-            );
+        if let Err(error) = &result {
+            report_error(socket, attempt, error);
         }
-        let _ = socket.shutdown(Shutdown::Both);
         result
     })
+}
+
+fn receive_start(
+    reader: &mut Reader<'_>,
+    deadline: Instant,
+    attempt: Attempt,
+    bytes: &AlignedVec,
+) -> Result<(Start, usize, Vec<u8>, Vec<u8>), Error> {
+    let start: Start = wire::decode(bytes).map_err(fail)?;
+    if start.settings.len() != BUILD_SETTINGS.len() {
+        return Err(fail("invalid build settings"));
+    }
+    let options = &start.options;
+    let window = validate_options(options).map_err(fail)?;
+    if start.elf_len == 0 || start.elf_len > ELF_LIMIT || start.input_len > INPUT_LIMIT {
+        return Err(fail("ELF or private input exceeds cluster limits"));
+    }
+    let elf = read_input(reader, deadline, attempt, start.elf_len).map_err(fail)?;
+    let inputs = read_input(reader, deadline, attempt, start.input_len).map_err(fail)?;
+    if hash(&elf) != start.elf_hash || hash(&inputs) != start.input_hash {
+        return Err(fail("input digests disagree"));
+    }
+    Ok((start, window, elf, inputs))
+}
+
+fn report_error(socket: &Connection, attempt: Attempt, error: &Error) {
+    let reason: String = error.to_string().chars().take(960).collect();
+    let _ = socket.send(
+        Instant::now() + Duration::from_millis(100),
+        attempt,
+        Kind::Error,
+        &reason,
+    );
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_host_rejects_invalid_start_before_execution() {
+        let opts = ProofOptions::default_test_options();
+        let format = BlockFormat::pinned();
+        for (window, elf_len, want) in [
+            (63, 1, "window_log2 exceeds worker limits"),
+            (BLOCK_WINDOW_LOG2, ELF_LIMIT + 1, "exceeds cluster limits"),
+            (BLOCK_WINDOW_LOG2, 1, "input digests disagree"),
+        ] {
+            let reserve = || TcpListener::bind("127.0.0.1:0").unwrap();
+            let coordinator = reserve();
+            let worker = reserve();
+            let topology = Topology::parse(&format!(
+                "coordinator {}\nworker {} 0 {}\ndeadlines-ms 2000 2000 2000",
+                coordinator.local_addr().unwrap(),
+                worker.local_addr().unwrap(),
+                "ab".repeat(32),
+            ))
+            .unwrap();
+            drop(worker);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| serve(&topology, 0, &opts, &format));
+                let deadline = Instant::now() + topology.startup;
+                let endpoint = &topology.endpoints[0];
+                let socket = wire::authenticate(
+                    connect(endpoint.address, deadline).unwrap(),
+                    deadline,
+                    endpoint.token.as_ref().unwrap(),
+                    &topology.context(0, &profile(&opts, &format)).unwrap(),
+                    true,
+                )
+                .unwrap();
+                let attempt = [7; 16];
+                let start = Start {
+                    trace_seed: [0; 16],
+                    options: BlockOptions {
+                        window_log2: Some(window),
+                        ..BlockOptions::production()
+                    },
+                    settings: vec![None; BUILD_SETTINGS.len()],
+                    elf_len,
+                    input_len: 0,
+                    elf_hash: [0; 32],
+                    input_hash: hash(&[]),
+                };
+                socket.send(deadline, attempt, Kind::Start, &start).unwrap();
+                if want == "input digests disagree" {
+                    send_input(&socket, deadline, attempt, &[1]).unwrap();
+                }
+                let error = socket
+                    .reader()
+                    .receive(deadline, Some(attempt), &[Kind::Finish])
+                    .unwrap_err();
+                assert!(error.to_string().contains(want), "{error}");
+                let error = worker.join().unwrap().unwrap_err();
+                assert!(error.to_string().contains(want), "{error}");
+            });
+        }
+    }
 
     #[test]
     fn cluster_host_proves_over_tcp() {

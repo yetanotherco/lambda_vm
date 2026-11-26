@@ -2046,6 +2046,8 @@ impl RealGuard {
     }
 }
 
+const BLOCK_MAX_ROWS: usize = 1 << 21;
+
 impl BlockOptions {
     /// Whether the finish streams the rest under its byte gate
     /// ([`Self::finish_stream`]): it needs the layout thread, the finish's
@@ -2062,7 +2064,7 @@ impl BlockOptions {
     /// KECCAK at 2^18, ECSM at 2^17, windows of 2^20 cycles.
     pub fn production() -> Self {
         Self {
-            max_rows: MaxRowsConfig::uniform(1 << 21),
+            max_rows: MaxRowsConfig::uniform(BLOCK_MAX_ROWS),
             keccak_rnd_rows_log2: BLOCK_KECCAK_RND_ROWS_LOG2,
             ecdas_rows_log2: BLOCK_ECDAS_ROWS_LOG2,
             keccak_rows_log2: BLOCK_KECCAK_ROWS_LOG2,
@@ -6498,7 +6500,11 @@ fn prove_block_whir_inner(
         .local_lookups()
         .then(|| std::mem::take(&mut proof.local));
     let mut proof = proof.with_local(local);
-    verify_cluster_base(&proof, elf_bytes, proof_options, format)?;
+    verify_cluster_base(&proof, elf_bytes, proof_options, format).inspect_err(|_| {
+        if tcp.is_some() {
+            cluster::tcp::mark_failed();
+        }
+    })?;
     let local = proof.local.take().unwrap_or_default();
     Ok((proof.with_local(local), stamps))
 }

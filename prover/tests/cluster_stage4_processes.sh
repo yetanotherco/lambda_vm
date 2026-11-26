@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Run on the CUDA box with the CUDA-enabled prover lib test executable.
+# Set LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF for the Ethereum seed gate.
+# Set LAMBDA_VM_TEST_CLUSTER_RUNNER to also test the cluster binary.
+# Pass review as the second argument to run just the stage-4 review cases.
 set -euo pipefail
 binary=$(realpath "${1:?CUDA-enabled prover lib test binary}")
 logs=$(mktemp -d /tmp/lambda-vm-cluster-tcp.XXXXXX)
@@ -10,7 +13,10 @@ export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1
 unset LAMBDA_VM_CLUSTER LAMBDA_VM_CARDS LAMBDA_VM_CARD_ALIASES
 unset LAMBDA_VM_TWO_CARD_SPLIT LAMBDA_VM_TWO_CARD_LEVELS LAMBDA_VM_TWO_CARD_OPENINGS
 parts=(base)
-if [[ -z ${LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF:-} ]]; then
+unset LAMBDA_VM_TEST_CLUSTER_BASE_ONLY
+if [[ ${2:-} == review ]]; then
+    export LAMBDA_VM_TEST_CLUSTER_BASE_ONLY=1
+elif [[ -z ${LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF:-} ]]; then
     parts+=(level-1 level-2 shipped)
 fi
 coordinator=lfm::levels_tests::cluster_stage2_test_commit_4
@@ -62,7 +68,7 @@ start_workers() {
     for ((id=0; id<count; id++)); do
         config="$dir/worker-$id.conf"
         mode=""
-        if [[ $fault == global-balance || $id == 1 ]]; then
+        if [[ $fault == global-balance ]] || (( id == count - 1 )); then
             if [[ $fault == wrong-token ]]; then
                 config="$dir/wrong.conf"
             else
@@ -123,6 +129,9 @@ success() {
     mkdir "$dir"
     topology "$dir" "$count" 12000
     start_workers "$dir" "$count" "$fault"
+    if [[ $fault == bad-handshake ]]; then
+        bad_handshake "$dir"
+    fi
     if ! run_coordinator "$dir" LAMBDA_VM_TEST_CLUSTER_TOPOLOGY="$dir/topology"; then
         show_fail "$dir"
         return 1
@@ -147,9 +156,63 @@ groups = json.loads(line.rsplit("worker ", 1)[1])
 assert len(groups) == int(sys.argv[2]) and all(groups), groups
 print("Groups by worker", groups)
 PYTHON
-    if [[ $fault == stale ]]; then
-        grep 'dropped .* stale frames' "$dir/coordinator.log"
+    case $fault in
+        stale) grep 'dropped .* stale frames' "$dir/coordinator.log" ;;
+        bad-handshake) grep 'rejected handshake: peer authentication failed' "$dir/worker-0.log" ;;
+        no-finish) grep 'missing Finish acknowledgement' "$dir/coordinator.log" ;;
+    esac
+}
+
+bad_handshake() {
+    python3 - "$1/topology" <<'PYTHON'
+import pathlib
+import socket
+import struct
+import sys
+import time
+
+address = pathlib.Path(sys.argv[1]).read_text().splitlines()[1].split()[1]
+host, port = address.split(":")
+deadline = time.monotonic() + 4
+while True:
+    try:
+        conn = socket.create_connection((host, int(port)), timeout=2)
+        break
+    except ConnectionRefusedError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.02)
+
+def frame(kind, payload):
+    return struct.pack(">HH16sI", 2, kind, bytes(16), len(payload)) + payload
+
+with conn, conn.makefile("rb") as reader:
+    conn.sendall(frame(1, bytes(32)))
+    reply = reader.read(88)
+    assert len(reply) == 88 and reply[:4] == bytes([0, 2, 0, 2]), reply
+    conn.sendall(frame(3, bytes(32)))
+    assert reader.read(1) == b"", "worker accepted a bad Welcome"
+PYTHON
+}
+
+runner() {
+    local dir="$logs/runner" runner
+    runner=$(realpath "$LAMBDA_VM_TEST_CLUSTER_RUNNER")
+    mkdir "$dir"
+    topology "$dir" 1 30000
+    env LAMBDA_VM_CARDS=0 timeout 40s "$runner" --family blake3 worker "$dir/worker-0.conf" 0 \
+        > "$dir/worker-0.log" 2>&1 &
+    pids+=("$!")
+    if ! time timeout 40s "$runner" --family blake3 prove "$dir/topology" \
+        executor/program_artifacts/asm/test_commit_4.elf - "$dir/proof" \
+        > "$dir/coordinator.log" 2>&1; then
+        show_fail "$dir"
+        return 1
     fi
+    wait "${pids[0]}"
+    pids=()
+    test -s "$dir/proof"
+    grep 'completed groups by worker' "$dir/coordinator.log"
 }
 
 failure() {
@@ -157,6 +220,9 @@ failure() {
     mkdir "$dir"
     if [[ $fault == timeout ]]; then commit_ms=2500; fi
     topology "$dir" 2 "$commit_ms"
+    if [[ $fault == card-hang ]]; then
+        sed -i 's/^deadlines-ms .*/deadlines-ms 10000 2500 12000/' "$dir/worker-1.conf"
+    fi
     start_workers "$dir" 2 "$fault"
     run_coordinator "$dir" LAMBDA_VM_TEST_CLUSTER_TOPOLOGY="$dir/topology" &
     ctl=$!
@@ -177,6 +243,26 @@ failure() {
     wait "$ctl" || rc=$?
     local finished
     finished=$(date +%s%N)
+    if [[ $fault == panic ]]; then
+        killed=$(awk '/CLUSTER TEST PANIC/ {print $4}' "$dir/worker-1.log")
+        test -n "$killed"
+    fi
+    if [[ $fault == card-hang ]]; then
+        for _ in {1..60}; do
+            if ! kill -0 "${pids[1]}" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+        done
+        if kill -0 "${pids[1]}" 2>/dev/null; then
+            show_fail "$dir"
+            return 1
+        fi
+        local worker_rc=0
+        wait "${pids[1]}" || worker_rc=$?
+        test "$worker_rc" -eq 1
+        grep 'still blocked after commit deadline, exiting' "$dir/worker-1.log"
+    fi
     stop_workers
     if [[ $rc == 0 || $rc == 124 || -e "$dir/proofs" ]] || ! grep -qi "$pattern" "$dir/coordinator.log"; then
         show_fail "$dir"
@@ -185,20 +271,65 @@ failure() {
     echo "$fault"
     grep 'CLUSTER PROVE ' "$dir/coordinator.log"
     if [[ $killed != 0 ]]; then
-        python3 - "$killed" "$finished" <<'PYTHON'
+        python3 - "$killed" "$finished" "$fault" <<'PYTHON'
 import sys
 elapsed = (int(sys.argv[2]) - int(sys.argv[1])) / 1e9
-print(f"Cancellation after SIGKILL {elapsed:.3f}s")
-assert elapsed < 3, elapsed
+print(f"Cancellation after {sys.argv[3]} {elapsed:.3f}s")
+assert 0 <= elapsed < (2 if sys.argv[3] == "panic" else 3), elapsed
 PYTHON
     fi
+}
+
+fallback() {
+    mkdir "$logs/fallback"
+    topology "$logs/fallback" 2 12000
+    echo 'fallback local' >> "$logs/fallback/topology"
+    start_workers "$logs/fallback" 2 global-balance
+    if ! run_coordinator "$logs/fallback" LAMBDA_VM_TEST_CLUSTER_TOPOLOGY="$logs/fallback/topology"; then
+        show_fail "$logs/fallback"
+        return 1
+    fi
+    stop_workers
+    echo fallback
+    grep 'failed verification.*BusImbalance' "$logs/fallback/coordinator.log"
+    grep 'starting a fresh local attempt (fallback 1)' "$logs/fallback/coordinator.log"
+    ok "$logs/fallback"
 }
 
 baseline local
 if [[ -n ${LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF:-} ]]; then
     success ethrex 1
+    unset LAMBDA_VM_FIXED_TRACE_HASH
+    success ethrex-random-seed 1
+    # The real Ethereum witness must detect a worker using the fixed keys.
+    mkdir "$logs/ethrex-ignore-seed"
+    topology "$logs/ethrex-ignore-seed" 1 12000
+    start_workers "$logs/ethrex-ignore-seed" 1 ignore-seed
+    rc=0
+    run_coordinator "$logs/ethrex-ignore-seed" \
+        LAMBDA_VM_TEST_CLUSTER_TOPOLOGY="$logs/ethrex-ignore-seed/topology" || rc=$?
+    stop_workers
+    if [[ $rc == 0 || $rc == 124 || -e "$logs/ethrex-ignore-seed/proofs" ]] ||
+        ! grep -Eq 'replica witness digest disagrees|cluster replica .* ordered records' "$logs/ethrex-ignore-seed/coordinator.log"; then
+        show_fail "$logs/ethrex-ignore-seed"
+        exit 1
+    fi
+    echo ethrex-ignore-seed
+    grep -E 'CLUSTER PROVE |cluster replica .* ordered records|replica witness digest disagrees' "$logs/ethrex-ignore-seed/coordinator.log"
     exit
 fi
+success bad-handshake 2 bad-handshake
+success no-finish 2 no-finish
+if [[ -n ${LAMBDA_VM_TEST_CLUSTER_RUNNER:-} ]]; then
+    runner
+fi
+failure panic 'commit: .*end of file'
+failure card-hang 'commit: .*end of file'
+fallback
+if [[ ${2:-} == review ]]; then
+    exit
+fi
+
 baseline inproc2 LAMBDA_VM_CLUSTER=inproc:2
 success tcp2 2
 baseline inproc4 LAMBDA_VM_CLUSTER=inproc:4
@@ -221,17 +352,3 @@ success fresh2 2 stale
 unset LAMBDA_VM_FIXED_TRACE_HASH
 success unfixed2 2
 success unfixed4 4
-
-export LAMBDA_VM_FIXED_TRACE_HASH=1
-mkdir "$logs/fallback"
-topology "$logs/fallback" 2 12000
-echo 'fallback local' >> "$logs/fallback/topology"
-start_workers "$logs/fallback" 2 duplicate
-if ! run_coordinator "$logs/fallback" LAMBDA_VM_TEST_CLUSTER_TOPOLOGY="$logs/fallback/topology"; then
-    show_fail "$logs/fallback"
-    exit 1
-fi
-stop_workers
-echo fallback
-grep 'starting a fresh local attempt' "$logs/fallback/coordinator.log"
-ok "$logs/fallback"

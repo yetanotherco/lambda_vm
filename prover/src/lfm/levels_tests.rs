@@ -2748,11 +2748,22 @@ fn rta_last_file(
 fn cluster_stage2_test_commit_4() {
     use super::levels::{prove_block_levels, verify_block_levels_under};
     if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF") {
-        cluster_stage4_ethrex_base(path);
+        let elf = std::fs::read(path).expect("read ethrex guest");
+        let input = include_bytes!("../../../executor/tests/ethrex_empty_block.bin");
+        cluster_stage4_base(
+            &elf,
+            input,
+            &cluster_ethrex_format(),
+            &crate::block_whir::BlockOptions::production(),
+        );
         return;
     }
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_BASE_ONLY").is_some() {
+        cluster_stage4_base(&elf, &[], &format, &streamed_options());
+        return;
+    }
     let opts = ProofOptions::default_test_options();
     let prove = || {
         prove_block_levels(
@@ -2797,31 +2808,24 @@ fn cluster_ethrex_format() -> BlockFormat {
     format
 }
 
-/// Run the actual Ethereum executor and witness finish, with test security
-/// settings. The assembly fixture covers the two recursion levels.
-fn cluster_stage4_ethrex_base(path: std::ffi::OsString) {
+/// Verify the base with test security settings. The runner covers the full
+/// recursion and shipment path in the focused review suite.
+fn cluster_stage4_base(
+    elf: &[u8],
+    input: &[u8],
+    format: &BlockFormat,
+    options: &crate::block_whir::BlockOptions,
+) {
     use crate::block_whir::{
-        BlockOptions, Deviations,
+        Deviations,
         cluster_tcp::{Topology, coordinate},
         prove_block_whir_with, verify_block_whir,
     };
-    let elf = std::fs::read(path).expect("read ethrex guest");
-    let input = include_bytes!("../../../executor/tests/ethrex_empty_block.bin");
     let opts = ProofOptions::default_test_options();
-    let format = cluster_ethrex_format();
-    let options = BlockOptions::production();
-    let prove = || {
-        prove_block_whir_with(
-            &elf,
-            input,
-            &opts,
-            &format,
-            &options,
-            &Deviations::default(),
-        )
-    };
+    let prove =
+        || prove_block_whir_with(elf, input, &opts, format, options, &Deviations::default());
     let start = std::time::Instant::now();
-    let (proof, _) = crate::base_only::with_blake3_levels(|| {
+    let result = crate::base_only::with_blake3_levels(|| {
         if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY") {
             let topology =
                 Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
@@ -2829,11 +2833,11 @@ fn cluster_stage4_ethrex_base(path: std::ffi::OsString) {
         } else {
             prove()
         }
-    })
-    .expect("the Ethereum fixture proves");
+    });
     println!("CLUSTER PROVE {:.6}s", start.elapsed().as_secs_f64());
+    let (proof, _) = result.expect("the base fixture proves");
     assert!(
-        crate::base_only::with_blake3_levels(|| verify_block_whir(&proof, &elf, &opts, &format))
+        crate::base_only::with_blake3_levels(|| verify_block_whir(&proof, elf, &opts, format))
             .unwrap()
     );
     if let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") {

@@ -2356,7 +2356,7 @@ pub fn verify_block_levels_at(
 /// lookups argued per group, [`crate::block_whir::B3_BASE_KECCAK_RND`]) and
 /// the round form `rounds` — never their environment knobs. The leaf order and round-0 trees are
 /// re-checked against the new base.
-pub(crate) fn pin_family(
+pub fn pin_family(
     mut format: crate::block_whir::BlockFormat,
     family: WlfmFamily,
     rounds: crate::block_whir::B3Rounds,

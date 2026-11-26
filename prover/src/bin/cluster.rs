@@ -11,12 +11,12 @@ use std::{
 
 use lambda_vm_prover::{
     block_whir::{
-        BlockFormat, BlockOptions,
+        B3Rounds, BlockFormat, BlockOptions,
         cluster_tcp::{Topology, coordinate, serve},
     },
     lfm::{
         last_level::{LastLevel, last_level_file, last_wire},
-        levels::{LevelStop, prove_block_levels, verify_block_levels_file},
+        levels::{LevelStop, pin_family, prove_block_levels, verify_block_levels_file},
         proof::block_base_options_under,
         wlfm::WlfmFamily,
     },
@@ -35,10 +35,24 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let family = WlfmFamily::P1;
-    let format = BlockFormat::pinned_with(GroupFold::Indexed);
+    let (family, command) = match args.as_slice() {
+        [flag, family, command @ ..] if flag == "--family" => {
+            let family = match family.to_str() {
+                Some("poseidon" | "p1") => WlfmFamily::P1,
+                Some("blake3" | "b3") => WlfmFamily::B3,
+                _ => return Err("--family must be poseidon or blake3".into()),
+            };
+            (family, command)
+        }
+        _ => (WlfmFamily::P1, args.as_slice()),
+    };
+    let format = pin_family(
+        BlockFormat::pinned_with(GroupFold::Indexed),
+        family,
+        B3Rounds::Fri,
+    )?;
     let opts = block_base_options_under(&format.zf);
-    match args.as_slice() {
+    match command {
         [mode, topology, id] if mode == "worker" => {
             let topology = Topology::read(Path::new(topology))?;
             let id = id
@@ -90,7 +104,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "usage: cluster worker TOPOLOGY INDEX | cluster prove TOPOLOGY ELF INPUT|- OUTPUT"
+                "usage: cluster [--family poseidon|blake3] worker TOPOLOGY INDEX | \
+                 cluster [--family poseidon|blake3] prove TOPOLOGY ELF INPUT|- OUTPUT"
                     .into(),
             );
         }

@@ -908,48 +908,60 @@ impl Records {
 /// rebuilt a table's records digests them before it fills the table from
 /// them.
 pub fn digest_of(records: &dyn TableRecords) -> [u64; 2] {
-    digest_word_stream(
-        [
-            records.rows() as u64,
-            records.cols() as u64,
-            records.bytes() as u64,
-            0x243f_6a88_85a3_08d3,
-        ],
-        |each| records.fill().words(each),
-    )
+    let mut digest = WordDigest::new([
+        records.rows() as u64,
+        records.cols() as u64,
+        records.bytes() as u64,
+        0x243f_6a88_85a3_08d3,
+    ]);
+    records.fill().words(|word| digest.push(word));
+    digest.finish()
 }
 
 /// An order-sensitive, non-cryptographic digest for witness parity.
 /// Every word is visited. Proof verification authenticates the actual witness.
 pub fn digest_words(feed: impl FnOnce(&mut dyn FnMut(u64))) -> [u64; 2] {
-    digest_word_stream([0, 0, 0, 0x243f_6a88_85a3_08d3], feed)
+    let mut digest = WordDigest::new([0, 0, 0, 0x243f_6a88_85a3_08d3]);
+    feed(&mut |word| digest.push(word));
+    digest.finish()
 }
 
-fn digest_word_stream(mut lanes: [u64; 4], feed: impl FnOnce(&mut dyn FnMut(u64))) -> [u64; 2] {
-    const K: [u64; 4] = [
-        0x9e37_79b9_7f4a_7c15,
-        0xc2b2_ae3d_27d4_eb4f,
-        0x1656_67b1_9e37_79f9,
-        0x85eb_ca77_c2b2_ae63,
-    ];
-    let mut i = 0usize;
-    feed(&mut |w| {
-        let l = i % 4;
-        lanes[l] = (lanes[l] ^ w).wrapping_mul(K[l]).rotate_left(31);
-        i += 1;
-    });
-    // MurmurHash3's finalizer, so every input bit reaches every output bit.
-    let fmix = |mut h: u64| {
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        h ^ (h >> 33)
-    };
-    [
-        fmix(lanes[0] ^ lanes[2].rotate_left(23)),
-        fmix(lanes[1] ^ lanes[3].rotate_left(41)),
-    ]
+struct WordDigest {
+    lanes: [u64; 4],
+    i: usize,
+}
+
+impl WordDigest {
+    fn new(lanes: [u64; 4]) -> Self {
+        Self { lanes, i: 0 }
+    }
+
+    fn push(&mut self, word: u64) {
+        const K: [u64; 4] = [
+            0x9e37_79b9_7f4a_7c15,
+            0xc2b2_ae3d_27d4_eb4f,
+            0x1656_67b1_9e37_79f9,
+            0x85eb_ca77_c2b2_ae63,
+        ];
+        let lane = self.i % 4;
+        self.lanes[lane] = (self.lanes[lane] ^ word)
+            .wrapping_mul(K[lane])
+            .rotate_left(31);
+        self.i += 1;
+    }
+
+    fn finish(self) -> [u64; 2] {
+        // MurmurHash3's finalizer, so every input bit reaches every output bit.
+        let fmix = |mut h: u64| {
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            h ^ (h >> 33)
+        };
+        let [a, b, c, d] = self.lanes;
+        [fmix(a ^ c.rotate_left(23)), fmix(b ^ d.rotate_left(41))]
+    }
 }
 
 impl PartialEq for Records {
@@ -1008,6 +1020,10 @@ mod tests {
         let base = records(ops(3), 8, 32);
         assert_eq!(base, records(ops(3), 8, 32));
         assert_eq!(base.digest(), records(ops(3), 8, 32).digest());
+        assert_eq!(
+            base.digest(),
+            [0xe85f_4153_0a24_9f5b, 0x98af_5e6a_0cb2_1b90]
+        );
         assert_eq!(base.bytes(), 3 * 208);
         let mut lane = ops(3);
         lane[2].input[24] ^= 1;
