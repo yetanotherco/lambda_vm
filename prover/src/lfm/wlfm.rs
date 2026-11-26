@@ -2906,10 +2906,11 @@ fn prove_traces_under<H: WhirHash>(
         WlfmProving::Streamed => {
             use stark::multilinear_block::{LanePolicy, TwoCardKnob};
             let mut lanes = super::levels::phase_a_lanes()?;
-            let cards = build
-                .stack_cards
-                .as_ref()
-                .filter(|_| lanes.knob == Some(TwoCardKnob::Levels));
+            let cards = build.stack_cards.as_ref().filter(|_| {
+                lanes.knob == Some(TwoCardKnob::Levels)
+                    && multilinear::gpu::two_card_levels_on()
+                    && multilinear::gpu::two_card_split_ready()
+            });
             if let Some(cards) = cards {
                 lanes.policy = LanePolicy::Fixed(cards.clone());
             }
@@ -2929,7 +2930,8 @@ fn prove_traces_under<H: WhirHash>(
             let options = crate::block_whir::BlockOptions::production();
             // ★ THE LEVELS' COMMITS BY CARD (`LAMBDA_VM_LEVELS_COMMITS_BY_CARD`):
             // phase A's groups on two commit lanes, one a card, put back by
-            // group index: the same block. One lane, as before, unless asked.
+            // group index: the same block. A second lane needs the levels'
+            // split on and its second card ready.
             BlockCommitted::commit_on_lanes::<H, H::Sponge>(
                 tables,
                 &artifacts.sizes,
@@ -2973,7 +2975,8 @@ fn prove_traces_under<H: WhirHash>(
     let phase_a = t_a.elapsed().as_secs_f64();
     let t_b = std::time::Instant::now();
     // Phase A may have replayed the second lane on card 0 and disabled its
-    // backend. Recover any held prepared stacks from their original columns.
+    // backend. Recover its held prepared stacks only when that lane was
+    // ready to take them at the start of phase A.
     let recover = shared_cards
         && stacks
             .iter()

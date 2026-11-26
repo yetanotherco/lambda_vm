@@ -723,14 +723,17 @@ fn the_blake3_driver_with_its_program_fast_proves_the_same_level_bytes() {
 
 /// Compare the full serialized base and every recursion proof at each pool size.
 #[test]
-#[ignore = "proves a small BLAKE3 block six times; run alone with deterministic grind and fixed trace hash"]
+#[ignore = "proves a small BLAKE3 block seven times; run alone with deterministic grind and fixed trace hash"]
 fn the_blake3_driver_on_each_program_pool_proves_the_same_bytes() {
-    use super::levels::{PROGRAM_POOL_FOR_TEST, prove_block_levels, set_program_fast_for_test};
+    use super::levels::{
+        PROGRAM_POOL_ENV, PROGRAM_POOL_FOR_TEST, prove_block_levels, set_program_fast_for_test,
+    };
     assert!(crypto::grinding::deterministic());
     assert_eq!(
         std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
         Ok("1")
     );
+    assert!(std::env::var_os(PROGRAM_POOL_ENV).is_none());
     let _serial = super::device_permit::serial_for_test();
     let _options = super::wlfm::test_format::set_driver_options();
     let _fast = set_program_fast_for_test(true);
@@ -739,7 +742,7 @@ fn the_blake3_driver_on_each_program_pool_proves_the_same_bytes() {
     let opts = ProofOptions::default_test_options();
     let options = streamed_options();
     let proof_bytes = |threads| {
-        PROGRAM_POOL_FOR_TEST.set(Some(threads));
+        PROGRAM_POOL_FOR_TEST.set(threads);
         let run = prove_block_levels(
             &elf,
             &[],
@@ -764,15 +767,16 @@ fn the_blake3_driver_on_each_program_pool_proves_the_same_bytes() {
             .collect();
         (base, levels)
     };
-    let (base, levels) = proof_bytes(0);
-    for threads in [1, 2, 4, 6, 8] {
+    let (base, levels) = proof_bytes(Some(0));
+    for threads in [None, Some(1), Some(2), Some(4), Some(6), Some(8)] {
         let (other_base, other_levels) = proof_bytes(threads);
-        assert!(base[..] == other_base[..], "pool size {threads}: base");
+        let pool = threads.map_or_else(|| "default".into(), |n| format!("{n} threads"));
+        assert!(base[..] == other_base[..], "pool {pool}: base");
         for (i, (a, b)) in levels.iter().zip(&other_levels).enumerate() {
-            assert!(a[..] == b[..], "pool size {threads}: level {}", i + 1);
+            assert!(a[..] == b[..], "pool {pool}: level {}", i + 1);
         }
         println!(
-            "LEVELS PROGRAM POOL IDENTITY: {threads} threads · base {} B · levels {} and {} B equal",
+            "LEVELS PROGRAM POOL IDENTITY: {pool} · base {} B · levels {} and {} B equal",
             base.len(),
             levels[0].len(),
             levels[1].len(),
@@ -1897,11 +1901,12 @@ fn the_blake3_driver_with_all_three_early_knobs_preserves_the_chain() {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "card: run alone with commits by card, deterministic grind and fixed trace hash"]
+#[ignore = "card: run alone with default commit lanes and program pool, deterministic grind and fixed trace hash"]
 fn the_blake3_driver_with_stacks_and_commits_by_card_preserves_the_chain() {
     use super::levels::{
-        COMMITS_BY_CARD_ENV, prove_block_levels, set_commits_by_card_for_test,
-        set_stacks_by_card_for_test, set_stacks_for_test, verify_block_levels_under,
+        COMMITS_BY_CARD_ENV, PROGRAM_POOL_ENV, PROGRAM_POOL_FOR_TEST, prove_block_levels,
+        set_commits_by_card_for_test, set_stacks_by_card_for_test, set_stacks_for_test,
+        verify_block_levels_under,
     };
     use math_cuda::device::{
         TwoCardSplit, backend, second_backend_started, set_two_card_levels_for_test,
@@ -1912,6 +1917,7 @@ fn the_blake3_driver_with_stacks_and_commits_by_card_preserves_the_chain() {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
+            PROGRAM_POOL_FOR_TEST.set(None);
             set_commits_by_card_for_test(None);
             set_stacks_by_card_for_test(None);
             set_two_card_levels_for_test(None);
@@ -1926,7 +1932,8 @@ fn the_blake3_driver_with_stacks_and_commits_by_card_preserves_the_chain() {
         std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
         Ok("1")
     );
-    assert_eq!(std::env::var(COMMITS_BY_CARD_ENV).as_deref(), Ok("1"));
+    assert!(std::env::var_os(COMMITS_BY_CARD_ENV).is_none());
+    assert!(std::env::var_os(PROGRAM_POOL_ENV).is_none());
     set_two_card_split_for_test(Some(TwoCardSplit::Off));
     set_two_card_levels_for_test(Some(TwoCardSplit::Forced));
     assert!(multilinear::gpu::two_card_split_ready());
@@ -1938,8 +1945,9 @@ fn the_blake3_driver_with_stacks_and_commits_by_card_preserves_the_chain() {
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = ProofOptions::default_test_options();
+    set_stacks_by_card_for_test(Some(true));
     let prove = |on: bool| {
-        set_stacks_by_card_for_test(Some(on));
+        PROGRAM_POOL_FOR_TEST.set((!on).then_some(0));
         set_commits_by_card_for_test((!on).then(PhaseALanes::default));
         let run = prove_block_levels(
             &elf,
@@ -2048,6 +2056,8 @@ fn driven_with_commits_by_card(setting: math_cuda::device::TwoCardSplit) -> usiz
         "the identity needs the deterministic grind"
     );
     let _restore = Restore;
+    // Use the same compact, multi-group chain in both build postures.
+    let _options = super::wlfm::test_format::set_driver_options();
     set_stacks_by_card_for_test(Some(false));
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
@@ -2077,7 +2087,7 @@ fn driven_with_commits_by_card(setting: math_cuda::device::TwoCardSplit) -> usiz
             &[],
             &opts,
             &format,
-            &streamed_options(),
+            &pipelined_options(),
             WlfmFamily::B3,
             LevelStop::DEFAULT,
             true,

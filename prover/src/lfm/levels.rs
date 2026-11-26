@@ -336,22 +336,22 @@ const GROUP_COMMIT_ROOM: u64 = 19 << 30;
 /// every place, so the same proofs: a prover's choice, never a format.
 pub const STACKS_ENV: &str = "LAMBDA_VM_LEVELS_STACKS";
 
-/// `LAMBDA_VM_LEVELS_COMMITS_BY_CARD=1`: under the levels' split
+/// `LAMBDA_VM_LEVELS_COMMITS_BY_CARD` (unset, empty or `1`: on): under the levels' split
 /// (`LAMBDA_VM_TWO_CARD_LEVELS`, its second card ready), each level's phase A
 /// commits its groups on two cards. With stacks by card, it uses the stack
 /// assignment. Otherwise the first free lane takes the next group. The
 /// lanes' results are put back by group index
 /// ([`stark::multilinear_block::BlockCommitted::commit_on_lanes`]). The roots
-/// block is absorbed once, in group order, in phase B: the same proofs. Unset,
-/// empty or `0`: off (one lane). Read once a process. A test override applies
+/// block is absorbed once, in group order, in phase B: the same proofs.
+/// `0`: off (one lane). Read once a process. A test override applies
 /// to the process because level 2 proves on a thread of its own.
 pub const COMMITS_BY_CARD_ENV: &str = "LAMBDA_VM_LEVELS_COMMITS_BY_CARD";
 
 /// What [`COMMITS_BY_CARD_ENV`] says: on or off; any other word is an error.
 pub fn parse_commits_by_card(value: Option<&str>) -> Result<bool, String> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(format!("{COMMITS_BY_CARD_ENV} must be 0 or 1, got `{v}`")),
     }
 }
@@ -554,13 +554,14 @@ pub fn program_fast() -> bool {
 static PROGRAM_FAST_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
 /// `LAMBDA_VM_LEVELS_PROGRAM_POOL=<threads>`: run level 1's parallel host
-/// work beside the base on a dedicated pool of this size. Unset or `0` uses
-/// the existing pools. The base and the later levels keep their own scheduling.
+/// work beside the base on a dedicated pool of this size. Unset or empty
+/// uses six threads. `0` restores the shared pool scheduling. The base and
+/// the later levels keep their own scheduling.
 pub const PROGRAM_POOL_ENV: &str = "LAMBDA_VM_LEVELS_PROGRAM_POOL";
 
 fn parse_program_pool(word: Option<&str>) -> Result<usize, String> {
     match word.map(str::trim) {
-        None | Some("") => Ok(0),
+        None | Some("") => Ok(6),
         Some(word) => word.parse().map_err(|_| {
             format!("{PROGRAM_POOL_ENV}={word:?}: expected a thread count (0 or greater)")
         }),
