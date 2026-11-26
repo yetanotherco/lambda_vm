@@ -13,16 +13,70 @@ use math::{
     traits::AsBytes,
 };
 use multilinear::{
-    Error as MlError, stacked_eval::StackedProof, whir_chain::ArgueFormat, whir_commit::Commitment,
+    Error as MlError, mle::Mle, stacked_eval::StackedProof, whir_chain::ArgueFormat,
+    whir_commit::Commitment,
 };
 
 use super::{
     BatchedArgue, GroupOpened, LocalArgue, TableProof, absorb_roots_answers_and_challenge,
-    group_fork,
 };
 
 #[derive(Clone, Copy)]
-pub struct InprocWorkers(NonZeroUsize);
+pub struct InprocWorkers {
+    count: NonZeroUsize,
+    #[cfg(test)]
+    fault: Option<(usize, WorkerFault)>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WorkerFault {
+    SuccessorRoot,
+    OodValue,
+    Sumcheck,
+    OpeningPath,
+    ExtraRound,
+    MissingRound,
+    MissingPreparedRound,
+    Fail,
+}
+
+#[cfg(test)]
+impl WorkerFault {
+    fn mutate<F: IsField, E: IsField + 'static>(self, parts: &mut GroupParts<F, E>) {
+        use multilinear::whir_chain::RoundOpenings;
+
+        let chain = if matches!(self, Self::MissingPreparedRound) {
+            &mut parts.prepared.as_mut().unwrap().polys[0]
+        } else {
+            &mut parts.opening.polys[0]
+        };
+        let round = &mut chain.rounds[0];
+        match self {
+            Self::SuccessorRoot => round.next_root.as_mut().unwrap()[0] ^= 1,
+            Self::OodValue => *round.ood_value.as_mut().unwrap() += FieldElement::<E>::one(),
+            Self::Sumcheck => round.sumcheck[0].evaluations[0] += FieldElement::<E>::one(),
+            Self::OpeningPath => {
+                let path = match &mut round.openings {
+                    RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                        &mut p.current[0].proof.merkle_path
+                    }
+                    RoundOpenings::Extension(p) => &mut p.current[0].proof.merkle_path,
+                    RoundOpenings::BaseGrouped(p) => &mut p.current[0][0].proof.merkle_path,
+                };
+                path[0][0] ^= 1;
+            }
+            Self::ExtraRound => {
+                let extra = round.clone();
+                chain.rounds.push(extra);
+            }
+            Self::MissingRound | Self::MissingPreparedRound => {
+                chain.rounds.pop().unwrap();
+            }
+            Self::Fail => unreachable!("sent as a failure command"),
+        }
+    }
+}
 
 impl InprocWorkers {
     pub fn from_env() -> Result<Option<Self>, String> {
@@ -34,6 +88,12 @@ impl InprocWorkers {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_fault(mut self, group: usize, fault: WorkerFault) -> Self {
+        self.fault = Some((group, fault));
+        self
+    }
+
     pub(crate) fn parse(value: &str) -> Result<Option<Self>, String> {
         match value.trim() {
             "" | "off" => Ok(None),
@@ -41,15 +101,22 @@ impl InprocWorkers {
                 .strip_prefix("inproc:")
                 .and_then(|n| n.parse::<NonZeroUsize>().ok())
                 .filter(|n| n.get() <= 64)
-                .map(|n| Some(Self(n)))
+                .map(|count| {
+                    Some(Self {
+                        count,
+                        #[cfg(test)]
+                        fault: None,
+                    })
+                })
                 .ok_or_else(|| "LAMBDA_VM_CLUSTER expects off or inproc:N (1–64)".into()),
         }
     }
 }
 
-pub(super) struct InprocRequest {
+pub(super) struct InprocRequest<F: IsField> {
     pub workers: InprocWorkers,
     pub statement: Vec<Vec<u8>>,
+    pub preprocessed: Vec<Vec<Mle<F>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -94,10 +161,7 @@ struct SealedPlan<E: IsField> {
 }
 
 impl<E: IsField + 'static> SealedPlan<E> {
-    fn replay<T: IsTranscript<E>>(&self, transcript: &mut T) -> Challenges<E> {
-        for bytes in &self.statement {
-            transcript.append_bytes(bytes);
-        }
+    fn front(&self) -> (Vec<Commitment>, Vec<FieldElement<E>>) {
         let roots: Vec<_> = self
             .groups
             .iter()
@@ -108,6 +172,14 @@ impl<E: IsField + 'static> SealedPlan<E> {
             .iter()
             .flat_map(|g| g.answers.iter().cloned())
             .collect();
+        (roots, answers)
+    }
+
+    fn replay<T: IsTranscript<E>>(&self, transcript: &mut T) -> Challenges<E> {
+        for bytes in &self.statement {
+            transcript.append_bytes(bytes);
+        }
+        let (roots, answers) = self.front();
         absorb_roots_answers_and_challenge(transcript, &roots, &self.derived, &answers)
     }
 
@@ -231,7 +303,7 @@ impl<T> Slots<T> {
         &mut self,
         reply: Reply<T>,
         check: impl FnOnce(usize, &T) -> bool,
-    ) -> Result<(), MlError> {
+    ) -> Result<&T, MlError> {
         let g = reply.header.group;
         let expected = self
             .expected
@@ -249,8 +321,7 @@ impl<T> Slots<T> {
                 "group payload disagrees with its assignment or sealed plan",
             ));
         }
-        *slot = Some(reply.payload);
-        Ok(())
+        Ok(slot.insert(reply.payload))
     }
 
     fn finish(self) -> Result<Vec<T>, MlError> {
@@ -263,45 +334,44 @@ impl<T> Slots<T> {
 
 pub(super) struct Results<F: IsField, E: IsField> {
     headers: Vec<Header>,
-    plan: Commitment,
+    bind: Arc<Bind<E>>,
     shapes: Vec<GroupShape>,
-    workers: Workers<F, E>,
     rx: mpsc::Receiver<Reply<GroupDone<F, E>>>,
 }
 
-impl<F: IsField, E: IsField> Results<F, E> {
-    pub fn sender(
-        &self,
-    ) -> impl Fn(usize, GroupParts<F, E>) -> Result<(), MlError> + Sync + use<F, E>
-    where
-        FieldElement<F>: Send,
-        FieldElement<E>: Send,
-    {
-        let headers = self.headers.clone();
-        let commands = self.workers.commands.clone();
-        move |group, parts| {
-            let header = headers[group];
-            commands[header.worker]
-                .send(Command::Opened(group, Box::new(parts)))
-                .map_err(|_| protocol("worker result channel closed"))
-        }
+impl<F: IsField, E: IsField + 'static> Results<F, E> {
+    pub fn front(&self) -> (Vec<Commitment>, Vec<FieldElement<E>>) {
+        self.bind.plan.front()
     }
 
-    pub fn worker_failed(&self) -> Arc<AtomicBool> {
-        self.workers.failed.clone()
-    }
-
-    pub fn finish(mut self) -> Result<Vec<GroupParts<F, E>>, MlError> {
-        let mut completed = vec![0; self.workers.threads.len()];
-        self.workers.join()?;
+    pub fn collect(
+        self,
+        worker_count: usize,
+        abort: &AtomicBool,
+        mut verify: impl FnMut(usize, &Committed<E>, &GroupParts<F, E>) -> Result<(), MlError>,
+    ) -> Result<Vec<GroupParts<F, E>>, MlError> {
+        let mut completed = vec![0; worker_count];
         let mut slots = Slots::new(&self.headers);
+        let mut result = Ok(());
         for reply in self.rx {
-            let worker = reply.header.worker;
-            slots.insert(reply, |g, done| {
-                done.plan == self.plan && self.shapes[g].check(&done.parts)
-            })?;
-            completed[worker] += 1;
+            // Keep draining on failure so closing the results channel cannot
+            // replace the verification error with a worker's send error.
+            if result.is_err() || abort.load(Relaxed) {
+                continue;
+            }
+            let Header { group, worker, .. } = reply.header;
+            result = slots
+                .insert(reply, |g, done| {
+                    done.plan == self.bind.digest && self.shapes[g].check(&done.parts)
+                })
+                .and_then(|done| verify(group, &self.bind.plan.groups[group], &done.parts));
+            if result.is_err() {
+                abort.store(true, Relaxed);
+            } else {
+                completed[worker] += 1;
+            }
         }
+        result?;
         let groups = slots.finish()?;
         eprintln!("BLOCK CLUSTER INPROC: completed groups by worker {completed:?}");
         Ok(groups.into_iter().map(|done| done.parts).collect())
@@ -312,16 +382,65 @@ enum Command<F: IsField, E: IsField> {
     Assign(Vec<Reply<Committed<E>>>),
     Bind(Arc<Bind<E>>),
     Opened(usize, Box<GroupParts<F, E>>),
+    #[cfg(test)]
+    Mutated(usize, Box<GroupParts<F, E>>, WorkerFault),
+    #[cfg(test)]
+    Fail(Arc<AtomicBool>, mpsc::Sender<()>),
 }
 
-struct Workers<F: IsField, E: IsField> {
+pub(super) struct Workers<F: IsField, E: IsField> {
     commands: Vec<mpsc::Sender<Command<F, E>>>,
     threads: Vec<std::thread::JoinHandle<Result<(), MlError>>>,
     failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    fault: Option<(usize, WorkerFault)>,
 }
 
 impl<F: IsField, E: IsField> Workers<F, E> {
-    fn join(&mut self) -> Result<(), MlError> {
+    pub fn sender(
+        &self,
+        results: &Results<F, E>,
+    ) -> impl Fn(usize, GroupParts<F, E>) -> Result<(), MlError> + Send + Sync + use<F, E>
+    where
+        FieldElement<F>: Send,
+        FieldElement<E>: Send,
+    {
+        let headers = results.headers.clone();
+        let commands = self.commands.clone();
+        #[cfg(test)]
+        let (fault, failed) = (self.fault, self.failed());
+        move |group, parts| {
+            let tx = &commands[headers[group].worker];
+            #[cfg(test)]
+            if let Some((at, fault)) = fault
+                && at == group
+            {
+                if matches!(fault, WorkerFault::Fail) {
+                    let (done, wait) = mpsc::channel();
+                    tx.send(Command::Fail(failed.clone(), done))
+                        .map_err(|_| protocol("worker result channel closed"))?;
+                    // The next turn must observe the failure in this test.
+                    let _ = wait.recv();
+                    return Ok(());
+                }
+                return tx
+                    .send(Command::Mutated(group, Box::new(parts), fault))
+                    .map_err(|_| protocol("worker result channel closed"));
+            }
+            tx.send(Command::Opened(group, Box::new(parts)))
+                .map_err(|_| protocol("worker result channel closed"))
+        }
+    }
+
+    pub fn failed(&self) -> Arc<AtomicBool> {
+        self.failed.clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.threads.len()
+    }
+
+    pub fn join(&mut self) -> Result<(), MlError> {
         // Closing the mailboxes also cancels workers waiting for Bind or work.
         self.commands.clear();
         let mut result = Ok(());
@@ -348,17 +467,19 @@ fn worker<F, E, T>(
     id: usize,
     commands: mpsc::Receiver<Command<F, E>>,
     receipts: mpsc::Sender<Reply<Committed<E>>>,
-    ready: mpsc::Sender<Reply<T>>,
+    ready: mpsc::Sender<()>,
     results: mpsc::Sender<Reply<GroupDone<F, E>>>,
 ) -> Result<(), MlError>
 where
     F: IsField,
     E: IsField + 'static,
     FieldElement<E>: AsBytes,
-    T: IsTranscript<E> + Default + Clone,
+    T: IsTranscript<E> + Default,
 {
-    let Ok(Command::Assign(private)) = commands.recv() else {
-        return Err(protocol("worker expected a commit assignment"));
+    let private = match commands.recv() {
+        Ok(Command::Assign(private)) => private,
+        Ok(_) => return Err(protocol("worker expected a commit assignment")),
+        Err(_) => return Ok(()),
     };
     for receipt in &private {
         if receipt.header.attempt != attempt || receipt.header.worker != id {
@@ -372,8 +493,10 @@ where
             .map_err(|_| protocol("receipt channel closed"))?;
     }
     drop(receipts);
-    let Ok(Command::Bind(bind)) = commands.recv() else {
-        return Err(protocol("worker expected a sealed plan"));
+    let bind = match commands.recv() {
+        Ok(Command::Bind(bind)) => bind,
+        Ok(_) => return Err(protocol("worker expected a sealed plan")),
+        Err(_) => return Ok(()),
     };
     if bind.attempt != attempt
         || bind.plan.digest() != bind.digest
@@ -397,20 +520,27 @@ where
         .into_iter()
         .map(|receipt| (receipt.header.group, receipt.header))
         .collect();
-    for (&group, &header) in &assigned {
-        ready
-            .send(Reply {
-                header,
-                payload: group_fork(&post, group),
-            })
-            .map_err(|_| protocol("worker fork channel closed"))?;
-    }
+    ready
+        .send(())
+        .map_err(|_| protocol("worker readiness channel closed"))?;
     drop(ready);
     let plan = bind.digest;
     drop(bind);
     for command in commands {
-        let Command::Opened(group, parts) = command else {
-            return Err(protocol("worker expected a group result"));
+        let (group, parts) = match command {
+            Command::Opened(group, parts) => (group, parts),
+            #[cfg(test)]
+            Command::Mutated(group, mut parts, fault) => {
+                fault.mutate(&mut parts);
+                (group, parts)
+            }
+            #[cfg(test)]
+            Command::Fail(failed, done) => {
+                failed.store(true, Relaxed);
+                drop(done);
+                return Err(protocol("a test's failed phase B worker"));
+            }
+            _ => return Err(protocol("worker expected a group result")),
         };
         let header = assigned
             .remove(&group)
@@ -428,31 +558,34 @@ where
     Ok(())
 }
 
-pub(super) struct Bound<F: IsField, E: IsField, T> {
-    pub forks: Vec<T>,
+pub(super) struct Bound<F: IsField, E: IsField> {
+    pub workers: Workers<F, E>,
     pub challenges: Challenges<E>,
     pub results: Results<F, E>,
 }
 
 pub(super) fn bind_workers<F, E, T>(
-    request: InprocRequest,
+    workers: InprocWorkers,
+    statement: Vec<Vec<u8>>,
     expected: Vec<Committed<E>>,
     derived: Vec<Commitment>,
     shapes: Vec<GroupShape>,
     transcript: &mut T,
-) -> Result<Bound<F, E, T>, MlError>
+) -> Result<Bound<F, E>, MlError>
 where
     F: IsField + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<F>: Send,
     FieldElement<E>: AsBytes + Send + Sync,
-    T: IsTranscript<E> + Default + Clone + Send + 'static,
+    T: IsTranscript<E> + Default,
 {
     // Stage 2 channels are process-local. The counter distinguishes
     // simultaneous and retried attempts within this process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let attempt = (u128::from(std::process::id()) << 64) | u128::from(NEXT.fetch_add(1, Relaxed));
-    let workers = request.workers.0.get();
+    #[cfg(test)]
+    let fault = workers.fault;
+    let workers = workers.count.get();
     let headers: Vec<_> = (0..expected.len())
         .map(|group| Header {
             attempt,
@@ -474,6 +607,8 @@ where
         commands: Vec::with_capacity(workers),
         threads: Vec::with_capacity(workers),
         failed: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        fault,
     };
     for (id, assigned) in assignments.into_iter().enumerate() {
         let (tx, rx) = mpsc::channel();
@@ -500,41 +635,48 @@ where
     drop(receipt_tx);
     drop(ready_tx);
     drop(result_tx);
-    let mut slots = Slots::new(&headers);
-    for receipt in receipt_rx {
-        slots.insert(receipt, |g, payload| expected[g].matches(payload))?;
-    }
-    let plan = SealedPlan {
-        statement: request.statement,
-        groups: slots.finish()?,
-        derived,
+    let binding = (|| {
+        let mut slots = Slots::new(&headers);
+        for receipt in &receipt_rx {
+            slots.insert(receipt, |g, payload| expected[g].matches(payload))?;
+        }
+        slots.finish()?;
+        let plan = SealedPlan {
+            statement,
+            groups: expected,
+            derived,
+        };
+        let challenges = plan.replay(transcript);
+        let digest = plan.digest();
+        let bind = Arc::new(Bind {
+            attempt,
+            plan,
+            digest,
+            challenges,
+        });
+        for tx in &workers.commands {
+            tx.send(Command::Bind(Arc::clone(&bind)))
+                .map_err(|_| protocol("worker channel closed"))?;
+        }
+        if ready_rx.iter().count() != workers.len() {
+            return Err(protocol("missing worker readiness"));
+        }
+        Ok(bind)
+    })();
+    let bind = match binding {
+        Ok(bind) => bind,
+        Err(error) => {
+            workers.join()?;
+            return Err(error);
+        }
     };
-    let challenges = plan.replay(transcript);
-    let digest = plan.digest();
-    let bind = Arc::new(Bind {
-        attempt,
-        plan,
-        digest,
-        challenges: challenges.clone(),
-    });
-    for tx in &workers.commands {
-        tx.send(Command::Bind(Arc::clone(&bind)))
-            .map_err(|_| protocol("worker channel closed"))?;
-    }
-    // These forks stay worker-side, with the shared in-process phase-B
-    // executor. The Bind itself carries only replay inputs, never a live sponge.
-    let mut forks = Slots::new(&headers);
-    for fork in ready_rx {
-        forks.insert(fork, |_, _| true)?;
-    }
     Ok(Bound {
-        forks: forks.finish()?,
-        challenges,
+        workers,
+        challenges: bind.challenges.clone(),
         results: Results {
             headers,
-            plan: digest,
+            bind,
             shapes,
-            workers,
             rx: result_rx,
         },
     })
@@ -582,7 +724,9 @@ mod tests {
     }
 
     fn admit(slots: &mut Slots<Committed<E>>, reply: Reply<Committed<E>>) -> Result<(), MlError> {
-        slots.insert(reply, |g, payload| receipt(g).matches(payload))
+        slots
+            .insert(reply, |g, payload| receipt(g).matches(payload))
+            .map(drop)
     }
 
     #[test]
@@ -661,19 +805,26 @@ mod tests {
         }
     }
 
-    fn start(workers: usize, transcript: &mut T) -> Bound<F, E, T> {
-        let request = InprocRequest {
-            workers: InprocWorkers(NonZeroUsize::new(workers).unwrap()),
-            statement: vec![vec![0x31, 0x32], vec![0x41, 0x42, 0x43]],
-        };
+    fn start(workers: usize, transcript: &mut T) -> Bound<F, E> {
         bind_workers(
-            request,
+            InprocWorkers::parse(&format!("inproc:{workers}"))
+                .unwrap()
+                .unwrap(),
+            vec![vec![0x31, 0x32], vec![0x41, 0x42, 0x43]],
             (0..4).map(receipt).collect(),
             vec![[103; 32], [100; 32], [102; 32], [101; 32]],
             vec![shape(); 4],
             transcript,
         )
         .unwrap()
+    }
+
+    fn finish(mut bound: Bound<F, E>) -> Result<Vec<GroupParts<F, E>>, MlError> {
+        let count = bound.workers.len();
+        bound.workers.join()?;
+        bound
+            .results
+            .collect(count, &AtomicBool::new(false), |_, _, _| Ok(()))
     }
 
     #[test]
@@ -699,49 +850,96 @@ mod tests {
                 )
             );
             assert_eq!(
-                coordinator.sample_field_element(),
+                coordinator.clone().sample_field_element(),
                 expected.clone().sample_field_element()
             );
-            for (g, mut worker_fork) in bound.forks.into_iter().enumerate() {
+            for g in 0..4 {
+                let mut coordinator_fork = super::super::group_fork(&coordinator, g);
                 let mut fork = expected.clone();
                 fork.append_bytes(&(g as u64).to_le_bytes());
                 for _ in 0..3 {
                     assert_eq!(
-                        worker_fork.sample_field_element(),
+                        coordinator_fork.sample_field_element(),
                         fork.sample_field_element()
                     );
                 }
             }
-            let send = bound.results.sender();
+            let send = bound.workers.sender(&bound.results);
             for g in [3, 1, 0, 2] {
                 send(g, parts()).unwrap();
             }
             drop(send);
-            assert_eq!(bound.results.finish().unwrap().len(), 4);
+            assert_eq!(finish(bound).unwrap().len(), 4);
         }
+    }
+
+    #[test]
+    fn results_stream_before_the_workers_finish() {
+        let mut bound = start(2, &mut T::default());
+        let send = bound.workers.sender(&bound.results);
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let count = bound.workers.len();
+        let collector = std::thread::spawn(move || {
+            bound
+                .results
+                .collect(count, &AtomicBool::new(false), |g, _, _| {
+                    seen_tx.send(g).unwrap();
+                    Ok(())
+                })
+        });
+
+        send(3, parts()).unwrap();
+        let first = seen_rx.recv_timeout(std::time::Duration::from_secs(3));
+        for g in [1, 2, 0] {
+            send(g, parts()).unwrap();
+        }
+        drop(send);
+        bound.workers.join().unwrap();
+        assert_eq!(collector.join().unwrap().unwrap().len(), 4);
+        assert_eq!(first, Ok(3));
+    }
+
+    #[test]
+    fn replay_refusal_preserves_the_workers_error() {
+        let mut coordinator = T::default();
+        coordinator.append_bytes(b"different initial transcript");
+        let bound = bind_workers::<F, E, _>(
+            InprocWorkers::parse("inproc:2").unwrap().unwrap(),
+            Vec::new(),
+            (0..4).map(receipt).collect(),
+            Vec::new(),
+            vec![shape(); 4],
+            &mut coordinator,
+        );
+        assert!(matches!(
+            bound,
+            Err(MlError::ClusterProtocol(
+                "worker challenge replay disagrees with coordinator"
+            ))
+        ));
     }
 
     #[test]
     fn a_worker_error_and_missing_results_cancel_the_exchange() {
         let bound = start(2, &mut T::default());
-        let send = bound.results.sender();
+        let send = bound.workers.sender(&bound.results);
         send(2, parts()).unwrap();
         // Send the same owned result twice to the worker. It already returned
         // that assignment, so it errors while the other worker is still live.
         let _ = send(2, parts());
         drop(send);
         assert!(matches!(
-            bound.results.finish(),
+            finish(bound),
             Err(MlError::ClusterProtocol("worker cannot return this group"))
         ));
 
         let bound = start(4, &mut T::default());
         assert!(matches!(
-            bound.results.finish(),
+            finish(bound),
             Err(MlError::ClusterProtocol("missing group"))
         ));
         let bound = start(1, &mut T::default());
-        let send = bound.results.sender();
+        let send = bound.workers.sender(&bound.results);
         for g in 0..4 {
             let mut result = parts();
             if g == 2 {
@@ -751,7 +949,7 @@ mod tests {
         }
         drop(send);
         assert!(matches!(
-            bound.results.finish(),
+            finish(bound),
             Err(MlError::ClusterProtocol(
                 "group payload disagrees with its assignment or sealed plan"
             ))

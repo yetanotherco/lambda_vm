@@ -645,7 +645,7 @@ fn inproc_driver_reverses_phase_b_and_releases_work_on_error() {
             faults,
             &|block| {
                 if remote {
-                    block.set_inproc(workers, Vec::new());
+                    block.set_inproc(workers, Vec::new(), vec![Vec::new(); SIZES.iter().sum()]);
                 }
             },
             None,
@@ -663,7 +663,7 @@ fn inproc_driver_reverses_phase_b_and_releases_work_on_error() {
         },
     );
     assert!(matches!(failed, Err(MlError::DeviceFailed { .. })));
-    assert!(observed.is_empty());
+    assert!(observed.iter().all(|(g, _)| order[..2].contains(g)));
     if gpu::reserve_budget() > before && !gpu::columns_disabled() {
         let peak = gpu::reserved_window_peak();
         assert!(peak > before, "the failed turn had a live CUDA reservation");
@@ -702,4 +702,96 @@ fn inproc_driver_reverses_phase_b_and_releases_work_on_error() {
         before,
         "the fresh attempt released its leases"
     );
+}
+
+fn prove_with_worker_fault(
+    group: usize,
+    fault: crate::multilinear_block::WorkerFault,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    use crate::multilinear_block::InprocWorkers;
+
+    let workers = InprocWorkers::parse("inproc:4")
+        .unwrap()
+        .unwrap()
+        .with_fault(group, fault);
+    let order: Vec<_> = std::iter::once(group)
+        .chain(in_order().into_iter().filter(|&g| g != group))
+        .collect();
+    prove_block_with::<H>(
+        &config(ArgueFormat::PerTable),
+        PhaseBOverlap::Off,
+        &order,
+        OverlapFaults::default(),
+        &|block| block.set_inproc(workers, Vec::new(), vec![Vec::new(); SIZES.iter().sum()]),
+        None,
+        true,
+        None,
+    )
+}
+
+#[test]
+fn inproc_rejects_invalid_group_contents_before_observing_the_group() {
+    use crate::multilinear_block::WorkerFault::*;
+
+    for fault in [SuccessorRoot, OodValue, Sumcheck, OpeningPath] {
+        let (result, heard) = prove_with_worker_fault(0, fault);
+        assert!(
+            matches!(result, Err(MlError::ColumnOpeningRejected { .. })),
+            "{fault:?} did not reach the host opening verifier: {:?}",
+            result.err(),
+        );
+        assert!(heard.iter().all(|(g, _)| *g != 0), "{fault:?}");
+    }
+}
+
+#[test]
+fn inproc_rejects_short_and_long_chains_including_prepared() {
+    use crate::multilinear_block::WorkerFault::*;
+
+    for (group, fault) in [
+        (0, ExtraRound),
+        (0, MissingRound),
+        (1, MissingPreparedRound),
+    ] {
+        let (result, heard) = prove_with_worker_fault(group, fault);
+        assert!(
+            matches!(result, Err(MlError::ColumnOpeningRejected { .. })),
+            "{fault:?}: {:?}",
+            result.err(),
+        );
+        assert!(heard.iter().all(|(g, _)| *g != group), "{fault:?}");
+    }
+}
+
+#[test]
+fn inproc_phase_b_worker_failure_preserves_the_error_and_releases_work() {
+    use crate::multilinear_block::WorkerFault;
+    use multilinear::gpu;
+
+    let before = gpu::ledger_reserved();
+    let (failed, heard) = prove_with_worker_fault(0, WorkerFault::Fail);
+    assert!(matches!(
+        failed,
+        Err(MlError::ClusterProtocol("a test's failed phase B worker"))
+    ));
+    assert!(heard.is_empty());
+    if gpu::reserve_budget() > before && !gpu::columns_disabled() {
+        let peak = gpu::reserved_window_peak();
+        assert!(peak > before, "phase B held a CUDA reservation");
+        eprintln!("Worker failure CUDA reservation peaked at {peak} bytes");
+    }
+    assert_eq!(gpu::ledger_reserved(), before);
+
+    let (proof, heard) = prove_split(
+        ArgueFormat::PerTable,
+        PhaseBOverlap::Off,
+        &in_order(),
+        true,
+        Split::None,
+        &[],
+        OverlapFaults::default(),
+    );
+    assert_eq!(heard.len(), SIZES.len());
+    verify(ArgueFormat::PerTable, &proof.unwrap()).unwrap();
+    assert_eq!(gpu::ledger_reserved(), before);
 }

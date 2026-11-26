@@ -71,6 +71,8 @@
 
 mod inproc;
 pub use inproc::InprocWorkers;
+#[cfg(test)]
+pub(crate) use inproc::WorkerFault;
 use inproc::{Committed, GroupParts, GroupShape, InprocRequest};
 
 use std::sync::Arc;
@@ -2573,7 +2575,7 @@ where
     /// A test's: the split runs its two drivers on the host, no second card
     /// needed ([`Self::set_two_card_split`]).
     split_on_host: bool,
-    inproc: Option<InprocRequest>,
+    inproc: Option<InprocRequest<F>>,
 }
 
 /// Which two-card knob lets a block's phase B split ([`BlockCommitted`]): the
@@ -3416,9 +3418,19 @@ where
 
     /// Route the base group's receipts, replay and results through logical
     /// workers. For this mode pass a fresh transcript to phase B, as the
-    /// sealed plan includes the statement's original append calls.
-    pub fn set_inproc(&mut self, workers: InprocWorkers, statement: Vec<Vec<u8>>) {
-        self.inproc = Some(InprocRequest { workers, statement });
+    /// sealed plan includes the statement's original append calls. Supply
+    /// the program's fixed columns in the committed tables' order.
+    pub fn set_inproc(
+        &mut self,
+        workers: InprocWorkers,
+        statement: Vec<Vec<u8>>,
+        preprocessed: Vec<Vec<Mle<F>>>,
+    ) {
+        self.inproc = Some(InprocRequest {
+            workers,
+            statement,
+            preprocessed,
+        });
     }
 
     /// Phase B argues each group's local lookups on the group's own
@@ -5199,7 +5211,6 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     post: T,
-    remote_forks: Vec<Option<T>>,
     tables: Vec<Option<&'t mut [CommittedTable<'a, F, E>]>>,
     spilled: Vec<Option<&'t mut [Option<Arc<Parked>>]>>,
     stamps: Vec<GroupStamps>,
@@ -5207,6 +5218,8 @@ where
     ood: Vec<Option<OodClaims<E>>>,
     local_started: Vec<Option<Box<dyn std::any::Any + Send>>>,
 }
+
+type SendGroup<F, E> = dyn Fn(usize, GroupParts<F, E>) -> Result<(), MlError> + Send + Sync;
 
 /// One card's phase B done: by group, its groups' stamps and shares of the
 /// proof; its two-card openings' counts; the most its ledger held at a turn's
@@ -5361,13 +5374,28 @@ where
         root_at += trees;
         answer_at += claims.answers.len();
     }
-    let (mut remote_forks, (z, alpha, beta), remote_results) = match inproc {
+    let mut verification_inputs = None;
+    let (roots, answers, (z, alpha, beta), remote_workers, remote_results) = match inproc {
         None => {
             let challenges =
                 absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers);
-            (Vec::new(), challenges, None)
+            (roots, answers, challenges, None, None)
         }
         Some(request) => {
+            // The collector keeps the statement and stack shapes while the
+            // lanes mutate and release the proving tables and stacks.
+            if request.preprocessed.len() != tables.len() {
+                return Err(MlError::QueryCountMismatch {
+                    expected: tables.len(),
+                    got: request.preprocessed.len(),
+                });
+            }
+            let layouts: Vec<_> = tables.iter().map(|table| table.layout().clone()).collect();
+            let stacks: Vec<_> = groups
+                .iter()
+                .map(|stack| (stack.layout().clone(), stack.domain().clone()))
+                .collect();
+            verification_inputs = Some((layouts, request.preprocessed, stacks));
             let mut prepared_by_group = vec![(Vec::new(), 0); n];
             for p in prepared {
                 let layout = match &p.commitment {
@@ -5425,17 +5453,26 @@ where
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            let bound = inproc::bind_workers(request, receipts, derived, shapes, transcript)?;
+            let bound = inproc::bind_workers(
+                request.workers,
+                request.statement,
+                receipts,
+                derived,
+                shapes,
+                transcript,
+            )?;
+            let (roots, answers) = bound.results.front();
             (
-                bound.forks.into_iter().map(Some).collect(),
+                roots,
+                answers,
                 bound.challenges,
+                Some(bound.workers),
                 Some(bound.results),
             )
         }
     };
-    let send_done = remote_results.as_ref().map(inproc::Results::sender);
-    let local_observer = send_done.is_none();
-    let remote_failed = remote_results.as_ref().map(inproc::Results::worker_failed);
+    let local_observer = remote_results.is_none();
+    let remote_failed = remote_workers.as_ref().map(inproc::Workers::failed);
     let ood: Vec<Option<OodClaims<E>>> = ood.into_iter().map(Some).collect();
     let retired: Vec<Option<RetiredStack<F>>> = groups.into_iter().map(Some).collect();
     // The finished groups' records go to a thread of their own (under a spill,
@@ -5602,7 +5639,6 @@ where
     let mut lane_ins: Vec<LaneIn<'_, '_, F, E, T>> = (0..lanes)
         .map(|_| LaneIn {
             post: transcript.clone(),
-            remote_forks: (0..n).map(|_| None).collect(),
             tables: (0..n).map(|_| None).collect(),
             spilled: (0..n).map(|_| None).collect(),
             stamps: vec![GroupStamps::default(); n],
@@ -5616,9 +5652,6 @@ where
         let mut ood = ood;
         for (g, (tables_g, spilled_g)) in table_slices.into_iter().zip(spill_slices).enumerate() {
             let lane = &mut lane_ins[card[g]];
-            if let Some(fork) = remote_forks.get_mut(g) {
-                lane.remote_forks[g] = fork.take();
-            }
             lane.tables[g] = Some(tables_g);
             lane.spilled[g] = Some(spilled_g);
             lane.stamps[g] = std::mem::take(&mut stamps[g]);
@@ -5631,11 +5664,11 @@ where
     // One card's phase B over its own groups, in phase B's order: today's
     // loop, the only one without the split.
     let drive = |lane: usize,
-                 lane_in: LaneIn<'_, '_, F, E, T>|
+                 lane_in: LaneIn<'_, '_, F, E, T>,
+                 send_done: Option<Arc<SendGroup<F, E>>>|
      -> Result<LaneOut<F, E>, PhaseBDriverError> {
         let LaneIn {
             post,
-            mut remote_forks,
             tables: mut lane_tables,
             spilled: mut lane_spilled,
             mut stamps,
@@ -5722,9 +5755,7 @@ where
                 turn_sched = now.map(|now| (now, g));
             }
             let (at, size) = (starts[g], sizes[g]);
-            let mut fork = remote_forks[g]
-                .take()
-                .unwrap_or_else(|| group_fork::<E, T>(&post, forks[g]));
+            let mut fork = group_fork::<E, T>(&post, forks[g]);
             if spill_on {
                 // This group's columns and the next's, back before their uploads
                 // (the next one's goes up beside this group's argue).
@@ -6375,14 +6406,16 @@ where
 
     // Join every driver before releasing shared records and stacks. Keep
     // the earliest real error, even if a different driver saw cancellation.
-    let run = |lane, input| {
+    let run = |lane, input, send_done| {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if indexed {
-                multilinear::gpu::on_indexed_card(cards[lane], false, || drive(lane, input))
+                multilinear::gpu::on_indexed_card(cards[lane], false, || {
+                    drive(lane, input, send_done)
+                })
             } else if lane == 1 {
-                multilinear::gpu::on_second_card(|| drive(lane, input))
+                multilinear::gpu::on_second_card(|| drive(lane, input, send_done))
             } else {
-                drive(lane, input)
+                drive(lane, input, send_done)
             }
         }))
         .unwrap_or_else(|_| {
@@ -6396,20 +6429,116 @@ where
         }
         out
     };
-    let results = std::thread::scope(|scope| {
+    let verification = verification_inputs
+        .as_ref()
+        .map(|(layouts, fixed, stacks)| {
+            let statements = layouts
+                .iter()
+                .zip(fixed)
+                .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+                .collect::<Vec<_>>();
+            (statements, stacks)
+        });
+    if let Some(((statements, _), local)) = verification.as_ref().zip(local.as_ref()) {
+        batched::check_local_receivers(statements, &local.buses)?;
+    }
+    let (results, worker_result, remote_parts) = std::thread::scope(|scope| {
+        let mut remote_workers = remote_workers;
+        let sender: Option<Arc<SendGroup<F, E>>> = remote_workers
+            .as_ref()
+            .zip(remote_results.as_ref())
+            .map(|(workers, results)| Arc::new(workers.sender(results)) as Arc<_>);
+        let collector =
+            remote_results
+                .zip(verification)
+                .map(|(results, (mut statements, stacks))| {
+                    let mut settled = vec![0; statements.len()];
+                    for p in prepared {
+                        for &(table, count) in &p.tables {
+                            settled[table] = count;
+                            if statements[table].preprocessed.is_empty() {
+                                // Some coordinator statements only supply fixed
+                                // columns through their derived prepared commitment.
+                                statements[table].num_preprocessed = count;
+                            }
+                        }
+                    }
+                    let post = transcript.clone();
+                    let (abort, starts, sizes, roots, answers, local, z, alpha, beta) = (
+                        &abort, &starts, &sizes, &roots, &answers, &local, &z, &alpha, &beta,
+                    );
+                    let worker_count = remote_workers.as_ref().map_or(0, inproc::Workers::len);
+                    scope.spawn(move || {
+                        results.collect(worker_count, abort, |g, receipt, parts| {
+                            let at = starts[g];
+                            let tables = at..at + sizes[g];
+                            let prepared = prepared.iter().find(|p| p.group == g).map(|p| {
+                                let (layout, domain) = match &p.commitment {
+                                    PreparedCommitment::Held(stack) => {
+                                        (stack.layout(), stack.domain())
+                                    }
+                                    PreparedCommitment::Retired(stack) => {
+                                        (stack.layout(), stack.domain())
+                                    }
+                                };
+                                BlockPreparedCheck {
+                                    group: g,
+                                    tables: p.tables.clone(),
+                                    roots: &receipt.prepared_roots,
+                                    layout,
+                                    domain,
+                                }
+                            });
+                            let (layout, domain) = &stacks[g];
+                            verify_opened_group::<F, E, T, H>(
+                                parts.view(g, &receipt.roots, &receipt.answers),
+                                &statements[tables.clone()],
+                                &settled[tables],
+                                at,
+                                prepared.as_ref(),
+                                layout,
+                                domain,
+                                config,
+                                z,
+                                alpha,
+                                beta,
+                                group_fork(&post, g),
+                                VerifierChecks::ALL,
+                                local
+                                    .as_ref()
+                                    .map(|local| (&local.buses[..], &receipt.local_digests[..])),
+                            )?;
+                            on_group(parts.view(g, roots, answers));
+                            Ok(())
+                        })
+                    })
+                });
         let mut inputs = lane_ins.into_iter().enumerate();
         let (lane, first) = inputs.next().expect("at least one phase B driver");
         let workers: Vec<_> = inputs
-            .map(|(lane, input)| scope.spawn(move || run(lane, input)))
+            .map(|(lane, input)| {
+                let sender = sender.clone();
+                scope.spawn(move || run(lane, input, sender))
+            })
             .collect();
-        std::iter::once(run(lane, first))
+        let lanes = std::iter::once(run(lane, first, sender))
             .chain(
                 workers
                     .into_iter()
                     .map(|worker| worker.join().expect("driver panics are caught")),
             )
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let workers = remote_workers
+            .as_mut()
+            .map_or(Ok(()), inproc::Workers::join);
+        let groups = collector.map(|handle| {
+            handle
+                .join()
+                .unwrap_or(Err(MlError::ClusterProtocol("group collector panicked")))
+        });
+        (lanes, workers, groups)
     });
+
     let mut outs = Vec::with_capacity(lanes);
     let mut errors = Vec::new();
     for (lane, result) in results.into_iter().enumerate() {
@@ -6431,9 +6560,14 @@ where
             }
         }
     }
-    if let Some((_, error)) = errors.into_iter().min_by_key(|(order, _)| *order) {
+    worker_result?;
+    if let Some(((cancelled, _, _), error)) = errors.into_iter().min_by_key(|(order, _)| *order) {
+        if cancelled && let Some(Err(verification)) = remote_parts {
+            return Err(verification);
+        }
         return Err(error);
     }
+    let remote_parts = remote_parts.transpose()?;
 
     // Each group's share and stamps back from the card that proved it.
     let mut group_parts: Vec<Option<GroupParts<F, E>>> = (0..n).map(|_| None).collect();
@@ -6536,15 +6670,8 @@ where
     if let Some(mem) = &mem {
         mem.release(tables.iter());
     }
-    drop(send_done);
-    let group_parts = match remote_results {
-        Some(results) => {
-            let groups = results.finish()?;
-            for (g, parts) in groups.iter().enumerate() {
-                on_group(parts.view(g, &roots, &answers));
-            }
-            groups
-        }
+    let group_parts = match remote_parts {
+        Some(groups) => groups,
         None => group_parts.into_iter().collect::<Option<Vec<_>>>().ok_or(
             MlError::QueryCountMismatch {
                 expected: n,
@@ -6809,170 +6936,43 @@ where
         .zip(sizes)
         .enumerate()
     {
-        let mut fork = group_fork::<E, T>(transcript, g);
-        let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
-        let mut values: Vec<FieldElement<E>> = Vec::new();
-        let group_statements = &statements[statement_at..statement_at + size];
-        let group_settled = &settled[statement_at..statement_at + size];
-        match config.format.argue {
-            ArgueFormat::PerTable => {
-                for ((table, statement), &settled) in proof.tables
-                    [statement_at..statement_at + size]
-                    .iter()
-                    .zip(group_statements)
-                    .zip(group_settled)
-                {
-                    let (output, reduced) =
-                        verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)?;
-                    balance += contribution(&output).ok_or(MlError::BusImbalance)?;
-                    for _ in 0..statement.slot_of.len() {
-                        points.push(reduced.point.clone());
-                    }
-                    values.extend(reduced.column_values);
-                }
-            }
-            ArgueFormat::Batched {
-                bin_log_cells,
-                pack,
-                ladder,
-            } => {
-                // The group's bins and trees come from its statements and the
-                // verifier's cap, packing and ladder, never from the proof.
-                let argue = &argues[g];
-                let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
-                let reduced = match local {
-                    Some(local) if group_is_local(group_statements, local.buses) => {
-                        // The local challenges from the proof's roots and
-                        // answers and the verifier's own layout and digests;
-                        // the local ladders and the local balance; then the
-                        // local state into the fork and the global class.
-                        let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
-                            g,
-                            layout,
-                            &proof.roots[root_at..root_at + trees],
-                            &commit_ood[answer_at..answer_at + layout.num_polys()],
-                            &local.digests[statement_at..statement_at + size],
-                            config,
-                            checks.local_binding,
-                        )?;
-                        let claims = batched::verify_local(
-                            &local.argues[g],
-                            group_statements,
-                            local.buses,
-                            &z_g,
-                            &alpha_g,
-                            bin_log_cells,
-                            pack,
-                            ladder,
-                            &mut own,
-                            checks,
-                            g,
-                        )?;
-                        if checks.local_state {
-                            fork.append_bytes(&own.state());
-                        }
-                        let global = ClassTables::split(group_statements, local.buses, false);
-                        batched::verify_argue_classed(
-                            argue,
-                            group_statements,
-                            &global,
-                            Some(&claims),
-                            bin_log_cells,
-                            pack,
-                            ladder,
-                            &z,
-                            &alpha,
-                            &beta,
-                            &mut fork,
-                            checks,
-                        )?
-                    }
-                    _ => {
-                        // A group with no local interaction carries no local
-                        // argue.
-                        if local.is_some_and(|local| !local.argues[g].is_empty()) {
-                            return Err(MlError::ArgueShapeMismatch {
-                                part: "local argue",
-                            });
-                        }
-                        batched::verify_argue(
-                            argue,
-                            group_statements,
-                            bin_log_cells,
-                            pack,
-                            ladder,
-                            &z,
-                            &alpha,
-                            &beta,
-                            &mut fork,
-                            checks,
-                        )?
-                    }
-                };
-                for output in &argue.bus_outputs {
-                    balance += contribution(output).ok_or(MlError::BusImbalance)?;
-                }
-                for ((statement, reduced), &settled) in
-                    group_statements.iter().zip(reduced).zip(group_settled)
-                {
-                    if checks.preprocessed {
-                        check_preprocessed(*statement, &reduced, settled)?;
-                    }
-                    for _ in 0..statement.slot_of.len() {
-                        points.push(reduced.point.clone());
-                    }
-                    values.extend(reduced.column_values);
-                }
-            }
-        }
         let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
         let roots = &proof.roots[root_at..root_at + trees];
-        // The group's point, from its own roots and the verifier's layout.
-        let z0 = commit_ood_point::<E, T>(g, layout, roots, config)?;
-        let ood = checks.commit_ood.then_some(CommitOod {
-            z0: &z0,
-            answers: &commit_ood[answer_at..answer_at + layout.num_polys()],
-        });
-        stacked_eval::verify_ood::<F, E, T, H>(
-            opening,
-            layout,
-            roots,
-            &Claimed::PerColumn(&points),
-            &values,
-            ood,
-            domain,
-            config,
-            &mut fork,
-        )?;
-        // The group's prepared stack, on this fork: the derived commitment must
-        // take the values each table settled on, at that table's point.
-        if let Some(k) = prepared
+        let answers = &commit_ood[answer_at..answer_at + layout.num_polys()];
+        let prepared_at = prepared
             .iter()
             .position(|p| p.group == g)
-            .filter(|_| !skip_prepared)
-        {
-            let firsts: Vec<usize> = statements[statement_at..statement_at + size]
-                .iter()
-                .scan(0usize, |first, s| {
-                    let at = *first;
-                    *first += s.slot_of.len();
-                    Some(at)
-                })
-                .collect();
-            let p = &prepared[k];
-            let (at_points, at_values) =
-                prepared_claims(&p.tables, statement_at, &firsts, &points, &values);
-            stacked_eval::verify::<F, E, T, H>(
-                &prepared_openings[k],
-                p.layout,
-                p.roots,
-                &Claimed::PerColumn(&at_points),
-                &at_values,
-                p.domain,
-                config,
-                &mut fork,
-            )?;
-        }
+            .filter(|_| !skip_prepared);
+        let opened = GroupOpened {
+            group: g,
+            roots,
+            commit_ood: answers,
+            tables: match config.format.argue {
+                ArgueFormat::PerTable => &proof.tables[statement_at..statement_at + size],
+                ArgueFormat::Batched { .. } => &[],
+            },
+            argue: argues.get(g),
+            local: local.map(|l| &l.argues[g]),
+            opening,
+            prepared: prepared_at.map(|k| &prepared_openings[k]),
+        };
+        let local = local.map(|l| (l.buses, &l.digests[statement_at..statement_at + size]));
+        balance += verify_opened_group::<F, E, T, H>(
+            opened,
+            &statements[statement_at..statement_at + size],
+            &settled[statement_at..statement_at + size],
+            statement_at,
+            prepared_at.map(|k| &prepared[k]),
+            layout,
+            domain,
+            config,
+            &z,
+            &alpha,
+            &beta,
+            group_fork(transcript, g),
+            checks,
+            local,
+        )?;
         statement_at += size;
         root_at += trees;
         answer_at += layout.num_polys();
@@ -6981,6 +6981,191 @@ where
         return Err(MlError::BusImbalance);
     }
     Ok(())
+}
+
+/// Verify a group's arguments and both openings on its coordinator-derived fork.
+#[allow(clippy::too_many_arguments)]
+fn verify_opened_group<F, E, T, H>(
+    opened: GroupOpened<'_, F, E>,
+    group_statements: &[TableStatement<'_, F, E>],
+    group_settled: &[usize],
+    statement_at: usize,
+    prepared: Option<&BlockPreparedCheck<'_, F>>,
+    layout: &StackedLayout,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    beta: &FieldElement<E>,
+    mut fork: T,
+    checks: VerifierChecks,
+    local: Option<(&[u64], &[[u8; 32]])>,
+) -> Result<FieldElement<E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Default,
+{
+    let g = opened.group;
+    let mut balance = FieldElement::<E>::zero();
+    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+    let mut values: Vec<FieldElement<E>> = Vec::new();
+    match config.format.argue {
+        ArgueFormat::PerTable => {
+            for ((table, statement), &settled) in opened
+                .tables
+                .iter()
+                .zip(group_statements)
+                .zip(group_settled)
+            {
+                let (output, reduced) =
+                    verify(table, *statement, z, alpha, beta, &mut fork, settled)?;
+                balance += contribution(&output).ok_or(MlError::BusImbalance)?;
+                for _ in 0..statement.slot_of.len() {
+                    points.push(reduced.point.clone());
+                }
+                values.extend(reduced.column_values);
+            }
+        }
+        ArgueFormat::Batched {
+            bin_log_cells,
+            pack,
+            ladder,
+        } => {
+            // The group's bins and trees come from its statements and the
+            // verifier's cap, packing and ladder, never from the proof.
+            let argue = opened.argue.ok_or(MlError::ArgueFormatMismatch)?;
+            let reduced = match local {
+                Some((buses, digests)) if group_is_local(group_statements, buses) => {
+                    // The local challenges from the proof's roots and
+                    // answers and the verifier's own layout and digests;
+                    // the local ladders and the local balance; then the
+                    // local state into the fork and the global class.
+                    let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
+                        g,
+                        layout,
+                        opened.roots,
+                        opened.commit_ood,
+                        digests,
+                        config,
+                        checks.local_binding,
+                    )?;
+                    let claims = batched::verify_local(
+                        opened.local.ok_or(MlError::ArgueFormatMismatch)?,
+                        group_statements,
+                        buses,
+                        &z_g,
+                        &alpha_g,
+                        bin_log_cells,
+                        pack,
+                        ladder,
+                        &mut own,
+                        checks,
+                        g,
+                    )?;
+                    if checks.local_state {
+                        fork.append_bytes(&own.state());
+                    }
+                    let global = ClassTables::split(group_statements, buses, false);
+                    batched::verify_argue_classed(
+                        argue,
+                        group_statements,
+                        &global,
+                        Some(&claims),
+                        bin_log_cells,
+                        pack,
+                        ladder,
+                        z,
+                        alpha,
+                        beta,
+                        &mut fork,
+                        checks,
+                    )?
+                }
+                _ => {
+                    // A group with no local interaction carries no local
+                    // argue.
+                    if opened.local.is_some_and(|argue| !argue.is_empty()) {
+                        return Err(MlError::ArgueShapeMismatch {
+                            part: "local argue",
+                        });
+                    }
+                    batched::verify_argue(
+                        argue,
+                        group_statements,
+                        bin_log_cells,
+                        pack,
+                        ladder,
+                        z,
+                        alpha,
+                        beta,
+                        &mut fork,
+                        checks,
+                    )?
+                }
+            };
+            for output in &argue.bus_outputs {
+                balance += contribution(output).ok_or(MlError::BusImbalance)?;
+            }
+            for ((statement, reduced), &settled) in
+                group_statements.iter().zip(reduced).zip(group_settled)
+            {
+                if checks.preprocessed {
+                    check_preprocessed(*statement, &reduced, settled)?;
+                }
+                for _ in 0..statement.slot_of.len() {
+                    points.push(reduced.point.clone());
+                }
+                values.extend(reduced.column_values);
+            }
+        }
+    }
+
+    let z0 = commit_ood_point::<E, T>(g, layout, opened.roots, config)?;
+    let ood = checks.commit_ood.then_some(CommitOod {
+        z0: &z0,
+        answers: opened.commit_ood,
+    });
+    stacked_eval::verify_ood::<F, E, T, H>(
+        opened.opening,
+        layout,
+        opened.roots,
+        &Claimed::PerColumn(&points),
+        &values,
+        ood,
+        domain,
+        config,
+        &mut fork,
+    )?;
+    if let Some(p) = prepared {
+        let firsts: Vec<usize> = group_statements
+            .iter()
+            .scan(0usize, |first, s| {
+                let at = *first;
+                *first += s.slot_of.len();
+                Some(at)
+            })
+            .collect();
+        let (at_points, at_values) =
+            prepared_claims(&p.tables, statement_at, &firsts, &points, &values);
+        stacked_eval::verify::<F, E, T, H>(
+            opened.prepared.ok_or(MlError::ArgueFormatMismatch)?,
+            p.layout,
+            p.roots,
+            &Claimed::PerColumn(&at_points),
+            &at_values,
+            p.domain,
+            config,
+            &mut fork,
+        )?;
+    }
+    Ok(balance)
 }
 
 #[cfg(test)]

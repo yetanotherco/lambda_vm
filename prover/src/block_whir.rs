@@ -6377,6 +6377,7 @@ pub(crate) fn trace_block_host_only(
         format,
         options,
         &deviations,
+        None,
         &|_, _| {},
         &|_| {},
         None,
@@ -6427,9 +6428,7 @@ fn prove_block_whir_inner(
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
-    let inproc = multilinear_block::InprocWorkers::from_env()
-        .map_err(Error::Prover)?
-        .is_some();
+    let inproc = multilinear_block::InprocWorkers::from_env().map_err(Error::Prover)?;
     // The page-locked pool (`LAMBDA_VM_PINNED_POOL_GIB`), locked once in the
     // process: a caller that locked it before its own clock (the block tree)
     // finds it locked; any other has it locked here, before the build.
@@ -6450,6 +6449,7 @@ fn prove_block_whir_inner(
         format,
         options,
         deviations,
+        inproc,
         on_statement,
         on_group,
         lead,
@@ -6490,7 +6490,7 @@ fn prove_block_whir_inner(
             parts.join(" · ")
         );
     }
-    if !inproc {
+    if inproc.is_none() {
         return proved;
     }
     let (mut proof, stamps) = proved?;
@@ -6498,13 +6498,23 @@ fn prove_block_whir_inner(
         .local_lookups()
         .then(|| std::mem::take(&mut proof.local));
     let mut proof = proof.with_local(local);
-    if !verify_block_whir(&proof, elf_bytes, proof_options, format)? {
+    verify_cluster_base(&proof, elf_bytes, proof_options, format)?;
+    let local = proof.local.take().unwrap_or_default();
+    Ok((proof.with_local(local), stamps))
+}
+
+fn verify_cluster_base(
+    proof: &BlockWhirProof<impl LocalPart>,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+) -> Result<(), Error> {
+    if !verify_block_whir(proof, elf_bytes, proof_options, format)? {
         return Err(Error::Prover(
             "the in-process cluster base proof failed verification".into(),
         ));
     }
-    let local = proof.local.take().unwrap_or_default();
-    Ok((proof.with_local(local), stamps))
+    Ok(())
 }
 
 /// Refuses a block format no prove makes a proof under: the word memory
@@ -6590,6 +6600,7 @@ fn prove_block_whir_body(
     format: &BlockFormat,
     options: &BlockOptions,
     deviations: &Deviations,
+    inproc: Option<multilinear_block::InprocWorkers>,
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
@@ -6609,6 +6620,7 @@ fn prove_block_whir_body(
             format,
             options,
             deviations,
+            inproc,
             on_statement,
             on_group,
             lead,
@@ -6702,7 +6714,7 @@ fn prove_block_whir_body(
         tamper(&mut traces);
     }
     stamps.prep = t.elapsed().as_secs_f64();
-    let proof = prove_traces(
+    let proof = prove_traces_with_cluster(
         &program,
         elf_bytes,
         &mut traces,
@@ -6710,6 +6722,7 @@ fn prove_block_whir_body(
         format,
         options,
         deviations,
+        inproc,
         true,
         on_statement,
         &mut stamps,
@@ -6827,6 +6840,7 @@ pub(crate) fn split_ecsm(traces: &mut Traces, rows_log2: usize, padding: CutPadd
 /// are taken — what a prove does; a test proving the same traces twice keeps
 /// them. Adds `prep`, `phase_a`, `phase_b` and the groups to `stamps`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_traces(
     program: &Elf,
     elf_bytes: &[u8],
@@ -6835,6 +6849,40 @@ pub(crate) fn prove_traces(
     format: &BlockFormat,
     options: &BlockOptions,
     deviations: &Deviations,
+    release_rows: bool,
+    on_statement: StatementObserver<'_>,
+    stamps: &mut BlockStamps,
+) -> Result<BlockWhirProof, Error> {
+    let inproc = multilinear_block::InprocWorkers::from_env().map_err(Error::Prover)?;
+    let proof = prove_traces_with_cluster(
+        program,
+        elf_bytes,
+        traces,
+        proof_options,
+        format,
+        options,
+        deviations,
+        inproc,
+        release_rows,
+        on_statement,
+        stamps,
+    )?;
+    if inproc.is_some() {
+        verify_cluster_base(&proof, elf_bytes, proof_options, format)?;
+    }
+    Ok(proof)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_traces_with_cluster(
+    program: &Elf,
+    elf_bytes: &[u8],
+    traces: &mut Traces,
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+    inproc: Option<multilinear_block::InprocWorkers>,
     release_rows: bool,
     on_statement: StatementObserver<'_>,
     stamps: &mut BlockStamps,
@@ -6935,6 +6983,7 @@ pub(crate) fn prove_traces(
             word_memory,
         };
         let replay = block_phase_b_statement(
+            inproc,
             &mut transcript,
             statement,
             &tag,
@@ -7031,7 +7080,9 @@ pub(crate) fn prove_traces(
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
         if let Some((workers, statement)) = replay {
-            block.set_inproc(workers, statement);
+            let refs = airs.air_refs();
+            let fixed = cluster_preprocessed(&groups, |i| refs.get(i).copied())?;
+            block.set_inproc(workers, statement, fixed);
         }
         let (proof, argues, prepared_openings, groups, commit_ood, _) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
@@ -9164,6 +9215,7 @@ fn prove_streamed(
     format: &BlockFormat,
     options: &BlockOptions,
     deviations: &Deviations,
+    inproc: Option<multilinear_block::InprocWorkers>,
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
@@ -11028,6 +11080,7 @@ fn prove_streamed(
             word_memory: laid.word_memory,
         };
         let replay = block_phase_b_statement(
+            inproc,
             &mut transcript,
             statement,
             &tag,
@@ -11212,7 +11265,17 @@ fn prove_streamed(
             }
         }
         if let Some((workers, statement)) = replay {
-            block.set_inproc(workers, statement);
+            let refs = run_airs
+                .get()
+                .ok_or_else(|| Error::Prover("the run's AIR set was never built".into()))?
+                .air_refs();
+            let local_air: AirRef<'_> = stream_airs.local_bytes.as_ref();
+            let fixed = cluster_preprocessed(&laid.groups, |i| {
+                refs.get(i).copied().or_else(|| {
+                    (format.local_lookups() && i < laid.shapes.len()).then_some(local_air)
+                })
+            })?;
+            block.set_inproc(workers, statement, fixed);
         }
         let (proof, argues, prepared_openings, groups, commit_ood, local_argues) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
@@ -11569,9 +11632,26 @@ pub(crate) fn block_statement_bytes(
     bytes
 }
 
+fn cluster_preprocessed<'a>(
+    groups: &[Vec<u32>],
+    air_at: impl Fn(usize) -> Option<AirRef<'a>>,
+) -> Result<Vec<Vec<Mle<F>>>, Error> {
+    groups
+        .iter()
+        .flatten()
+        .map(|&i| {
+            let air = air_at(i as usize).ok_or_else(|| {
+                Error::Prover(format!("cluster statement has no AIR for table {i}"))
+            })?;
+            preprocessed_mles(air)
+        })
+        .collect()
+}
+
 type BlockReplay = (multilinear_block::InprocWorkers, Vec<Vec<u8>>);
 
 fn block_phase_b_statement(
+    inproc: Option<multilinear_block::InprocWorkers>,
     transcript: &mut impl IsTranscript<E>,
     statement: BlockStatement<'_>,
     tag: &[u8],
@@ -11579,7 +11659,7 @@ fn block_phase_b_statement(
     config: &multilinear::whir_chain::ChainConfig,
     memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<Option<BlockReplay>, Error> {
-    if let Some(workers) = multilinear_block::InprocWorkers::from_env().map_err(Error::Prover)? {
+    if let Some(workers) = inproc {
         let calls = block_statement_calls(statement, tag, elf_bytes, config, memory)
             .map_err(Error::Prover)?;
         return Ok(Some((workers, calls)));
