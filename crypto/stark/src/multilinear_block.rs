@@ -69,6 +69,10 @@
 //! card; every answer still enters the main transcript before `(z, α, β)`.
 //! Prepared roots need none: the verifier derives them, so each is a codeword.
 
+mod inproc;
+pub use inproc::InprocWorkers;
+use inproc::{Committed, GroupParts, GroupShape, InprocRequest};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
@@ -2569,6 +2573,7 @@ where
     /// A test's: the split runs its two drivers on the host, no second card
     /// needed ([`Self::set_two_card_split`]).
     split_on_host: bool,
+    inproc: Option<InprocRequest>,
 }
 
 /// Which two-card knob lets a block's phase B split ([`BlockCommitted`]): the
@@ -3405,7 +3410,15 @@ where
             two_card_split: None,
             two_card_knob: TwoCardKnob::Split,
             split_on_host: false,
+            inproc: None,
         })
+    }
+
+    /// Route the base group's receipts, replay and results through logical
+    /// workers. For this mode pass a fresh transcript to phase B, as the
+    /// sealed plan includes the statement's original append calls.
+    pub fn set_inproc(&mut self, workers: InprocWorkers, statement: Vec<Vec<u8>>) {
+        self.inproc = Some(InprocRequest { workers, statement });
     }
 
     /// Phase B argues each group's local lookups on the group's own
@@ -5186,6 +5199,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     post: T,
+    remote_forks: Vec<Option<T>>,
     tables: Vec<Option<&'t mut [CommittedTable<'a, F, E>]>>,
     spilled: Vec<Option<&'t mut [Option<Arc<Parked>>]>>,
     stamps: Vec<GroupStamps>,
@@ -5203,11 +5217,7 @@ where
     E: IsField,
 {
     stamps: Vec<GroupStamps>,
-    group_tables: Vec<Vec<TableProof<E>>>,
-    group_argue: Vec<Option<BatchedArgue<E>>>,
-    group_local: Vec<Option<LocalArgue<E>>>,
-    group_opening: Vec<Option<StackedProof<F, E>>>,
-    group_prepared: Vec<Option<StackedProof<F, E>>>,
+    groups: Vec<Option<GroupParts<F, E>>>,
     two_card: (usize, usize),
     /// Of the groups opened on the openings' card, those opened over the
     /// host's columns (their upload there declined).
@@ -5287,6 +5297,7 @@ where
         two_card_split,
         two_card_knob,
         split_on_host,
+        inproc,
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
@@ -5327,8 +5338,6 @@ where
         .iter()
         .flat_map(|claims| claims.answers.iter().cloned())
         .collect();
-    let (z, alpha, beta) =
-        absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers);
     // Under local lookups: the batched argue only, a digest a table, and
     // where each group's roots and answers start.
     if let Some(local) = &local {
@@ -5352,6 +5361,81 @@ where
         root_at += trees;
         answer_at += claims.answers.len();
     }
+    let (mut remote_forks, (z, alpha, beta), remote_results) = match inproc {
+        None => {
+            let challenges =
+                absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers);
+            (Vec::new(), challenges, None)
+        }
+        Some(request) => {
+            let mut prepared_by_group = vec![(Vec::new(), 0); n];
+            for p in prepared {
+                let layout = match &p.commitment {
+                    PreparedCommitment::Held(stack) => stack.layout(),
+                    PreparedCommitment::Retired(stack) => stack.layout(),
+                };
+                prepared_by_group[p.group] = (
+                    p.commitment.roots(),
+                    stacked_eval::index_chains(layout.num_polys(), config.format.group).len(),
+                );
+            }
+            let receipts = (0..n)
+                .map(|g| {
+                    let at = starts[g];
+                    Committed {
+                        roots: groups[g].roots(),
+                        answers: ood[g].answers.clone(),
+                        prepared_roots: std::mem::take(&mut prepared_by_group[g].0),
+                        local_digests: local.as_ref().map_or_else(Vec::new, |local| {
+                            local.digests[at..at + sizes[g]].to_vec()
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let recorded_roots = receipts.iter().flat_map(|r| r.roots.iter().copied());
+            if !recorded_roots.eq(roots.iter().copied()) {
+                return Err(MlError::ClusterProtocol(
+                    "carried roots disagree with the committed stacks",
+                ));
+            }
+            let shapes = receipts
+                .iter()
+                .enumerate()
+                .map(|(g, receipt)| {
+                    let polys = groups[g].layout().num_polys();
+                    if receipt.roots.len() != root_ranges[g].len() || receipt.answers.len() != polys
+                    {
+                        return Err(MlError::ClusterProtocol(
+                            "commit receipt has an invalid shape",
+                        ));
+                    }
+                    let at = starts[g];
+                    Ok(GroupShape {
+                        tables: sizes[g],
+                        chains: stacked_eval::index_chains(polys, config.format.group).len(),
+                        prepared_chains: prepared_by_group[g].1,
+                        local: local.as_ref().is_some_and(|local| {
+                            let statements: Vec<_> = tables[at..at + sizes[g]]
+                                .iter()
+                                .map(CommittedTable::statement)
+                                .collect();
+                            group_is_local(&statements, &local.buses)
+                        }),
+                        argue: config.format.argue,
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let bound = inproc::bind_workers(request, receipts, derived, shapes, transcript)?;
+            (
+                bound.forks.into_iter().map(Some).collect(),
+                bound.challenges,
+                Some(bound.results),
+            )
+        }
+    };
+    let send_done = remote_results.as_ref().map(inproc::Results::sender);
+    let local_observer = send_done.is_none();
+    let remote_failed = remote_results.as_ref().map(inproc::Results::worker_failed);
     let ood: Vec<Option<OodClaims<E>>> = ood.into_iter().map(Some).collect();
     let retired: Vec<Option<RetiredStack<F>>> = groups.into_iter().map(Some).collect();
     // The finished groups' records go to a thread of their own (under a spill,
@@ -5367,6 +5451,11 @@ where
     // setting is the process's: one guard for both cards' drivers.
     let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let forks: Vec<usize> = (0..n).map(fork_of).collect();
+    if !local_observer && !forks.iter().copied().eq(0..n) {
+        return Err(MlError::ClusterProtocol(
+            "worker forks require original group indices",
+        ));
+    }
 
     // Placement is computed after the canonical transcript front is bound.
     // Legacy split callers keep their old admission rule and placement.
@@ -5513,6 +5602,7 @@ where
     let mut lane_ins: Vec<LaneIn<'_, '_, F, E, T>> = (0..lanes)
         .map(|_| LaneIn {
             post: transcript.clone(),
+            remote_forks: (0..n).map(|_| None).collect(),
             tables: (0..n).map(|_| None).collect(),
             spilled: (0..n).map(|_| None).collect(),
             stamps: vec![GroupStamps::default(); n],
@@ -5526,6 +5616,9 @@ where
         let mut ood = ood;
         for (g, (tables_g, spilled_g)) in table_slices.into_iter().zip(spill_slices).enumerate() {
             let lane = &mut lane_ins[card[g]];
+            if let Some(fork) = remote_forks.get_mut(g) {
+                lane.remote_forks[g] = fork.take();
+            }
             lane.tables[g] = Some(tables_g);
             lane.spilled[g] = Some(spilled_g);
             lane.stamps[g] = std::mem::take(&mut stamps[g]);
@@ -5542,6 +5635,7 @@ where
      -> Result<LaneOut<F, E>, PhaseBDriverError> {
         let LaneIn {
             post,
+            mut remote_forks,
             tables: mut lane_tables,
             spilled: mut lane_spilled,
             mut stamps,
@@ -5551,11 +5645,15 @@ where
         } = lane_in;
         let card_id = cards[lane];
         // Each group's share, by group, assembled in group order at the end.
-        let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
-        let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
-        let mut group_local: Vec<Option<LocalArgue<E>>> = (0..n).map(|_| None).collect();
-        let mut group_opening: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
-        let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+        let mut group_parts: Vec<Option<GroupParts<F, E>>> = (0..n).map(|_| None).collect();
+        let mut finish = |group, parts| {
+            if let Some(send) = &send_done {
+                send(group, parts)
+            } else {
+                group_parts[group] = Some(parts);
+                Ok(())
+            }
+        };
         // The next group's columns, uploaded during this group's argument — the
         // card idles through the argument's host glue, and a group's store is a
         // few GiB beside the argument's working set, not beside its codewords.
@@ -5580,6 +5678,12 @@ where
         // The most this card's ledger held at a turn's end.
         let mut ledger_most = 0u64;
         loop {
+            if remote_failed
+                .as_ref()
+                .is_some_and(|failed| failed.load(Relaxed))
+            {
+                return Err(MlError::ClusterProtocol("worker failed during phase B").into());
+            }
             // The other card's driver failed: this one stops at its next turn.
             if abort.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(MlError::DeviceFailed {
@@ -5618,7 +5722,9 @@ where
                 turn_sched = now.map(|now| (now, g));
             }
             let (at, size) = (starts[g], sizes[g]);
-            let mut fork = group_fork::<E, T>(&post, forks[g]);
+            let mut fork = remote_forks[g]
+                .take()
+                .unwrap_or_else(|| group_fork::<E, T>(&post, forks[g]));
             if spill_on {
                 // This group's columns and the next's, back before their uploads
                 // (the next one's goes up beside this group's argue).
@@ -5815,16 +5921,18 @@ where
                                             false, fails,
                                         ).map_err(PhaseBDriverError::from)
                                     }?;
-                                    on_group(GroupOpened {
-                                        group: earlier.group,
-                                        roots: roots_ref,
-                                        commit_ood: answers_ref,
-                                        argue: earlier.argue.as_ref(),
-                                        local: earlier.local.as_ref(),
-                                        tables: &earlier.proofs,
-                                        opening: &opened.opening,
-                                        prepared: opened.prepared.as_ref(),
-                                    });
+                                    if local_observer {
+                                        on_group(GroupOpened {
+                                            group: earlier.group,
+                                            roots: roots_ref,
+                                            commit_ood: answers_ref,
+                                            argue: earlier.argue.as_ref(),
+                                            local: earlier.local.as_ref(),
+                                            tables: &earlier.proofs,
+                                            opening: &opened.opening,
+                                            prepared: opened.prepared.as_ref(),
+                                        });
+                                    }
                                     drop(stacked);
                                     Ok(opened)
                                 },
@@ -6064,11 +6172,16 @@ where
                 s.open_paid = open_paid;
                 s.overlapped = true;
                 s.open_draws = opened.draws;
-                group_tables[h] = earlier.proofs;
-                group_argue[h] = earlier.argue;
-                group_local[h] = earlier.local;
-                group_opening[h] = Some(opened.opening);
-                group_prepared[h] = opened.prepared;
+                finish(
+                    h,
+                    GroupParts {
+                        tables: earlier.proofs,
+                        argue: earlier.argue,
+                        local: earlier.local,
+                        opening: opened.opening,
+                        prepared: opened.prepared,
+                    },
+                )?;
                 stamps[h].records_released = release_group(
                     lane_mut(&mut lane_tables, h)?,
                     h,
@@ -6210,21 +6323,28 @@ where
             stamps[g].open_reserved = opened.open_reserved.unwrap_or(0);
             stamps[g].open_paid = paid.elapsed().as_secs_f64();
             stamps[g].open_draws = opened.draws;
-            on_group(GroupOpened {
-                group: g,
-                roots: &roots,
-                commit_ood: &answers,
-                argue: argued.argue.as_ref(),
-                local: argued.local.as_ref(),
-                tables: &argued.proofs,
-                opening: &opened.opening,
-                prepared: opened.prepared.as_ref(),
-            });
-            group_tables[g] = argued.proofs;
-            group_argue[g] = argued.argue;
-            group_local[g] = argued.local;
-            group_opening[g] = Some(opened.opening);
-            group_prepared[g] = opened.prepared;
+            if local_observer {
+                on_group(GroupOpened {
+                    group: g,
+                    roots: &roots,
+                    commit_ood: &answers,
+                    argue: argued.argue.as_ref(),
+                    local: argued.local.as_ref(),
+                    tables: &argued.proofs,
+                    opening: &opened.opening,
+                    prepared: opened.prepared.as_ref(),
+                });
+            }
+            finish(
+                g,
+                GroupParts {
+                    tables: argued.proofs,
+                    argue: argued.argue,
+                    local: argued.local,
+                    opening: opened.opening,
+                    prepared: opened.prepared,
+                },
+            )?;
             drop(stacked);
             stamps[g].records_released = release_group(
                 lane_mut(&mut lane_tables, g)?,
@@ -6245,11 +6365,7 @@ where
         let second_declined = second_declined.into_inner();
         Ok(LaneOut {
             stamps,
-            group_tables,
-            group_argue,
-            group_local,
-            group_opening,
-            group_prepared,
+            groups: group_parts,
             two_card,
             second_declined,
             ledger_most,
@@ -6320,11 +6436,7 @@ where
     }
 
     // Each group's share and stamps back from the card that proved it.
-    let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
-    let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
-    let mut group_local: Vec<Option<LocalArgue<E>>> = (0..n).map(|_| None).collect();
-    let mut group_opening: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
-    let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+    let mut group_parts: Vec<Option<GroupParts<F, E>>> = (0..n).map(|_| None).collect();
     let mut two_card = (0usize, 0usize);
     let mut second_declined = 0usize;
     // Per card: (groups, cells, argue seconds, span from its first group's
@@ -6341,11 +6453,7 @@ where
             cells += stamps[g].cells;
             first = first.min(stamps[g].start_b);
             last = last.max(stamps[g].end_b);
-            group_tables[g] = std::mem::take(&mut out.group_tables[g]);
-            group_argue[g] = out.group_argue[g].take();
-            group_local[g] = out.group_local[g].take();
-            group_opening[g] = out.group_opening[g].take();
-            group_prepared[g] = out.group_prepared[g].take();
+            group_parts[g] = out.groups[g].take();
         }
         two_card.0 += out.two_card.0;
         two_card.1 += out.two_card.1;
@@ -6428,33 +6536,48 @@ where
     if let Some(mem) = &mem {
         mem.release(tables.iter());
     }
-    let openings = group_opening
-        .into_iter()
-        .map(|opening| {
-            opening.ok_or(MlError::QueryCountMismatch {
+    drop(send_done);
+    let group_parts = match remote_results {
+        Some(results) => {
+            let groups = results.finish()?;
+            for (g, parts) in groups.iter().enumerate() {
+                on_group(parts.view(g, &roots, &answers));
+            }
+            groups
+        }
+        None => group_parts.into_iter().collect::<Option<Vec<_>>>().ok_or(
+            MlError::QueryCountMismatch {
                 expected: n,
                 got: order.len(),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            },
+        )?,
+    };
+    let mut tables = Vec::new();
+    let mut columns = Vec::with_capacity(n);
+    let mut argues = Vec::new();
+    let mut prepared = Vec::new();
+    let mut locals = Vec::new();
+    for parts in group_parts {
+        tables.extend(parts.tables);
+        columns.push(parts.opening);
+        argues.extend(parts.argue);
+        prepared.extend(parts.prepared);
+        if local.is_some() {
+            locals.push(parts.local.unwrap_or_default());
+        }
+    }
     Ok((
         MultiProof {
             roots,
-            tables: group_tables.into_iter().flatten().collect(),
-            columns: openings,
+            tables,
+            columns,
             preprocessed: None,
         },
-        group_argue.into_iter().flatten().collect(),
-        group_prepared.into_iter().flatten().collect(),
+        argues,
+        prepared,
         stamps,
         answers,
-        match local {
-            Some(_) => group_local
-                .into_iter()
-                .map(Option::unwrap_or_default)
-                .collect(),
-            None => Vec::new(),
-        },
+        locals,
     ))
 }
 

@@ -6427,6 +6427,9 @@ fn prove_block_whir_inner(
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
+    let inproc = multilinear_block::InprocWorkers::from_env()
+        .map_err(Error::Prover)?
+        .is_some();
     // The page-locked pool (`LAMBDA_VM_PINNED_POOL_GIB`), locked once in the
     // process: a caller that locked it before its own clock (the block tree)
     // finds it locked; any other has it locked here, before the build.
@@ -6487,7 +6490,21 @@ fn prove_block_whir_inner(
             parts.join(" · ")
         );
     }
-    proved
+    if !inproc {
+        return proved;
+    }
+    let (mut proof, stamps) = proved?;
+    let local = format
+        .local_lookups()
+        .then(|| std::mem::take(&mut proof.local));
+    let mut proof = proof.with_local(local);
+    if !verify_block_whir(&proof, elf_bytes, proof_options, format)? {
+        return Err(Error::Prover(
+            "the in-process cluster base proof failed verification".into(),
+        ));
+    }
+    let local = proof.local.take().unwrap_or_default();
+    Ok((proof.with_local(local), stamps))
 }
 
 /// Refuses a block format no prove makes a proof under: the word memory
@@ -6907,26 +6924,31 @@ pub(crate) fn prove_traces(
     let tag = block_format_tag(format);
     let proof = crate::with_base_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
-        absorb_block(
+        let statement = BlockStatement {
+            table_num_vars: &table_num_vars,
+            runtime_page_ranges: &runtime_page_ranges,
+            table_counts: &table_counts,
+            public_output: &public_output,
+            num_private_input_pages,
+            groups: &groups,
+            fused_memory,
+            word_memory,
+        };
+        let replay = block_phase_b_statement(
             &mut transcript,
+            statement,
             &tag,
             elf_bytes,
-            &public_output,
-            &table_counts,
-            &fused_statement_words(format.memory, fused_memory, word_memory),
-            num_private_input_pages,
-            &runtime_page_ranges,
-            &table_num_vars,
             &config,
-            &groups,
-        );
+            format.memory,
+        )?;
         let t = Instant::now();
         let check_preprocessed = !deviations.unchecked_preprocessed;
         let (block, produced) = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let producer = scope.spawn(move || -> Result<f64, Error> {
                 let mut busy = 0.0;
-                for group in groups_of_pairs {
+                for (index, group) in groups_of_pairs.into_iter().enumerate() {
                     let t = Instant::now();
                     let tables = group
                         .into_par_iter()
@@ -6935,23 +6957,26 @@ pub(crate) fn prove_traces(
                         })
                         .collect::<Result<Vec<_>, Error>>()?;
                     busy += t.elapsed().as_secs_f64();
-                    if tx.send(tables).is_err() {
+                    if tx.send(CommitAssignment { index, tables }).is_err() {
                         break;
                     }
                 }
                 Ok(busy)
             });
+            let mut assignments = CommitAssignments::from(&rx);
             let block = BlockCommitted::commit_streamed::<
                 H,
                 <H as multilinear::whir_hash::WhirHash>::Sponge,
             >(
-                rx.iter(),
+                &mut assignments,
                 &sizes,
                 &config,
                 options.drop_levels,
                 options.narrow,
                 options.upload_ahead,
             );
+            let block = assignments.finish(block);
+            drop(rx);
             (block, producer.join())
         });
         // The producer's error names the cause; a commit that ran out of
@@ -6967,19 +6992,7 @@ pub(crate) fn prove_traces(
         let (prepared, tampered, derive) =
             prover_prepared::<H>(prepared_columns, &groups, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
-        on_statement(
-            BlockStatement {
-                table_num_vars: &table_num_vars,
-                runtime_page_ranges: &runtime_page_ranges,
-                table_counts: &table_counts,
-                public_output: &public_output,
-                num_private_input_pages,
-                groups: &groups,
-                fused_memory,
-                word_memory,
-            },
-            &prepared_roots(&prepared),
-        );
+        on_statement(statement, &prepared_roots(&prepared));
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
             .map(|p| multilinear::stacking::borrow(&p.columns))
@@ -7017,6 +7030,9 @@ pub(crate) fn prove_traces(
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
+        if let Some((workers, statement)) = replay {
+            block.set_inproc(workers, statement);
+        }
         let (proof, argues, prepared_openings, groups, commit_ood, _) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block
@@ -7581,6 +7597,52 @@ type Placed<'a> = (
     Option<LocalCounts>,
 );
 
+/// The phase-A committer's local assignment. The witness stays in-process.
+struct CommitAssignment<'a> {
+    index: usize,
+    tables: Vec<CommittedTable<'a, F, E>>,
+}
+
+struct CommitAssignments<'r, 'a> {
+    messages: std::iter::Enumerate<std::sync::mpsc::Iter<'r, CommitAssignment<'a>>>,
+    invalid: bool,
+}
+
+impl<'r, 'a> From<&'r std::sync::mpsc::Receiver<CommitAssignment<'a>>>
+    for CommitAssignments<'r, 'a>
+{
+    fn from(receiver: &'r std::sync::mpsc::Receiver<CommitAssignment<'a>>) -> Self {
+        Self {
+            messages: receiver.iter().enumerate(),
+            invalid: false,
+        }
+    }
+}
+
+impl<'a> Iterator for CommitAssignments<'_, 'a> {
+    type Item = Vec<CommittedTable<'a, F, E>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.invalid {
+            return None;
+        }
+        let (expected, assignment) = self.messages.next()?;
+        self.invalid = expected != assignment.index;
+        (!self.invalid).then_some(assignment.tables)
+    }
+}
+
+impl CommitAssignments<'_, '_> {
+    fn finish<T>(self, result: Result<T, multilinear::Error>) -> Result<T, multilinear::Error> {
+        if self.invalid {
+            return Err(multilinear::Error::ClusterProtocol(
+                "phase A assignment is out of order",
+            ));
+        }
+        result
+    }
+}
+
 /// Packs tables, in the order they come, into groups of at most `max_polys`
 /// stacked polynomials, and sends each group to phase A as it closes. With
 /// [`Self::own`], KECCAK_RND's streamed chunks are packed apart, in groups of
@@ -7590,7 +7652,7 @@ struct Packer<'a> {
     open_shapes: Vec<(usize, usize)>,
     open_keys: Vec<Key>,
     group_keys: Vec<Vec<Key>>,
-    out: std::sync::mpsc::SyncSender<Vec<CommittedTable<'a, F, E>>>,
+    out: std::sync::mpsc::SyncSender<CommitAssignment<'a>>,
     cap: multilinear::whir_chain::StackVars,
     max_polys: usize,
     /// The most groups the statement may declare: the group past it is
@@ -7947,7 +8009,10 @@ impl<'a> Packer<'a> {
         let t = Instant::now();
         let sent = self
             .out
-            .send(tables)
+            .send(CommitAssignment {
+                index: reached - 1,
+                tables,
+            })
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
         sent
@@ -10362,7 +10427,7 @@ fn prove_streamed(
             });
 
             // One closed group waits for phase A; the packer holds the next.
-            let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
+            let (gtx, grx) = std::sync::mpsc::sync_channel(1);
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let rest_keccak_airs = &rest_keccak_airs;
@@ -10621,7 +10686,7 @@ fn prove_streamed(
 
             // A memory log: a group leaves the channel as the committer takes
             // it.
-            let groups = grx.iter();
+            let mut groups = CommitAssignments::from(&grx);
             let block = if deviations.host_only {
                 // The trace alone: each closed group counted and dropped as
                 // it comes, nothing committed.
@@ -10631,7 +10696,7 @@ fn prove_streamed(
                     cells: 0,
                     at: 0.0,
                 };
-                for group in groups {
+                for group in &mut groups {
                     drained.groups += 1;
                     drained.tables += group.len();
                     drained.cells += group
@@ -10642,11 +10707,11 @@ fn prove_streamed(
                 drained.at = start.elapsed().as_secs_f64();
                 Err(drained)
             } else {
-                Ok(BlockCommitted::commit_groups_probed::<
+                let block = BlockCommitted::commit_groups_probed::<
                     H,
                     <H as multilinear::whir_hash::WhirHash>::Sponge,
                 >(
-                    groups.inspect(|group| {
+                    (&mut groups).inspect(|group| {
                         if let Some(ledger) = ledger {
                             ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
                         }
@@ -10669,8 +10734,10 @@ fn prove_streamed(
                             lane: local_lane,
                             binding: stark::multilinear_table::batched::LocalBinding::ALL,
                         }),
-                ))
+                );
+                Ok(groups.finish(block))
             };
+            drop(grx);
             (block, builder.join(), layout.join(), executor.join())
         });
         stamps.head = head_log::take_lines();
@@ -10950,38 +11017,31 @@ fn prove_streamed(
         }
         let table_num_vars: Vec<u8> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
-        absorb_block(
+        let statement = BlockStatement {
+            table_num_vars: &table_num_vars,
+            runtime_page_ranges: &laid.runtime_page_ranges,
+            table_counts: &laid.table_counts,
+            public_output: &laid.public_output,
+            num_private_input_pages: laid.num_private_input_pages,
+            groups: &laid.groups,
+            fused_memory: laid.fused_memory,
+            word_memory: laid.word_memory,
+        };
+        let replay = block_phase_b_statement(
             &mut transcript,
+            statement,
             &tag,
             elf_bytes,
-            &laid.public_output,
-            &laid.table_counts,
-            &fused_statement_words(format.memory, laid.fused_memory, laid.word_memory),
-            laid.num_private_input_pages,
-            &laid.runtime_page_ranges,
-            &table_num_vars,
             &config,
-            &laid.groups,
-        );
+            format.memory,
+        )?;
         let (prepared, tampered, derive) =
             prover_prepared::<H>(laid.prepared, &laid.groups, &config, deviations)?;
         stamps.prepared = (prepared.len(), derive);
         if let Some(ledger) = ledger {
             ledger.line("prepared committed");
         }
-        on_statement(
-            BlockStatement {
-                table_num_vars: &table_num_vars,
-                runtime_page_ranges: &laid.runtime_page_ranges,
-                table_counts: &laid.table_counts,
-                public_output: &laid.public_output,
-                num_private_input_pages: laid.num_private_input_pages,
-                groups: &laid.groups,
-                fused_memory: laid.fused_memory,
-                word_memory: laid.word_memory,
-            },
-            &prepared_roots(&prepared),
-        );
+        on_statement(statement, &prepared_roots(&prepared));
         let borrowed: Vec<Vec<&Mle<F>>> = prepared
             .iter()
             .map(|p| multilinear::stacking::borrow(&p.columns))
@@ -11150,6 +11210,9 @@ fn prove_streamed(
                     "local lookups: the digests taken at commit time are not the AIRs'".into(),
                 ));
             }
+        }
+        if let Some((workers, statement)) = replay {
+            block.set_inproc(workers, statement);
         }
         let (proof, argues, prepared_openings, groups, commit_ood, local_argues) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
@@ -11504,6 +11567,37 @@ pub(crate) fn block_statement_bytes(
         }
     }
     bytes
+}
+
+type BlockReplay = (multilinear_block::InprocWorkers, Vec<Vec<u8>>);
+
+fn block_phase_b_statement(
+    transcript: &mut impl IsTranscript<E>,
+    statement: BlockStatement<'_>,
+    tag: &[u8],
+    elf_bytes: &[u8],
+    config: &multilinear::whir_chain::ChainConfig,
+    memory: crate::tables::fused_memory::MemoryFormat,
+) -> Result<Option<BlockReplay>, Error> {
+    if let Some(workers) = multilinear_block::InprocWorkers::from_env().map_err(Error::Prover)? {
+        let calls = block_statement_calls(statement, tag, elf_bytes, config, memory)
+            .map_err(Error::Prover)?;
+        return Ok(Some((workers, calls)));
+    }
+    absorb_block(
+        transcript,
+        tag,
+        elf_bytes,
+        statement.public_output,
+        statement.table_counts,
+        &fused_statement_words(memory, statement.fused_memory, statement.word_memory),
+        statement.num_private_input_pages,
+        statement.runtime_page_ranges,
+        statement.table_num_vars,
+        config,
+        statement.groups,
+    );
+    Ok(None)
 }
 
 /// The `append_bytes` calls [`absorb_block`] makes, in its order: what an
@@ -14186,16 +14280,21 @@ mod packer_tests {
                 .collect()
         };
         // What phase A is handed: each group's tables by their heights.
-        let take = |groups: std::sync::mpsc::Receiver<Vec<_>>| -> Vec<Vec<usize>> {
-            groups
-                .iter()
-                .map(
-                    |group: Vec<stark::multilinear_table::CommittedTable<'_, _, _>>| {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        group.iter().map(|table| table.num_vars()).collect()
-                    },
-                )
-                .collect()
+        let take = |groups: std::sync::mpsc::Receiver<super::CommitAssignment<'_>>| {
+            let mut assignments = super::CommitAssignments::from(&groups);
+            let heights = assignments
+                .by_ref()
+                .map(|group| {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    group
+                        .iter()
+                        .map(|table| table.num_vars())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assignments
+                .finish(Ok(heights))
+                .expect("indexed assignments")
         };
         let (packed, taken) = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
