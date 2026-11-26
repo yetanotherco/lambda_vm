@@ -40,6 +40,7 @@ fn wlfm_pin_print() {
 /// ★ The fixture program's W-LFM identity at the production config, pinned:
 /// the identity it had before the WHIR round form existed (the round form is
 /// hashed only when a chain takes it). Grind-free: no proof is made.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn the_default_wlfm_program_id_is_unmoved() {
     let program = honest();

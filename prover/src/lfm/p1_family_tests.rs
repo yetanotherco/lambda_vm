@@ -23,7 +23,9 @@ use super::statement::{LFM_STATEMENT_TAG, absorb_lfm_statement, absorb_lfm_state
 use super::word::LfmWord;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("options")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("options")
 }
 
 fn arenas() -> Vec<Vec<LfmWord>> {

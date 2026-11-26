@@ -2561,6 +2561,7 @@ fn the_production_blake3_run_costs_its_closed_form() {
 /// tail rounds 5 and 6 then checked once a leaf: 30,962) and today's 41,109
 /// (cap 3, every round per query).
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn the_blake3_base_format_run_costs_its_closed_form() {
     use super::whir_chain::{
         ChainShape, LeafQuery, chain_cap_perms, chain_grind_perms, chain_opening_perms, chain_perms,

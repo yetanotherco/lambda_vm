@@ -305,49 +305,85 @@ fn light_is_todays_under(
 /// one cycle to many, batches that cross them, both MEMW_A forms and both
 /// register formats: the light walk emits today's lists and counts, and its
 /// walker routes as today's accumulator.
-#[test]
-fn the_light_walk_emits_today_s_lists() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+mod the_light_walk_emits_today_s_lists {
+    use super::*;
+
+    #[test]
+    fn asm_in_row_limbs() {
+        assert_light_asm_walk(MemwAlignedOrder::Limbs, RegisterFormat::InRow);
+    }
+
+    #[test]
+    fn asm_in_row_lt() {
+        assert_light_asm_walk(MemwAlignedOrder::Lt, RegisterFormat::InRow);
+    }
+
+    #[test]
+    fn asm_tokens_limbs() {
+        assert_light_asm_walk(MemwAlignedOrder::Limbs, RegisterFormat::Tokens32);
+    }
+
+    #[test]
+    fn rust_guests() {
+        for name in RUST_GUESTS {
+            let program = rust_elf(name);
+            let mut windows = 0;
+            for (window, batch) in [(97, 2048), (4096, 7)] {
+                windows += light_is_todays(
+                    name,
+                    &program,
+                    &[],
+                    window,
+                    batch,
+                    MemwAlignedOrder::Limbs,
+                    RegisterFormat::InRow,
+                );
+            }
+            // A short guest can halt in both of the configured windows.
+            if windows == 0 {
+                windows = light_is_todays(
+                    name,
+                    &program,
+                    &[],
+                    1,
+                    2048,
+                    MemwAlignedOrder::Limbs,
+                    RegisterFormat::InRow,
+                );
+            }
+            assert!(windows > 0, "{name}: compared windows");
+        }
+    }
+
+    #[test]
+    fn ethrex_transfers() {
+        let ethrex = rust_elf("ethrex");
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
+        let input = std::fs::read(fixtures.join("ethrex_10_transfers.bin")).expect("the fixture");
+        assert!(
+            light_is_todays(
+                "ethrex_10_transfers",
+                &ethrex,
+                &input,
+                1 << 16,
+                2048,
+                MemwAlignedOrder::Limbs,
+                RegisterFormat::InRow,
+            ) > 0,
+            "compared windows for ethrex"
+        );
+    }
+}
+
+fn assert_light_asm_walk(order: MemwAlignedOrder, format: RegisterFormat) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let mut windows = 0;
     for name in PROGRAMS {
         let (program, _) = run(name);
-        for (order, format) in [
-            (MemwAlignedOrder::Limbs, RegisterFormat::InRow),
-            (MemwAlignedOrder::Lt, RegisterFormat::InRow),
-            (MemwAlignedOrder::Limbs, RegisterFormat::Tokens32),
-        ] {
-            for (window, batch) in [(1, 2048), (7, 3), (33, 2048), (4096, 5), (4096, 2048)] {
-                windows += light_is_todays(name, &program, &[], window, batch, order, format);
-            }
+        for (window, batch) in [(1, 2048), (7, 3), (33, 2048), (4096, 5), (4096, 2048)] {
+            windows += light_is_todays(name, &program, &[], window, batch, order, format);
         }
     }
-    for name in RUST_GUESTS {
-        let program = rust_elf(name);
-        for (window, batch) in [(97, 2048), (4096, 7)] {
-            windows += light_is_todays(
-                name,
-                &program,
-                &[],
-                window,
-                batch,
-                MemwAlignedOrder::Limbs,
-                RegisterFormat::InRow,
-            );
-        }
-    }
-    let ethrex = rust_elf("ethrex");
-    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
-    let input = std::fs::read(fixtures.join("ethrex_10_transfers.bin")).expect("the fixture");
-    windows += light_is_todays(
-        "ethrex_10_transfers",
-        &ethrex,
-        &input,
-        1 << 16,
-        2048,
-        MemwAlignedOrder::Limbs,
-        RegisterFormat::InRow,
-    );
     assert!(windows > 1000, "{windows} windows compared");
 }
 
@@ -643,31 +679,51 @@ pub(super) fn built(
 /// three, under both register formats, hands its chunks out in today's order
 /// and builds today's tables, row for row: CPU's side records, MEMW_A, LOAD,
 /// BITWISE, DECODE, LT and the routed tables among them.
-#[test]
-fn the_light_walk_builds_today_s_tables() {
+fn assert_light_walk_builds_the_same_tables(format: RegisterFormat, window: usize) {
     // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     let mut chunks = 0usize;
     for name in PROGRAMS {
         let (program, _) = run(name);
-        for format in [RegisterFormat::InRow, RegisterFormat::Tokens32] {
-            for window in [7, 33, 4096] {
-                let none = crate::tables::trace_builder::WalkCuts::default();
-                let (want, want_order) = built(&program, &max_rows, window, 2, (0, none), format);
-                chunks += want_order.len();
-                for (level, walkers) in [(1, 3), (2, 1), (2, 3)] {
-                    let what = format!("{name}/{format:?}/{window}/level {level}/{walkers}");
-                    let (got, order) =
-                        built(&program, &max_rows, window, walkers, (level, none), format);
-                    assert_eq!(order, want_order, "{what}: the hand-out");
-                    same_traces(&want, &got);
-                }
-            }
+        let none = crate::tables::trace_builder::WalkCuts::default();
+        let (want, want_order) = built(&program, &max_rows, window, 2, (0, none), format);
+        chunks += want_order.len();
+        for (level, walkers) in [(1, 3), (2, 1), (2, 3)] {
+            let what = format!("{name}/{format:?}/{window}/level {level}/{walkers}");
+            let (got, order) = built(&program, &max_rows, window, walkers, (level, none), format);
+            assert_eq!(order, want_order, "{what}: the hand-out");
+            same_traces(&want, &got);
         }
     }
     assert!(chunks > 0, "no chunk handed out");
 }
+
+macro_rules! table_cases {
+    ($test:ident, $format:ident) => {
+        mod $test {
+            use super::*;
+
+            #[test]
+            fn window_7() {
+                assert_light_walk_builds_the_same_tables(RegisterFormat::$format, 7);
+            }
+
+            #[test]
+            fn window_33() {
+                assert_light_walk_builds_the_same_tables(RegisterFormat::$format, 33);
+            }
+
+            #[test]
+            fn window_4096() {
+                assert_light_walk_builds_the_same_tables(RegisterFormat::$format, 4096);
+            }
+        }
+    };
+}
+
+table_cases!(the_light_walk_builds_the_same_in_row_tables, InRow);
+table_cases!(the_light_walk_builds_the_same_token_tables, Tokens32);
 
 /// The level refuses what it does not take, and only before the first window.
 #[test]

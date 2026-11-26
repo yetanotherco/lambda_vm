@@ -161,6 +161,14 @@ fn lean_compressions_round_trip_through_wlfm() {
     assert_eq!(rev, back);
     let msg: Vec<u8> = (0..150u32).map(|i| (i * 7 + 3) as u8).collect();
     assert_eq!(chain, blake3::hash(&msg).as_bytes().to_vec());
+
+    // The head's digest sends must balance the claimed words' reads.
+    let mut claimed = proof.public_words.clone();
+    claimed[4].1[0] += FE::one();
+    assert!(
+        verify_wlfm(a, &proof, &claimed).is_err(),
+        "tampered published digest"
+    );
 }
 
 /// A program with no compression keeps today's AIR set: no lean table, not
@@ -175,19 +183,6 @@ fn a_program_with_no_compression_has_no_lean_table() {
     let airs = a.airs();
     assert_eq!(airs.air_refs().len(), airs.lfm.air_refs().len());
     assert_eq!(a.table_num_vars.len(), airs.lfm.air_refs().len());
-}
-
-/// A tampered published digest is refused: the head's digest sends no longer
-/// balance the claimed words' reads.
-#[test]
-fn a_tampered_digest_word_is_refused() {
-    let _fast = test_format::set(Some(2));
-    let program = honest();
-    let build = build(&program);
-    let proof = prove(&program, &build);
-    let mut claimed = proof.public_words.clone();
-    claimed[4].1[0] += FE::one();
-    assert!(verify_wlfm(&build.artifacts, &proof, &claimed).is_err());
 }
 
 /// ★ A forged instruction column: the same program with the parent's flags
@@ -944,10 +939,9 @@ fn an_observed_prove_hands_out_the_next_levels_arena_group_by_group() {
 /// driver runs it under `LAMBDA_VM_LEVELS_STREAM_NEXT`), and over the arena
 /// written from the finished proof: one proof, byte for byte. A piece of the
 /// wrong length, or pieces that stop short, refuse.
-#[test]
-fn the_next_level_streamed_beside_the_prove_is_the_same_level() {
+fn assert_the_streamed_next_level(family: super::wlfm::WlfmFamily) {
     use super::levels::stream_level_over_pieces;
-    use super::wlfm::{WlfmFamily, WlfmProving};
+    use super::wlfm::WlfmProving;
     use super::wlfm_leg::{
         WlfmChild, wlfm_leg_arena, wlfm_leg_front, wlfm_leg_group, wlfm_leg_program_marked,
     };
@@ -956,98 +950,102 @@ fn the_next_level_streamed_beside_the_prove_is_the_same_level() {
     let _groups = test_format::set_group_polys(1);
     let hasher = HasherKind::Poseidon1W16;
     let (level, arenas) = super::levels_probe::level_program(4, 256);
-    for family in [WlfmFamily::P1, WlfmFamily::B3] {
-        let levers = super::wlfm::WlfmLevers::with_family(family);
-        let build = super::wlfm::build_wlfm_under(&level, hasher, WlfmRate::Two, levers, false)
-            .expect("builds");
-        let filled =
-            super::wlfm::execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
-        let public = filled.public_words().to_vec();
-        let child = WlfmChild {
-            artifacts: build.artifacts.clone(),
-            num_public_words: public.len(),
-            cap_mux: None,
-        };
-        let (leg, marks) = wlfm_leg_program_marked(&child).expect("the marked leg");
-        assert!(marks.len() >= 3, "{family:?}: a front and several groups");
-        let leg_hasher = leg.hasher(<BlockFamily as ProofFamily>::SOCKET);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let t0 = std::time::Instant::now();
-        let (proof, streamed) = std::thread::scope(|scope| {
-            let next = scope.spawn(|| stream_level_over_pieces(&leg, &marks, leg_hasher, rx, t0));
-            let front_sent = std::sync::atomic::AtomicBool::new(false);
-            let proof = super::wlfm::prove_wlfm_traces_observed(
-                &build,
-                filled,
-                true,
-                WlfmProving::Streamed,
-                &|opened| {
-                    if !front_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        let front =
-                            wlfm_leg_front(&child, &public, opened.roots, opened.commit_ood)
-                                .expect("the front");
-                        tx.send((0, front)).expect("the stream listens");
-                    }
-                    let words = wlfm_leg_group(
-                        &child,
-                        opened.group,
-                        opened.argue.expect("a batched argue"),
-                        opened.opening,
-                        opened.prepared,
-                    )
-                    .expect("the group's words");
-                    tx.send((opened.group + 1, words))
-                        .expect("the stream listens");
-                },
-            )
-            .expect("proves");
-            drop(tx);
-            (proof, next.join().expect("the stream ran"))
-        });
-        let (streamed, times) = streamed.expect("the next level streams");
-        assert_eq!(times.pieces, marks.len(), "{family:?}: every piece landed");
-        let arena = wlfm_leg_arena(&child, &proof).expect("the arena");
-        let plain = execute_and_fill_unmerged(&leg, std::slice::from_ref(&arena), leg_hasher)
-            .expect("the leg executes");
-        assert!(
-            streamed.public_words() == plain.public_words(),
-            "{family:?}: the streamed level publishes the same words"
-        );
-        let leg_build =
-            super::wlfm::build_wlfm_under(&leg, leg_hasher, WlfmRate::Two, levers, false)
-                .expect("the leg builds");
-        let bytes = |p: &WlfmProof| rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("bytes");
-        let prove = |f| {
-            super::wlfm::prove_wlfm_traces_as(&leg_build, f, true, WlfmProving::Streamed)
-                .expect("the leg proves")
-        };
-        assert!(
-            bytes(&prove(streamed))[..] == bytes(&prove(plain))[..],
-            "{family:?}: the streamed level is the same proof, byte for byte"
-        );
-        // The refusals: a piece cut short, and pieces that stop before the last.
-        let piece = |i: usize| {
-            arena[marks.get(i.wrapping_sub(1)).map_or(0, |&m| m as usize)..marks[i] as usize]
-                .to_vec()
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut short = piece(1);
-        short.pop();
-        tx.send((0, piece(0))).expect("sends");
-        tx.send((1, short)).expect("sends");
+    let levers = super::wlfm::WlfmLevers::with_family(family);
+    let build = super::wlfm::build_wlfm_under(&level, hasher, WlfmRate::Two, levers, false)
+        .expect("builds");
+    let filled = super::wlfm::execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+    let public = filled.public_words().to_vec();
+    let child = WlfmChild {
+        artifacts: build.artifacts.clone(),
+        num_public_words: public.len(),
+        cap_mux: None,
+    };
+    let (leg, marks) = wlfm_leg_program_marked(&child).expect("the marked leg");
+    assert!(marks.len() >= 3, "{family:?}: a front and several groups");
+    let leg_hasher = leg.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t0 = std::time::Instant::now();
+    let (proof, streamed) = std::thread::scope(|scope| {
+        let next = scope.spawn(|| stream_level_over_pieces(&leg, &marks, leg_hasher, rx, t0));
+        let front_sent = std::sync::atomic::AtomicBool::new(false);
+        let proof = super::wlfm::prove_wlfm_traces_observed(
+            &build,
+            filled,
+            true,
+            WlfmProving::Streamed,
+            &|opened| {
+                if !front_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let front = wlfm_leg_front(&child, &public, opened.roots, opened.commit_ood)
+                        .expect("the front");
+                    tx.send((0, front)).expect("the stream listens");
+                }
+                let words = wlfm_leg_group(
+                    &child,
+                    opened.group,
+                    opened.argue.expect("a batched argue"),
+                    opened.opening,
+                    opened.prepared,
+                )
+                .expect("the group's words");
+                tx.send((opened.group + 1, words))
+                    .expect("the stream listens");
+            },
+        )
+        .expect("proves");
         drop(tx);
-        let err = stream_level_over_pieces(&leg, &marks, leg_hasher, rx, t0)
-            .err()
-            .expect("a short piece refuses");
-        assert!(err.contains("words"), "{family:?}: {err}");
-        let (tx, rx) = std::sync::mpsc::channel();
-        tx.send((0, piece(0))).expect("sends");
-        drop(tx);
-        let err = stream_level_over_pieces(&leg, &marks, leg_hasher, rx, t0)
-            .err()
-            .expect("stopped pieces refuse");
-        assert!(err.contains("stopped"), "{family:?}: {err}");
-    }
+        (proof, next.join().expect("the stream ran"))
+    });
+    let (streamed, times) = streamed.expect("the next level streams");
+    assert_eq!(times.pieces, marks.len(), "{family:?}: every piece landed");
+    let arena = wlfm_leg_arena(&child, &proof).expect("the arena");
+    let plain = execute_and_fill_unmerged(&leg, std::slice::from_ref(&arena), leg_hasher)
+        .expect("the leg executes");
+    assert!(
+        streamed.public_words() == plain.public_words(),
+        "{family:?}: the streamed level publishes the same words"
+    );
+    let leg_build = super::wlfm::build_wlfm_under(&leg, leg_hasher, WlfmRate::Two, levers, false)
+        .expect("the leg builds");
+    let bytes = |p: &WlfmProof| rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("bytes");
+    let prove = |f| {
+        super::wlfm::prove_wlfm_traces_as(&leg_build, f, true, WlfmProving::Streamed)
+            .expect("the leg proves")
+    };
+    assert!(
+        bytes(&prove(streamed))[..] == bytes(&prove(plain))[..],
+        "{family:?}: the streamed level is the same proof, byte for byte"
+    );
+    // The refusals: a piece cut short, and pieces that stop before the last.
+    let piece = |i: usize| {
+        arena[marks.get(i.wrapping_sub(1)).map_or(0, |&m| m as usize)..marks[i] as usize].to_vec()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut short = piece(1);
+    short.pop();
+    tx.send((0, piece(0))).expect("sends");
+    tx.send((1, short)).expect("sends");
+    drop(tx);
+    let err = stream_level_over_pieces(&leg, &marks, leg_hasher, rx, t0)
+        .err()
+        .expect("a short piece refuses");
+    assert!(err.contains("words"), "{family:?}: {err}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send((0, piece(0))).expect("sends");
+    drop(tx);
+    let err = stream_level_over_pieces(&leg, &marks, leg_hasher, rx, t0)
+        .err()
+        .expect("stopped pieces refuse");
+    assert!(err.contains("stopped"), "{family:?}: {err}");
+}
+
+#[test]
+fn the_streamed_next_level_matches_under_poseidon1() {
+    assert_the_streamed_next_level(super::wlfm::WlfmFamily::P1);
+}
+
+#[test]
+fn the_streamed_next_level_matches_under_blake3() {
+    assert_the_streamed_next_level(super::wlfm::WlfmFamily::B3);
 }
 
 /// The head's block-byte pair lookups are what tie a felt block's hashed bytes

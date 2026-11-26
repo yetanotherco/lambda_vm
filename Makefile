@@ -4,7 +4,7 @@ clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-gkr2-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
-test-prover-cuda test-prover-comprehensive-cuda \
+test-prover-cuda test-prover-comprehensive-cuda test-prover-identities-cuda test-cross-posture test-cross-posture-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
@@ -586,18 +586,18 @@ test: compile-programs test-syscalls test-ethrex-crypto
 # Fast prover tests (skips ignored slow tests). Recursion smoke/PoC tests read
 # prebuilt guest ELFs, so build them first.
 test-fast: compile-recursion-elfs
-	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
+	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel,lambda-vm-prover/test-security
 
 # Prover tests only
 test-prover: compile-recursion-elfs
-	cargo test -p lambda-vm-prover
+	cargo test -p lambda-vm-prover --features test-security
 
 # Prover tests including slow ones. The recursion smoke tests read prebuilt
 # guest ELFs from executor/program_artifacts/recursion/ — the fast ones on every
 # run, the slow ones (still #[ignore]d) only under --include-ignored — so build
-# them first.
+# them first. The proof exchanges need both binaries and run in test-cross-posture.
 test-prover-all: compile-recursion-elfs
-	cargo test -p lambda-vm-prover -- --include-ignored
+	cargo test -p lambda-vm-prover -- --include-ignored --skip rejects_test_posture
 
 # Prover tests with debug-checks (shows bus balance report). Also unfiltered, so
 # it runs the non-ignored recursion tests that read prebuilt guest ELFs.
@@ -615,7 +615,7 @@ GPU_TEST_TIMEOUT := timeout -k 30 2700
 # math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
 # so a hang here also costs Groups 2-6: they run after it, sequentially.
 test-math-cuda:
-	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release -- --test-threads=1
 
 # Known-answer tests for the BLAKE3 device kernels, run on the HOST. No GPU, no
 # nvcc, no cargo — a couple of seconds.
@@ -862,14 +862,43 @@ test-cuda-fallback:
 # smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
 test-prover-cuda: compile-recursion-elfs
 	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
-	    --features lambda-vm-prover/cuda -- --test-threads=1
+	    --features lambda-vm-prover/cuda,lambda-vm-prover/test-security -- --test-threads=1
 
-# The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
-# NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
-# comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
-test-prover-comprehensive-cuda:
-	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda \
-	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
+# These exact tests pin production parameters or smoke-test proof paths at
+# production settings. Build the unit binary without test-security.
+test-prover-comprehensive-cuda: compile-recursion-elfs
+	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda --lib -- \
+	    --exact --include-ignored --test-threads=1 --nocapture $$(cat .config/production-posture-tests.txt)
+
+# Each identity gets its own process for the prover's format knobs and device
+# fault state. Forced split runs both backends on a single card.
+test-prover-identities-cuda: compile-programs-asm
+	@unset LAMBDA_VM_WORD_CHUNKS LAMBDA_VM_BLOCK_WALKERS; \
+	export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1; \
+	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
+	failed=0; \
+	while read -r features test; do \
+	    if ! $(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --lib \
+	        --features "test-security,$$features" -- --ignored --exact --test-threads=1 "$$test" \
+	        > "$$output" 2>&1 || ! grep -Fq 'test result: ok. 1 passed;' "$$output"; then \
+	        echo "CUDA identity failed or missing: $$test" >&2; failed=1; \
+	    fi; \
+	    cat "$$output"; \
+	done < .config/cuda-identity-tests.txt; \
+	exit "$$failed"
+
+# Hand honest serialized proofs from the TEST binary to the production binary.
+test-cross-posture-cuda: CROSS_POSTURE_ARGS := --features cuda
+test-cross-posture-cuda: CROSS_POSTURE_RUN := $(GPU_TEST_TIMEOUT)
+test-cross-posture-cuda: test-cross-posture
+test-cross-posture: $(ASM_ARTIFACTS_DIR)/basic_program.elf
+	@set -eu; \
+	dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
+	export LAMBDA_VM_TEST_POSTURE_PROOFS="$$dir"; \
+	$(CROSS_POSTURE_RUN) cargo test --release -p lambda-vm-prover --lib $(CROSS_POSTURE_ARGS) --features test-security \
+	    rejects_test_posture -- --ignored --test-threads=1; \
+	$(CROSS_POSTURE_RUN) cargo test --release -p lambda-vm-prover --lib $(CROSS_POSTURE_ARGS) \
+	    rejects_test_posture -- --ignored --test-threads=1
 
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
@@ -913,6 +942,7 @@ clippy:
 	# "blake3-absorb"))` and this is a host pass, so what compiles is its
 	# `cfg(not(...))` stub.
 	cargo clippy -p crypto --all-targets --features blake3-absorb -- -D warnings -A clippy::op_ref
+	cargo clippy -p lambda-vm-prover --all-targets --features test-security -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -958,6 +988,9 @@ lint:
 	# compiled by nothing and a box run was its first compiler. No GPU needed;
 	# cuda clippy builds against the cubin stubs like the pass above.
 	cargo clippy -p lambda-vm-prover --all-targets --features cuda,hash-metrics -- -D warnings -A clippy::op_ref
+	# The test security posture (`security_posture`): its test-only half is
+	# `cfg(all(test, feature = "test-security"))`, which no pass above compiles.
+	cargo clippy -p lambda-vm-prover --all-targets --features test-security -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

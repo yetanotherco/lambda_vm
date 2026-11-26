@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use stark::lookup::BusInteraction;
 
 use super::bus_net_tests::{multiplicity, named, unbalanced};
-use super::finish_tests::{contents, run, windowed};
+use super::finish_tests::{contents_without_bitwise, run, windowed};
 use super::*;
 use crate::tables::MaxRowsConfig;
 use crate::tables::lt::{LtConstraints, cols};
@@ -486,48 +486,56 @@ fn lt_tuples(t: &Traces) -> BTreeMap<(u64, u64, bool, bool), u64> {
 /// table but LT's and BITWISE is the same word for word, the counts and what
 /// the statement reads are the same, LT's tuples with their μ summed are the
 /// same, and LT's tables do change somewhere (the test sees the knob).
-#[test]
-fn with_the_merge_only_lt_and_bitwise_change() {
+fn assert_lt_merge_changes_only_lt_and_bitwise(window: usize, max_rows: &MaxRowsConfig) {
     let mut changed = 0usize;
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, today, merge) in &configs() {
-                    let what = format!("{name} window {window} {config}");
-                    let a = windowed(&program, &logs, &max_rows, window, today.as_ref());
-                    let b = windowed(&program, &logs, &max_rows, window, merge.as_ref());
-                    let keep = |(name, _): &(String, String)| {
-                        !(name.starts_with("LT[") || name == "BITWISE")
-                    };
-                    let (ca, cb): (Vec<_>, Vec<_>) = (
-                        contents(&a).into_iter().filter(keep).collect(),
-                        contents(&b).into_iter().filter(keep).collect(),
-                    );
-                    assert_eq!(ca.len(), cb.len(), "{what}: the tables");
-                    for ((n, x), (_, y)) in ca.iter().zip(&cb) {
-                        assert_eq!(x, y, "{what}: {n}");
-                    }
-                    assert_eq!(lt_tuples(&a), lt_tuples(&b), "{what}: LT's tuples");
-                    let (la, lb): (Vec<_>, Vec<_>) = (
-                        contents(&a)
-                            .into_iter()
-                            .filter(|(n, _)| n.starts_with("LT["))
-                            .collect(),
-                        contents(&b)
-                            .into_iter()
-                            .filter(|(n, _)| n.starts_with("LT["))
-                            .collect(),
-                    );
-                    if config.contains("concatenated") {
-                        assert_eq!(la, lb, "{what}: nothing merges with LT concatenated");
-                    }
-                    changed += usize::from(la != lb);
-                }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        for (config, today, merge) in &configs() {
+            let what = format!("{name} window {window} {config}");
+            let a = windowed(&program, &logs, max_rows, window, today.as_ref());
+            let b = windowed(&program, &logs, max_rows, window, merge.as_ref());
+            let split = |t| {
+                contents_without_bitwise(t)
+                    .into_iter()
+                    .partition::<Vec<_>, _>(|(name, _)| name.starts_with("LT["))
+            };
+            let ((la, ca), (lb, cb)) = (split(&a), split(&b));
+            assert_eq!(ca.len(), cb.len(), "{what}: the tables");
+            for ((n, x), (_, y)) in ca.iter().zip(&cb) {
+                assert_eq!(x, y, "{what}: {n}");
             }
+            assert_eq!(lt_tuples(&a), lt_tuples(&b), "{what}: LT's tuples");
+            if config.contains("concatenated") {
+                assert_eq!(la, lb, "{what}: nothing merges with LT concatenated");
+            }
+            changed += usize::from(la != lb);
         }
     }
     assert!(changed > 0, "the merge changed no LT table");
+}
+
+mod lt_merge_changes_only_lt_and_bitwise {
+    use super::*;
+
+    #[test]
+    fn small_window_7() {
+        assert_lt_merge_changes_only_lt_and_bitwise(7, &MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn small_window_1000() {
+        assert_lt_merge_changes_only_lt_and_bitwise(1000, &MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn uniform_window_7() {
+        assert_lt_merge_changes_only_lt_and_bitwise(7, &MaxRowsConfig::uniform(4));
+    }
+
+    #[test]
+    fn uniform_window_1000() {
+        assert_lt_merge_changes_only_lt_and_bitwise(1000, &MaxRowsConfig::uniform(4));
+    }
 }
 
 /// ★ Every inner bus balances on the merged builds (the μ bound's lookups
@@ -535,34 +543,29 @@ fn with_the_merge_only_lt_and_bitwise_change() {
 /// map's rows under merged tables (`lt_merge_count_fault`, the mutant)
 /// leaves tuples on the μ bound's bus, and on no other, in some build: the
 /// count is load-bearing.
-#[test]
-fn with_the_merge_every_inner_bus_balances_and_a_map_count_does_not() {
+fn assert_lt_merge_checks_the_inner_buses(window: usize, max_rows: &MaxRowsConfig) {
     let mut failed = Vec::new();
     let mut caught = 0usize;
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, _, merge) in &configs() {
-                    let what = format!("{name} window {window} {config}");
-                    let mut t = windowed(&program, &logs, &max_rows, window, merge.as_ref());
-                    let left = unbalanced(&program, &mut t);
-                    if !left.is_empty() {
-                        failed.push(format!("{what}: {}", named(&left)));
-                    }
-                    let mut t = windowed(&program, &logs, &max_rows, window, &|b| {
-                        merge(b).lt_merge_count_fault()
-                    });
-                    let left = unbalanced(&program, &mut t);
-                    let bound = u64::from(BusId::AreBytes);
-                    assert!(
-                        left.keys().all(|bus| *bus == bound),
-                        "{what}: the fault left {}",
-                        named(&left)
-                    );
-                    caught += usize::from(!left.is_empty());
-                }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        for (config, _, merge) in &configs() {
+            let what = format!("{name} window {window} {config}");
+            let mut t = windowed(&program, &logs, max_rows, window, merge.as_ref());
+            let left = unbalanced(&program, &mut t);
+            if !left.is_empty() {
+                failed.push(format!("{what}: {}", named(&left)));
             }
+            let mut t = windowed(&program, &logs, max_rows, window, &|b| {
+                merge(b).lt_merge_count_fault()
+            });
+            let left = unbalanced(&program, &mut t);
+            let bound = u64::from(BusId::AreBytes);
+            assert!(
+                left.keys().all(|bus| *bus == bound),
+                "{what}: the fault left {}",
+                named(&left)
+            );
+            caught += usize::from(!left.is_empty());
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
@@ -570,6 +573,30 @@ fn with_the_merge_every_inner_bus_balances_and_a_map_count_does_not() {
         caught > 0,
         "no build caught the map's count under merged tables"
     );
+}
+
+mod lt_merge_checks_the_inner_buses {
+    use super::*;
+
+    #[test]
+    fn small_window_7() {
+        assert_lt_merge_checks_the_inner_buses(7, &MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn small_window_1000() {
+        assert_lt_merge_checks_the_inner_buses(1000, &MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn uniform_window_7() {
+        assert_lt_merge_checks_the_inner_buses(7, &MaxRowsConfig::uniform(4));
+    }
+
+    #[test]
+    fn uniform_window_1000() {
+        assert_lt_merge_checks_the_inner_buses(1000, &MaxRowsConfig::uniform(4));
+    }
 }
 
 /// ★ A MEMW op's comparisons are `old_timestamp[i] < timestamp` for each of

@@ -926,42 +926,67 @@ fn word_record_build_with(
 /// every second window re-walked from the lean pass's entries and its first
 /// cells compared with the history's by word, builds the tables the
 /// sequential windowed build makes, and they balance every bus.
-#[test]
-fn record_mode_under_the_word_format_builds_the_windowed_tables() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for name in [
+fn assert_word_record_mode_matches_windowed_tables(window: usize, programs: &[&str]) {
+    for &name in programs {
+        let (program, logs) = run(name);
+        let want = word_build(&program, &logs, RegisterFormat::InRow, 7);
+        for (walkers, level) in [(1, 0u8), (3, 0), (3, 2)] {
+            for recheck in [0, 2] {
+                let mut got = word_record_build(&program, window, walkers, level, recheck)
+                    .unwrap_or_else(|e| {
+                        panic!("{name}/{window}/{walkers}/{level}/{recheck}: {e:?}")
+                    });
+                crate::tests::windowed_builder_tests::same_traces(&want, &got);
+                let left = left(&program, &mut got, RegisterFormat::InRow);
+                assert!(
+                    left.is_empty(),
+                    "{name}: {}",
+                    super::bus_net_tests::named(&left)
+                );
+            }
+        }
+    }
+}
+
+mod word_record_mode_matches_windowed_tables {
+    use super::*;
+
+    const MEMORY: &[&str] = &[
         "fused_mem_cases",
         "cross_4gib",
         "all_loadstore_32",
         "misalign_sw",
         "loop_4096",
+    ];
+    const SYSCALLS: &[&str] = &[
         "test_copy_ecalls",
         "copy_4gib",
         "test_copy_overlaps",
         "test_commit_split",
         "test_keccak256",
         "test_ecrec",
-    ] {
-        let (program, logs) = run(name);
-        let want = word_build(&program, &logs, RegisterFormat::InRow, 7);
-        for window in [7, 33] {
-            for (walkers, level) in [(1, 0u8), (3, 0), (3, 2)] {
-                for recheck in [0, 2] {
-                    let mut got = word_record_build(&program, window, walkers, level, recheck)
-                        .unwrap_or_else(|e| {
-                            panic!("{name}/{window}/{walkers}/{level}/{recheck}: {e:?}")
-                        });
-                    crate::tests::windowed_builder_tests::same_traces(&want, &got);
-                    let left = left(&program, &mut got, RegisterFormat::InRow);
-                    assert!(
-                        left.is_empty(),
-                        "{name}: {}",
-                        super::bus_net_tests::named(&left)
-                    );
-                }
-            }
-        }
+    ];
+
+    #[test]
+    fn memory_window_7() {
+        assert_word_record_mode_matches_windowed_tables(7, MEMORY);
+    }
+
+    #[test]
+    fn memory_window_33() {
+        assert_word_record_mode_matches_windowed_tables(33, MEMORY);
+    }
+
+    #[test]
+    fn syscalls_window_7() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        assert_word_record_mode_matches_windowed_tables(7, SYSCALLS);
+    }
+
+    #[test]
+    fn syscalls_window_33() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        assert_word_record_mode_matches_windowed_tables(33, SYSCALLS);
     }
 }
 
@@ -1590,8 +1615,7 @@ const LEAN_PROGRAMS: [&str; 11] = [
 /// 2: the tables are the full stream's, every streamed chunk is handed out
 /// alike with the same records digest (the CPU chunks' kept logs byte for
 /// byte, as regeneration checks them), and every bus balances.
-#[test]
-fn the_lean_stream_builds_the_full_streams_tables_and_records() {
+fn lean_stream_matches_the_full_stream(window: usize) -> usize {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let lean = StreamRun {
         lean: true,
@@ -1602,32 +1626,46 @@ fn the_lean_stream_builds_the_full_streams_tables_and_records() {
     let mut held = 0usize;
     for name in LEAN_PROGRAMS {
         let (program, _) = run(name);
-        for window in [7, 33] {
-            for (walkers, level) in [(1, 1u8), (3, 2)] {
-                let what = format!("{name}/{window}/{walkers}/{level}");
-                eprintln!("{what}: full");
-                let (want, want_chunks) =
-                    word_stream_build(&program, window, walkers, level, StreamRun::default())
-                        .unwrap_or_else(|e| panic!("{what}: full: {e:?}"));
-                eprintln!("{what}: lean");
-                let (mut got, got_chunks) =
-                    word_stream_build(&program, window, walkers, level, lean)
-                        .unwrap_or_else(|e| panic!("{what}: lean: {e:?}"));
-                crate::tests::windowed_builder_tests::same_traces(&want, &got);
-                assert_eq!(got_chunks, want_chunks, "{what}");
-                held += got_chunks.iter().filter(|(_, _, d)| d.is_some()).count();
-                if window == 7 && walkers == 3 {
-                    let left = left(&program, &mut got, RegisterFormat::InRow);
-                    assert!(
-                        left.is_empty(),
-                        "{what}: {}",
-                        super::bus_net_tests::named(&left)
-                    );
-                }
+        for (walkers, level) in [(1, 1u8), (3, 2)] {
+            let what = format!("{name}/{window}/{walkers}/{level}");
+            eprintln!("{what}: full");
+            let (want, want_chunks) =
+                word_stream_build(&program, window, walkers, level, StreamRun::default())
+                    .unwrap_or_else(|e| panic!("{what}: full: {e:?}"));
+            eprintln!("{what}: lean");
+            let (mut got, got_chunks) = word_stream_build(&program, window, walkers, level, lean)
+                .unwrap_or_else(|e| panic!("{what}: lean: {e:?}"));
+            crate::tests::windowed_builder_tests::same_traces(&want, &got);
+            assert_eq!(got_chunks, want_chunks, "{what}");
+            held += got_chunks.iter().filter(|(_, _, d)| d.is_some()).count();
+            if window == 7 && walkers == 3 {
+                let left = left(&program, &mut got, RegisterFormat::InRow);
+                assert!(
+                    left.is_empty(),
+                    "{what}: {}",
+                    super::bus_net_tests::named(&left)
+                );
             }
         }
     }
-    assert!(held > 0, "a chunk held as records, its logs kept");
+    held
+}
+
+mod the_lean_stream_builds_the_full_streams_tables_and_records {
+    use super::*;
+
+    #[test]
+    fn window_7() {
+        assert!(
+            lean_stream_matches_the_full_stream(7) > 0,
+            "a chunk held as records, its logs kept"
+        );
+    }
+
+    #[test]
+    fn window_33() {
+        lean_stream_matches_the_full_stream(33);
+    }
 }
 
 /// ★ The lean stream is refused, never run as another mode: a lean window

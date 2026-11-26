@@ -45,6 +45,12 @@ blake3-6round = ["crypto/blake3-6round"]
 blake3-absorb = ["crypto/blake3-absorb"]
 # Host-only verify-hash counter for `test_count_recursion_hashes` (see `crypto::hash_metrics`).
 hash-metrics = ["crypto/hash-metrics"]
+# TEST ONLY: the prover crate's own unit-test binary proves and verifies at a low
+# security target (32 bits, grinds of at most 8 bits; `security_posture`). It
+# has no effect on any other build: the posture is gated on `cfg(test)` as well,
+# so a release binary, an integration test or a guest built with this feature is
+# still production (a compile-time assertion in `security_posture`).
+test-security = []
 
 [dependencies]
 stark = { path = "../crypto/stark" }

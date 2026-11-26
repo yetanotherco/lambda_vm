@@ -1,8 +1,8 @@
 //! The block's recursion as levels ([`super::levels`]) over small blocks: the
 //! closed level-1 program, the chain to its last level, and the refusals that
 //! make each piece load-bearing, under Poseidon1 and under 7-round BLAKE3.
-//! Every test that proves a block's base is box tier; the hash and base
-//! pairings are checked on the laptop.
+//! CI proves a compact two-level chain at the TEST posture. Whole-block
+//! level fixtures run on the box.
 
 use super::edsl::WrapHash;
 use super::executor::execute;
@@ -1582,8 +1582,17 @@ fn driven_under_levels_split_stacks(
         "the identity needs the deterministic grind"
     );
     let _restore = Restore;
+    // With the test query counts, a production stack can fit the whole
+    // level in one group. Use a smaller cap for the smoke test's two drivers.
+    #[cfg(feature = "test-security")]
+    let _stack = super::wlfm::test_format::use_small_card_stack();
+    let guest = if cfg!(feature = "test-security") {
+        "basic_program"
+    } else {
+        "test_commit_4"
+    };
     let format = b3_format();
-    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = crate::test_utils::asm_elf_bytes(guest);
     let opts = ProofOptions::default_test_options();
     set_two_card_split_for_test(Some(TwoCardSplit::Off));
     set_two_card_levels_for_test(Some(setting));
@@ -1643,7 +1652,14 @@ fn driven_under_levels_split_stacks(
         derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
     };
     let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(run.proofs.len(), 2, "the base feeds both recursion levels");
     assert_eq!(proofs.len(), run.proofs.len());
+    verify_levels(
+        &run.plan,
+        WlfmFamily::B3,
+        run.proofs.last().expect("the last level"),
+    )
+    .expect("the split proof verifies and claims the block");
     for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
         let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
         let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
@@ -2510,7 +2526,10 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// on the card either way, `LAMBDA_VM_LEVELS_STACKS`), `RTA_LEVELS` (the
 /// chain's length; 2), `RTA_RUNS` (runs in this process, the first a warm-up;
 /// 1). Prints `RTA …` lines, each run's tagged `run k`; everything is verified
-/// off the clock.
+/// off the clock, as `RTA_VERIFY` says: unset or `all` (the default) every
+/// run; `last` the process's last run alone; `off` no run (`RTA VERIFIED:
+/// skipped` a run skipped: a timing process whose arm the job's identity step
+/// verifies).
 ///
 /// `RTA_L1_GROUPS=k1,k2,…` measures level 1's prove rate at a chosen size
 /// instead ([`rta_first_groups`]): the base proved once, then one level-1 run
@@ -2523,6 +2542,13 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 fn rta_a_real_block_through_its_levels() {
     use super::whir_block_tree::WhirTreeConfig;
     let _permit = super::device_permit::serial_for_test();
+    // The build's security posture (`crate::security_posture`): production in
+    // a timing binary, test in a `test-security` one. `RTA_POSTURE` names the
+    // one the caller expects, and any other refuses before anything proves.
+    let posture = crate::security_posture::name();
+    println!("RTA POSTURE: {posture}");
+    rta_posture_check(std::env::var("RTA_POSTURE").ok().as_deref(), posture)
+        .unwrap_or_else(|e| panic!("{e}"));
     let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
@@ -2557,11 +2583,22 @@ fn rta_a_real_block_through_its_levels() {
     let levels: usize =
         std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
     let runs: usize = std::env::var("RTA_RUNS").map_or(1, |v| v.trim().parse().expect("RTA_RUNS"));
+    // A misspelt RTA_VERIFY refuses here, before any prove.
+    let verify = RtaVerify::from_word(std::env::var("RTA_VERIFY").ok().as_deref());
     // A pricing probe: keep the process's memory between blocks (see
     // `KEEP_MEMORY_FOR_TEST`); off unless `RTA_KEEP_MEMORY=1`.
     let keep = std::env::var("RTA_KEEP_MEMORY").is_ok_and(|v| v.trim() == "1");
     super::levels::KEEP_MEMORY_FOR_TEST.store(keep, std::sync::atomic::Ordering::Relaxed);
     let opts = super::proof::block_base_options();
+    match verify {
+        RtaVerify::All => {}
+        RtaVerify::Last => {
+            println!("RTA VERIFY: last (RTA_VERIFY=last): the process's last run alone verified")
+        }
+        RtaVerify::Off => {
+            println!("RTA VERIFY: off (RTA_VERIFY=off): no run verified in this process")
+        }
+    }
     println!(
         "RTA CONFIG: base {:?} · tag {} · group polys {} · family {family:?} · levels {levels} · \
          beside {beside} · build beside {build_beside} · runs {runs}",
@@ -2607,9 +2644,42 @@ fn rta_a_real_block_through_its_levels() {
             levels,
             beside,
             build_beside,
+            verify.skips(k, runs.max(1)),
         );
     }
     println!("RTA DONE");
+}
+
+/// `RTA_POSTURE` against the build's posture: unset or empty takes the
+/// build's; `production` or `test` must be the build's; any other word refuses.
+fn rta_posture_check(want: Option<&str>, build: &str) -> Result<(), String> {
+    match want.map(str::trim) {
+        None | Some("") => Ok(()),
+        Some(w @ ("production" | "test")) if w == build => Ok(()),
+        Some(w @ ("production" | "test")) => Err(format!(
+            "RTA_POSTURE={w}, but this binary proves under the {build} posture \
+             (a timing binary is built without `test-security`, a gate binary with it)"
+        )),
+        Some(w) => Err(format!("RTA_POSTURE is production or test, not {w:?}")),
+    }
+}
+
+/// `RTA_POSTURE` takes the build's posture or nothing, and refuses the other
+/// and any misspelling before the harness proves anything.
+#[test]
+fn the_rta_posture_word_must_be_the_builds() {
+    let build = crate::security_posture::name();
+    let other = if build == "test" {
+        "production"
+    } else {
+        "test"
+    };
+    assert_eq!(rta_posture_check(None, build), Ok(()));
+    assert_eq!(rta_posture_check(Some(" "), build), Ok(()));
+    assert_eq!(rta_posture_check(Some(build), build), Ok(()));
+    assert!(rta_posture_check(Some(other), build).is_err());
+    assert!(rta_posture_check(Some("prod"), build).is_err());
+    assert!(rta_posture_check(Some("Test"), build).is_err());
 }
 
 /// Level 1's and level 2's host chains, on the driver's clock: what each
@@ -2749,6 +2819,7 @@ fn rta_one_run(
     levels: usize,
     beside: bool,
     build_beside: bool,
+    skip_checks: Option<&str>,
 ) {
     use super::levels::prove_block_levels;
     let (elf, input) = (elf.to_vec(), input.to_vec());
@@ -3197,43 +3268,60 @@ fn rta_one_run(
             .join(" · ")
     );
     // Off the clock: the base (a BLAKE3 one under the test permit), every
-    // level, and the block's verifier.
-    let ok_base = crate::base_only::with_permit(|| {
-        crate::block_whir::verify_block_whir(&run.base_proof, &elf, &opts, &cfg.format)
-    })
-    .expect("verify runs");
-    let mut ok_levels = true;
-    for (level, p) in run.levels.iter().zip(&run.proofs) {
-        ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
+    // level, and the block's verifier, each step's seconds on one line —
+    // unless `RTA_VERIFY` skips this run (`skip_checks`: its word).
+    if let Some(word) = skip_checks {
+        println!("RTA VERIFIED: skipped (RTA_VERIFY={word})");
+    } else {
+        let t = std::time::Instant::now();
+        let ok_base = crate::base_only::with_permit(|| {
+            crate::block_whir::verify_block_whir(&run.base_proof, &elf, &opts, &cfg.format)
+        })
+        .expect("verify runs");
+        let base_s = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let mut ok_levels = true;
+        for (level, p) in run.levels.iter().zip(&run.proofs) {
+            ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
+        }
+        let levels_s = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let ok_last = super::levels::verify_block_levels_under(
+            &elf,
+            &opts,
+            &cfg.format,
+            run.base_proof.statement(),
+            family,
+            LevelStop::Levels(levels),
+            run.proofs.last().expect("a last level"),
+        )
+        .is_ok();
+        let block_s = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let ok_file = rta_last_file(&elf, &opts, cfg, &run, family, levels);
+        let file_s = t.elapsed().as_secs_f64();
+        println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
+        // A tampered last proof (one published word changed) is refused against
+        // the last level's artifacts.
+        let t = std::time::Instant::now();
+        let mut tampered = run.proofs.last().expect("a last level").clone();
+        if let Some((_, w)) = tampered.public_words.first_mut() {
+            w[0] += crate::tables::types::FE::one();
+        }
+        let top = &run.levels.last().expect("a last level").build.artifacts;
+        let refused = verify_wlfm(top, &tampered, &tampered.public_words).is_err();
+        let tamper_s = t.elapsed().as_secs_f64();
+        println!("RTA TAMPER: a changed word of the last level refused {refused}");
+        println!(
+            "RTA VERIFY SECONDS: base {base_s:.3}s · levels {levels_s:.3}s · block {block_s:.3}s · \
+             last file {file_s:.3}s · tamper {tamper_s:.3}s"
+        );
+        assert!(
+            ok_base && ok_levels && ok_last && ok_file,
+            "everything verifies"
+        );
+        assert!(refused, "a tampered last level is refused");
     }
-    let ok_last = super::levels::verify_block_levels_under(
-        &elf,
-        &opts,
-        &cfg.format,
-        run.base_proof.statement(),
-        family,
-        LevelStop::Levels(levels),
-        run.proofs.last().expect("a last level"),
-    )
-    .is_ok();
-    println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
-    // The last level's file in the knob's encoding (`LAMBDA_VM_LAST_LEVEL_WIRE`),
-    // read back and verified by the block's verifier when it is compact.
-    let ok_file = rta_last_file(&elf, &opts, cfg, &run, family, levels);
-    // A tampered last proof (one published word changed) is refused against
-    // the last level's artifacts.
-    let mut tampered = run.proofs.last().expect("a last level").clone();
-    if let Some((_, w)) = tampered.public_words.first_mut() {
-        w[0] += crate::tables::types::FE::one();
-    }
-    let top = &run.levels.last().expect("a last level").build.artifacts;
-    let refused = verify_wlfm(top, &tampered, &tampered.public_words).is_err();
-    println!("RTA TAMPER: a changed word of the last level refused {refused}");
-    assert!(
-        ok_base && ok_levels && ok_last && ok_file,
-        "everything verifies"
-    );
-    assert!(refused, "a tampered last level is refused");
     // Off the clock, a box row (`RTA_IDENTITY=host`, with
     // `LAMBDA_VM_DETERMINISTIC_GRIND=1`): every level proved again over the
     // same base with its prepared stacks on the host must give the same bytes
@@ -3339,6 +3427,68 @@ fn rta_last_file(
         bytes.len()
     );
     ok
+}
+
+/// Which runs of [`rta_a_real_block_through_its_levels`] are verified off the
+/// clock (the base, every level, the shipped last-level file, a tampered last level
+/// refused): `RTA_VERIFY` unset, empty or `all` (the default) every run;
+/// `last` the process's last run alone (no run of the process follows a
+/// verify); `off` none. Any other word refuses the process before its first
+/// prove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtaVerify {
+    All,
+    Last,
+    Off,
+}
+
+impl RtaVerify {
+    fn from_word(word: Option<&str>) -> Self {
+        match word.map(str::trim) {
+            None | Some("") | Some("all") => Self::All,
+            Some("last") => Self::Last,
+            Some("off") => Self::Off,
+            Some(other) => panic!("RTA_VERIFY is all, last or off, not {other:?}"),
+        }
+    }
+
+    /// `None` when run `k` of `runs` is verified; else the word that skips it.
+    fn skips(self, k: usize, runs: usize) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Last if k + 1 == runs => None,
+            Self::Last => Some("last"),
+            Self::Off => Some("off"),
+        }
+    }
+}
+
+/// The harness verifies every run unless told `last` or `off`, `last` verifies
+/// the last run alone, and a word it does not take refuses (a misspelt `off`
+/// must not leave a run verified by surprise, nor a misspelt `all` skip it).
+#[test]
+fn the_rta_verify_word_verifies_by_default_and_refuses_other_words() {
+    for on in [None, Some(""), Some("all"), Some(" all ")] {
+        let v = RtaVerify::from_word(on);
+        assert_eq!(v, RtaVerify::All, "{on:?}");
+        assert!((0..3).all(|k| v.skips(k, 3).is_none()), "{on:?}");
+    }
+    let last = RtaVerify::from_word(Some("last"));
+    assert_eq!(
+        (0..3).map(|k| last.skips(k, 3)).collect::<Vec<_>>(),
+        [Some("last"), Some("last"), None]
+    );
+    assert_eq!(last.skips(0, 1), None, "one run: it is the last");
+    for off in [Some("off"), Some(" off\n")] {
+        let v = RtaVerify::from_word(off);
+        assert!((0..3).all(|k| v.skips(k, 3) == Some("off")), "{off:?}");
+    }
+    for bad in ["0", "1", "none", "Off", "skip", "all,off", "first"] {
+        assert!(
+            std::panic::catch_unwind(|| RtaVerify::from_word(Some(bad))).is_err(),
+            "{bad:?} taken"
+        );
+    }
 }
 
 /// One run of level 1 over a block's first `k` groups
@@ -4422,6 +4572,128 @@ fn a_levels_verifier_pins_its_familys_base() {
         )
         .unwrap_or_else(|e| panic!("shrink {shrink}: {e}"));
     }
+}
+
+#[cfg(feature = "test-security")]
+#[test]
+fn two_compact_blake3_levels_verify_at_test_security() {
+    use super::builder::{B3Block, B3Cv, LfmBuilder};
+    use super::compiler::compile;
+    use super::last_level::LastLevel;
+    use super::levels::build_level;
+    use super::wlfm::{WlfmProving, prove_wlfm_as};
+    use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program};
+    use crate::tables::types::FE;
+
+    let family = WlfmFamily::B3;
+    let mut builder = LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(true);
+    let zero = builder.digest_const([FE::zero(); 4]).as_cell();
+    let digest = builder.b3_compress(
+        B3Cv::Iv,
+        B3Block::Lanes([zero; 4]),
+        0,
+        crypto::hash::blake3::chain::FLAGS_ONE_BLOCK as u8,
+    );
+    for word in digest {
+        builder.public(word);
+    }
+    let first = build_level(
+        compile(builder.finish()),
+        family,
+        None,
+        false,
+        (LevelStop::DEFAULT, 1),
+        LastLevel::OFF,
+    )
+    .expect("build level 1");
+    let first_proof = prove_wlfm_as(&first.program, &first.build, &[], WlfmProving::Streamed)
+        .expect("prove level 1");
+    verify_wlfm(
+        &first.build.artifacts,
+        &first_proof,
+        &first_proof.public_words,
+    )
+    .expect("verify level 1");
+
+    let child = WlfmChild {
+        artifacts: first.build.artifacts,
+        num_public_words: first_proof.public_words.len(),
+        cap_mux: Some(super::merkle_cap::CapMux::Packed),
+    };
+    let program = wlfm_leg_program(&child).expect("emit the level 2 verifier");
+    let arena = wlfm_leg_arena(&child, &first_proof).expect("encode the level 1 proof");
+    let second = build_level(
+        program,
+        family,
+        None,
+        false,
+        (LevelStop::DEFAULT, 2),
+        LastLevel::OFF,
+    )
+    .expect("build level 2");
+    let second_proof = prove_wlfm_as(
+        &second.program,
+        &second.build,
+        &[arena],
+        WlfmProving::Streamed,
+    )
+    .expect("prove level 2");
+    assert_eq!(
+        second_proof.public_words, first_proof.public_words,
+        "level 2 republishes the verified level 1 words"
+    );
+    verify_wlfm(
+        &second.build.artifacts,
+        &second_proof,
+        &first_proof.public_words,
+    )
+    .expect("verify level 2");
+}
+
+#[cfg(feature = "test-security")]
+#[test]
+fn the_pinned_blake3_base_and_both_levels_verify_at_test_security() {
+    let family = WlfmFamily::B3;
+    let format = super::levels::pin_family(
+        BlockFormat::pinned_with(multilinear::whir_chain::GroupFold::Indexed),
+        family,
+        crate::block_whir::B3Rounds::Fri,
+    )
+    .expect("the pinned BLAKE3 format");
+    let opts = super::proof::block_base_options_under(&format.zf);
+    let elf = crate::test_utils::asm_elf_bytes("basic_program");
+    let run = super::levels::prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &streamed_options(),
+        family,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
+    .expect("the block proves through both levels");
+    assert!(
+        crate::base_only::with_permit(|| crate::block_whir::verify_block_whir(
+            &run.base_proof,
+            &elf,
+            &opts,
+            &format
+        )
+        .expect("base verification runs")),
+        "the BLAKE3 base verifies"
+    );
+    assert_eq!(run.levels.len(), 2, "the driver builds both levels");
+    assert_eq!(run.proofs.len(), 2, "the driver proves both levels");
+    for (index, (level, proof)) in run.levels.iter().zip(&run.proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, proof, &proof.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", index + 1));
+    }
+    super::levels::verify_block_levels(&elf, run.base_proof.statement(), family, &run.proofs[1])
+        .expect("the public verifier accepts the last level");
 }
 
 /// ★ A public entry accepts: a small block with a keccak call (`test_keccak`,

@@ -8,7 +8,9 @@
 #   3. num_parts==1 (DECODE) device path (make test-cuda-d1)
 #   4. GPU error-path / CPU fallback     (make test-cuda-fallback)
 #   5. prover/stark/crypto/ecsm suite    (make test-prover-cuda) — CPU CI's prover tests on GPU
-#   6. comprehensive all-instructions    (make test-prover-comprehensive-cuda)
+#   6. production-posture coverage       (make test-prover-comprehensive-cuda)
+#   7. cross-posture proof rejection     (make test-cross-posture-cuda)
+#   8. fixed-seed proof identities      (make test-prover-identities-cuda)
 #
 # Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All groups
 # run even if one fails (so the log shows every failure); the script exits non-zero if ANY
@@ -51,17 +53,22 @@ make compile-programs-rust
 fail=0
 run() {  # $1 = make target
     log "make $1"
-    if ! make "$1"; then
+    local output
+    output=$(mktemp)
+    if ! make "$1" 2>&1 | tee "$output" || grep -qi 'empty cubin stubs' "$output"; then
         echo "::error::GPU test group failed: $1"
         fail=1
     fi
+    rm -f "$output"
 }
 run test-math-cuda                  # Group 1: kernel parity
 run test-cuda-integration           # Group 2: end-to-end GPU dispatch + proof verifies
 run test-cuda-d1                    # Group 3: num_parts==1 (DECODE) device DEEP/FRI + verify
 run test-cuda-fallback              # Group 4: GPU error -> CPU fallback still verifies
 run test-prover-cuda                # Group 5: prover/stark/crypto/ecsm suite on the GPU path
-run test-prover-comprehensive-cuda  # Group 6: comprehensive all-instructions prove on GPU
+run test-prover-comprehensive-cuda  # Group 6: production proofs and parameter pins
+run test-cross-posture-cuda         # Group 7: production refusal of TEST proofs
+run test-prover-identities-cuda     # Group 8: deterministic proofs under the host and card levers
 
 if [ "$fail" -ne 0 ]; then
     log "FAILED — one or more GPU test groups failed"

@@ -278,8 +278,7 @@ fn record_build(
 /// part) makes the tables it makes with none, under both histories, with and
 /// without a private input: the hoisted state built once a build, and never
 /// with the knob off.
-#[test]
-fn record_mode_with_the_state_hoisted_builds_the_same_tables() {
+fn record_mode_with_the_state_hoisted_builds_the_same_tables(name: &str) {
     let _turn = turn();
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     // Counted: another test's block prove beside this one, under the knob's
@@ -289,45 +288,62 @@ fn record_mode_with_the_state_hoisted_builds_the_same_tables() {
         ..HostHoist::none()
     }
     .counted();
-    for name in [
-        "fused_mem_cases",
-        "page_runs",
-        "cross_4gib",
-        "test_keccak256",
-    ] {
-        let program = program(name);
-        for input in [Vec::new(), (0..300u32).map(|i| i as u8).collect()] {
-            // The executor must run the program on this input.
-            Executor::new(&program, input.clone())
-                .expect("the executor starts")
-                .run()
-                .expect("the program runs");
-            for words in [false, true] {
-                for (window, walkers) in [(7, 1), (33, 3)] {
-                    let what = format!(
-                        "{name}, {} input bytes, words {words}, window {window}, {walkers} walkers",
-                        input.len()
-                    );
-                    let _ = calls::take_states();
-                    let want = record_build(
-                        &program,
-                        &input,
-                        window,
-                        walkers,
-                        words,
-                        HostHoist::none().counted(),
-                    )
-                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
-                    assert_eq!(calls::take_states(), 0, "{what}: off never hoists");
-                    for hoist in [state, HostHoist::all().counted()] {
-                        let got = record_build(&program, &input, window, walkers, words, hoist)
-                            .unwrap_or_else(|e| panic!("{what}, {hoist:?}: {e:?}"));
-                        assert_eq!(calls::take_states(), 1, "{what}, {hoist:?}: built once");
-                        same_traces(&want, &got);
-                    }
+    let program = program(name);
+    for input in [Vec::new(), (0..300u32).map(|i| i as u8).collect()] {
+        // The executor must run the program on this input.
+        Executor::new(&program, input.clone())
+            .expect("the executor starts")
+            .run()
+            .expect("the program runs");
+        for words in [false, true] {
+            for (window, walkers) in [(7, 1), (33, 3)] {
+                let what = format!(
+                    "{name}, {} input bytes, words {words}, window {window}, {walkers} walkers",
+                    input.len()
+                );
+                let _ = calls::take_states();
+                let want = record_build(
+                    &program,
+                    &input,
+                    window,
+                    walkers,
+                    words,
+                    HostHoist::none().counted(),
+                )
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                assert_eq!(calls::take_states(), 0, "{what}: off never hoists");
+                for hoist in [state, HostHoist::all().counted()] {
+                    let got = record_build(&program, &input, window, walkers, words, hoist)
+                        .unwrap_or_else(|e| panic!("{what}, {hoist:?}: {e:?}"));
+                    assert_eq!(calls::take_states(), 1, "{what}, {hoist:?}: built once");
+                    same_traces(&want, &got);
                 }
             }
         }
+    }
+}
+
+mod state_hoisted_record_mode {
+    use super::*;
+
+    #[test]
+    fn fused_memory() {
+        record_mode_with_the_state_hoisted_builds_the_same_tables("fused_mem_cases");
+    }
+
+    #[test]
+    fn page_runs() {
+        record_mode_with_the_state_hoisted_builds_the_same_tables("page_runs");
+    }
+
+    #[test]
+    fn crossing_4gib() {
+        record_mode_with_the_state_hoisted_builds_the_same_tables("cross_4gib");
+    }
+
+    #[test]
+    fn keccak256() {
+        record_mode_with_the_state_hoisted_builds_the_same_tables("test_keccak256");
     }
 }
 

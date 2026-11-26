@@ -1178,6 +1178,7 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// group's run as the default (a joint leaf and one path a query; the lean
 /// check's median mix one leaf fewer), the block presets' lean KECCAK_RND form
 /// (1,011 interactions), the ECREC table and the 23-count statement.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1493,6 +1494,7 @@ fn the_lean_leaf_cuts_every_groups_rows_on_the_median_mix() {
 /// takes more. At the single heights ([`LeafScale::Fixed`]): at the default
 /// blowup 2 the median mix takes enough leaves that the production scale
 /// doubles them, and the doubled partition is the next test's.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");

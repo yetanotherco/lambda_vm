@@ -29,6 +29,7 @@ pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;
 pub mod recursion;
+pub mod security_posture;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -2069,7 +2070,9 @@ pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmPr
     prove_with_options_and_inputs(
         elf_bytes,
         private_inputs,
-        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &GoldilocksCubicProofOptions::with_blowup(2)
+            .map(security_posture::stark_options)
+            .expect("blowup=2 is always valid"),
         &MaxRowsConfig::default(),
     )
 }
@@ -2282,7 +2285,9 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
         vm_proof,
         elf_bytes,
-        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &GoldilocksCubicProofOptions::with_blowup(2)
+            .map(security_posture::stark_options)
+            .expect("blowup=2 is always valid"),
         None,
         None,
     )

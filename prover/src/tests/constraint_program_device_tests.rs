@@ -146,7 +146,9 @@ fn check_air_device(
 
 #[test]
 fn all_table_programs_lower_and_match_folders() {
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let opts = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
     let airs = production_airs(&opts);
     assert_eq!(
         airs.len(),

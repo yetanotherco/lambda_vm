@@ -863,7 +863,9 @@ fn a_non_boolean_index_bit_is_refused() {
         compile(b.finish())
     };
     validate(&program).expect("admissible");
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+    let opts = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("options");
     let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
     let arena = vec![base_word(FE::from(2u64))];
     let exec = execute(&program, std::slice::from_ref(&arena), &KIND).expect("executes");

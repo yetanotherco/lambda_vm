@@ -130,8 +130,12 @@ pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape])
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
         format.whir_folds,
         tallest,
-        CHAIN_SECURITY_BITS,
-        format.whir_grind_bits(),
+        crate::security_posture::chain_security_bits(),
+        format
+            .whir_grind
+            .bits(crate::security_posture::whir_grind_bits(
+                format.whir_grind_bits,
+            )),
     );
     format.chain(config)
 }

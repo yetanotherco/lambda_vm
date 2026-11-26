@@ -51,7 +51,7 @@ where
         "grinding_factor must be in 1..=64, got {grinding_factor}"
     );
     let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
-    let limit = 1 << (64 - grinding_factor);
+    let limit = grinding_limit(grinding_factor);
     is_valid_nonce_for_inner_hash::<D>(&inner_hash, nonce, limit)
 }
 
@@ -123,17 +123,22 @@ where
         return generate_nonce_smallest::<D>(seed, grinding_factor);
     }
     let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
-    let limit = 1 << (64 - grinding_factor);
+    let limit = grinding_limit(grinding_factor);
 
     #[cfg(not(feature = "parallel"))]
-    return (0..u64::MAX).find(|&candidate_nonce| {
+    return (0..=u64::MAX).find(|&candidate_nonce| {
         is_valid_nonce_for_inner_hash::<D>(&inner_hash, candidate_nonce, limit)
     });
 
     #[cfg(feature = "parallel")]
-    return (0..u64::MAX).into_par_iter().find_any(|&candidate_nonce| {
-        is_valid_nonce_for_inner_hash::<D>(&inner_hash, candidate_nonce, limit)
-    });
+    return (0..u64::MAX)
+        .into_par_iter()
+        .find_any(|&candidate_nonce| {
+            is_valid_nonce_for_inner_hash::<D>(&inner_hash, candidate_nonce, limit)
+        })
+        .or_else(|| {
+            is_valid_nonce_for_inner_hash::<D>(&inner_hash, u64::MAX, limit).then_some(u64::MAX)
+        });
 }
 
 /// ★ The SMALLEST valid nonce — a function of the seed and the factor alone,
@@ -141,11 +146,17 @@ where
 ///
 /// Exposed as its own entry point rather than reachable only through the
 /// environment, so the property "this is reproducible, and it is genuinely the
-/// smallest" is testable without a process-global switch. `find_first` rather
-/// than `find_any`: rayon prunes candidates above the best hit so far, so the
-/// cost is bounded by the smallest hit's index rather than by the whole range,
-/// but it cannot stop as early as `find_any` and that is the price of the
-/// property.
+/// smallest" is testable without a process-global switch.
+///
+/// Under `parallel` the range is scanned in consecutive chunks of
+/// [`SMALLEST_CHUNK_PER_THREAD`] nonces a thread, each chunk by `find_first`
+/// across the pool, stopping at the first chunk that holds a valid nonce: the
+/// answer is the smallest valid nonce of that chunk, and no earlier chunk holds
+/// one, so it is the smallest valid nonce overall — the same nonce a scan from
+/// 0 finds. One `find_first` over the whole of `0..u64::MAX` returns that nonce
+/// too, but rayon cuts the range into a piece a thread up front, so every
+/// thread but the first scans near 2^64 / threads and only one thread does the
+/// useful work: a serial search that also keeps every other core busy.
 pub fn generate_nonce_smallest<D>(seed: &[u8; 32], grinding_factor: u8) -> Option<u64>
 where
     D: Digest + OutputSizeUser<OutputSize = U32> + 'static,
@@ -155,19 +166,67 @@ where
         "grinding_factor must be in 1..=64, got {grinding_factor}"
     );
     let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
-    let limit = 1 << (64 - grinding_factor);
+    let limit = grinding_limit(grinding_factor);
 
     #[cfg(not(feature = "parallel"))]
-    return (0..u64::MAX).find(|&candidate_nonce| {
+    return (0..=u64::MAX).find(|&candidate_nonce| {
         is_valid_nonce_for_inner_hash::<D>(&inner_hash, candidate_nonce, limit)
     });
 
     #[cfg(feature = "parallel")]
-    return (0..u64::MAX)
+    return smallest_in_chunks(0..=u64::MAX, SMALLEST_CHUNK_PER_THREAD, |candidate_nonce| {
+        is_valid_nonce_for_inner_hash::<D>(&inner_hash, candidate_nonce, limit)
+    });
+}
+
+/// Nonces a pool thread scans in one chunk of [`generate_nonce_smallest`]'s
+/// search: a chunk holds this many times the pool's threads.
+#[cfg(feature = "parallel")]
+pub const SMALLEST_CHUNK_PER_THREAD: u64 = 1 << 12;
+
+/// The smallest nonce in the inclusive range matching `valid`, scanned in consecutive
+/// chunks of `per_thread` nonces a pool thread, each chunk by `find_first`.
+#[cfg(feature = "parallel")]
+pub(crate) fn smallest_in_chunks(
+    range: core::ops::RangeInclusive<u64>,
+    per_thread: u64,
+    valid: impl Fn(u64) -> bool + Sync,
+) -> Option<u64> {
+    let chunk = per_thread
+        .max(1)
+        .saturating_mul(rayon::current_num_threads().max(1) as u64);
+    let (mut start, last) = range.into_inner();
+    while start <= last {
+        let end = start.saturating_add(chunk - 1).min(last);
+        if let Some(n) = (start..=end).into_par_iter().find_first(|&n| valid(n)) {
+            return Some(n);
+        }
+        if end == last {
+            break;
+        }
+        start = end + 1;
+    }
+    None
+}
+
+/// [`generate_nonce_smallest`]'s search before the chunks: one `find_first`
+/// over the whole range. Test-only: the equality and pace probes compare the
+/// two.
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) fn generate_nonce_smallest_whole_range<D>(
+    seed: &[u8; 32],
+    grinding_factor: u8,
+) -> Option<u64>
+where
+    D: Digest + OutputSizeUser<OutputSize = U32> + 'static,
+{
+    let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
+    let limit = grinding_limit(grinding_factor);
+    (0..u64::MAX)
         .into_par_iter()
         .find_first(|&candidate_nonce| {
             is_valid_nonce_for_inner_hash::<D>(&inner_hash, candidate_nonce, limit)
-        });
+        })
 }
 
 /// Successful KECCAK GPU grind dispatches — one per nonce search that ran on
@@ -431,8 +490,33 @@ where
 
     let digest = D::digest(data);
 
-    let seed_head = u64::from_be_bytes(digest[..8].try_into().unwrap());
-    seed_head < limit
+    digest_prefix_below_limit(&digest, limit)
+}
+
+#[inline(always)]
+fn grinding_limit(factor: u8) -> u64 {
+    1 << (64 - factor)
+}
+
+#[inline(always)]
+fn digest_prefix_below_limit(digest: &[u8], limit: u64) -> bool {
+    u64::from_be_bytes(digest[..8].try_into().unwrap()) < limit
+}
+
+#[cfg(test)]
+#[test]
+fn the_hash_prefix_limit_is_strict_at_the_first_and_last_factors() {
+    for (factor, boundary) in [(1, 0x8000_0000_0000_0000u64), (64, 1)] {
+        let limit = grinding_limit(factor);
+        let mut digest = [0xff; 32];
+        digest[..8].copy_from_slice(&(boundary - 1).to_be_bytes());
+        assert!(digest_prefix_below_limit(&digest, limit), "factor {factor}");
+        digest[..8].copy_from_slice(&boundary.to_be_bytes());
+        assert!(
+            !digest_prefix_below_limit(&digest, limit),
+            "factor {factor}"
+        );
+    }
 }
 
 /// Returns the bit-string constructed as

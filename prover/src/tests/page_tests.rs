@@ -178,7 +178,9 @@ fn elf_data_page_commitments(
 fn page_commitments_some_matches_default_path() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     let list = elf_data_page_commitments(&elf_bytes, &vm_proof, &options);
     assert!(
@@ -202,7 +204,9 @@ fn page_commitments_some_matches_default_path() {
 fn page_commitments_wrong_value_rejects() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     let mut list = elf_data_page_commitments(&elf_bytes, &vm_proof, &options);
     assert!(!list.is_empty(), "test ELF must have ≥ 1 ELF data page");
@@ -221,7 +225,9 @@ fn page_commitments_wrong_value_rejects() {
 fn page_commitments_zero_bytes_rejects() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     let mut list = elf_data_page_commitments(&elf_bytes, &vm_proof, &options);
     assert!(!list.is_empty(), "test ELF must have ≥ 1 ELF data page");
@@ -241,7 +247,9 @@ fn page_commitments_zero_bytes_rejects() {
 fn page_commitments_empty_list_matches_none() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     let empty: [(u64, stark::config::Commitment); 0] = [];
     let result = verify_with_options(&vm_proof, &elf_bytes, &options, None, Some(&empty))

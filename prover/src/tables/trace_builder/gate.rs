@@ -40,6 +40,8 @@ struct GateState {
     /// acquisitions waited.
     waited: f64,
     waits: usize,
+    #[cfg(test)]
+    wait_starts: usize,
     /// Why the gate stopped, once it has.
     stopped: Option<String>,
 }
@@ -97,7 +99,13 @@ impl ByteGate {
                 }
                 return Ok(());
             }
-            since.get_or_insert_with(std::time::Instant::now);
+            since.get_or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    state.wait_starts += 1;
+                }
+                std::time::Instant::now()
+            });
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -246,6 +254,10 @@ mod tests {
                 let gate = Arc::clone(&gate);
                 std::thread::spawn(move || gate.acquire(1, 100))
             };
+            while gate.state().wait_starts == 0 {
+                assert!(!waiter.is_finished(), "table 1 waits for table 0");
+                std::thread::yield_now();
+            }
             std::thread::sleep(Duration::from_millis(50));
             assert!(!waiter.is_finished(), "table 1 waits for table 0");
             gate.release(0);

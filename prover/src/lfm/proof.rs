@@ -1277,7 +1277,7 @@ pub fn aggregation_wrap_options_under(zf: &crate::zf_format::ZfFormat) -> ProofO
         .expect("blowup=4 is valid");
     opts.fri_number_of_queries = LFM_QUERIES;
     opts.fri_final_poly_log_degree = 8;
-    zf.options(opts)
+    crate::security_posture::stark_options(zf.options(opts))
 }
 
 /// The LFM proofs' query count: two above the blowup-4 preset's 110, which
@@ -1302,7 +1302,7 @@ pub fn block_base_options() -> ProofOptions {
 
 /// [`block_base_options`] under the format `zf` rather than the process's.
 pub fn block_base_options_under(zf: &crate::zf_format::ZfFormat) -> ProofOptions {
-    zf.options(crate::recursion::Preset::Blowup4.options())
+    crate::security_posture::stark_options(zf.options(crate::recursion::Preset::Blowup4.options()))
 }
 
 #[cfg(test)]

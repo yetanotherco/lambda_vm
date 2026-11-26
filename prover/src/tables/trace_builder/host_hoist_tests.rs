@@ -11,7 +11,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
 
-use super::finish_tests::shape_and_words;
+use super::finish_tests::main_words_match;
 use super::gate::ByteGate;
 use super::*;
 use crate::tables::MaxRowsConfig;
@@ -104,6 +104,7 @@ fn the_hoisted_page_layout_is_the_page_layout() {
 }
 
 type Configure = Box<dyn for<'b> Fn(WindowedTraceBuilder<'b>) -> WindowedTraceBuilder<'b>>;
+type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 /// The finish's configurations: the block's under the word memory format
 /// (BITWISE counted beside the builds), the word format with BITWISE counted
@@ -159,7 +160,7 @@ fn streamed(
     hoist: HostHoist,
 ) -> (
     (Vec<(u64, Option<Vec<u8>>, bool)>, String, Vec<u8>),
-    Vec<(usize, Option<(usize, usize, Vec<u64>)>)>,
+    Vec<(usize, Option<Table>)>,
     (usize, usize, usize),
 ) {
     let max_rows = MaxRowsConfig::small();
@@ -189,10 +190,7 @@ fn streamed(
                     gate.release(placed);
                     placed += 1;
                 }
-                out.push((
-                    emitted.position,
-                    emitted.table.as_ref().map(shape_and_words),
-                ));
+                out.push((emitted.position, emitted.table));
                 Ok(())
             }))
         })
@@ -217,48 +215,78 @@ fn streamed(
 /// from whole pages, and without it a byte at a time as before, never from
 /// pages; under `image` the builder writes its image a run at a time, and
 /// without it never.
-#[test]
-fn the_hoisted_parts_stream_the_same_tables() {
+mod the_hoisted_parts_stream_the_same_tables {
+    macro_rules! cases {
+        ($($name:ident),+ $(,)?) => {
+            $(
+                mod $name {
+                    use super::super::{assert_hoisted_parts_stream_same_tables, inputs};
+
+                    #[test]
+                    fn no_input() {
+                        assert_hoisted_parts_stream_same_tables(stringify!($name), &inputs()[0]);
+                    }
+
+                    #[test]
+                    fn short_input() {
+                        assert_hoisted_parts_stream_same_tables(stringify!($name), &inputs()[1]);
+                    }
+
+                    #[test]
+                    fn two_pages() {
+                        assert_hoisted_parts_stream_same_tables(stringify!($name), &inputs()[2]);
+                    }
+                }
+            )+
+        };
+    }
+
+    cases!(fused_mem_cases, test_keccak256);
+}
+
+fn assert_hoisted_parts_stream_same_tables(name: &str, input: &[u8]) {
     let parts = [
         ("pages", HostHoist::parse(Some("pages")).expect("a part")),
         ("image", HostHoist::parse(Some("image")).expect("a part")),
         ("all", HostHoist::all()),
     ];
-    for name in PROGRAMS {
-        for input in inputs() {
-            let (program, logs) = run_on(name, &input);
-            for (config, configure) in configs() {
-                let what = format!("{name}, {} input bytes, {config}", input.len());
-                let (header_off, tables_off, calls_off) =
-                    streamed(&program, &logs, &input, &configure, HostHoist::default());
-                assert_eq!(calls_off.1, 0, "{what}: off never hoists");
-                assert!(calls_off.0 >= 1, "{what}: off computes it by byte");
-                assert_eq!(calls_off.2, 0, "{what}: off writes no run");
-                assert!(
-                    tables_off.iter().filter(|(_, t)| t.is_some()).count() > 10,
-                    "{what}: tables built"
-                );
-                for (part, hoist) in parts {
-                    let what = format!("{what}, {part}");
-                    let (header_on, tables_on, calls_on) =
-                        streamed(&program, &logs, &input, &configure, hoist);
-                    assert_eq!(header_on, header_off, "{what}: the header");
-                    assert_eq!(tables_on.len(), tables_off.len(), "{what}: the tables");
-                    for (k, (a, b)) in tables_on.iter().zip(&tables_off).enumerate() {
-                        assert_eq!(a, b, "{what}: table {k}");
-                    }
-                    if hoist.pages {
-                        assert_eq!(
-                            (calls_on.0, calls_on.1),
-                            (0, 1),
-                            "{what}: hoisted once, never by byte"
-                        );
-                    } else {
-                        assert_eq!(calls_on.1, 0, "{what}: never hoisted");
-                    }
-                    assert_eq!(calls_on.2, usize::from(hoist.image), "{what}: runs");
-                }
+    let (program, logs) = run_on(name, input);
+    for (config, configure) in configs() {
+        let what = format!("{name}, {} input bytes, {config}", input.len());
+        let (header_off, tables_off, calls_off) =
+            streamed(&program, &logs, input, &configure, HostHoist::default());
+        assert_eq!(calls_off.1, 0, "{what}: off never hoists");
+        assert!(calls_off.0 >= 1, "{what}: off computes it by byte");
+        assert_eq!(calls_off.2, 0, "{what}: off writes no run");
+        assert!(
+            tables_off.iter().filter(|(_, t)| t.is_some()).count() > 10,
+            "{what}: tables built"
+        );
+        for (part, hoist) in parts {
+            let what = format!("{what}, {part}");
+            let (header_on, tables_on, calls_on) =
+                streamed(&program, &logs, input, &configure, hoist);
+            assert_eq!(header_on, header_off, "{what}: the header");
+            assert_eq!(tables_on.len(), tables_off.len(), "{what}: the tables");
+            for ((on_pos, on), (off_pos, off)) in tables_on.iter().zip(&tables_off) {
+                assert_eq!(on_pos, off_pos, "{what}: the AIR position");
+                let matches = match (on, off) {
+                    (None, None) => true,
+                    (Some(on), Some(off)) => main_words_match(on, off),
+                    _ => false,
+                };
+                assert!(matches, "{what}: table {on_pos}");
             }
+            if hoist.pages {
+                assert_eq!(
+                    (calls_on.0, calls_on.1),
+                    (0, 1),
+                    "{what}: hoisted once, never by byte"
+                );
+            } else {
+                assert_eq!(calls_on.1, 0, "{what}: never hoisted");
+            }
+            assert_eq!(calls_on.2, usize::from(hoist.image), "{what}: runs");
         }
     }
 }

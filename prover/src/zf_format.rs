@@ -696,6 +696,11 @@ impl ZfFormat {
     fn announce(&self) {
         println!("{}", self.banner());
         println!("{}", self.whir_schedule_line());
+        // Only the prover crate's own test binary built with `test-security`
+        // prints a third line (`crate::security_posture`).
+        if let Some(line) = crate::security_posture::banner() {
+            println!("{line}");
+        }
     }
 
     /// `Err` naming the knobs set to a lever this build does not implement.
@@ -1536,6 +1541,7 @@ mod tests {
     /// ★ Q is charged the tallest STACKED polynomial, not only the widest
     /// table: three narrow tables that each fit 14 variables stack to 16, a
     /// four-round chain under first6 where each table alone runs three.
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_query_count_charges_the_tallest_stacked_polynomial() {
         use crate::multilinear_prove::chain_config_under;
@@ -1650,6 +1656,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_schedule_line_states_the_rounds() {
         assert_eq!(
@@ -1698,6 +1705,7 @@ mod tests {
     /// is carried, Q is charged the schedule's rounds, and at the block's
     /// tallest stack (25) every fold arm keeps the legacy Q = 112 at 20 grind
     /// bits, and the default's Q = 114 at its 18.
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_production_chain_config_under_each_arm() {
         use crate::multilinear_prove::chain_config_under;
@@ -1749,6 +1757,7 @@ mod tests {
     /// default's rollback. Blowup 4 moves the chains' rate and the query count
     /// the rule charges for it, and nothing else: not the WHIR format fields,
     /// not the univariate options the recursion's proofs are built from.
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_blowup_knob_moves_the_rate_and_the_rule_s_queries_only() {
         use crate::multilinear_prove::chain_config_under;
@@ -1879,6 +1888,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn production_sites_build_the_default_format_when_nothing_is_set() {
         // No test sets a ZF knob, so the process format is the default and the
@@ -2023,6 +2033,7 @@ mod tests {
     /// and the in-guest emitters build from, as its bits and its nonce layout
     /// together, at every accepted stack; Q does not move, and the knob moves
     /// nothing else.
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_whir_grind_lever_is_selectable_and_carried() {
         for (v, bits, nonces) in [
@@ -2071,6 +2082,7 @@ mod tests {
     /// The default differs from it in the grind (placed before the queries
     /// alone, at 18 bits), its rate (blowup 2) and Q (229) and the nonce
     /// layout, and in nothing else.
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_grind_opt_out_is_the_production_config_before_p2() {
         let before_p2 = ChainConfig {
@@ -2161,6 +2173,7 @@ mod tests {
     /// the block's shapes), 111 → 113 below a fourth round, under either
     /// placement. At the default's blowup 2 the same two bits buy four queries
     /// at every production height.
+    #[cfg(not(feature = "test-security"))]
     #[test]
     fn the_grind_bits_knob_trades_two_bits_for_two_queries() {
         use crate::multilinear_prove::chain_config_under;

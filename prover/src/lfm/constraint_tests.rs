@@ -41,7 +41,9 @@ type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
 
 fn options() -> stark::proof::options::ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 /// Deterministic SplitMix64, matching the artifact suite's generator so the two

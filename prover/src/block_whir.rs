@@ -1282,7 +1282,7 @@ impl BlockFormat {
             config = config
                 .with_whir_rounds(
                     usize::from(shrink),
-                    crate::multilinear_prove::CHAIN_SECURITY_BITS,
+                    crate::security_posture::chain_security_bits(),
                     B3_ROUND_FORM_STACK_BOUND,
                 )
                 .expect("a shrink from 1 to 3 is a round form");

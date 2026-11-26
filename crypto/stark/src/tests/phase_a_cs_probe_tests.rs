@@ -9,11 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use math::field::{
-    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+    extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
     goldilocks::GoldilocksField as Fp,
 };
 use multilinear::{
-    mle::Mle,
     whir_chain::{ArgueFormat, ChainConfig},
     whir_commit::TreeDrop,
     whir_hash::WhirHash,
@@ -432,15 +431,31 @@ fn the_merge_probe_runs_after_each_argue_and_moves_no_byte() {
 /// no room for a job (hold 0), or no store and no host each defer every
 /// group, by name; nothing runs, and the bytes are the same.
 ///
-/// The no-store case needs a process whose commits hold no store: with a
-/// card each group's columns go up for its commit, so the group is on the
-/// card and the lane does not defer it for want of a store. There it is
-/// left out.
+/// On CUDA, run with column uploads disabled so the no-store case can
+/// exercise the same deferral as the host build.
 #[test]
 fn the_lane_defers_a_group_it_may_not_hold() {
-    let column = Mle::new(vec![FieldElement::<Fp>::from(1u64); 16]).expect("a column");
-    let stores = multilinear::gpu::upload_columns(&[&column]).is_some();
-    let cases = [
+    #[cfg(feature = "cuda")]
+    if !multilinear::gpu::columns_disabled() {
+        // A CUDA worker can upload this fixture's columns. Configure a
+        // child process before the upload switch is read so the NoStore
+        // arm runs without a store on both builds.
+        let (_, module) = module_path!().split_once("::").expect("the test module");
+        let test = format!("{module}::the_lane_defers_a_group_it_may_not_hold");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", &test, "--nocapture"])
+            .env("LAMBDA_VM_NO_GPU_COLUMNS", "1")
+            .output()
+            .expect("run the lane test without a column store");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{test} did not pass without a column store\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    for (limits, host, why) in [
         (
             LaneLimits {
                 hold_bytes: Some(0),
@@ -458,11 +473,7 @@ fn the_lane_defers_a_group_it_may_not_hold() {
             LaneDefer::Hold,
         ),
         (LaneLimits::default(), false, LaneDefer::NoStore),
-    ];
-    for (limits, host, why) in cases {
-        if stores && why == LaneDefer::NoStore {
-            continue;
-        }
+    ] {
         let (probe, decided) = lane(false, host, limits);
         let proved = prove_probed(ArgueFormat::BATCHED, probe);
         assert_eq!(

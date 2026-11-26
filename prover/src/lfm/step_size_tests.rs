@@ -79,7 +79,9 @@ type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("fixture options")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("fixture options")
 }
 
 // =============================================================================

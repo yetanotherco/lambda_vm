@@ -360,12 +360,13 @@ fn the_last_levels_levers_give_a_sized_round_form_config() {
         on.num_queries, today_w.num_queries,
         "round 0 keeps its count"
     );
-    assert_eq!(on.num_queries, 229);
-    assert_eq!(
-        queries,
-        vec![229, 114, 76, 57, 46, 39, 33],
-        "all seven counts"
-    );
+    let expected = if crate::security_posture::TEST_POSTURE {
+        [55, 28, 19, 14, 11, 10, 8]
+    } else {
+        [229, 114, 76, 57, 46, 39, 33]
+    };
+    assert_eq!(on.num_queries, expected[0]);
+    assert_eq!(queries, expected, "all seven counts");
     assert_ne!(
         on.fold_word(),
         today_w.fold_word(),

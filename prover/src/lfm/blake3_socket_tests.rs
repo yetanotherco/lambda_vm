@@ -70,7 +70,9 @@ type E = GoldilocksExtension;
 const KIND: HasherKind = HasherKind::Blake3;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 // =========================================================================

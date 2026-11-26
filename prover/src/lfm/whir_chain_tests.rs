@@ -503,6 +503,142 @@ fn the_chain_executes_on_a_proof_the_host_accepts() {
     }
 }
 
+/// ★ The test posture is real where it matters: the in-guest verifier of the
+/// production chain at the block's stack (pinned at 183 631 instructions in
+/// [`the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2`], which this
+/// binary therefore fails) is a quarter of that, and its config grinds 8 bits.
+#[cfg(feature = "test-security")]
+#[test]
+fn the_test_posture_shrinks_the_production_chain_program() {
+    let opt_out = crate::zf_format::ZfFormat {
+        whir_blowup: 4,
+        whir_grind: crate::zf_format::WhirGrind::All,
+        whir_grind_bits: crate::zf_format::LEGACY_WHIR_GRIND_BITS,
+        ..crate::zf_format::ZfFormat::DEFAULT
+    };
+    let config = crate::multilinear_prove::chain_config_under(&opt_out, &[(1, 25)]);
+    assert_eq!(config.grind, GrindBits::uniform(8));
+    let program = chain_program(&ChainShape::new(&config, 25));
+    println!(
+        "test posture: production S=25 chain program {} instructions",
+        program.instrs.len()
+    );
+    assert!(
+        program.instrs.len() < 183_631 / 3,
+        "{}",
+        program.instrs.len()
+    );
+}
+
+/// ★ A chain at a production site's config (`chain_config_under` at the
+/// default format) under this build's security posture: the host verifies it,
+/// the in-guest chain verifier executes on it, and a forged final value,
+/// query nonce or Merkle sibling is refused by both. Production in the default
+/// binary (Q and 18 bits as the target and the format give them); the test
+/// posture's 32 bits and 8 bits in a `test-security` one, where it shows the
+/// prover, the host verifier and the level's verifier agree and still check.
+#[test]
+#[cfg_attr(
+    not(feature = "test-security"),
+    ignore = "production posture smoke; box tier"
+)]
+fn a_production_site_chain_verifies_on_both_sides_and_refuses_forgeries_in_this_posture() {
+    let num_vars = 10;
+    let cfg = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, num_vars)],
+    );
+    let rounds = (1..=num_vars).map(|m| cfg.rounds(m)).max().unwrap_or(1);
+    let (bits, grind) = if crate::security_posture::TEST_POSTURE {
+        (
+            crate::security_posture::TEST_CHAIN_SECURITY_BITS,
+            crate::security_posture::TEST_GRIND_BITS,
+        )
+    } else {
+        (
+            crate::multilinear_prove::CHAIN_SECURITY_BITS,
+            crate::zf_format::PRODUCTION_WHIR_GRIND_BITS,
+        )
+    };
+    assert_eq!(cfg.grind.query, grind);
+    assert_eq!(
+        cfg.num_queries,
+        multilinear::query_count::num_queries(cfg.log_blowup, rounds, bits, grind)
+    );
+    println!(
+        "posture {}: chain S={num_vars} Q {} grind {} ({rounds} rounds)",
+        crate::security_posture::name(),
+        cfg.num_queries,
+        cfg.grind.query
+    );
+
+    let f = fixture_with(&cfg, num_vars);
+    let program = chain_program(&f.shape);
+    assert!(
+        machine_accepts(&program, chain_arena(&f, &f.proof)),
+        "the untouched proof must execute, or the refusals below prove nothing"
+    );
+
+    let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+    let mut forged = f.proof.clone();
+    forged.final_value += FEE::one();
+    sites.push(("the final value", forged));
+    let mut forged = f.proof.clone();
+    forged.rounds[0].nonces.query ^= 1;
+    sites.push(("a query nonce", forged));
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+            p.current[0].proof.merkle_path[0][0] ^= 1
+        }
+        RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
+    }
+    sites.push(("a Merkle sibling", forged));
+    for (name, forged) in &sites {
+        assert!(
+            !host_accepts(&f, &cfg, forged),
+            "{name}: the host must refuse it"
+        );
+        assert!(
+            !machine_accepts(&program, chain_arena(&f, forged)),
+            "{name}: the machine must refuse it"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires both posture builds; run make test-cross-posture"]
+fn whir_chain_rejects_test_posture() {
+    type WireProof = ([u8; 32], Vec<FEE>, FEE, ChainProof<F, E>);
+
+    let num_vars = 10;
+    let cfg = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, num_vars)],
+    );
+    let control = fixture_with(&cfg, num_vars);
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&(
+        control.root_bytes,
+        control.z.clone(),
+        control.y,
+        control.proof.clone(),
+    ))
+    .expect("serialize the chain");
+    crate::security_posture::exchange_test_proof("chain", &bytes, |foreign| {
+        let (root, z, y, proof): WireProof =
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(foreign).expect("decode the TEST chain");
+        assert_eq!(
+            (root, z, y),
+            (control.root_bytes, control.z.clone(), control.y)
+        );
+        assert!(
+            !host_accepts(&control, &cfg, &proof),
+            "production accepted the TEST chain"
+        );
+    });
+}
+
 /// ★ The tamper arm: three halves, five sites.
 ///
 /// ⚠ Run at a REAL grind width, and the reason is a catch this arm made on
@@ -1749,6 +1885,9 @@ fn a_first_fold_chain_executes_on_a_proof_the_host_accepts() {
                 f.shape.schedule
             )
         });
+        if (num_vars, num_queries, grind, k0) == (9, 3, 8, 6) {
+            a_tampered_first_fold_chain_cannot_execute(&cfg, &f, &program);
+        }
     }
 }
 
@@ -1756,17 +1895,16 @@ fn a_first_fold_chain_executes_on_a_proof_the_host_accepts() {
 /// 64-value block and one of its Merkle siblings. The host must reject each
 /// forgery (so the refusal is of something invalid) and the machine must
 /// refuse it.
-#[test]
-fn a_tampered_first_fold_chain_cannot_execute() {
-    let grind = 8u8;
-    let cfg = first_fold_config(3, grind, 6);
-    let f = fixture_with(&cfg, 9);
+fn a_tampered_first_fold_chain_cannot_execute(
+    cfg: &ChainConfig,
+    f: &Fixture,
+    program: &LfmProgram,
+) {
     assert_eq!(f.shape.schedule, vec![6, 3]);
-    let program = chain_program(&f.shape);
     assert!(
         execute(
-            &program,
-            &[chain_arena(&f, &f.proof)],
+            program,
+            &[chain_arena(f, &f.proof)],
             &crate::hash_pin::BLOCK_HASHER
         )
         .is_ok(),
@@ -1775,8 +1913,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
 
     let host_rejects = |proof: &ChainProof<F, E>| -> bool {
         let mut t = Recording::new();
-        verify::<F, E, _, RpxWhir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, &cfg, &mut t)
-            .is_err()
+        verify::<F, E, _, RpxWhir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, cfg, &mut t).is_err()
     };
 
     let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
@@ -1819,8 +1956,8 @@ fn a_tampered_first_fold_chain_cannot_execute() {
         );
         assert!(
             execute(
-                &program,
-                &[chain_arena(&f, forged)],
+                program,
+                &[chain_arena(f, forged)],
                 &crate::hash_pin::BLOCK_HASHER
             )
             .is_err(),
@@ -1895,6 +2032,7 @@ fn the_first_fold_production_chains_cost_what_the_design_derived() {
 /// One production chain's pinned costs at `S = 25`: the auto caps per tree and
 /// their permutations, the grinds' permutations, every permutation, the
 /// arena's words, and the shape rows and rows a chain.
+#[cfg(not(feature = "test-security"))]
 struct ChainPins {
     caps: &'static [usize],
     cap_perms: usize,
@@ -1924,6 +2062,7 @@ struct ChainPins {
 /// these three tests are the binary chain's ([`ChainShape::new`]), which it
 /// does not enter.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_production_default_chain_is_first6_under_the_auto_cap() {
     let production = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat::DEFAULT,
@@ -1960,6 +2099,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
 /// bits, with every cost the default had before its blowup moved to 2^1: these
 /// pins are that default's, unmoved.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip() {
     let at4 = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat {
@@ -2005,6 +2145,7 @@ fn the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip() {
 /// Q: fewer permutations than either alone, and fewer than the same chain
 /// grinding all three.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_grind_bits_opt_out_chain_keeps_its_pins() {
     let at20 = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat {
@@ -2046,6 +2187,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
 /// grinds before all three challenges and three nonce words a round, and every
 /// cost it had then: these pins are the pre-P2 default's, unmoved.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
     let opt_out = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat {
@@ -2078,6 +2220,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
 }
 
 /// The closed forms of one production chain against its pins.
+#[cfg(not(feature = "test-security"))]
 fn check_production_chain(label: &str, shape: &ChainShape, pins: &ChainPins) {
     assert_eq!(
         shape.schedule,
@@ -2137,6 +2280,7 @@ fn check_production_chain(label: &str, shape: &ChainShape, pins: &ChainPins) {
 /// (6 × 2 permutations), one nonce word a round; blowup 2^1 and Q 229 at 18
 /// grind bits, the last tree's auto cap one lower than at 2^2 (its domain a bit
 /// smaller).
+#[cfg(not(feature = "test-security"))]
 const DEFAULT_CHAIN_PINS: ChainPins = ChainPins {
     caps: &[3, 3, 3, 3, 3, 1],
     cap_perms: 36,
@@ -2149,6 +2293,7 @@ const DEFAULT_CHAIN_PINS: ChainPins = ChainPins {
 
 /// The blowup opt-out's pins (blowup 2^2, Q 114 at 18 bits), which are the
 /// production default's from before the blowup moved to 2^1.
+#[cfg(not(feature = "test-security"))]
 const BLOWUP_4_CHAIN_PINS: ChainPins = ChainPins {
     caps: &[3, 3, 3, 3, 3, 2],
     cap_perms: 38,
@@ -2161,6 +2306,7 @@ const BLOWUP_4_CHAIN_PINS: ChainPins = ChainPins {
 
 /// The grind-bits opt-out's pins (blowup 2^2, 20 bits, Q 112), which are the
 /// production default's from before the bits moved.
+#[cfg(not(feature = "test-security"))]
 const GRIND_BITS_20_CHAIN_PINS: ChainPins = ChainPins {
     caps: &[3, 3, 3, 3, 3, 2],
     cap_perms: 38,
@@ -2173,6 +2319,7 @@ const GRIND_BITS_20_CHAIN_PINS: ChainPins = ChainPins {
 
 /// The opt-out's pins, which are the production default's from before P2:
 /// `3R − 1 = 17` grinds (34 permutations), three nonce words a round.
+#[cfg(not(feature = "test-security"))]
 const GRIND_ALL_CHAIN_PINS: ChainPins = ChainPins {
     caps: &[3, 3, 3, 3, 3, 2],
     cap_perms: 38,
@@ -2527,6 +2674,7 @@ pub(super) fn program_digest(program: &LfmProgram) -> String {
     hex(&h.finalize())
 }
 
+#[cfg(not(feature = "test-security"))]
 fn arena_digest(words: &[LfmWord]) -> String {
     use digest::Digest;
     hex(&crypto::hash::platform_keccak::PlatformKeccak256::digest(
@@ -2535,6 +2683,7 @@ fn arena_digest(words: &[LfmWord]) -> String {
 }
 
 /// The proof's rkyv length and keccak.
+#[cfg(not(feature = "test-security"))]
 fn proof_digest(proof: &ChainProof<F, E>) -> (usize, String) {
     use digest::Digest;
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("the proof serializes");
@@ -2555,6 +2704,7 @@ fn proof_digest(proof: &ChainProof<F, E>) -> (usize, String) {
 /// and blowup 2^2, at the stacks the block reaches (25 and 27): the program the
 /// pre-P2 default emitted.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
     const PROGRAMS: [(usize, u8, usize, u32, &str); 4] = [
         (

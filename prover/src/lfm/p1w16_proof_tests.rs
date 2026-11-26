@@ -36,7 +36,9 @@ type E = GoldilocksExtension;
 const KIND: HasherKind = HasherKind::Poseidon1W16;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("options")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("options")
 }
 
 fn word(seed: u64) -> [FE; 4] {

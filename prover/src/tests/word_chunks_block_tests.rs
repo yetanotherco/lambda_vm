@@ -8,8 +8,7 @@
 //! output and group roots, every proof verifies, and under the deterministic
 //! grind (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once a process: run alone) the
 //! same bytes. At word caps of 4 rows, so every family with rows hands out
-//! chunks. The proving tests run where a block can be proved (the box's lib
-//! run and CI).
+//! chunks.
 
 use crate::block_whir::regen::RegenMode;
 use crate::block_whir::{
@@ -27,13 +26,6 @@ fn bytes(proof: &BlockWhirProof) -> Vec<u8> {
         .to_vec()
 }
 
-/// Two pages' worth of private input, ending inside the second.
-fn two_pages_of_input() -> Vec<u8> {
-    (0..(crate::tables::page::DEFAULT_PAGE_SIZE as u32 + 300))
-        .map(|i| (i * 7 + 3) as u8)
-        .collect()
-}
-
 /// Whether the process runs record mode (the lean stream's ground): unless
 /// the walkers or the history are turned off.
 fn record_mode() -> bool {
@@ -41,27 +33,40 @@ fn record_mode() -> bool {
         && std::env::var("LAMBDA_VM_EXEC_HISTORY").map_or(true, |v| v.trim() != "0")
 }
 
-#[test]
-fn the_word_chunks_in_parts_prove_the_same_block() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    let programs = [
-        ("fused_mem_cases", Vec::new()),
-        ("test_copy_ecalls", Vec::new()),
-        ("test_keccak256", Vec::new()),
-        ("test_ecrec", Vec::new()),
-        ("page_runs", two_pages_of_input()),
-    ];
-    let regens = [None, Some(RegenMode::Always)];
-    // Every block this test compares, named before any is proved: a reader
-    // of the output counts the `SAME BYTES` lines against these, so a block
-    // skipped (record mode off, the grind not deterministic) never reads as
-    // compared.
-    for (name, _) in &programs {
-        for regen in regens {
-            eprintln!("WORD CHUNKS WANTS: {name}, regeneration {regen:?}");
-        }
+mod word_chunks_in_parts {
+    use super::*;
+
+    macro_rules! program {
+        ($name:ident, $input:expr) => {
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn no_regeneration() {
+                    assert_word_chunks_identity(stringify!($name), $input, None);
+                }
+
+                #[test]
+                fn regenerate_every_chunk() {
+                    assert_word_chunks_identity(stringify!($name), $input, Some(RegenMode::Always));
+                }
+            }
+        };
     }
+
+    program!(fused_mem_cases, &[]);
+    program!(test_copy_ecalls, &[]);
+    program!(test_keccak256, &[]);
+    program!(test_ecrec, &[]);
+    program!(
+        page_runs,
+        &crate::tests::word_memory_block_tests::two_pages_of_input()
+    );
+}
+
+fn assert_word_chunks_identity(name: &str, input: &[u8], regen: Option<RegenMode>) {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    eprintln!("WORD CHUNKS WANTS: {name}, regeneration {regen:?}");
     if !record_mode() {
         eprintln!("the lean stream needs record mode: skipped (walkers or history off)");
         return;
@@ -75,80 +80,72 @@ fn the_word_chunks_in_parts_prove_the_same_block() {
         mem_store: 4,
         ..MaxRowsConfig::small()
     };
-    for (name, input) in programs {
-        let elf = asm_elf_bytes(name);
-        for regen in regens {
-            let what = format!("{name}, regeneration {regen:?}");
-            // `levers`: the hoist, every walk cut, both finish steps and the
-            // lean stream on, on three walkers.
-            let prove = |chunks: WordChunks, levers: bool| {
-                let mut options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
-                options.drop_streamed_ops = true;
-                options.regen = regen;
-                let (hoist, cuts, early) = if levers {
-                    (HostHoist::all(), WalkCuts::all(), FinishEarly::all())
-                } else {
-                    (
-                        HostHoist::default(),
-                        WalkCuts::default(),
-                        FinishEarly::default(),
-                    )
-                };
-                prove_block_whir_with(
-                    &elf,
-                    &input,
-                    &opts,
-                    &format,
-                    &options,
-                    &Deviations {
-                        word_stream: Some(true),
-                        word_chunks: Some(chunks),
-                        walkers: Some(3),
-                        host_hoist: Some(hoist),
-                        walk_cuts: Some(cuts),
-                        finish_early: Some(early),
-                        exec_stream_lean: Some(levers),
-                        ..Deviations::default()
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{what}, {chunks:?}, levers {levers}: {e:?}"))
-                .0
-            };
-            let off = prove(WordChunks::Copy, false);
-            assert!(
-                matches!(verify_block_whir(&off, &elf, &opts, &format), Ok(true)),
-                "{what}: copy verifies"
-            );
-            assert!(
-                off.word_memory.iter().any(|&n| n > 1),
-                "{what}: a word family cut into several tables {:?}",
-                off.word_memory
-            );
-            for levers in [false, true] {
-                let arm = format!("{what}, part, levers {levers}");
-                let on = prove(WordChunks::Parts, levers);
-                assert!(
-                    matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
-                    "{arm}: verifies"
-                );
-                assert_eq!(on.groups, off.groups, "{arm}: the partition");
-                assert_eq!(on.table_num_vars, off.table_num_vars, "{arm}: the heights");
-                assert_eq!(
-                    format!("{:?}", on.table_counts),
-                    format!("{:?}", off.table_counts),
-                    "{arm}: the counts"
-                );
-                assert_eq!(on.word_memory, off.word_memory, "{arm}: the word tables");
-                assert_eq!(on.public_output, off.public_output, "{arm}: the output");
-                assert_eq!(on.proof.roots, off.proof.roots, "{arm}: the group roots");
-                if crypto::grinding::deterministic() {
-                    assert_eq!(bytes(&on), bytes(&off), "{arm}: the proof's bytes");
-                }
-            }
-            if crypto::grinding::deterministic() {
-                eprintln!("WORD CHUNKS SAME BYTES: {what}");
-            }
+    let elf = asm_elf_bytes(name);
+    let what = format!("{name}, regeneration {regen:?}");
+    // `levers`: the hoist, every walk cut, both finish steps and the
+    // lean stream on, on three walkers.
+    let prove = |chunks: WordChunks, levers: bool| {
+        let mut options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
+        options.drop_streamed_ops = true;
+        options.regen = regen;
+        let (hoist, cuts, early) = if levers {
+            (HostHoist::all(), WalkCuts::all(), FinishEarly::all())
+        } else {
+            (HostHoist::none(), WalkCuts::none(), FinishEarly::none())
+        };
+        prove_block_whir_with(
+            &elf,
+            input,
+            &opts,
+            &format,
+            &options,
+            &Deviations {
+                word_stream: Some(true),
+                word_chunks: Some(chunks),
+                walkers: Some(3),
+                host_hoist: Some(hoist),
+                walk_cuts: Some(cuts),
+                finish_early: Some(early),
+                exec_stream_lean: Some(levers),
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{what}, {chunks:?}, levers {levers}: {e:?}"))
+        .0
+    };
+    let off = prove(WordChunks::Copy, false);
+    assert!(
+        matches!(verify_block_whir(&off, &elf, &opts, &format), Ok(true)),
+        "{what}: copy verifies"
+    );
+    assert!(
+        off.word_memory.iter().any(|&n| n > 1),
+        "{what}: a word family cut into several tables {:?}",
+        off.word_memory
+    );
+    for levers in [false, true] {
+        let arm = format!("{what}, part, levers {levers}");
+        let on = prove(WordChunks::Parts, levers);
+        assert!(
+            matches!(verify_block_whir(&on, &elf, &opts, &format), Ok(true)),
+            "{arm}: verifies"
+        );
+        assert_eq!(on.groups, off.groups, "{arm}: the partition");
+        assert_eq!(on.table_num_vars, off.table_num_vars, "{arm}: the heights");
+        assert_eq!(
+            format!("{:?}", on.table_counts),
+            format!("{:?}", off.table_counts),
+            "{arm}: the counts"
+        );
+        assert_eq!(on.word_memory, off.word_memory, "{arm}: the word tables");
+        assert_eq!(on.public_output, off.public_output, "{arm}: the output");
+        assert_eq!(on.proof.roots, off.proof.roots, "{arm}: the group roots");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&on), bytes(&off), "{arm}: the proof's bytes");
         }
+    }
+    if crypto::grinding::deterministic() {
+        eprintln!("WORD CHUNKS SAME BYTES: {what}");
     }
 }
 
@@ -204,35 +201,36 @@ fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
 
 /// Explicit `part` requires streamed and dropped word rows. The default
 /// also handles split memory, the word stream off, and kept ops.
-#[test]
-fn the_word_chunks_in_parts_are_refused_where_the_word_families_do_not_stream() {
-    let elf = asm_elf_bytes("fused_mem_cases");
-    let opts = ProofOptions::default_test_options();
-    let words = BlockFormat::production()
-        .with_memory(MemoryFormat::Words)
-        .with_page_run(0);
-    let dropped = || {
-        let mut o = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
-        o.drop_streamed_ops = true;
-        o
-    };
-    let kept = || {
-        let mut o = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
-        o.drop_streamed_ops = false;
-        o
-    };
-    let cases = [
-        (
-            "the split format",
-            BlockFormat::production(),
-            dropped(),
-            Some(true),
-        ),
-        ("the word stream off", words, dropped(), Some(false)),
-        ("the ops kept", words, kept(), Some(true)),
-    ];
-    for (what, format, options, stream) in cases {
-        let with = |chunks: Option<WordChunks>| {
+mod word_chunks_with_no_stream {
+    use super::*;
+
+    #[test]
+    fn split_memory() {
+        assert_default_proves(BlockFormat::production(), true, true);
+    }
+
+    #[test]
+    fn word_stream_off() {
+        assert_default_proves(words(), true, false);
+    }
+
+    #[test]
+    fn streamed_ops_kept() {
+        assert_default_proves(words(), false, true);
+    }
+
+    fn words() -> BlockFormat {
+        BlockFormat::production()
+            .with_memory(MemoryFormat::Words)
+            .with_page_run(0)
+    }
+
+    fn assert_default_proves(format: BlockFormat, drop_streamed_ops: bool, word_stream: bool) {
+        let elf = asm_elf_bytes("fused_mem_cases");
+        let opts = ProofOptions::default_test_options();
+        let mut options = super::super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+        options.drop_streamed_ops = drop_streamed_ops;
+        let prove = |word_chunks| {
             prove_block_whir_with(
                 &elf,
                 &[],
@@ -240,18 +238,18 @@ fn the_word_chunks_in_parts_are_refused_where_the_word_families_do_not_stream() 
                 &format,
                 &options,
                 &Deviations {
-                    word_stream: stream,
-                    word_chunks: chunks,
+                    word_stream: Some(word_stream),
+                    word_chunks,
                     ..Deviations::default()
                 },
             )
             .map(|_| ())
         };
-        let err = with(Some(WordChunks::Parts));
+        let err = prove(Some(WordChunks::Parts));
         assert!(
             matches!(&err, Err(crate::Error::Prover(m)) if m.contains("LAMBDA_VM_WORD_CHUNKS=part needs")),
-            "{what}: {err:?}"
+            "{err:?}"
         );
-        assert!(with(None).is_ok(), "{what}: the default proves");
+        prove(None).expect("the default proves");
     }
 }

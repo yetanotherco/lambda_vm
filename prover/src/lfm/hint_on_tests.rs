@@ -323,7 +323,9 @@ fn a_hint_on_is_a_hint_row_and_a_rotated_walk_proves() {
         path.clone(),
     ];
 
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup 2");
+    let opts = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup 2");
     let rotated = walk_program(depth, HintMode::Rotated);
     let swapped = walk_program(depth, HintMode::Swapped);
     let plain = walk_program(depth, HintMode::Plain);

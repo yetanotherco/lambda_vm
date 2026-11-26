@@ -712,6 +712,7 @@ fn production_shapes() -> Vec<(usize, usize)> {
 /// config carries no round-form bit. A Poseidon1 format ignores the field:
 /// its tag and its config do not move.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn the_blake3_round_form_is_named_in_the_tag_and_bound_by_the_fold_word() {
     use crate::block_whir::{B3Rounds, block_format_tag};
     use multilinear::whir_chain::{

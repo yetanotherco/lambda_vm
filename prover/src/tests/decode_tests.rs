@@ -185,7 +185,9 @@ fn decode_commitment_some_matches_default_path() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
     let elf = Elf::load(&elf_bytes).expect("ELF load");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     let decode_c = commitment_from_elf(&elf, &options).expect("decode commitment");
 
@@ -206,7 +208,9 @@ fn decode_commitment_wrong_value_rejects() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
     let elf = Elf::load(&elf_bytes).expect("ELF load");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     // Flip a byte in the correct commitment so the Fiat-Shamir transcripts diverge.
     let mut wrong = commitment_from_elf(&elf, &options).expect("decode commitment");
@@ -224,7 +228,9 @@ fn decode_commitment_wrong_value_rejects() {
 fn decode_commitment_zero_bytes_rejects() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     // [0u8; 32] is the most plausible accidental default — passing it must
     // not pass verification.
@@ -283,7 +289,9 @@ const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
 fn decode_commitment_compile_time_const_accepts() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
 
     // Pass the OFFLINE-COMPUTED const directly — mimics the recursion guest's
     // workflow where the value lives in the caller's compiled binary.
@@ -307,7 +315,9 @@ fn decode_commitment_compile_time_const_accepts() {
 fn print_decode_commitment_for_sub() {
     let elf_bytes = asm_elf_bytes("sub");
     let elf = Elf::load(&elf_bytes).expect("ELF load");
-    let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let options = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
     let c = commitment_from_elf(&elf, &options).expect("decode commitment");
     eprintln!("SUB_DECODE_COMMITMENT_BLOWUP_2 (sub.elf, blowup=2):");
     eprintln!("{c:02x?}");

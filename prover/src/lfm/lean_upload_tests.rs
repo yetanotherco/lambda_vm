@@ -117,7 +117,9 @@ fn a_lean_upload_proves_the_same_bytes() {
     use stark::proof::options::GoldilocksCubicProofOptions;
 
     let _restore = Restore;
-    let mut opts: ProofOptions = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+    let mut opts: ProofOptions = GoldilocksCubicProofOptions::with_blowup(4)
+        .map(crate::security_posture::stark_options)
+        .expect("options");
     opts.grinding_factor = 0;
     // 2^13 rows at blowup 4 is a 2^15-row LDE, above the device commit floor.
     let program = chained(6000);
@@ -191,7 +193,9 @@ fn the_lean_upload_and_the_subcoset_composition_together_prove_the_same_bytes() 
         }
     }
     let _restore = RestoreBoth;
-    let mut opts: ProofOptions = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+    let mut opts: ProofOptions = GoldilocksCubicProofOptions::with_blowup(4)
+        .map(crate::security_posture::stark_options)
+        .expect("options");
     opts.grinding_factor = 0;
     // 2^13 rows at blowup 4 is a 2^15-row LDE, above the device commit floor.
     let program = chained(6000);

@@ -2382,6 +2382,7 @@ fn the_tree_prover_refuses_to_compress_another_page_run() {
 /// The leaf digests of `owned` under `format` (each leaf, in order) and the
 /// plan's identity's first eight bytes, with the prepared opening forced onto
 /// every ELF page with data when `dense`.
+#[cfg(not(feature = "test-security"))]
 fn leaf_digests(
     format: &BlockFormat,
     owned: &OwnedBlockStatement,
@@ -2414,6 +2415,7 @@ fn leaf_digests(
 /// from (built there and here, equal), so the split format's leaves are
 /// unchanged on every page kind. Not blind: with a private page on an ELF
 /// page's route (its count check out), the leaf moves.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn the_split_leaves_with_a_private_page_are_pinned() {
     const ID: [u8; 8] = [0x8d, 0x0b, 0x67, 0xfc, 0x2c, 0x1a, 0x33, 0x65];
@@ -2449,6 +2451,7 @@ fn the_split_leaves_with_a_private_page_are_pinned() {
 /// fused block, each plan's identity and every leaf's digest. A change to a
 /// word leaf (a route, a leg, a word table) moves them. Not blind: with the
 /// page leg taken out, the word leaf moves.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn the_word_and_fused_leaves_are_pinned() {
     const WORD_ID: [u8; 8] = [0xe7, 0xf5, 0x5a, 0xc7, 0x00, 0x9a, 0x6e, 0x04];
@@ -3128,12 +3131,12 @@ fn every_route_of_a_plan_with_page_blocks_is_held_and_its_leaves_emit() {
     emit_leaves(&plan).expect("every leaf emits");
 }
 
-/// ★ The leaf of a plan under local lookups, pinned in the default tier: it
+/// ★ The leaf of a production plan under local lookups, pinned: it
 /// derives and emits from a hand-built statement — KECCAK and
 /// KECCAK_RND beside the small split mix, one LOCAL_BYTES closing the
-/// KECCAK_RND group — with no proof, so a digest pin of it can run in the
-/// default tier; and every one of the leaf's local checks moves the local
+/// KECCAK_RND group — with no proof, and every one of the leaf's local checks moves the local
 /// leaf's digest while the non-local leaves' digests stay.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn a_local_leaf_is_pinned_without_a_proof() {
     use super::local_faults::{self, Fault as LocalFault};
@@ -3278,6 +3281,7 @@ fn the_plan_refuses_a_dynamic_local_receiver_in_its_air_set() {
 /// hand-built local statement under the 7-round BLAKE3 base, one leaf
 /// (`derive_blake3`), so the byte sponge's arm of the local transcript is
 /// pinned too; every local fault moves the leaf.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn a_blake3_local_leaf_is_pinned_without_a_proof() {
     use super::local_faults::{self, Fault as LocalFault};
@@ -3341,6 +3345,7 @@ fn a_blake3_local_leaf_is_pinned_without_a_proof() {
 /// above derive from the test process's production format (the one-layer
 /// ladder); this one is the leaf a public entry derives, and every local
 /// fault moves it.
+#[cfg(not(feature = "test-security"))]
 #[test]
 fn the_pinned_blake3_local_leaf_is_pinned_without_a_proof() {
     use super::local_faults::{self, Fault as LocalFault};

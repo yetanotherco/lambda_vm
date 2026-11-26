@@ -334,8 +334,9 @@ fn the_one_row_challenge_replay_matches_production() {
         (2048, stark::proof::options::FriMode::Pair),
         (2048, stark::proof::options::FriMode::Dp),
     ] {
-        let mut opts =
-            stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup 2");
+        let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+            .map(crate::security_posture::stark_options)
+            .expect("blowup 2");
         opts.format.one_row = stark::proof::options::OneRowMode::On;
         opts.format.fri_mode = fri;
         let (air, proof) = super::fri_tests::folding_fixture_with(boundaries, opts);

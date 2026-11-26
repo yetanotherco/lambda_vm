@@ -31,7 +31,6 @@ pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
 pub mod residency_mode_tests;
-pub mod row_pair_opening_tests;
 pub mod small_trace_tests;
 #[cfg(feature = "cuda")]
 pub mod subcoset_device_tests;

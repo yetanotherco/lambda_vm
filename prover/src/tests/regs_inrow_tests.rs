@@ -232,17 +232,31 @@ fn verifies(proof: &block_whir::BlockWhirProof, elf: &[u8], format: &BlockFormat
 /// Blocks proved under the in-row register format verify: every instruction,
 /// KECCAK's chips (register reads through the residual register table), the commit syscall (x254),
 /// and registers idle past a CPU slot's reach (keep-alives).
-#[test]
-fn an_in_row_block_proves_and_verifies() {
-    for name in [
-        "all_instructions_64",
-        "test_keccak_multi",
-        "test_commit_split",
-        "keep_alive_regs",
-    ] {
-        let elf = asm_elf_bytes(name);
-        let proof = prove(&elf, &in_row());
-        assert!(verifies(&proof, &elf, &in_row()), "{name}");
+fn assert_in_row_block_verifies(name: &str) {
+    let elf = asm_elf_bytes(name);
+    let proof = prove(&elf, &in_row());
+    assert!(verifies(&proof, &elf, &in_row()), "{name}");
+}
+
+mod an_in_row_block_proves_and_verifies {
+    #[test]
+    fn all_instructions_64() {
+        super::assert_in_row_block_verifies("all_instructions_64");
+    }
+
+    #[test]
+    fn test_keccak_multi() {
+        super::assert_in_row_block_verifies("test_keccak_multi");
+    }
+
+    #[test]
+    fn test_commit_split() {
+        super::assert_in_row_block_verifies("test_commit_split");
+    }
+
+    #[test]
+    fn keep_alive_regs() {
+        super::assert_in_row_block_verifies("keep_alive_regs");
     }
 }
 
@@ -401,8 +415,8 @@ fn refused_by(
 /// ★ Box: the in-row forgeries proved (`tables::trace_builder::
 /// in_row_forgery_tests`, which reads each on the buses): every forged build
 /// proves, and the block verifier refuses it at the check it targets, and
-/// verifies it with that check off; the honest build of each program proves
-/// and verifies. Each forged build has BITWISE's `IS_HALF` counts recounted,
+/// verifies it with that check off. Cases on the same program share one
+/// honest proof. Each forged build has BITWISE's `IS_HALF` counts recounted,
 /// as its prover would, so a stale count cannot be what refuses it. With the
 /// PC chain run past the exit call (HALT's pc `(1, 0)`) among them, against
 /// the honest exit 0 of the program without its first exit.
@@ -422,6 +436,7 @@ fn in_row_forgeries_are_refused_by_the_block_verifier() {
         with_verifier_files(&program, &mut traces);
         (program, traces)
     };
+    let mut honest_controls = std::collections::BTreeMap::new();
     let mut wrong = Vec::new();
     let mut refused = 0;
     for forgery in [
@@ -438,20 +453,25 @@ fn in_row_forgeries_are_refused_by_the_block_verifier() {
             Forgery::KeepAliveChangesValue => Check::Constraint,
             _ => Check::Balance,
         };
-        let elf = asm_elf_bytes(program_of(forgery));
-        let (program, mut honest) = run(&elf, None);
-        let proof =
-            prove_built(&program, &elf, &mut honest, &format).expect("the honest build proves");
+        let (elf, honest_proof) = honest_controls
+            .entry(program_of(forgery))
+            .or_insert_with(|| {
+                let elf = asm_elf_bytes(program_of(forgery));
+                let (program, mut honest) = run(&elf, None);
+                let proof = prove_built(&program, &elf, &mut honest, &format)
+                    .expect("the honest build proves");
+                (elf, proof)
+            });
         assert!(
-            verifies(&proof, &elf, &format),
+            verifies(honest_proof, elf, &format),
             "{forgery:?}: the honest build verifies"
         );
-        let (program, mut forged) = run(&elf, None);
+        let (program, mut forged) = run(elf, None);
         forge(forgery, &mut forged);
         let recounted = recount_is_half(&program, &mut forged);
         let proof =
-            prove_built(&program, &elf, &mut forged, &format).expect("the forged build proves");
-        match refused_by(&proof, &elf, &format, check) {
+            prove_built(&program, elf, &mut forged, &format).expect("the forged build proves");
+        match refused_by(&proof, elf, &format, check) {
             None => refused += 1,
             Some(read) => wrong.push(format!("{forgery:?}: {read}")),
         }

@@ -40,7 +40,9 @@ const KIND: HasherKind = HasherKind::Blake3;
 const P: u64 = 0xFFFF_FFFF_0000_0001;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 fn felts_of(vals: &[u64; 4]) -> LfmWord {

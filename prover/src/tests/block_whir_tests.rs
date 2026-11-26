@@ -151,11 +151,26 @@ pub(super) fn before_word_counts<'a>(proof: &BlockWhirProof, bytes: &'a [u8]) ->
 }
 
 #[test]
-fn a_program_proves_and_verifies_as_one_block() {
+fn one_group_whir_statement_and_prepared_opening_checks() {
     let elf = asm_elf_bytes("sub");
-    let proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
-    assert_eq!(groups_of(&proof), 1);
-    assert!(verify(&proof, &elf, &one_group()));
+    let format = one_group();
+    let honest = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    a_program_proves_and_verifies_as_one_block(&elf, &format, &honest);
+    the_verifier_refuses_one_group_over_the_maximum(&elf, &format, honest.clone());
+    a_tampered_public_output_is_refused(&elf, &format, honest.clone());
+    a_restated_table_height_is_refused(&elf, &format, honest.clone());
+    an_extra_root_is_refused(&elf, &format, honest.clone());
+    a_missing_prepared_opening_is_refused(&elf, &format, honest.clone());
+    the_block_carries_decodes_prepared_opening(&elf, &format, &honest);
+}
+
+fn a_program_proves_and_verifies_as_one_block(
+    elf: &[u8],
+    format: &BlockFormat,
+    proof: &BlockWhirProof,
+) {
+    assert_eq!(groups_of(proof), 1);
+    assert!(verify(proof, elf, format));
 }
 
 /// ★ `LAMBDA_VM_ZF_WHIR_GRIND_BITS` on the block: the grind bits, and the Q
@@ -163,6 +178,7 @@ fn a_program_proves_and_verifies_as_one_block() {
 /// ground at 18 bits verifies under 18 and is refused by a verifier at 20; a
 /// block ground at 20 is refused by a verifier at 18.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn a_block_ground_at_18_bits_is_refused_by_a_verifier_at_20() {
     let at = |bits: u8| BlockFormat {
         zf: ZfFormat {
@@ -206,6 +222,7 @@ fn a_block_ground_at_18_bits_is_refused_by_a_verifier_at_20() {
 /// ground honestly verifies. Proved at 17 bits, a count no other test of this
 /// process grinds at, because the fault is armed process-wide.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn a_block_whose_nonces_fail_the_grind_is_refused() {
     let at17 = BlockFormat {
         zf: ZfFormat {
@@ -246,9 +263,14 @@ fn a_block_at_blowup_2_is_refused_by_a_verifier_at_blowup_4() {
         at(4).chain_config(&[(1, 27)]),
         at(2).chain_config(&[(1, 27)]),
     );
+    let (q4, q2) = if crate::security_posture::TEST_POSTURE {
+        (28, 55)
+    } else {
+        (114, 229)
+    };
     assert_eq!(
         (c4.log_blowup, c4.num_queries, c2.log_blowup, c2.num_queries),
-        (2, 114, 1, 229)
+        (2, q4, 1, q2)
     );
     let elf = asm_elf_bytes("sub");
     let options = options(MaxRowsConfig::small(), 3);
@@ -1661,20 +1683,25 @@ fn closing_ahead_of_bitwise_moves_no_byte() {
 /// same partition, and verifies; an order that is not a permutation of the
 /// groups is refused. So does each group's openings run beside the next
 /// group's argue (phase B's overlap), in group order and reversed.
-#[test]
-fn phase_b_in_any_order_proves_the_same_bytes() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    use stark::multilinear_block::PhaseBOverlap::{Off, On, Pinned};
-    let proved = |order: Option<fn(usize) -> Vec<usize>>,
-                  overlap: stark::multilinear_block::PhaseBOverlap| {
+mod phase_b_in_any_order_proves_the_same_bytes {
+    use super::*;
+    use stark::multilinear_block::PhaseBOverlap::{self, Off, On, Pinned};
+
+    type Order = fn(usize) -> Vec<usize>;
+
+    fn prove_order(
+        elf: &[u8],
+        format: &BlockFormat,
+        order: Option<Order>,
+        overlap: PhaseBOverlap,
+    ) -> Result<BlockWhirProof, crate::Error> {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
         o.phase_b_overlap = overlap;
         prove_block_whir_with(
-            &elf,
+            elf,
             &[],
             &ProofOptions::default_test_options(),
-            &format,
+            format,
             &o,
             &Deviations {
                 phase_b_order: order,
@@ -1682,43 +1709,80 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
             },
         )
         .map(|(proof, _)| proof)
-    };
-    let bytes = |p: &BlockWhirProof| {
-        rkyv::to_bytes::<rkyv::rancor::Error>(p)
-            .expect("serialize")
-            .to_vec()
-    };
-    let in_order = proved(None, Off).expect("prove");
-    assert!(
-        in_order.groups.len() > 3,
-        "{} groups",
-        in_order.groups.len()
-    );
-    let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
-    let odd_first: fn(usize) -> Vec<usize> =
-        |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
-    for (what, order, overlap) in [
-        ("reversed", Some(reversed), Off),
-        ("odd first", Some(odd_first), Off),
-        ("in order, overlapped", None, On),
-        ("reversed, overlapped", Some(reversed), On),
-        ("in order, pinned", None, Pinned),
-        ("reversed, pinned", Some(reversed), Pinned),
-    ] {
-        let proof = proved(order, overlap).expect("prove");
-        assert_eq!(proof.groups, in_order.groups, "{what}: the partition");
-        assert!(verify(&proof, &elf, &format), "{what}");
+    }
+
+    fn reversed(n: usize) -> Vec<usize> {
+        (0..n).rev().collect()
+    }
+
+    fn odd_first(n: usize) -> Vec<usize> {
+        (1..n).step_by(2).chain((0..n).step_by(2)).collect()
+    }
+
+    fn repeated_group(n: usize) -> Vec<usize> {
+        std::iter::repeat_n(0, n).collect()
+    }
+
+    fn missing_group(n: usize) -> Vec<usize> {
+        (1..n).collect()
+    }
+
+    fn check_proof(order: Option<Order>, overlap: PhaseBOverlap) {
+        static BASELINE: std::sync::OnceLock<BlockWhirProof> = std::sync::OnceLock::new();
+        let elf = asm_elf_bytes("test_keccak_multi");
+        let format = many_groups();
+        let in_order = BASELINE.get_or_init(|| {
+            let proof = prove_order(&elf, &format, None, Off).expect("prove");
+            assert!(proof.groups.len() > 3, "{} groups", proof.groups.len());
+            proof
+        });
+        let proof = prove_order(&elf, &format, order, overlap).expect("prove");
+        assert_eq!(proof.groups, in_order.groups, "the partition");
+        assert!(verify(&proof, &elf, &format));
         if crypto::grinding::deterministic() {
-            assert_eq!(bytes(&proof), bytes(&in_order), "{what}: the proof");
+            let bytes = |p: &BlockWhirProof| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serialize")
+                    .to_vec()
+            };
+            assert_eq!(bytes(&proof), bytes(in_order), "the proof");
         }
     }
-    let twice: fn(usize) -> Vec<usize> = |n| std::iter::repeat_n(0, n).collect();
-    let short: fn(usize) -> Vec<usize> = |n| (1..n).collect();
-    for (what, order) in [("a group twice", twice), ("a group left out", short)] {
-        for overlap in [Off, On, Pinned] {
-            assert!(proved(Some(order), overlap).is_err(), "{what}: proved");
-        }
+
+    fn check_invalid(order: Order, overlap: PhaseBOverlap) {
+        let elf = asm_elf_bytes("test_keccak_multi");
+        let format = many_groups();
+        assert!(prove_order(&elf, &format, Some(order), overlap).is_err());
     }
+
+    macro_rules! cases {
+        ($check:ident; $($name:ident ($order:expr, $overlap:expr)),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    $check($order, $overlap);
+                }
+            )+
+        };
+    }
+
+    cases!(check_proof;
+        serial_reversed(Some(reversed), Off),
+        serial_odd_first(Some(odd_first), Off),
+        overlapped_in_order(None, On),
+        overlapped_reversed(Some(reversed), On),
+        pinned_in_order(None, Pinned),
+        pinned_reversed(Some(reversed), Pinned),
+    );
+
+    cases!(check_invalid;
+        serial_repeated_group(repeated_group, Off),
+        serial_missing_group(missing_group, Off),
+        overlapped_repeated_group(repeated_group, On),
+        overlapped_missing_group(missing_group, On),
+        pinned_repeated_group(repeated_group, Pinned),
+        pinned_missing_group(missing_group, Pinned),
+    );
 }
 
 /// ★ Phase B with the group of the most tables first
@@ -3361,11 +3425,11 @@ fn the_rest_airs_built_beside_prove_the_same_bytes() {
 /// through the test's own deviation, not the environment.
 #[test]
 fn more_walkers_prove_the_same_bytes() {
-    let elf = asm_elf_bytes("all_instructions_64");
+    let elf = asm_elf_bytes("test_commit_4");
     let format = many_groups();
-    let o = streamed(MaxRowsConfig::small(), 16, 3);
+    let o = streamed(MaxRowsConfig::small(), 16, 1);
     let proved = |walkers: usize| {
-        let (proof, _) = prove_block_whir_with(
+        let (proof, stamps) = prove_block_whir_with(
             &elf,
             &[],
             &ProofOptions::default_test_options(),
@@ -3377,6 +3441,7 @@ fn more_walkers_prove_the_same_bytes() {
             },
         )
         .expect("prove");
+        assert!(stamps.executor.windows >= walkers, "one window per walker");
         assert!(verify(&proof, &elf, &format), "{walkers} walkers");
         proof
     };
@@ -3809,19 +3874,19 @@ fn the_plan_takes_the_group_maximum_and_refuses_one_more() {
 /// ★ The group maximum's edge at the verifier: a statement of 1025 groups is refused by the
 /// group maximum, before its partition is read; at 1024 the maximum lets the
 /// statement through, and the partition check refuses the forged groups.
-#[test]
-fn the_verifier_refuses_one_group_over_the_maximum() {
-    let elf = asm_elf_bytes("sub");
-    let format = one_group();
-    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
-    assert!(verify(&proof, &elf, &format));
+fn the_verifier_refuses_one_group_over_the_maximum(
+    elf: &[u8],
+    format: &BlockFormat,
+    mut proof: BlockWhirProof,
+) {
+    assert!(verify(&proof, elf, format));
     for groups in [
         block_whir::BLOCK_MAX_GROUPS,
         block_whir::BLOCK_MAX_GROUPS + 1,
     ] {
         proof.groups = vec![vec![0]; groups];
         let Err(crate::Error::InvalidTableCounts(why)) =
-            verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &format)
+            verify_block_whir(&proof, elf, &ProofOptions::default_test_options(), format)
         else {
             panic!("the verifier did not refuse {groups} groups");
         };
@@ -3833,15 +3898,21 @@ fn the_verifier_refuses_one_group_over_the_maximum() {
     }
 }
 
-/// One table's claimed column value moved: its group's opening refuses it.
 #[test]
-fn a_tampered_column_claim_is_refused() {
+fn grouped_whir_proof_refuses_tampering() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
-    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+    let honest = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+    a_tampered_column_claim_is_refused(&elf, &format, honest.clone());
+    a_restated_cpu_table_height_is_refused(&elf, &format, &honest);
+    a_tampered_prepared_opening_is_refused(&elf, &format, honest.clone());
+}
+
+/// One table's claimed column value moved: its group's opening refuses it.
+fn a_tampered_column_claim_is_refused(elf: &[u8], format: &BlockFormat, mut proof: BlockWhirProof) {
     let last = proof.proof.tables.len() - 1;
     proof.proof.tables[last].constraint.reduce.column_values[0] += FieldElement::<E>::one();
-    assert!(!verify(&proof, &elf, &format));
+    assert!(!verify(&proof, elf, format));
 }
 
 /// One table's bus output moved: its GKR no longer lands on its trace.
@@ -3854,20 +3925,18 @@ fn a_tampered_bus_output_is_refused() {
     assert!(!verify(&proof, &elf, &format));
 }
 
-#[test]
-fn a_tampered_public_output_is_refused() {
-    let elf = asm_elf_bytes("sub");
-    let mut proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+fn a_tampered_public_output_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    mut proof: BlockWhirProof,
+) {
     proof.public_output.push(0xff);
-    assert!(!verify(&proof, &elf, &one_group()));
+    assert!(!verify(&proof, elf, format));
 }
 
-#[test]
-fn a_restated_table_height_is_refused() {
-    let elf = asm_elf_bytes("sub");
-    let mut proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+fn a_restated_table_height_is_refused(elf: &[u8], format: &BlockFormat, mut proof: BlockWhirProof) {
     proof.table_num_vars[0] += 1;
-    assert!(!verify(&proof, &elf, &one_group()));
+    assert!(!verify(&proof, elf, format));
 }
 
 /// ⛔ A CPU table's stated height is what its timestamp base and the final PC
@@ -3875,12 +3944,12 @@ fn a_restated_table_height_is_refused() {
 /// the statement re-bound), within every bound, a full CPU table halved or the
 /// last one doubled, the proof is refused; past the block's 2^21 cap it is
 /// refused before anything is built.
-#[test]
-fn a_restated_cpu_table_height_is_refused() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups();
-    let honest = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
-    assert!(verify(&honest, &elf, &format));
+fn a_restated_cpu_table_height_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    honest: &BlockWhirProof,
+) {
+    assert!(verify(honest, elf, format));
     let start = crate::cpu_proof_start(true, &honest.table_counts);
     let cpus = honest.table_counts.cpu;
     assert!(cpus >= 2, "{cpus} CPU tables");
@@ -3900,28 +3969,26 @@ fn a_restated_cpu_table_height_is_refused() {
     ] {
         let mut restated = honest.clone();
         restated.table_num_vars[at] = vars;
-        assert!(!verify(&restated, &elf, &format), "{what}: accepted");
+        assert!(!verify(&restated, elf, format), "{what}: accepted");
     }
 }
 
 /// A root the layouts do not claim is refused before anything is drawn.
-#[test]
-fn an_extra_root_is_refused() {
-    let elf = asm_elf_bytes("sub");
-    let mut proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+fn an_extra_root_is_refused(elf: &[u8], format: &BlockFormat, mut proof: BlockWhirProof) {
     let root = proof.proof.roots[0];
     proof.proof.roots.push(root);
-    assert!(!verify(&proof, &elf, &one_group()));
+    assert!(!verify(&proof, elf, format));
 }
 
 /// DECODE's columns are settled by a prepared opening: one per prepared table,
 /// and a small program's only prepared table is DECODE.
-#[test]
-fn the_block_carries_decodes_prepared_opening() {
-    let elf = asm_elf_bytes("sub");
-    let proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+fn the_block_carries_decodes_prepared_opening(
+    elf: &[u8],
+    format: &BlockFormat,
+    proof: &BlockWhirProof,
+) {
     assert_eq!(proof.prepared.len(), 1);
-    assert!(verify(&proof, &elf, &one_group()));
+    assert!(verify(proof, elf, format));
 }
 
 /// ★ DECODE's index is found by NAME, and "exactly one" is the assertion.
@@ -4020,24 +4087,25 @@ fn the_prepared_set_is_decode_and_the_dense_pages() {
 /// A prepared opening altered in one value is refused. The openings sit last on
 /// their group's fork, so nothing after them reads the tamper: only the
 /// opening's own check can refuse it.
-#[test]
-fn a_tampered_prepared_opening_is_refused() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups();
-    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
-    assert!(verify(&proof, &elf, &format));
+fn a_tampered_prepared_opening_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    mut proof: BlockWhirProof,
+) {
+    assert!(verify(&proof, elf, format));
     proof.prepared[0].polys[0].final_value += FieldElement::<E>::one();
-    assert!(!verify(&proof, &elf, &format));
+    assert!(!verify(&proof, elf, format));
 }
 
 /// A proof that leaves a prepared opening out is refused: the verifier derives
 /// the prepared set from the program, not from the proof.
-#[test]
-fn a_missing_prepared_opening_is_refused() {
-    let elf = asm_elf_bytes("sub");
-    let mut proof = prove(&elf, &one_group(), &options(MaxRowsConfig::default(), 16));
+fn a_missing_prepared_opening_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    mut proof: BlockWhirProof,
+) {
     proof.prepared.pop();
-    assert!(!verify(&proof, &elf, &one_group()));
+    assert!(!verify(&proof, elf, format));
 }
 
 /// A prover that commits DECODE's prepared columns for another program (one
@@ -6154,8 +6222,12 @@ pub(super) fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
 /// deterministic grind; each family alone, both, and both beside KECCAK_RND's;
 /// laid out inline and on workers; for programs whose chunks lie in several
 /// windows.
-#[test]
-fn cpu_and_memw_r_filled_from_records_move_no_byte() {
+fn cpu_and_memw_r_filled_from_records_move_no_byte(
+    name: &str,
+    workers: usize,
+    (cpu, memw_r, keccak_rnd): (bool, bool, bool),
+    baseline: &std::sync::OnceLock<BlockWhirProof>,
+) {
     let _fills = records_fill_lock();
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
@@ -6163,93 +6235,132 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
             .expect("serialize")
             .to_vec()
     };
-    for name in ["all_instructions_64", "test_keccak_multi"] {
-        let elf = asm_elf_bytes(name);
-        for workers in [0usize, 3] {
-            let proved = |deviations: Deviations| {
-                let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-                o.layout_workers = workers;
-                o.drop_streamed_ops = true;
-                let (proof, stamps) = prove_block_whir_with(
-                    &elf,
-                    &[],
-                    &ProofOptions::default_test_options(),
-                    &format,
-                    &o,
-                    &deviations,
-                )
-                .expect("prove");
-                assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
-                (proof, stamps)
-            };
-            let (host, host_stamps) = proved(Deviations {
-                card_fill: Some(false),
-                card_fill_streamed: Some([false, false]),
-                ..finish_keccak_rnd()
-            });
-            let off = host_stamps.windows.card_fill;
-            assert_eq!(
-                (off.cpu, off.memw_r, off.records_bytes),
-                ([0, 0], [0, 0], 0),
-                "knob off"
-            );
-            assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
-            for (cpu, memw_r, keccak_rnd) in [
-                (true, false, false),
-                (false, true, false),
-                (true, true, false),
-                (true, true, true),
-            ] {
-                let what = format!(
-                    "{name}, {workers} workers, cpu {cpu} memw_r {memw_r} keccak_rnd {keccak_rnd}"
+    let elf = asm_elf_bytes(name);
+    let proved = |deviations: Deviations| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.layout_workers = workers;
+        o.drop_streamed_ops = true;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &deviations,
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
+        (proof, stamps)
+    };
+    let host = baseline.get_or_init(|| {
+        let (proof, host_stamps) = proved(Deviations {
+            card_fill: Some(false),
+            card_fill_streamed: Some([false, false]),
+            ..finish_keccak_rnd()
+        });
+        let off = host_stamps.windows.card_fill;
+        assert_eq!(
+            (off.cpu, off.memw_r, off.records_bytes),
+            ([0, 0], [0, 0], 0),
+            "knob off"
+        );
+        assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
+        proof
+    });
+    let what =
+        format!("{name}, {workers} workers, cpu {cpu} memw_r {memw_r} keccak_rnd {keccak_rnd}");
+    // Regeneration is off here, and parked records need it: kept.
+    // KECCAK_RND built at the finish, as the host's run: its
+    // records are then the rest's (`records_rest`, which `held`
+    // counts) and the partition is the host's. Handed out during
+    // the windows (the default where the card fills it) its tables
+    // would be records `held` does not count, in groups of their own.
+    let (card, stamps) = proved(Deviations {
+        card_fill: Some(keccak_rnd),
+        records_keep: Some(true),
+        stream_keccak_rnd: Some(false),
+        ..streamed_records(cpu, memw_r)
+    });
+    let c = stamps.windows.card_fill;
+    assert_eq!(c.out_of_step, 0, "{what}: {c:?}");
+    assert_eq!(c.room_out, None, "{what}: {c:?}");
+    assert_eq!((c.cpu[1], c.memw_r[1]), (0, 0), "{what}: {c:?}");
+    assert_eq!(c.cpu[0] > 0, cpu, "{what}: {c:?}");
+    assert_eq!(c.memw_r[0] > 0, memw_r, "{what}: {c:?}");
+    let held = (c.cpu[0] + c.memw_r[0] + stamps.layout.records_rest.0) as u64;
+    let (on_card, on_host) = stamps.records_fills;
+    if cfg!(feature = "cuda") {
+        // At its commit and at its argument on the card; at this
+        // size a commit under the card's floor encodes on the host
+        // from the host's fill, once a table.
+        assert!(
+            (held..=2 * held).contains(&on_card) && on_host <= held,
+            "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
+        );
+    } else {
+        assert_eq!(
+            (on_card, on_host),
+            (0, held),
+            "{what}: each on the host once"
+        );
+    }
+    assert_eq!(host.groups, card.groups, "{what}: the partition");
+    assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
+    assert_eq!(
+        format!("{:?}", host.table_counts),
+        format!("{:?}", card.table_counts),
+        "{what}"
+    );
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(host), bytes(&card), "{what}: the proof");
+    }
+}
+macro_rules! record_fill_cases {
+    ($guest:ident, $schedule:ident, $workers:expr) => {
+        mod $schedule {
+            fn check(fill: (bool, bool, bool)) {
+                static BASELINE: std::sync::OnceLock<crate::block_whir::BlockWhirProof> =
+                    std::sync::OnceLock::new();
+                super::super::super::cpu_and_memw_r_filled_from_records_move_no_byte(
+                    stringify!($guest),
+                    $workers,
+                    fill,
+                    &BASELINE,
                 );
-                // Regeneration is off here, and parked records need it: kept.
-                // KECCAK_RND built at the finish, as the host's run: its
-                // records are then the rest's (`records_rest`, which `held`
-                // counts) and the partition is the host's. Handed out during
-                // the windows (the default where the card fills it) its tables
-                // would be records `held` does not count, in groups of their own.
-                let (card, stamps) = proved(Deviations {
-                    card_fill: Some(keccak_rnd),
-                    records_keep: Some(true),
-                    stream_keccak_rnd: Some(false),
-                    ..streamed_records(cpu, memw_r)
-                });
-                let c = stamps.windows.card_fill;
-                assert_eq!(c.out_of_step, 0, "{what}: {c:?}");
-                assert_eq!(c.room_out, None, "{what}: {c:?}");
-                assert_eq!((c.cpu[1], c.memw_r[1]), (0, 0), "{what}: {c:?}");
-                assert_eq!(c.cpu[0] > 0, cpu, "{what}: {c:?}");
-                assert_eq!(c.memw_r[0] > 0, memw_r, "{what}: {c:?}");
-                let held = (c.cpu[0] + c.memw_r[0] + stamps.layout.records_rest.0) as u64;
-                let (on_card, on_host) = stamps.records_fills;
-                if cfg!(feature = "cuda") {
-                    // At its commit and at its argument on the card; at this
-                    // size a commit under the card's floor encodes on the host
-                    // from the host's fill, once a table.
-                    assert!(
-                        (held..=2 * held).contains(&on_card) && on_host <= held,
-                        "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
-                    );
-                } else {
-                    assert_eq!(
-                        (on_card, on_host),
-                        (0, held),
-                        "{what}: each on the host once"
-                    );
-                }
-                assert_eq!(host.groups, card.groups, "{what}: the partition");
-                assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
-                assert_eq!(
-                    format!("{:?}", host.table_counts),
-                    format!("{:?}", card.table_counts),
-                    "{what}"
-                );
-                if crypto::grinding::deterministic() {
-                    assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
-                }
+            }
+
+            #[test]
+            fn cpu() {
+                check((true, false, false));
+            }
+
+            #[test]
+            fn memw_r() {
+                check((false, true, false));
+            }
+
+            #[test]
+            fn cpu_and_memw_r() {
+                check((true, true, false));
+            }
+
+            #[test]
+            fn cpu_memw_r_and_keccak() {
+                check((true, true, true));
             }
         }
+    };
+}
+
+mod cpu_and_memw_r_filled_from_records_move_no_byte {
+    mod all_instructions_64 {
+        record_fill_cases!(all_instructions_64, inline, 0);
+        record_fill_cases!(all_instructions_64, layout_workers, 3);
+    }
+
+    mod test_keccak_multi {
+        record_fill_cases!(test_keccak_multi, inline, 0);
+        record_fill_cases!(test_keccak_multi, layout_workers, 3);
     }
 }
 
@@ -6264,8 +6375,11 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
 /// they make them (the default), so it is handed no CPU, MEMW_R or SHIFT
 /// chunk, and only MEMW_A, MEMW and LT chunks a run hands out, which a small
 /// one may not.
-#[test]
-fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
+fn counting_the_hand_out_on_its_own_thread_moves_no_byte(
+    name: &str,
+    workers: usize,
+    records: bool,
+) {
     use crate::tables::trace_builder::StreamTable;
     let _fills = records_fill_lock();
     let format = many_groups();
@@ -6274,73 +6388,102 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
             .expect("serialize")
             .to_vec()
     };
-    for name in ["all_instructions_64", "test_keccak_multi"] {
-        let elf = asm_elf_bytes(name);
-        for workers in [0usize, 3] {
-            for records in [false, true] {
-                let what = format!("{name}, {workers} workers, records {records}");
-                let proved = |on_thread: bool| {
-                    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-                    o.layout_workers = workers;
-                    o.drop_streamed_ops = true;
-                    let base = if records {
-                        Deviations {
-                            records_keep: Some(true),
-                            ..streamed_records(true, true)
-                        }
-                    } else {
-                        Deviations {
-                            card_fill_streamed: Some([false, false]),
-                            card_fill_rows: Some(RowFamilies::NONE),
-                            ..Deviations::default()
-                        }
-                    };
-                    let (proof, stamps) = prove_block_whir_with(
-                        &elf,
-                        &[],
-                        &ProofOptions::default_test_options(),
-                        &format,
-                        &o,
-                        &Deviations {
-                            handout_count_thread: Some(on_thread),
-                            ..base
-                        },
-                    )
-                    .expect("prove");
-                    assert!(verify(&proof, &elf, &format), "{what}, thread {on_thread}");
-                    match (on_thread, stamps.windows.count_thread) {
-                        (false, None) => {}
-                        (true, Some(c)) => {
-                            for table in [
-                                StreamTable::Cpu,
-                                StreamTable::MemwRegister,
-                                StreamTable::Shift,
-                            ] {
-                                assert_eq!(
-                                    c.chunks[table.position()],
-                                    0,
-                                    "{what}: the thread counted {table:?} chunks the walkers counted"
-                                );
-                            }
-                        }
-                        (on, c) => panic!("{what}: thread {on}, stamps {c:?}"),
-                    }
-                    proof
-                };
-                let inline = proved(false);
-                let thread = proved(true);
-                assert_eq!(inline.groups, thread.groups, "{what}: the partition");
-                assert_eq!(inline.table_num_vars, thread.table_num_vars, "{what}");
-                assert_eq!(
-                    format!("{:?}", inline.table_counts),
-                    format!("{:?}", thread.table_counts),
-                    "{what}"
-                );
-                if crypto::grinding::deterministic() {
-                    assert_eq!(bytes(&inline), bytes(&thread), "{what}: the proof");
+    let elf = asm_elf_bytes(name);
+    let what = format!("{name}, {workers} workers, records {records}");
+    let proved = |on_thread: bool| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.layout_workers = workers;
+        o.drop_streamed_ops = true;
+        let base = if records {
+            Deviations {
+                records_keep: Some(true),
+                ..streamed_records(true, true)
+            }
+        } else {
+            Deviations {
+                card_fill_streamed: Some([false, false]),
+                card_fill_rows: Some(RowFamilies::NONE),
+                ..Deviations::default()
+            }
+        };
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                handout_count_thread: Some(on_thread),
+                ..base
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "{what}, thread {on_thread}");
+        match (on_thread, stamps.windows.count_thread) {
+            (false, None) => {}
+            (true, Some(c)) => {
+                for table in [
+                    StreamTable::Cpu,
+                    StreamTable::MemwRegister,
+                    StreamTable::Shift,
+                ] {
+                    assert_eq!(
+                        c.chunks[table.position()],
+                        0,
+                        "{what}: the thread counted {table:?} chunks the walkers counted"
+                    );
                 }
             }
+            (on, c) => panic!("{what}: thread {on}, stamps {c:?}"),
         }
+        proof
+    };
+    let inline = proved(false);
+    let thread = proved(true);
+    assert_eq!(inline.groups, thread.groups, "{what}: the partition");
+    assert_eq!(inline.table_num_vars, thread.table_num_vars, "{what}");
+    assert_eq!(
+        format!("{:?}", inline.table_counts),
+        format!("{:?}", thread.table_counts),
+        "{what}"
+    );
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&inline), bytes(&thread), "{what}: the proof");
+    }
+}
+macro_rules! handout_count_cases {
+    ($guest:ident, $schedule:ident, $workers:expr) => {
+        mod $schedule {
+            #[test]
+            fn host_fill() {
+                super::super::super::counting_the_hand_out_on_its_own_thread_moves_no_byte(
+                    stringify!($guest),
+                    $workers,
+                    false,
+                );
+            }
+
+            #[test]
+            fn records_fill() {
+                super::super::super::counting_the_hand_out_on_its_own_thread_moves_no_byte(
+                    stringify!($guest),
+                    $workers,
+                    true,
+                );
+            }
+        }
+    };
+}
+
+mod counting_the_hand_out_on_its_own_thread_moves_no_byte {
+    mod all_instructions_64 {
+        handout_count_cases!(all_instructions_64, inline, 0);
+        handout_count_cases!(all_instructions_64, layout_workers, 3);
+    }
+
+    mod test_keccak_multi {
+        handout_count_cases!(test_keccak_multi, inline, 0);
+        handout_count_cases!(test_keccak_multi, layout_workers, 3);
     }
 }
 

@@ -1689,64 +1689,68 @@ fn active_rows(tables: &[Table], mu: &[usize]) -> Vec<Vec<u64>> {
 /// BITWISE's multiplicities as the build counted them (its collectors count
 /// each fused row's checks); and every load and store of the run is a LOAD,
 /// STORE or fused row, once.
-#[test]
-fn the_walk_makes_the_fused_tables_the_conversion_makes() {
+fn assert_walk_reproduces_fused_tables(max_rows: &MaxRowsConfig) {
     let mut failed = Vec::new();
     let mut fused_rows = 0usize;
-    for (sizes, max_rows) in [
-        ("small", MaxRowsConfig::small()),
-        ("2^2", MaxRowsConfig::uniform(4)),
-    ] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            let split = windowed(&program, &logs, &max_rows, 1000, &|b| {
-                b.register_format(RegisterFormat::InRow)
-                    .expect("before any window")
-                    .memw_aligned_order(MemwAlignedOrder::Limbs)
-                    .expect("before any window")
-            });
-            let (loads, stores) = (load_ops(&split.loads).len(), store_ops(&split.stores).len());
-            let (want, _) = fuse(split);
-            for window in [7, 1000] {
-                for dropped in [false, true] {
-                    let what = format!("{name} {sizes} window {window} dropped {dropped}");
-                    let mut got = walk_fused(&program, &logs, &max_rows, window, dropped);
-                    for (family, a, b, mu) in [
-                        ("MEM_LOAD", &got.mem_loads, &want.mem_loads, vec![ml::MU]),
-                        ("MEM_STORE", &got.mem_stores, &want.mem_stores, vec![ms::MU]),
-                        ("LOAD", &got.loads, &want.loads, vec![ld::MU]),
-                        ("STORE", &got.stores, &want.stores, vec![st::MU]),
-                        (
-                            "MEMW_A",
-                            &got.memw_aligneds,
-                            &want.memw_aligneds,
-                            vec![ma::MU_READ, ma::MU_WRITE],
-                        ),
-                    ] {
-                        if active_rows(a, &mu) != active_rows(b, &mu) {
-                            failed.push(format!("{what}: {family}'s rows differ"));
-                        }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        let split = windowed(&program, &logs, max_rows, 1000, &|b| {
+            b.register_format(RegisterFormat::InRow)
+                .expect("before any window")
+                .memw_aligned_order(MemwAlignedOrder::Limbs)
+                .expect("before any window")
+        });
+        let (loads, stores) = (load_ops(&split.loads).len(), store_ops(&split.stores).len());
+        let (want, _) = fuse(split);
+        for window in [7, 1000] {
+            for dropped in [false, true] {
+                let what = format!("{name} window {window} dropped {dropped}");
+                let mut got = walk_fused(&program, &logs, max_rows, window, dropped);
+                for (family, a, b, mu) in [
+                    ("MEM_LOAD", &got.mem_loads, &want.mem_loads, vec![ml::MU]),
+                    ("MEM_STORE", &got.mem_stores, &want.mem_stores, vec![ms::MU]),
+                    ("LOAD", &got.loads, &want.loads, vec![ld::MU]),
+                    ("STORE", &got.stores, &want.stores, vec![st::MU]),
+                    (
+                        "MEMW_A",
+                        &got.memw_aligneds,
+                        &want.memw_aligneds,
+                        vec![ma::MU_READ, ma::MU_WRITE],
+                    ),
+                ] {
+                    if active_rows(a, &mu) != active_rows(b, &mu) {
+                        failed.push(format!("{what}: {family}'s rows differ"));
                     }
-                    let (l, s) = (
-                        active_rows(&got.mem_loads, &[ml::MU]).len(),
-                        active_rows(&got.mem_stores, &[ms::MU]).len(),
-                    );
-                    if load_ops(&got.loads).len() + l != loads
-                        || store_ops(&got.stores).len() + s != stores
-                    {
-                        failed.push(format!("{what}: an access lost or doubled"));
-                    }
-                    fused_rows += l + s;
-                    let left = left_with(&program, &mut got, &|_| None, true);
-                    if !left.accepted() {
-                        failed.push(format!("{what}: {left}"));
-                    }
+                }
+                let (l, s) = (
+                    active_rows(&got.mem_loads, &[ml::MU]).len(),
+                    active_rows(&got.mem_stores, &[ms::MU]).len(),
+                );
+                if load_ops(&got.loads).len() + l != loads
+                    || store_ops(&got.stores).len() + s != stores
+                {
+                    failed.push(format!("{what}: an access lost or doubled"));
+                }
+                fused_rows += l + s;
+                let left = left_with(&program, &mut got, &|_| None, true);
+                if !left.accepted() {
+                    failed.push(format!("{what}: {left}"));
                 }
             }
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert!(fused_rows > 0);
+}
+
+#[test]
+fn the_walk_reproduces_small_fused_tables() {
+    assert_walk_reproduces_fused_tables(&MaxRowsConfig::small());
+}
+
+#[test]
+fn the_walk_reproduces_uniform_fused_tables() {
+    assert_walk_reproduces_fused_tables(&MaxRowsConfig::uniform(4));
 }
 
 /// ★ The verifier's frame of a fused statement, with no proof: the statement

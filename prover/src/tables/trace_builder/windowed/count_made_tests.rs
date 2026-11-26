@@ -101,42 +101,63 @@ fn made_build(
 /// ★ Counted where the rows are made, through the split and through `push`, the hand-out's counting on its thread
 /// or not, at every window length and the three chunk sizes, the windows
 /// build the whole-run tables.
-#[test]
-fn counting_where_made_builds_the_whole_run_tables() {
+fn assert_counting_where_made_builds_the_whole_run_tables(window: usize, config: usize) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for (what, max_rows) in configs() {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            let reference = whole(&program, &logs, &max_rows);
-            for window in [1, 7, 33, 1000] {
-                for (split, count_thread) in
-                    [(true, true), (true, false), (false, true), (false, false)]
-                {
-                    let (traces, counted) = made_build(
-                        &program,
-                        &logs,
-                        &max_rows,
-                        window,
-                        split,
-                        count_thread,
-                        false,
-                    );
-                    let traces = traces.unwrap_or_else(|e| {
-                        panic!("{what} {name}, window {window}, split {split}: {e:?}")
-                    });
-                    same_traces(&reference, &traces);
-                    let body = (logs.len() - 1) / window;
-                    if split {
-                        assert_eq!(counted, body, "{name}: every window counted by its walker");
-                    }
-                }
+    let (what, max_rows) = &configs()[config];
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, max_rows);
+        for (split, count_thread) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (traces, counted) = made_build(
+                &program,
+                &logs,
+                max_rows,
+                window,
+                split,
+                count_thread,
+                false,
+            );
+            let traces = traces
+                .unwrap_or_else(|e| panic!("{what} {name}, window {window}, split {split}: {e:?}"));
+            same_traces(&reference, &traces);
+            let body = (logs.len() - 1) / window;
+            if split {
+                assert_eq!(counted, body, "{name}: every window counted by its walker");
             }
         }
     }
 }
 
-/// ★ Under the mode, a window absorbed without its walker's counts (its rows
-/// would go uncounted) is refused at the finish.
+mod counting_where_made_builds_whole_run_tables {
+    macro_rules! cases {
+        ($name:ident, $window:literal) => {
+            mod $name {
+                use super::super::assert_counting_where_made_builds_the_whole_run_tables as check;
+
+                #[test]
+                fn small() {
+                    check($window, 0);
+                }
+
+                #[test]
+                fn padded() {
+                    check($window, 1);
+                }
+
+                #[test]
+                fn one_op() {
+                    check($window, 2);
+                }
+            }
+        };
+    }
+
+    cases!(window_1, 1);
+    cases!(window_7, 7);
+    cases!(window_33, 33);
+    cases!(window_1000, 1000);
+}
+
 #[test]
 fn a_window_without_its_walkers_counts_is_refused() {
     let (program, logs) = run("all_instructions_64");

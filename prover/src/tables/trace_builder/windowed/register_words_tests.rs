@@ -159,55 +159,44 @@ fn rooms() -> Vec<(&'static str, RecordsRoom)> {
     ]
 }
 
-/// ★ Every program, windows of 7 and 33 cycles, one and three walkers, every
-/// room rule: words mode builds the whole-run tables, holds MEMW_R chunks as
-/// words, and each held chunk's digest is the rows-mode chunk's. Then each
-/// mutant, one at a time, on the programs with ECALLs: the walker sending an
-/// ECALL cycle's rows as words, and the decode reading a write's old value
-/// whatever its slot, must change a table or fail the build; the walker
-/// sending a write whose old access lies before its window as a word is the
-/// card's mutant (its kernel refuses the row), reported here.
-#[test]
-fn words_mode_builds_the_whole_run_tables_and_each_mutant_moves_them() {
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+/// At this window size, compare the tables and the digests of the held chunks
+/// against rows mode, with both walker counts and every room rule.
+fn assert_words_mode_matches_rows(window: usize, programs: &[&str]) {
     let max_rows = MaxRowsConfig::small();
     let mut words_chunks = 0usize;
     let mut compared = 0usize;
-    for name in PROGRAMS {
+    for &name in programs {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [7usize, 33] {
-            for walkers in [1usize, 3] {
-                for (what, room) in rooms() {
-                    let at = format!("{name}, window {window}, {walkers} walkers, room {what}");
-                    let (traces, held) =
-                        built(&program, &max_rows, window, walkers, room, true, true);
+        for walkers in [1usize, 3] {
+            for (what, room) in rooms() {
+                let at = format!("{name}, window {window}, {walkers} walkers, room {what}");
+                let (traces, held) = built(&program, &max_rows, window, walkers, room, true, true);
+                same_traces(&reference, &traces);
+                words_chunks += held.words;
+                if what == "always" {
+                    // The accumulator counting the handed-out words.
+                    let (traces, _) = built(
+                        &program,
+                        &max_rows,
+                        window,
+                        walkers,
+                        Arc::new(|_| true),
+                        true,
+                        false,
+                    );
                     same_traces(&reference, &traces);
-                    words_chunks += held.words;
-                    if what == "always" {
-                        // The accumulator counting the handed-out words.
-                        let (traces, _) = built(
-                            &program,
-                            &max_rows,
-                            window,
-                            walkers,
-                            Arc::new(|_| true),
-                            true,
-                            false,
-                        );
-                        same_traces(&reference, &traces);
-                        let (_, rows) = built(
-                            &program,
-                            &max_rows,
-                            window,
-                            walkers,
-                            Arc::new(|_| true),
-                            false,
-                            true,
-                        );
-                        assert_eq!(held.digests, rows.digests, "{at}: the chunks' digests");
-                        compared += held.digests.len();
-                    }
+                    let (_, rows) = built(
+                        &program,
+                        &max_rows,
+                        window,
+                        walkers,
+                        Arc::new(|_| true),
+                        false,
+                        true,
+                    );
+                    assert_eq!(held.digests, rows.digests, "{at}: the chunks' digests");
+                    compared += held.digests.len();
                 }
             }
         }
@@ -219,7 +208,43 @@ fn words_mode_builds_the_whole_run_tables_and_each_mutant_moves_them() {
         words_chunks > 0 && compared > 0,
         "words mode never held a chunk"
     );
+}
 
+mod words_mode_matches_rows {
+    use super::{PROGRAMS, assert_words_mode_matches_rows};
+
+    #[test]
+    fn keccak_window_7() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        assert_words_mode_matches_rows(7, &PROGRAMS[..7]);
+    }
+
+    #[test]
+    fn ecrec_window_7() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        assert_words_mode_matches_rows(7, &PROGRAMS[7..]);
+    }
+
+    #[test]
+    fn keccak_window_33() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        assert_words_mode_matches_rows(33, &PROGRAMS[..7]);
+    }
+
+    #[test]
+    fn ecrec_window_33() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        assert_words_mode_matches_rows(33, &PROGRAMS[7..]);
+    }
+}
+
+/// Sending an ECALL cycle's rows as words and reading every write's old value
+/// must change a table or fail the build. A write before the window is the
+/// card's mutant. Report its effect on the host, too.
+#[test]
+fn words_mode_mutants_move_the_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let max_rows = MaxRowsConfig::small();
     for (mutant, bit, must) in [
         ("an ECALL cycle's rows as words", WORDS_FAULT_ECALL, true),
         (

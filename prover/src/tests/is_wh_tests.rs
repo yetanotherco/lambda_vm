@@ -292,7 +292,9 @@ fn prove_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> bool {
 
 /// [`prove_keccak_with`] for any asm program.
 fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
-    let options = crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
+    let options = crate::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid");
     let (elf_bytes, program, mut traces) = full_traces(name);
 
     rewrite(&mut traces);

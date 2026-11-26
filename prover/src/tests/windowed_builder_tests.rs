@@ -127,7 +127,11 @@ fn same(what: &str, a: &Table, b: &Table) {
         (b.main_table.width, b.main_table.height),
         "{what}: shape"
     );
-    assert!(rows(a) == rows(b), "{what}: rows differ");
+    let cells = a.main_table.width * a.main_table.height;
+    assert!(
+        a.main_table.row_major_data()[..cells] == b.main_table.row_major_data()[..cells],
+        "{what}: rows differ"
+    );
 }
 
 fn same_list(what: &str, a: &[Table], b: &[Table]) {
@@ -967,8 +971,7 @@ fn a_late_decode_trace_is_waited_for_before_its_rows_are_counted() {
 /// split, at several windows, with the derived LT ops compact or raw, or
 /// streamed. The thread did count every table's chunks, and the build that
 /// counts inline started none.
-#[test]
-fn the_hand_outs_count_on_a_thread_of_its_own_builds_the_same_tables() {
+fn assert_threaded_hand_out_count(window: usize) {
     let one_op = MaxRowsConfig {
         memw: 1,
         load: 1,
@@ -986,52 +989,49 @@ fn the_hand_outs_count_on_a_thread_of_its_own_builds_the_same_tables() {
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [1, 7, 33] {
-            // With the MEMW-derived LT ops streamed, LT's lists follow the
-            // windows: the build that keeps its ops at the same windows.
-            let lt_streamed_reference =
-                windowed_with(&program, &logs, &max_rows, window, false, |b| {
-                    b.stream_memw_lt()
-                })
-                .0;
-            for split in [false, true] {
-                type Configure = fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>;
-                let lists: [(&str, Configure); 3] = [
-                    ("compact", |b| b),
-                    ("raw", |b| b.raw_memw_lt().expect("before any window")),
-                    ("streamed", |b| b.stream_memw_lt()),
-                ];
-                for (what, lists) in lists {
-                    let mut built = Vec::new();
-                    for on_thread in [false, true] {
-                        let (traces, stamps) =
-                            windowed_counted(&program, &logs, &max_rows, window, split, |b| {
-                                lists(b.count_handout_on_thread(on_thread))
-                                    .drop_streamed_ops()
-                                    .expect("before any window")
-                            });
-                        let at = format!("{name}/{window}/{split}/{what}/thread {on_thread}");
-                        match (on_thread, stamps) {
-                            (false, Some(_)) => panic!("{at}: a count thread ran"),
-                            (true, Some(s)) => {
-                                for (sum, n) in counted.iter_mut().zip(s.chunks) {
-                                    *sum += n;
-                                }
+        // With the MEMW-derived LT ops streamed, LT's lists follow the
+        // windows: the build that keeps its ops at the same windows.
+        let lt_streamed_reference = windowed_with(&program, &logs, &max_rows, window, false, |b| {
+            b.stream_memw_lt()
+        })
+        .0;
+        for split in [false, true] {
+            type Configure = fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>;
+            let lists: [(&str, Configure); 3] = [
+                ("compact", |b| b),
+                ("raw", |b| b.raw_memw_lt().expect("before any window")),
+                ("streamed", |b| b.stream_memw_lt()),
+            ];
+            for (what, lists) in lists {
+                let mut built = Vec::new();
+                for on_thread in [false, true] {
+                    let (traces, stamps) =
+                        windowed_counted(&program, &logs, &max_rows, window, split, |b| {
+                            lists(b.count_handout_on_thread(on_thread))
+                                .drop_streamed_ops()
+                                .expect("before any window")
+                        });
+                    let at = format!("{name}/{window}/{split}/{what}/thread {on_thread}");
+                    match (on_thread, stamps) {
+                        (false, Some(_)) => panic!("{at}: a count thread ran"),
+                        (true, Some(s)) => {
+                            for (sum, n) in counted.iter_mut().zip(s.chunks) {
+                                *sum += n;
                             }
-                            (true, None) if logs.len() > window + 1 => {
-                                panic!("{at}: no count thread ran")
-                            }
-                            _ => {}
                         }
-                        if what == "streamed" {
-                            same_traces(&lt_streamed_reference, &traces);
-                        } else {
-                            same_traces(&reference, &traces);
+                        (true, None) if logs.len() > window + 1 => {
+                            panic!("{at}: no count thread ran")
                         }
-                        built.push(traces);
+                        _ => {}
                     }
-                    same_traces(&built[0], &built[1]);
+                    if what == "streamed" {
+                        same_traces(&lt_streamed_reference, &traces);
+                    } else {
+                        same_traces(&reference, &traces);
+                    }
+                    built.push(traces);
                 }
+                same_traces(&built[0], &built[1]);
             }
         }
     }
@@ -1047,6 +1047,25 @@ fn the_hand_outs_count_on_a_thread_of_its_own_builds_the_same_tables() {
             counted[table.position()] > 0,
             "the count thread counted no {table:?} chunk"
         );
+    }
+}
+
+mod the_hand_outs_count_on_a_thread_of_its_own_builds_the_same_tables {
+    use super::assert_threaded_hand_out_count;
+
+    #[test]
+    fn window_1() {
+        assert_threaded_hand_out_count(1);
+    }
+
+    #[test]
+    fn window_7() {
+        assert_threaded_hand_out_count(7);
+    }
+
+    #[test]
+    fn window_33() {
+        assert_threaded_hand_out_count(33);
     }
 }
 
@@ -1480,8 +1499,7 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
 /// without dropping the streamed ops (the dropping builds through the split),
 /// on programs with keccak calls, narrow and odd-offset loads and stores; and
 /// so does each part alone.
-#[test]
-fn the_lean_walk_builds_the_whole_run_tables() {
+fn assert_lean_walk_builds_the_whole_run_tables(name: &str) {
     let max_rows = MaxRowsConfig::small();
     let only = |f: fn(&mut WalkLean)| {
         let mut lean = WalkLean::NONE;
@@ -1493,37 +1511,50 @@ fn the_lean_walk_builds_the_whole_run_tables() {
         only(|l| l.lookups = true),
         only(|l| l.route = true),
     ];
-    for name in [
-        "sub",
-        "all_instructions_64",
-        "test_keccak",
-        "test_keccak_multi",
-        "lw_sw_offset_odd",
-        "test_memw_split_ts",
-    ] {
-        let (program, logs) = run(name);
-        let reference = whole(&program, &logs, &max_rows);
-        for window in [1, 7, 32, 33, 1000, logs.len()] {
-            let mut settings = vec![WalkLean::NONE, WalkLean::ALL];
-            if window == 33 && name.starts_with("test_") {
-                settings.extend(parts);
-            }
-            for lean in settings {
-                for drop in [false, true] {
-                    let (traces, _) =
-                        windowed_with(&program, &logs, &max_rows, window, drop, |builder| {
-                            let builder = builder.walk_lean(lean);
-                            if drop {
-                                builder
-                                    .drop_streamed_ops()
-                                    .expect("before the first window")
-                            } else {
-                                builder
-                            }
-                        });
-                    same_traces(&reference, &traces);
-                }
+    let (program, logs) = run(name);
+    let reference = whole(&program, &logs, &max_rows);
+    for window in [1, 7, 32, 33, 1000, logs.len()] {
+        let mut settings = vec![WalkLean::NONE, WalkLean::ALL];
+        if window == 33 && name.starts_with("test_") {
+            settings.extend(parts);
+        }
+        for lean in settings {
+            for drop in [false, true] {
+                let (traces, _) =
+                    windowed_with(&program, &logs, &max_rows, window, drop, |builder| {
+                        let builder = builder.walk_lean(lean);
+                        if drop {
+                            builder
+                                .drop_streamed_ops()
+                                .expect("before the first window")
+                        } else {
+                            builder
+                        }
+                    });
+                same_traces(&reference, &traces);
             }
         }
     }
+}
+
+mod the_lean_walk_builds_the_whole_run_tables {
+    macro_rules! cases {
+        ($($name:ident),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    super::assert_lean_walk_builds_the_whole_run_tables(stringify!($name));
+                }
+            )+
+        };
+    }
+
+    cases!(
+        sub,
+        all_instructions_64,
+        test_keccak,
+        test_keccak_multi,
+        lw_sw_offset_odd,
+        test_memw_split_ts,
+    );
 }

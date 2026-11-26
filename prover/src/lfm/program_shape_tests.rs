@@ -30,7 +30,9 @@ use super::word::LfmWord;
 const HASHERS: [HasherKind; 3] = [HasherKind::Test, HasherKind::Blake3, HasherKind::Rpx];
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("options")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("options")
 }
 
 /// The four family combinations, each keeping `BITWISE`.

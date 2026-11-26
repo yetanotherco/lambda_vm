@@ -94,68 +94,105 @@ impl BeforeWords {
     }
 }
 
-/// ★ A split and a fused proof's bytes are the format's before the word
-/// counts, then the counts: the struct before them archives to exactly the
-/// proof's bytes but its last 56, which are zero. On a chip-free run and on
-/// runs that call COPY (commits), keccak256 and ECREC, whose tables the word
-/// format replaces. So the bytes a binary
-/// before the word format proves are this prefix, and a byte moved in any
-/// earlier field moves the prefix (the check's mutant: one flipped byte of a
-/// group index).
-#[test]
-fn a_split_and_a_fused_proof_are_the_bytes_before_the_word_counts_then_zeros() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for (name, memory) in [
-        "fused_mem_cases",
-        "test_commit_split",
-        "test_keccak256",
-        "test_ecrec",
-    ]
-    .into_iter()
-    .flat_map(|name| [(name, MemoryFormat::Split), (name, MemoryFormat::Fused)])
-    {
-        let elf = asm_elf_bytes(name);
-        let proof = prove(&elf, &format(memory));
-        if name != "fused_mem_cases" {
-            let c = &proof.table_counts;
-            assert!(
-                c.copy + c.keccak + c.ecrec > 0,
-                "{name}: COPY, KECCAK or ECREC tables, the chips' own"
-            );
-        }
-        assert_eq!(proof.word_memory, [0; 7], "{memory:?}");
-        let now = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");
-        let before =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&BeforeWords::of(&proof)).expect("serialize");
-        assert_eq!(now.len(), before.len() + 56, "{memory:?}: 56 bytes after");
-        assert_eq!(
-            &now[..before.len()],
-            &before[..],
-            "{memory:?}: the bytes before"
-        );
-        assert_eq!(
-            &now[before.len()..],
-            &[0u8; 56],
-            "{memory:?}: the counts, zero"
-        );
-        // The comparison's mutant: a proof with one byte moved before the
-        // counts is not the struct before them, the counts still zero.
-        let mut moved = proof.clone();
-        moved.groups[0][0] ^= 1;
-        let moved_now = rkyv::to_bytes::<rkyv::rancor::Error>(&moved).expect("serialize");
-        assert_eq!(
-            moved_now.len(),
-            now.len(),
-            "{memory:?}: the moved proof's length"
-        );
-        assert_ne!(
-            &moved_now[..before.len()],
-            &before[..],
-            "{memory:?}: a moved byte parts the prefix"
-        );
-        assert_eq!(&moved_now[before.len()..], &[0u8; 56], "{memory:?}");
+/// Each proof covers the word-count wire layout and its cross-format refusal.
+mod split_and_fused_block_proofs {
+    use super::MemoryFormat;
+
+    macro_rules! cases {
+        ($name:ident) => {
+            mod $name {
+                #[test]
+                fn split() {
+                    super::super::assert_split_or_fused_block(
+                        stringify!($name),
+                        super::MemoryFormat::Split,
+                    );
+                }
+
+                #[test]
+                fn fused() {
+                    super::super::assert_split_or_fused_block(
+                        stringify!($name),
+                        super::MemoryFormat::Fused,
+                    );
+                }
+            }
+        };
     }
+
+    cases!(fused_mem_cases);
+    cases!(test_commit_split);
+    cases!(test_keccak256);
+    cases!(test_ecrec);
+}
+
+fn assert_split_or_fused_block(name: &str, memory: MemoryFormat) {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let elf = asm_elf_bytes(name);
+    let f = format(memory);
+    let proof = prove(&elf, &f);
+    assert_split_or_fused_wire_bytes(name, memory, &proof);
+    assert!(verifies(&proof, &elf, &f), "{name} {memory:?}");
+    if name == "fused_mem_cases" {
+        assert_unbound_word_counts_refused(&proof, &elf, &f);
+    }
+    let refused = verify_block_whir(
+        &proof,
+        &elf,
+        &ProofOptions::default_test_options(),
+        &format(MemoryFormat::Words),
+    );
+    let why = match (name, memory) {
+        ("fused_mem_cases", MemoryFormat::Split) => "states no LOAD table",
+        ("fused_mem_cases", MemoryFormat::Fused) => "states no fused table",
+        _ => "the word memory format states no",
+    };
+    assert!(
+        matches!(&refused, Err(crate::Error::InvalidTableCounts(w)) if w.contains(why)),
+        "{name} {memory:?}: {refused:?}"
+    );
+}
+
+/// The split or fused proof appends 56 zero bytes of word counts to the
+/// previous wire format. Moving a group index changes the prefix.
+fn assert_split_or_fused_wire_bytes(name: &str, memory: MemoryFormat, proof: &BlockWhirProof) {
+    if name != "fused_mem_cases" {
+        let c = &proof.table_counts;
+        assert!(
+            c.copy + c.keccak + c.ecrec > 0,
+            "{name}: COPY, KECCAK or ECREC tables, the chips' own"
+        );
+    }
+    assert_eq!(proof.word_memory, [0; 7], "{memory:?}");
+    let now = rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("serialize");
+    let before = rkyv::to_bytes::<rkyv::rancor::Error>(&BeforeWords::of(proof)).expect("serialize");
+    assert_eq!(now.len(), before.len() + 56, "{memory:?}: 56 bytes after");
+    assert_eq!(
+        &now[..before.len()],
+        &before[..],
+        "{memory:?}: the bytes before"
+    );
+    assert_eq!(
+        &now[before.len()..],
+        &[0u8; 56],
+        "{memory:?}: the counts, zero"
+    );
+    // The comparison's mutant: a proof with one byte moved before the
+    // counts is not the struct before them, the counts still zero.
+    let mut moved = proof.clone();
+    moved.groups[0][0] ^= 1;
+    let moved_now = rkyv::to_bytes::<rkyv::rancor::Error>(&moved).expect("serialize");
+    assert_eq!(
+        moved_now.len(),
+        now.len(),
+        "{memory:?}: the moved proof's length"
+    );
+    assert_ne!(
+        &moved_now[..before.len()],
+        &before[..],
+        "{memory:?}: a moved byte parts the prefix"
+    );
+    assert_eq!(&moved_now[before.len()..], &[0u8; 56], "{memory:?}");
 }
 
 /// ★ A split or fused proof stating word tables is refused: the counts are
@@ -163,105 +200,29 @@ fn a_split_and_a_fused_proof_are_the_bytes_before_the_word_counts_then_zeros() {
 /// family at 1, and one at `2^32 − 1`, on an honest proof are each refused;
 /// with the refusal taken out (a control mutant) each verifies, the counts
 /// unbound.
-#[test]
-fn a_split_or_fused_proof_stating_word_tables_is_refused() {
-    let elf = asm_elf_bytes("fused_mem_cases");
-    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
-        let f = format(memory);
-        let honest = prove(&elf, &f);
-        assert!(verifies(&honest, &elf, &f), "{memory:?}");
-        for stated in [
-            [1, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, u64::from(u32::MAX)],
-        ] {
-            let mut forged = honest.clone();
-            forged.word_memory = stated;
-            assert!(
-                !verifies(&forged, &elf, &f),
-                "{memory:?} {stated:?} refused"
-            );
-            WORD_COUNTS_UNCHECKED.with(|c| c.set(true));
-            let control = verifies(&forged, &elf, &f);
-            WORD_COUNTS_UNCHECKED.with(|c| c.set(false));
-            assert!(
-                control,
-                "{memory:?} {stated:?}: without the refusal it verifies"
-            );
-        }
-    }
-}
-
-/// ★ A split or a fused proof does not verify under the word format: the
-/// format is the verifier's constant. Each is refused by the word format's
-/// own rule on what it retires: the split proof states LOAD tables, the fused
-/// one fused tables (both of `fused_mem_cases`).
-#[test]
-fn a_split_or_fused_proof_is_refused_under_the_word_format() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    let elf = asm_elf_bytes("fused_mem_cases");
-    for (memory, why) in [
-        (MemoryFormat::Split, "states no LOAD table"),
-        (MemoryFormat::Fused, "states no fused table"),
+fn assert_unbound_word_counts_refused(honest: &BlockWhirProof, elf: &[u8], format: &BlockFormat) {
+    for stated in [
+        [1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, u64::from(u32::MAX)],
     ] {
-        let proof = prove(&elf, &format(memory));
-        assert!(verifies(&proof, &elf, &format(memory)));
-        let refused = verify_block_whir(
-            &proof,
-            &elf,
-            &ProofOptions::default_test_options(),
-            &format(MemoryFormat::Words),
-        );
+        let mut forged = honest.clone();
+        forged.word_memory = stated;
         assert!(
-            matches!(&refused, Err(crate::Error::InvalidTableCounts(w)) if w.contains(why)),
-            "{memory:?}: {refused:?}"
+            !verifies(&forged, elf, format),
+            "{:?} {stated:?} refused",
+            format.memory
         );
-    }
-    // The chips' runs: a split or fused proof stating COPY, KECCAK or ECREC
-    // tables (the byte-message chips) is refused under the word format by
-    // what it retires.
-    for (name, memory) in ["test_commit_split", "test_keccak256", "test_ecrec"]
-        .into_iter()
-        .flat_map(|name| [(name, MemoryFormat::Split), (name, MemoryFormat::Fused)])
-    {
-        let elf = asm_elf_bytes(name);
-        let proof = prove(&elf, &format(memory));
-        assert!(verifies(&proof, &elf, &format(memory)));
-        let refused = verify_block_whir(
-            &proof,
-            &elf,
-            &ProofOptions::default_test_options(),
-            &format(MemoryFormat::Words),
-        );
+        WORD_COUNTS_UNCHECKED.with(|c| c.set(true));
+        let control = verifies(&forged, elf, format);
+        WORD_COUNTS_UNCHECKED.with(|c| c.set(false));
         assert!(
-            matches!(&refused, Err(crate::Error::InvalidTableCounts(w)) if w.contains("the word memory format states no")),
-            "{name} {memory:?}: {refused:?}"
+            control,
+            "{:?} {stated:?}: without the refusal it verifies",
+            format.memory
         );
     }
 }
 
-/// The chip-free programs a word block is proved of: every width, sign and
-/// alignment of the CPU's loads and stores, every instruction, the misaligned
-/// accesses one by one, and loads and stores across `2^32` (their second
-/// word's key carried into the high word).
-const WORD_PROGRAMS: [&str; 12] = [
-    "fused_mem_cases",
-    "cross_4gib",
-    "all_loadstore_32",
-    "all_instructions_64",
-    "misalign_ld",
-    "misalign_lh",
-    "misalign_lhu",
-    "misalign_lw",
-    "misalign_lwu",
-    "misalign_sd",
-    "misalign_sh",
-    "misalign_sw",
-];
-
-/// `elf`'s run built by the windowed builder under `format` (windows of 1000
-/// cycles, the small chunks), REGISTER's files the verifier's: what
-/// [`prove_built`] proves.
 fn word_build(elf: &[u8], format: &BlockFormat) -> crate::tables::trace_builder::Traces {
     word_build_with(elf, format, &[])
 }
@@ -354,105 +315,143 @@ fn verdict(
 /// the ones the walk makes of the run (each family's count the windowed
 /// build's), so every load and store is one row of one of them; on
 /// `fused_mem_cases` every CPU family holds a table.
-#[test]
-fn a_word_block_proves_and_verifies() {
+fn assert_word_block_verifies(name: &str) {
     let words = format(MemoryFormat::Words);
-    for name in WORD_PROGRAMS {
-        let elf = asm_elf_bytes(name);
-        let proof = prove(&elf, &words);
-        assert!(verifies(&proof, &elf, &words), "{name}");
-        // Under the split and fused formats the word counts are absorbed
-        // nowhere: refused by that rule (every program here holds a word
-        // table but `all_instructions_64`, which loads and stores nothing).
-        for other in [MemoryFormat::Split, MemoryFormat::Fused] {
-            let refused = verify_block_whir(
-                &proof,
-                &elf,
-                &ProofOptions::default_test_options(),
-                &format(other),
-            );
-            let by_rule = matches!(
-                &refused,
-                Err(crate::Error::InvalidTableCounts(w)) if w.contains("states no word table")
-            );
-            assert!(
-                by_rule || (proof.word_memory == [0; 7] && !matches!(refused, Ok(true))),
-                "{name}: under {other:?}: {refused:?}"
-            );
-        }
-        let c = &proof.table_counts;
-        assert_eq!(
-            (c.load, c.store, c.memw, c.memw_aligned),
-            (0, 0, 0, 0),
-            "{name}: no retired table"
-        );
-        assert_eq!(proof.fused_memory, [0, 0], "{name}");
-        assert_eq!(proof.word_memory[6], 0, "{name}: no MEMW_W");
-        let built = word_build(&elf, &words).word_counts().map(|n| n as u64);
-        assert_eq!(proof.word_memory, built, "{name}: the walk's word tables");
-        if name == "fused_mem_cases" {
-            assert!(
-                proof.word_memory[..6].iter().all(|&n| n > 0),
-                "{name}: {:?}",
-                proof.word_memory
-            );
-        }
-        println!("WORD BLOCK {name}: word tables {:?}", proof.word_memory);
-    }
-}
-
-/// ★ A word block whose first row of each CPU word family is moved four
-/// cycles later (its dispatch then names no CPU row, its tokens no word's
-/// timestamp), proved from the built traces, is refused by the bus balance,
-/// and verifies with that one check off: nothing but the balance reads the
-/// move. The honest build proves and verifies.
-#[test]
-fn a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone() {
-    use crate::tables::{mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew};
-    let words = format(MemoryFormat::Words);
-    let elf = asm_elf_bytes("fused_mem_cases");
-    let mut honest = word_build(&elf, &words);
-    let proof = prove_built(&elf, &mut honest, &words).expect("the honest build proves");
-    assert!(verifies(&proof, &elf, &words), "the honest build verifies");
-    let timestamps = [
-        mem_load8::cols::TIMESTAMP,
-        mem_store8::cols::TIMESTAMP,
-        mem_loadw::cols::TIMESTAMP,
-        mem_storew::cols::TIMESTAMP,
-        mem_load2w::cols::TIMESTAMP,
-        mem_store2w::cols::TIMESTAMP,
-    ];
-    let mut wrong = Vec::new();
-    for (family, &ts) in timestamps.iter().enumerate() {
-        let mut forged = word_build(&elf, &words);
-        let table = &mut forged.word_tables[family][0];
-        let moved = table.get_main(0, ts).canonical_u64() + 16;
-        table
-            .main_table
-            .set(0, ts, crate::tables::types::FE::from(moved));
-        let proof = prove_built(&elf, &mut forged, &words).expect("the forged build proves");
-        let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
-        let off = verdict(
+    let elf = asm_elf_bytes(name);
+    let proof = prove(&elf, &words);
+    assert!(verifies(&proof, &elf, &words), "{name}");
+    // Under the split and fused formats the word counts are absorbed
+    // nowhere: refused by that rule (every program here holds a word
+    // table but `all_instructions_64`, which loads and stores nothing).
+    for other in [MemoryFormat::Split, MemoryFormat::Fused] {
+        let refused = verify_block_whir(
             &proof,
             &elf,
-            &words,
-            VerifierChecks {
-                balance: false,
-                ..VerifierChecks::ALL
-            },
+            &ProofOptions::default_test_options(),
+            &format(other),
         );
-        let named = matches!(
-            &all,
-            Ok(Err(block_whir::BlockRefusal::Proof(e))) if *e == multilinear::Error::BusImbalance
+        let by_rule = matches!(
+            &refused,
+            Err(crate::Error::InvalidTableCounts(w)) if w.contains("states no word table")
         );
-        if !(named && matches!(&off, Ok(Ok(())))) {
-            wrong.push(format!(
-                "{}: every check {all:?} · without the balance {off:?}",
-                block_whir::WORD_TABLES[family]
-            ));
-        }
+        assert!(
+            by_rule || (proof.word_memory == [0; 7] && !matches!(refused, Ok(true))),
+            "{name}: under {other:?}: {refused:?}"
+        );
     }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let c = &proof.table_counts;
+    assert_eq!(
+        (c.load, c.store, c.memw, c.memw_aligned),
+        (0, 0, 0, 0),
+        "{name}: no retired table"
+    );
+    assert_eq!(proof.fused_memory, [0, 0], "{name}");
+    assert_eq!(proof.word_memory[6], 0, "{name}: no MEMW_W");
+    let built = word_build(&elf, &words).word_counts().map(|n| n as u64);
+    assert_eq!(proof.word_memory, built, "{name}: the walk's word tables");
+    if name == "fused_mem_cases" {
+        assert!(
+            proof.word_memory[..6].iter().all(|&n| n > 0),
+            "{name}: {:?}",
+            proof.word_memory
+        );
+    }
+    println!("WORD BLOCK {name}: word tables {:?}", proof.word_memory);
+}
+
+mod a_word_block_proves_and_verifies {
+    macro_rules! cases {
+        ($($name:ident),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    super::assert_word_block_verifies(stringify!($name));
+                }
+            )+
+        };
+    }
+
+    cases!(
+        fused_mem_cases,
+        cross_4gib,
+        all_loadstore_32,
+        all_instructions_64,
+        misalign_ld,
+        misalign_lh,
+        misalign_lhu,
+        misalign_lw,
+        misalign_lwu,
+        misalign_sd,
+        misalign_sh,
+        misalign_sw,
+    );
+}
+
+/// The honest build verifies. Each edited word family still produces a proof
+/// that the verifier refuses by the bus balance alone.
+mod a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone {
+    use super::*;
+    use crate::tables::{mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew};
+
+    #[test]
+    fn honest() {
+        let words = format(MemoryFormat::Words);
+        let elf = asm_elf_bytes("fused_mem_cases");
+        let mut honest = word_build(&elf, &words);
+        let proof = prove_built(&elf, &mut honest, &words).expect("the honest build proves");
+        assert!(verifies(&proof, &elf, &words), "the honest build verifies");
+    }
+
+    macro_rules! cases {
+        ($($family:ident = $index:literal),+ $(,)?) => {
+            $(
+                #[test]
+                fn $family() {
+                    super::assert_moved_word_row_refused($index, $family::cols::TIMESTAMP);
+                }
+            )+
+        };
+    }
+
+    cases!(
+        mem_load8 = 0,
+        mem_store8 = 1,
+        mem_loadw = 2,
+        mem_storew = 3,
+        mem_load2w = 4,
+        mem_store2w = 5,
+    );
+}
+
+fn assert_moved_word_row_refused(family: usize, ts: usize) {
+    let words = format(MemoryFormat::Words);
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let mut forged = word_build(&elf, &words);
+    let table = &mut forged.word_tables[family][0];
+    let moved = table.get_main(0, ts).canonical_u64() + 16;
+    table
+        .main_table
+        .set(0, ts, crate::tables::types::FE::from(moved));
+    let proof = prove_built(&elf, &mut forged, &words).expect("the forged build proves");
+    let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
+    let off = verdict(
+        &proof,
+        &elf,
+        &words,
+        VerifierChecks {
+            balance: false,
+            ..VerifierChecks::ALL
+        },
+    );
+    let named = matches!(
+        &all,
+        Ok(Err(block_whir::BlockRefusal::Proof(e))) if *e == multilinear::Error::BusImbalance
+    );
+    assert!(
+        named && matches!(&off, Ok(Ok(()))),
+        "{}: every check {all:?} · without the balance {off:?}",
+        block_whir::WORD_TABLES[family]
+    );
 }
 
 /// ★ A hand-built word block stating the table of a chip the format takes no
@@ -484,22 +483,6 @@ fn a_word_block_stating_a_chip_table_is_refused_by_the_chip_rule_alone() {
     assert!(control, "without the chip rule the forged block verifies");
 }
 
-/// The runs that call the COPY chip: asm programs of every row shape,
-/// overlapping copies, commits split across calls and calls across `2^32`;
-/// Rust guests' memcpy, memmove, memset and commit cases.
-const COPY_ASM: [&str; 4] = [
-    "test_copy_ecalls",
-    "copy_4gib",
-    "test_copy_overlaps",
-    "test_commit_split",
-];
-const COPY_RUST: [&str; 4] = [
-    "dma_memcpy_cases",
-    "dma_memmove_cases",
-    "dma_memset_cases",
-    "commit",
-];
-
 fn rust_elf_bytes(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../executor/program_artifacts/rust")
@@ -512,50 +495,60 @@ fn rust_elf_bytes(name: &str) -> Vec<u8> {
 /// under neither the split nor the fused format; it states COPY_W tables in
 /// COPY's place and MEMW_W tables (the walk's count), no retired or fused
 /// table; and its public output is the run's.
-#[test]
-fn a_word_block_calling_the_copy_chip_proves_and_verifies() {
+mod a_word_block_calling_the_copy_chip_proves_and_verifies {
+    macro_rules! cases {
+        ($load:ident: $($name:ident),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    let name = stringify!($name);
+                    super::assert_copy_block_verifies(name, &super::$load(name));
+                }
+            )+
+        };
+    }
+
+    cases!(asm_elf_bytes: test_copy_ecalls, copy_4gib, test_copy_overlaps, test_commit_split);
+    cases!(rust_elf_bytes: dma_memcpy_cases, dma_memmove_cases, dma_memset_cases, commit);
+}
+
+fn assert_copy_block_verifies(name: &str, elf: &[u8]) {
     let words = format(MemoryFormat::Words);
-    let runs = COPY_ASM
-        .iter()
-        .map(|&name| (name, asm_elf_bytes(name)))
-        .chain(COPY_RUST.iter().map(|&name| (name, rust_elf_bytes(name))));
-    for (name, elf) in runs {
-        let proof = prove(&elf, &words);
-        assert!(verifies(&proof, &elf, &words), "{name}");
-        for other in [MemoryFormat::Split, MemoryFormat::Fused] {
-            assert!(
-                !verifies(&proof, &elf, &format(other)),
-                "{name}: verifies under {other:?}"
-            );
-        }
-        let c = &proof.table_counts;
-        assert_eq!(
-            (c.load, c.store, c.memw, c.memw_aligned),
-            (0, 0, 0, 0),
-            "{name}: no retired table"
-        );
-        assert_eq!(proof.fused_memory, [0, 0], "{name}");
+    let proof = prove(elf, &words);
+    assert!(verifies(&proof, elf, &words), "{name}");
+    for other in [MemoryFormat::Split, MemoryFormat::Fused] {
         assert!(
-            c.copy > 0 && proof.word_memory[6] > 0,
-            "{name}: COPY_W and MEMW_W"
-        );
-        let build = word_build(&elf, &words);
-        assert_eq!(
-            proof.word_memory,
-            build.word_counts().map(|n| n as u64),
-            "{name}: the walk's word tables"
-        );
-        assert_eq!(
-            proof.public_output, build.public_output_bytes,
-            "{name}: the run's public output"
-        );
-        println!(
-            "WORD COPY BLOCK {name}: COPY_W tables {}, word tables {:?}, output {} bytes",
-            c.copy,
-            proof.word_memory,
-            proof.public_output.len()
+            !verifies(&proof, elf, &format(other)),
+            "{name}: verifies under {other:?}"
         );
     }
+    let c = &proof.table_counts;
+    assert_eq!(
+        (c.load, c.store, c.memw, c.memw_aligned),
+        (0, 0, 0, 0),
+        "{name}: no retired table"
+    );
+    assert_eq!(proof.fused_memory, [0, 0], "{name}");
+    assert!(
+        c.copy > 0 && proof.word_memory[6] > 0,
+        "{name}: COPY_W and MEMW_W"
+    );
+    let build = word_build(elf, &words);
+    assert_eq!(
+        proof.word_memory,
+        build.word_counts().map(|n| n as u64),
+        "{name}: the walk's word tables"
+    );
+    assert_eq!(
+        proof.public_output, build.public_output_bytes,
+        "{name}: the run's public output"
+    );
+    println!(
+        "WORD COPY BLOCK {name}: COPY_W tables {}, word tables {:?}, output {} bytes",
+        c.copy,
+        proof.word_memory,
+        proof.public_output.len()
+    );
 }
 
 /// ★ A word block whose first COPY_W row is moved four cycles later (its
@@ -605,51 +598,59 @@ fn a_word_block_with_a_moved_copy_row_is_refused_by_the_balance_alone() {
 /// states KECCAK_W or ECREC_W tables in their chips' places and MEMW_W tables
 /// (the walk's count), no retired or fused table; and its public output is
 /// the run's.
-#[test]
-fn a_word_block_calling_keccak256_and_ecrec_proves_and_verifies() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+mod a_word_block_calling_keccak256_and_ecrec_proves_and_verifies {
+    #[test]
+    fn keccak256() {
+        super::assert_word_chip_block_verifies("test_keccak256");
+    }
+
+    #[test]
+    fn ecrec() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        super::assert_word_chip_block_verifies("test_ecrec");
+    }
+}
+
+fn assert_word_chip_block_verifies(name: &str) {
     let words = format(MemoryFormat::Words);
-    for name in ["test_keccak256", "test_ecrec"] {
-        let elf = asm_elf_bytes(name);
-        let proof = prove(&elf, &words);
-        assert!(verifies(&proof, &elf, &words), "{name}");
-        for other in [MemoryFormat::Split, MemoryFormat::Fused] {
-            assert!(
-                !verifies(&proof, &elf, &format(other)),
-                "{name}: verifies under {other:?}"
-            );
-        }
-        let c = &proof.table_counts;
-        assert_eq!(
-            (c.load, c.store, c.memw, c.memw_aligned),
-            (0, 0, 0, 0),
-            "{name}: no retired table"
-        );
-        assert_eq!(proof.fused_memory, [0, 0], "{name}");
+    let elf = asm_elf_bytes(name);
+    let proof = prove(&elf, &words);
+    assert!(verifies(&proof, &elf, &words), "{name}");
+    for other in [MemoryFormat::Split, MemoryFormat::Fused] {
         assert!(
-            (c.keccak > 0 || c.ecrec > 0) && proof.word_memory[6] > 0,
-            "{name}: KECCAK_W or ECREC_W, and MEMW_W"
-        );
-        let build = word_build(&elf, &words);
-        assert_eq!(
-            proof.word_memory,
-            build.word_counts().map(|n| n as u64),
-            "{name}: the walk's word tables"
-        );
-        assert_eq!(
-            proof.public_output, build.public_output_bytes,
-            "{name}: the run's public output"
-        );
-        println!(
-            "WORD CHIP BLOCK {name}: KECCAK_W {} ECREC_W {} ECDAS {}, word tables {:?}, output {} bytes",
-            c.keccak,
-            c.ecrec,
-            c.ecdas,
-            proof.word_memory,
-            proof.public_output.len()
+            !verifies(&proof, &elf, &format(other)),
+            "{name}: verifies under {other:?}"
         );
     }
+    let c = &proof.table_counts;
+    assert_eq!(
+        (c.load, c.store, c.memw, c.memw_aligned),
+        (0, 0, 0, 0),
+        "{name}: no retired table"
+    );
+    assert_eq!(proof.fused_memory, [0, 0], "{name}");
+    assert!(
+        (c.keccak > 0 || c.ecrec > 0) && proof.word_memory[6] > 0,
+        "{name}: KECCAK_W or ECREC_W, and MEMW_W"
+    );
+    let build = word_build(&elf, &words);
+    assert_eq!(
+        proof.word_memory,
+        build.word_counts().map(|n| n as u64),
+        "{name}: the walk's word tables"
+    );
+    assert_eq!(
+        proof.public_output, build.public_output_bytes,
+        "{name}: the run's public output"
+    );
+    println!(
+        "WORD CHIP BLOCK {name}: KECCAK_W {} ECREC_W {} ECDAS {}, word tables {:?}, output {} bytes",
+        c.keccak,
+        c.ecrec,
+        c.ecdas,
+        proof.word_memory,
+        proof.public_output.len()
+    );
 }
 
 /// ★ The word memory format under the 32-bit register tokens, which the
@@ -780,48 +781,59 @@ fn refused(said: &Result<Result<(), block_whir::BlockRefusal>, String>) -> bool 
 /// changed, proved from the edited traces by a prover that skips its own
 /// check: refused by the verifier; with the preprocessed check off (a
 /// control) each verifies, so that check is the one that answers.
-#[test]
-fn page_w_columns_are_the_verifiers_at_proof_level() {
+mod page_w_columns_are_the_verifiers_at_proof_level {
+    #[test]
+    fn zero_page_offset() {
+        super::assert_page_w_columns_are_bound(false, "offset");
+    }
+
+    #[test]
+    fn zero_page_init() {
+        super::assert_page_w_columns_are_bound(false, "init");
+    }
+
+    #[test]
+    fn elf_page_offset() {
+        super::assert_page_w_columns_are_bound(true, "offset");
+    }
+
+    #[test]
+    fn elf_page_init() {
+        super::assert_page_w_columns_are_bound(true, "init");
+    }
+}
+
+fn assert_page_w_columns_are_bound(elf_page: bool, edit: &str) {
     let words = format(MemoryFormat::Words);
     let elf = asm_elf_bytes("fused_mem_cases");
-    let honest = word_build(&elf, &words);
-    let zero = honest
+    let mut forged = word_build(&elf, &words);
+    let page = forged
         .page_configs
         .iter()
-        .position(|c| !c.is_private_input && c.init_values.is_none())
-        .expect("a zero page");
-    let elf_page = honest
-        .page_configs
-        .iter()
-        .position(|c| !c.is_private_input && c.init_values.is_some())
-        .expect("an ELF page");
-    for page in [zero, elf_page] {
-        for edit in ["offset", "init"] {
-            let mut forged = word_build(&elf, &words);
-            let row = untouched(&forged, page);
-            edit_page(&mut forged, page, row, edit);
-            assert!(
-                prove_built(&elf, &mut word_edit(&elf, &words, page, row, edit), &words).is_err(),
-                "page {page} {edit}: the honest prover refuses the edited traces"
-            );
-            let proof = prove_forged(&elf, &mut forged, &words).expect("the forger proves");
-            let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
-            assert!(refused(&all), "page {page} {edit}: {all:?}");
-            let without = verdict(
-                &proof,
-                &elf,
-                &words,
-                VerifierChecks {
-                    preprocessed: false,
-                    ..VerifierChecks::ALL
-                },
-            );
-            assert!(
-                matches!(without, Ok(Ok(()))),
-                "page {page} {edit}: control: {without:?}"
-            );
-        }
-    }
+        .position(|c| !c.is_private_input && c.init_values.is_some() == elf_page)
+        .expect("the requested zero or ELF page");
+    let row = untouched(&forged, page);
+    edit_page(&mut forged, page, row, edit);
+    assert!(
+        prove_built(&elf, &mut word_edit(&elf, &words, page, row, edit), &words).is_err(),
+        "page {page} {edit}: the honest prover refuses the edited traces"
+    );
+    let proof = prove_forged(&elf, &mut forged, &words).expect("the forger proves");
+    let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
+    assert!(refused(&all), "page {page} {edit}: {all:?}");
+    let without = verdict(
+        &proof,
+        &elf,
+        &words,
+        VerifierChecks {
+            preprocessed: false,
+            ..VerifierChecks::ALL
+        },
+    );
+    assert!(
+        matches!(without, Ok(Ok(()))),
+        "page {page} {edit}: control: {without:?}"
+    );
 }
 
 /// `elf`'s word build with one page edit (see [`edit_page`]).
@@ -1060,96 +1072,116 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
     }
 }
 
-/// The private input of [`page_runs_block`]: two pages' worth.
-fn two_pages_of_input() -> Vec<u8> {
+/// Two pages of private input.
+pub(super) fn two_pages_of_input() -> Vec<u8> {
     (0..(crate::tables::page::DEFAULT_PAGE_SIZE as u32 + 300))
         .map(|i| (i * 7 + 3) as u8)
         .collect()
 }
 
-/// `page_runs` (runs of zero pages from pages 64 and 81, two private-input
-/// pages) proved by the prove's own walk under `format`.
-fn page_runs_block(format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
+/// Each page grouping proves by the streamed walk and from the built traces.
+/// The streamed proof is also checked against the other groupings.
+mod a_word_block_with_page_runs_proves_and_verifies {
+    macro_rules! cases {
+        ($($streamed:ident, $built:ident = $run_log2:literal),+ $(,)?) => {
+            $(
+                #[test]
+                fn $streamed() {
+                    super::assert_streamed_page_run($run_log2);
+                }
+
+                #[test]
+                fn $built() {
+                    super::assert_built_page_run($run_log2);
+                }
+            )+
+        };
+    }
+
+    cases!(
+        streamed_off,
+        built_off = 0,
+        streamed_2,
+        built_2 = 1,
+        streamed_16,
+        built_16 = 4
+    );
+}
+
+fn assert_streamed_page_run(run_log2: u8) {
     let elf = asm_elf_bytes("page_runs");
+    let opts = ProofOptions::default_test_options();
+    let words = format(MemoryFormat::Words).with_page_run(run_log2);
     let options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
     let (proof, _) = prove_block_whir_with(
         &elf,
         &two_pages_of_input(),
-        &ProofOptions::default_test_options(),
-        format,
+        &opts,
+        &words,
         &options,
         &Deviations::default(),
     )
     .expect("the prove's own walk proves");
-    (elf, proof)
+    assert!(matches!(
+        verify_block_whir(&proof, &elf, &opts, &words),
+        Ok(true)
+    ));
+    assert_eq!(proof.num_private_input_pages, 2);
+    let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &words).expect("frames");
+    assert_eq!(
+        frame.page_tables,
+        crate::tables::page_w::page_tables(&frame.page_configs, run_log2).expect("cut")
+    );
+    use crate::tables::page_w::PageTableKind;
+    let blocks = |kind| {
+        frame
+            .page_tables
+            .iter()
+            .filter(|t| t.kind == kind && t.pages() > 1)
+            .count()
+    };
+    if run_log2 == 0 {
+        assert_eq!(frame.page_tables.len(), frame.page_configs.len());
+    } else {
+        assert!(
+            blocks(PageTableKind::Zero) > 0,
+            "at 2^{run_log2}: a zero block"
+        );
+        assert_eq!(blocks(PageTableKind::Private), 1, "at 2^{run_log2}");
+    }
+    let built = word_build_with(&elf, &words, &two_pages_of_input());
+    assert_eq!(
+        built.pages.len(),
+        frame.page_tables.len(),
+        "at 2^{run_log2}"
+    );
+    for other in [0, 1, 4].into_iter().filter(|&other| other != run_log2) {
+        let their_cut =
+            crate::tables::page_w::page_tables(&frame.page_configs, other).expect("other cut");
+        assert_ne!(
+            frame.page_tables, their_cut,
+            "the cuts at 2^{run_log2} and 2^{other} differ"
+        );
+        assert!(
+            !matches!(
+                verify_block_whir(&proof, &elf, &opts, &words.with_page_run(other)),
+                Ok(true)
+            ),
+            "proved at 2^{run_log2}, refused at 2^{other}"
+        );
+    }
 }
 
-/// ★ Completeness under page runs: `page_runs` proves and verifies with runs
-/// off and at runs of 2 and 16 pages, by the prove's own walk and from the
-/// built traces; its page tables are the rule's cut of the verifier's pages,
-/// zero and private blocks among them under runs; each proof is refused at
-/// the other runs, whose cuts differ.
-#[test]
-fn a_word_block_with_page_runs_proves_and_verifies() {
-    use crate::tables::page_w::{self, PageTableKind};
+fn assert_built_page_run(run_log2: u8) {
+    let elf = asm_elf_bytes("page_runs");
     let opts = ProofOptions::default_test_options();
-    let runs = [0u8, 1, 4];
-    let mut proofs = Vec::new();
-    for run_log2 in runs {
-        let words = format(MemoryFormat::Words).with_page_run(run_log2);
-        let (elf, proof) = page_runs_block(&words);
-        assert!(
-            matches!(verify_block_whir(&proof, &elf, &opts, &words), Ok(true)),
-            "at 2^{run_log2}"
-        );
-        assert_eq!(proof.num_private_input_pages, 2);
-        let frame =
-            block_whir::block_frame(proof.statement(), &elf, &opts, &words).expect("frames");
-        assert_eq!(
-            frame.page_tables,
-            page_w::page_tables(&frame.page_configs, run_log2).expect("cut")
-        );
-        let blocks = |kind| {
-            frame
-                .page_tables
-                .iter()
-                .filter(|t| t.kind == kind && t.pages() > 1)
-                .count()
-        };
-        if run_log2 == 0 {
-            assert_eq!(frame.page_tables.len(), frame.page_configs.len());
-        } else {
-            assert!(
-                blocks(PageTableKind::Zero) > 0,
-                "at 2^{run_log2}: a zero block"
-            );
-            assert_eq!(blocks(PageTableKind::Private), 1, "at 2^{run_log2}");
-        }
-        // From the built traces: the finish cut the pages as the format.
-        let mut built = word_build_with(&elf, &words, &two_pages_of_input());
-        assert_eq!(
-            built.pages.len(),
-            frame.page_tables.len(),
-            "at 2^{run_log2}"
-        );
-        let again = prove_built(&elf, &mut built, &words).expect("the built traces prove");
-        assert!(matches!(
-            verify_block_whir(&again, &elf, &opts, &words),
-            Ok(true)
-        ));
-        proofs.push((run_log2, words, elf, proof, frame.page_tables.clone()));
-    }
-    for (r, _, elf, proof, cut) in &proofs {
-        for (s, theirs, _, _, their_cut) in &proofs {
-            if r != s {
-                assert_ne!(cut, their_cut, "the cuts at 2^{r} and 2^{s} differ");
-                assert!(
-                    !matches!(verify_block_whir(proof, elf, &opts, theirs), Ok(true)),
-                    "proved at 2^{r}, refused at 2^{s}"
-                );
-            }
-        }
-    }
+    let words = format(MemoryFormat::Words).with_page_run(run_log2);
+    let mut built = word_build_with(&elf, &words, &two_pages_of_input());
+    let proof = prove_built(&elf, &mut built, &words).expect("the built traces prove");
+    assert!(matches!(
+        verify_block_whir(&proof, &elf, &opts, &words),
+        Ok(true)
+    ));
 }
 
 /// The last row of page table `page` no access touched (final timestamp 0),

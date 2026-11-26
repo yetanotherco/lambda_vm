@@ -170,7 +170,7 @@ fn the_leg_refuses_a_child_only_the_host_can_check() {
 fn the_leg_proved_at_blowup_64_under_the_second_steps_levers_verifies() {
     use super::wlfm::{build_wlfm_under, prove_wlfm, verify_wlfm};
     use crate::hash_pin::{BlockFamily, ProofFamily};
-    let _small = test_format::set(Some(12));
+    let _small = test_format::set(Some(4));
     let (_, proof, leg, arena) = honest_child(WlfmRate::Sixteen);
     let hasher = leg.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let c2 = build_wlfm_under(

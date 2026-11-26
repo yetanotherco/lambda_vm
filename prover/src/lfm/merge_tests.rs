@@ -53,7 +53,9 @@ fn ext(a: u64, b: u64, c: u64) -> FEE {
 }
 
 fn options(merge: bool) -> ProofOptions {
-    let mut o = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+    let mut o = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("options");
     o.format.merge_equal_height_tables = merge;
     o
 }

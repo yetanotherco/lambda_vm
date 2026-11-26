@@ -48,7 +48,9 @@ type F = GoldilocksField;
 type E = GoldilocksExtension;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 /// The message the framing tests are taken over: byte `i` is `37i + 11`, the

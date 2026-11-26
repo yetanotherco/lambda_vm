@@ -112,8 +112,9 @@ fn the_stark_prove_refuses_chips_held_as_records() {
     let program = every_chip(5, 9);
     let _on = test_format::set_chip_records(true);
     let filled = execute_and_fill_unmerged(&program, &arenas(), HASHER).expect("executes");
-    let options =
-        stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup 2");
+    let options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup 2");
     let artifacts = super::registry::build_artifacts_with_hasher(&program, &options, HASHER);
     let err = filled
         .prove(

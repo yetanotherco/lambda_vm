@@ -11,7 +11,9 @@
 #![cfg(feature = "cuda")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
-use lambda_vm_prover::{prove, verify};
+mod common;
+
+use common::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
     gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls,
@@ -25,9 +27,9 @@ use stark::gpu_lde::{
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_composition_path_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_composition_calls() > 0,
         "GPU composition path did not fire (tables below threshold or gate fell back to CPU)"
@@ -42,9 +44,9 @@ fn gpu_composition_path_fires_and_verifies() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_logup_aux_build_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_logup_calls() > 0,
         "GPU LogUp aux-build path did not fire (tables below threshold or fell back)"
@@ -60,15 +62,15 @@ fn gpu_logup_aux_build_fires_and_verifies() {
 fn gpu_path_fires_end_to_end() {
     // Warm-up amortises PTX load + pool warm-up + first-call pinned alloc
     // so the profiled-pass counter assertions reflect only steady-state work.
-    let elf = asm_elf_bytes("fib_iterative_1M");
-    let _ = prove(&elf).expect("warm-up prove");
+    let elf = asm_elf_bytes("fib_iterative_160k");
+    let _ = lambda_vm_prover::prove(&elf).expect("warm-up prove");
 
     reset_all_gpu_call_counters();
 
-    let proof = prove(&elf).expect("prove");
+    let proof = lambda_vm_prover::prove(&elf).expect("prove");
 
     // R1 main + aux fused LDE+Merkle. Fires for every table above the LDE
-    // threshold; fib_iterative_1M has plenty.
+    // threshold; fib_iterative_160k has plenty.
     assert!(gpu_lde_calls() > 0, "R1 GPU LDE path did not fire");
 
     // R3 OOD barycentric reads the R1 main + aux device handles. Fires once
@@ -82,7 +84,7 @@ fn gpu_path_fires_end_to_end() {
     // the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`), or the
     // d=1 de-interleave (`== 1`, counted by `gpu_comp_h_slabs_calls` — covered
     // separately by `cuda_d1_path.rs`, since no d=1 table here crosses the
-    // default LDE threshold). fib_iterative_1M only exercises the degree-2 path,
+    // default LDE threshold). fib_iterative_160k only exercises the degree-2 path,
     // so assert on either of the two counted here.
     assert!(
         gpu_extend_halves_calls() + gpu_parts_lde_calls() > 0,
@@ -148,7 +150,7 @@ fn gpu_path_fires_end_to_end() {
 
     // Counters only prove the dispatches ran; this checks the GPU proof
     // actually satisfies the verifier.
-    let ok = verify(&proof, &elf).expect("verify");
+    let ok = lambda_vm_prover::verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
 
@@ -160,12 +162,12 @@ fn gpu_path_fires_end_to_end() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_fri_commit_produces_verifiable_proof() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_fri_calls() > 0,
-        "GPU FRI commit path did not fire on a 1M-row trace"
+        "GPU FRI commit path did not fire on the Fibonacci trace"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),
@@ -181,9 +183,9 @@ fn gpu_fri_commit_produces_verifiable_proof() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_proof_verifies_row_pair_commitment() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_lde_calls() > 0,
         "GPU LDE path did not fire (silent CPU fallback would not test the GPU commit)"
@@ -204,9 +206,9 @@ fn gpu_proof_verifies_row_pair_commitment() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_opening_gather_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_opening_gather_calls() > 0,
         "device-resident opening gather did not fire (openings fell back to the host LDE)"
@@ -232,9 +234,9 @@ fn gpu_opening_gather_fires_and_verifies() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_device_only_calls() > 0,
         "device-only residency path did not fire (every table kept its host trace)"

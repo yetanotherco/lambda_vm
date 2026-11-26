@@ -469,44 +469,50 @@ fn streamed_once(
 /// families, the level-shaped probe (two groups) proves the held build's
 /// bytes with the knob on and off; nothing is planned out or refused, and a
 /// store is used only where there is a card, a retired build and the knob.
-#[test]
-fn the_upload_once_proves_the_same_bytes_in_every_place() {
+fn assert_upload_once_moves_no_bytes(family: WlfmFamily) {
     let _restore = UploadOnceRestore;
     let _fast = test_format::set(Some(2));
     let _groups = test_format::set_group_polys(1);
     let card = multilinear::gpu::reserve_budget() > 0;
-    for family in [WlfmFamily::P1, WlfmFamily::B3] {
-        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
-        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
-            .expect("the held build proves");
-        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
-            let (_, _, build) = probe_placed(family, place);
-            for on in [false, true] {
-                let (got, groups) =
-                    streamed_once(&program, &build, &arenas, on, Default::default())
-                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+    let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+    let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+        .expect("the held build proves");
+    for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+        let (_, _, build) = probe_placed(family, place);
+        for on in [false, true] {
+            let (got, groups) = streamed_once(&program, &build, &arenas, on, Default::default())
+                .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+            assert!(
+                got == want,
+                "{family:?} {place:?} upload once {on}: the held bytes"
+            );
+            assert!(
+                groups
+                    .iter()
+                    .all(|s| !s.upload_once.planned_out && !s.upload_once.refused),
+                "{family:?} {place:?} {on}: nothing planned out or refused"
+            );
+            let used = groups.iter().filter(|s| s.upload_once.used).count();
+            if card && on && place == StackPlace::CardRetired {
                 assert!(
-                    got == want,
-                    "{family:?} {place:?} upload once {on}: the held bytes"
+                    used > 0,
+                    "{family:?}: a retired stack's columns went up once"
                 );
-                assert!(
-                    groups
-                        .iter()
-                        .all(|s| !s.upload_once.planned_out && !s.upload_once.refused),
-                    "{family:?} {place:?} {on}: nothing planned out or refused"
-                );
-                let used = groups.iter().filter(|s| s.upload_once.used).count();
-                if card && on && place == StackPlace::CardRetired {
-                    assert!(
-                        used > 0,
-                        "{family:?}: a retired stack's columns went up once"
-                    );
-                } else {
-                    assert_eq!(used, 0, "{family:?} {place:?} {on}: no store");
-                }
+            } else {
+                assert_eq!(used, 0, "{family:?} {place:?} {on}: no store");
             }
         }
     }
+}
+
+#[test]
+fn upload_once_moves_no_bytes_under_poseidon1() {
+    assert_upload_once_moves_no_bytes(WlfmFamily::P1);
+}
+
+#[test]
+fn upload_once_moves_no_bytes_under_blake3() {
+    assert_upload_once_moves_no_bytes(WlfmFamily::B3);
 }
 
 /// ★ Box gate, its own process under `LAMBDA_VM_NO_GPU_COLUMNS=1` (read once
@@ -661,50 +667,55 @@ fn the_overlap_priced_resident_proves_the_same_bytes_in_every_place() {
 /// retired stacks (the planned overlap's place), the probe's one planned
 /// transition needs exactly the other group's columns more with the term on
 /// (8 bytes a cell): the term reaches the plan, once.
-#[test]
-fn the_overlap_pricing_the_next_columns_proves_the_same_bytes_in_every_place() {
+fn assert_next_columns_pricing_moves_no_bytes(family: WlfmFamily) {
     let _restore = UploadOnceRestore;
     let _fast = test_format::set(Some(2));
     let _groups = test_format::set_group_polys(1);
     let card = multilinear::gpu::reserve_budget() > 0;
     super::wlfm::set_overlap_resident_for_test(Some(true));
-    for family in [WlfmFamily::P1, WlfmFamily::B3] {
-        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
-        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
-            .expect("the held build proves");
-        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
-            let (_, _, build) = probe_placed(family, place);
-            let mut stamps = Vec::new();
-            for on in [false, true] {
-                super::wlfm::set_overlap_next_columns_for_test(Some(on));
-                let (got, groups) =
-                    streamed_once(&program, &build, &arenas, true, Default::default())
-                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
-                assert!(
-                    got == want,
-                    "{family:?} {place:?} next columns priced {on}: the held bytes"
-                );
-                assert!(
-                    groups.iter().all(|s| !s.upload_once.refused),
-                    "{family:?} {place:?} {on}: no store refused"
-                );
-                stamps.push(groups);
-            }
-            if card && place == StackPlace::CardRetired {
-                let (off, on) = (&stamps[0], &stamps[1]);
-                assert_eq!(off.len(), 2, "{family:?}: the probe's two groups");
-                let planned: Vec<usize> =
-                    (0..2).filter(|&g| off[g].overlap_plan_need > 0).collect();
-                assert_eq!(planned.len(), 1, "{family:?}: one planned transition");
-                let (g, next) = (planned[0], 1 - planned[0]);
-                assert_eq!(
-                    on[g].overlap_plan_need - off[g].overlap_plan_need,
-                    on[next].cells as u64 * 8,
-                    "{family:?}: the next group's columns, once"
-                );
-            }
+    let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+    let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+        .expect("the held build proves");
+    for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+        let (_, _, build) = probe_placed(family, place);
+        let mut stamps = Vec::new();
+        for on in [false, true] {
+            super::wlfm::set_overlap_next_columns_for_test(Some(on));
+            let (got, groups) = streamed_once(&program, &build, &arenas, true, Default::default())
+                .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+            assert!(
+                got == want,
+                "{family:?} {place:?} next columns priced {on}: the held bytes"
+            );
+            assert!(
+                groups.iter().all(|s| !s.upload_once.refused),
+                "{family:?} {place:?} {on}: no store refused"
+            );
+            stamps.push(groups);
+        }
+        if card && place == StackPlace::CardRetired {
+            let (off, on) = (&stamps[0], &stamps[1]);
+            assert_eq!(off.len(), 2, "{family:?}: the probe's two groups");
+            let planned: Vec<usize> = (0..2).filter(|&g| off[g].overlap_plan_need > 0).collect();
+            assert_eq!(planned.len(), 1, "{family:?}: one planned transition");
+            let (g, next) = (planned[0], 1 - planned[0]);
+            assert_eq!(
+                on[g].overlap_plan_need - off[g].overlap_plan_need,
+                on[next].cells as u64 * 8,
+                "{family:?}: the next group's columns, once"
+            );
         }
     }
+}
+
+#[test]
+fn next_columns_overlap_pricing_moves_no_bytes_under_poseidon1() {
+    assert_next_columns_pricing_moves_no_bytes(WlfmFamily::P1);
+}
+
+#[test]
+fn next_columns_overlap_pricing_moves_no_bytes_under_blake3() {
+    assert_next_columns_pricing_moves_no_bytes(WlfmFamily::B3);
 }
 
 /// The next-columns pricing knob's name; it is on by default, and only `0`
@@ -858,8 +869,7 @@ fn the_narrow_commit_knob_is_named_and_on_by_default() {
 /// narrow store sent the bytes packed before; without a card, or on the host,
 /// nothing was packed. The stamps outlive the release of the prover's half,
 /// which the levels' driver makes before its readout.
-#[test]
-fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
+fn assert_narrow_commit_moves_no_bytes(family: WlfmFamily, place: StackPlace) {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -873,75 +883,104 @@ fn the_narrow_commit_proves_the_same_bytes_in_every_place() {
     let _fast = test_format::set(Some(2));
     let _groups = test_format::set_group_polys(1);
     let card = multilinear::gpu::reserve_budget() > 0;
-    for family in [WlfmFamily::P1, WlfmFamily::B3] {
-        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
-        let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
-            .expect("the held build proves");
-        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
-            for (ahead, staged) in [(false, false), (true, false), (true, true)] {
-                // The narrow store on at the build: a retired stack keeps its
-                // packed bytes only for a store that sends them.
-                super::wlfm::set_narrow_commit_for_test(Some(true));
-                super::wlfm::set_narrow_commit_staged_for_test(Some(staged));
-                super::wlfm::set_narrow_store_for_test(Some(true));
-                let mut pre = super::wlfm::prepare_wlfm(
-                    &program,
-                    super::wlfm_tests::HASHER,
-                    WlfmRate::Two,
-                    WlfmLevers::with_family(family),
-                )
-                .expect("prepares");
-                if ahead {
-                    pre.hold_narrow_packs();
-                }
-                let mut build = pre.commit(place).expect("commits");
-                super::wlfm::set_narrow_commit_for_test(None);
-                super::wlfm::set_narrow_commit_staged_for_test(None);
-                super::wlfm::set_narrow_store_for_test(None);
-                let tag = format!("{family:?} {place:?} ahead {ahead} staged {staged}");
-                assert_eq!(
-                    build.artifacts.program_id, held.artifacts.program_id,
-                    "{tag}: the wide build's identity"
+    let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+    let (want, _) = streamed_once(&program, &held, &arenas, false, Default::default())
+        .expect("the held build proves");
+    for (ahead, staged) in [(false, false), (true, false), (true, true)] {
+        // The narrow store on at the build: a retired stack keeps its
+        // packed bytes only for a store that sends them.
+        super::wlfm::set_narrow_commit_for_test(Some(true));
+        super::wlfm::set_narrow_commit_staged_for_test(Some(staged));
+        super::wlfm::set_narrow_store_for_test(Some(true));
+        let mut pre = super::wlfm::prepare_wlfm(
+            &program,
+            super::wlfm_tests::HASHER,
+            WlfmRate::Two,
+            WlfmLevers::with_family(family),
+        )
+        .expect("prepares");
+        if ahead {
+            pre.hold_narrow_packs();
+        }
+        let mut build = pre.commit(place).expect("commits");
+        super::wlfm::set_narrow_commit_for_test(None);
+        super::wlfm::set_narrow_commit_staged_for_test(None);
+        super::wlfm::set_narrow_store_for_test(None);
+        let tag = format!("{family:?} {place:?} ahead {ahead} staged {staged}");
+        assert_eq!(
+            build.artifacts.program_id, held.artifacts.program_id,
+            "{tag}: the wide build's identity"
+        );
+        let stamps = build.narrow_commit_stamps();
+        if card && place != StackPlace::Host {
+            assert!(
+                !stamps.is_empty()
+                    && stamps
+                        .iter()
+                        .all(|n| n.sent && n.packed_bytes <= n.words && n.packed_ahead == ahead),
+                "{tag}: every stack's commit sent its store narrow"
+            );
+        } else {
+            assert!(stamps.is_empty(), "{tag}: nothing packed");
+        }
+        for narrow in [false, true] {
+            super::wlfm::set_narrow_store_for_test(Some(narrow));
+            let (got, groups) = streamed_once(&program, &build, &arenas, true, Default::default())
+                .unwrap_or_else(|e| panic!("{tag} narrow store {narrow}: {e}"));
+            super::wlfm::set_narrow_store_for_test(None);
+            assert!(got == want, "{tag} narrow store {narrow}: the held bytes");
+            let used: Vec<_> = groups.iter().filter(|s| s.upload_once.used).collect();
+            if card && place == StackPlace::CardRetired {
+                assert!(!used.is_empty(), "{tag} {narrow}: a store went up");
+                assert!(
+                    used.iter().all(|s| s.upload_once.prepacked == narrow
+                        && (!narrow || s.upload_once.pack_secs == 0.0)),
+                    "{tag} {narrow}: the opening sent the bytes packed before"
                 );
-                let stamps = build.narrow_commit_stamps();
-                if card && place != StackPlace::Host {
-                    assert!(
-                        !stamps.is_empty()
-                            && stamps.iter().all(|n| n.sent
-                                && n.packed_bytes <= n.words
-                                && n.packed_ahead == ahead),
-                        "{tag}: every stack's commit sent its store narrow"
-                    );
-                } else {
-                    assert!(stamps.is_empty(), "{tag}: nothing packed");
-                }
-                for narrow in [false, true] {
-                    super::wlfm::set_narrow_store_for_test(Some(narrow));
-                    let (got, groups) =
-                        streamed_once(&program, &build, &arenas, true, Default::default())
-                            .unwrap_or_else(|e| panic!("{tag} narrow store {narrow}: {e}"));
-                    super::wlfm::set_narrow_store_for_test(None);
-                    assert!(got == want, "{tag} narrow store {narrow}: the held bytes");
-                    let used: Vec<_> = groups.iter().filter(|s| s.upload_once.used).collect();
-                    if card && place == StackPlace::CardRetired {
-                        assert!(!used.is_empty(), "{tag} {narrow}: a store went up");
-                        assert!(
-                            used.iter().all(|s| s.upload_once.prepacked == narrow
-                                && (!narrow || s.upload_once.pack_secs == 0.0)),
-                            "{tag} {narrow}: the opening sent the bytes packed before"
-                        );
-                    } else {
-                        assert!(used.is_empty(), "{tag} {narrow}: no store");
-                    }
-                }
-                build.release_prover_half();
-                assert_eq!(
-                    build.narrow_commit_stamps().len(),
-                    stamps.len(),
-                    "{tag}: the narrow commit's stamps outlive the release"
-                );
+            } else {
+                assert!(used.is_empty(), "{tag} {narrow}: no store");
             }
         }
+        build.release_prover_half();
+        assert_eq!(
+            build.narrow_commit_stamps().len(),
+            stamps.len(),
+            "{tag}: the narrow commit's stamps outlive the release"
+        );
+    }
+}
+
+mod narrow_commit_moves_no_bytes {
+    use super::*;
+
+    #[test]
+    fn poseidon1_retired() {
+        assert_narrow_commit_moves_no_bytes(WlfmFamily::P1, StackPlace::CardRetired);
+    }
+
+    #[test]
+    fn poseidon1_card() {
+        assert_narrow_commit_moves_no_bytes(WlfmFamily::P1, StackPlace::Card);
+    }
+
+    #[test]
+    fn poseidon1_host() {
+        assert_narrow_commit_moves_no_bytes(WlfmFamily::P1, StackPlace::Host);
+    }
+
+    #[test]
+    fn blake3_retired() {
+        assert_narrow_commit_moves_no_bytes(WlfmFamily::B3, StackPlace::CardRetired);
+    }
+
+    #[test]
+    fn blake3_card() {
+        assert_narrow_commit_moves_no_bytes(WlfmFamily::B3, StackPlace::Card);
+    }
+
+    #[test]
+    fn blake3_host() {
+        assert_narrow_commit_moves_no_bytes(WlfmFamily::B3, StackPlace::Host);
     }
 }
 

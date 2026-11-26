@@ -98,29 +98,47 @@ fn only_the_fused_format_absorbs_its_pair() {
 /// ECALL rows beside the fused ones), loads and stores of every kind. Each
 /// holds fused tables of both kinds, and LOAD or STORE tables for the
 /// accesses MEMW_A would not take.
-#[test]
-fn a_fused_block_proves_and_verifies() {
-    for name in [
-        "fused_mem_cases",
-        "all_instructions_64",
-        "all_loadstore_32",
-        "test_keccak_multi",
-        "test_commit_split",
-    ] {
-        let elf = asm_elf_bytes(name);
-        let proof = prove(&elf, &fused());
-        assert!(verifies(&proof, &elf, &fused()), "{name}");
-        if name == "fused_mem_cases" {
-            assert!(
-                proof.fused_memory[0] > 0 && proof.fused_memory[1] > 0,
-                "{name}: {:?} fused tables",
-                proof.fused_memory
-            );
-            assert!(
-                proof.table_counts.load > 0 && proof.table_counts.store > 0,
-                "the unaligned and mixed accesses stay LOAD's and STORE's"
-            );
-        }
+fn assert_fused_block_verifies(name: &str) {
+    let elf = asm_elf_bytes(name);
+    let proof = prove(&elf, &fused());
+    assert!(verifies(&proof, &elf, &fused()), "{name}");
+    if name == "fused_mem_cases" {
+        assert!(
+            proof.fused_memory[0] > 0 && proof.fused_memory[1] > 0,
+            "{name}: {:?} fused tables",
+            proof.fused_memory
+        );
+        assert!(
+            proof.table_counts.load > 0 && proof.table_counts.store > 0,
+            "the unaligned and mixed accesses stay LOAD's and STORE's"
+        );
+    }
+}
+
+mod a_fused_block_proves_and_verifies {
+    #[test]
+    fn fused_mem_cases() {
+        super::assert_fused_block_verifies("fused_mem_cases");
+    }
+
+    #[test]
+    fn all_instructions_64() {
+        super::assert_fused_block_verifies("all_instructions_64");
+    }
+
+    #[test]
+    fn all_loadstore_32() {
+        super::assert_fused_block_verifies("all_loadstore_32");
+    }
+
+    #[test]
+    fn test_keccak_multi() {
+        super::assert_fused_block_verifies("test_keccak_multi");
+    }
+
+    #[test]
+    fn test_commit_split() {
+        super::assert_fused_block_verifies("test_commit_split");
     }
 }
 

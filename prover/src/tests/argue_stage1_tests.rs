@@ -1437,8 +1437,9 @@ fn the_corner_check_on_the_card_refuses_a_broken_trace() {
 fn the_device_tail_takes_the_long_vm_programs() {
     use multilinear::gpu_fused::{DEVICE_TAIL_MIN_STEPS, lower_fused};
     let mut vm = vm_airs();
-    let opts =
-        stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
     vm.push((
         Box::new(crate::test_utils::create_ecrec_air(&opts)),
         "ECREC",

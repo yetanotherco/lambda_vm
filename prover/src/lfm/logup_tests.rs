@@ -39,7 +39,9 @@ type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
 
 fn options() -> stark::proof::options::ProofOptions {
-    stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 /// The mirrored bus discriminant really is the VM's.

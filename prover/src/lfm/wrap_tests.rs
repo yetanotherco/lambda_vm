@@ -60,7 +60,9 @@ use crate::tables::types::FE;
 /// with a leg cost. The inner epoch's options are a different thing entirely and
 /// are named per measurement.
 fn wrap_options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 /// Instructions of each kind, for the shape line every measurement prints.

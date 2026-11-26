@@ -54,7 +54,9 @@ const NUM_QUERIES: usize = 4;
 const QUERY_BITS: usize = 4;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 /// The end-to-end vector for the round count this build compiled.

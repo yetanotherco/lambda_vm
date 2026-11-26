@@ -210,8 +210,8 @@ mod tests {
         let _g = lock();
         use crate::tables::types::FE;
         let program = super::super::programs::trivial_program();
-        let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(16)
-            .expect("blowup 16 is valid");
+        let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
+            .expect("blowup 4 is valid");
         opts.coset_offset = 13;
         let arenas = vec![
             (0..4u64)

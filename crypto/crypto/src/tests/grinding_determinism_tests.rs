@@ -127,3 +127,161 @@ fn a_valid_nonce_really_does_have_the_leading_zeros() {
         "nonce {n} gives only {leading} leading zero bits, needed {FACTOR}"
     );
 }
+
+/// ★ The chunked search finds the nonce the whole-range search found: the same
+/// smallest nonce, so a byte gate's proof is the bytes it was before the chunks.
+/// Factors up to 16 and twelve seeds a factor, against the search it replaced.
+#[cfg(feature = "parallel")]
+#[test]
+fn the_chunked_smallest_nonce_is_the_whole_range_ones() {
+    use crate::grinding::generate_nonce_smallest_whole_range;
+    let mut above_a_chunk = 0;
+    let chunk = crate::grinding::SMALLEST_CHUNK_PER_THREAD * rayon::current_num_threads() as u64;
+    for factor in [1u8, 4, 8, 12, 14, 16] {
+        for tag in 0..12u8 {
+            let s = seed(tag.wrapping_mul(17).wrapping_add(factor));
+            let chunked = generate_nonce_smallest::<Keccak>(&s, factor).expect("a nonce exists");
+            let whole =
+                generate_nonce_smallest_whole_range::<Keccak>(&s, factor).expect("a nonce exists");
+            assert_eq!(chunked, whole, "factor {factor}, seed {tag}");
+            above_a_chunk += usize::from(chunked >= chunk);
+        }
+    }
+    // The chunks' own loop is exercised only past the first chunk: some seed at
+    // 16 bits must land beyond it on any pool of at most 16 threads.
+    if rayon::current_num_threads() <= 16 {
+        assert!(above_a_chunk > 0, "every answer fell in the first chunk");
+    }
+}
+
+/// The chunk loop at its edges, on a predicate the test controls: the answer
+/// at a chunk's first and last nonce, one past a chunk, deep in a later chunk,
+/// and the smallest of several valid nonces in one chunk.
+#[cfg(feature = "parallel")]
+#[test]
+fn the_chunk_loop_returns_the_smallest_at_every_edge() {
+    use crate::grinding::smallest_in_chunks;
+    let per = 8u64;
+    let chunk = per * rayon::current_num_threads() as u64;
+    for want in [
+        0,
+        1,
+        chunk - 1,
+        chunk,
+        chunk + 1,
+        2 * chunk - 1,
+        7 * chunk + 3,
+    ] {
+        assert_eq!(
+            smallest_in_chunks(0..=u64::MAX, per, |n| n == want),
+            Some(want),
+            "at {want}"
+        );
+        assert_eq!(
+            smallest_in_chunks(0..=u64::MAX, per, |n| n >= want && (n - want) % 3 == 0),
+            Some(want),
+            "the smallest of several from {want}"
+        );
+    }
+    // A chunk of one nonce a thread still walks every nonce in order.
+    assert_eq!(
+        smallest_in_chunks(0..=u64::MAX, 1, |n| n == 1000),
+        Some(1000)
+    );
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn the_search_checks_the_last_partial_chunk_and_exhausts_the_range() {
+    use crate::grinding::smallest_in_chunks;
+    use std::sync::Mutex;
+
+    let per = 4;
+    let chunk = per * rayon::current_num_threads() as u64;
+    let range = u64::MAX - 2 * chunk - 1..=u64::MAX;
+    for want in [u64::MAX - 1, u64::MAX] {
+        assert_eq!(
+            smallest_in_chunks(range.clone(), per, |n| n == want),
+            Some(want)
+        );
+    }
+    let seen = Mutex::new(Vec::new());
+    assert_eq!(
+        smallest_in_chunks(range.clone(), per, |n| {
+            seen.lock().unwrap().push(n);
+            false
+        }),
+        None
+    );
+    let mut seen = seen.into_inner().unwrap();
+    seen.sort_unstable();
+    assert_eq!(seen, range.collect::<Vec<_>>());
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn the_chunked_search_preserves_the_post_grind_transcript() {
+    use crate::fiat_shamir::default_transcript::DefaultTranscript;
+    use crate::fiat_shamir::is_transcript::IsTranscript;
+    use crate::grinding::generate_nonce_smallest_whole_range;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+
+    type Transcript = DefaultTranscript<Degree3GoldilocksExtensionField>;
+    for threads in [1, 2, 4, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for tag in 0..4 {
+                let mut chunked = Transcript::new(&seed(tag));
+                chunked.sample_field_element();
+                chunked.append_bytes(&seed(tag + 16));
+                let mut whole = chunked.clone();
+                let state = chunked.state();
+                let nonce = generate_nonce_smallest::<Keccak>(&state, FACTOR).unwrap();
+                let old_nonce =
+                    generate_nonce_smallest_whole_range::<Keccak>(&state, FACTOR).unwrap();
+                chunked.append_bytes(&nonce.to_be_bytes());
+                whole.append_bytes(&old_nonce.to_be_bytes());
+                assert_eq!(chunked.state(), whole.state(), "pool {threads}, seed {tag}");
+                assert_eq!(
+                    chunked.sample_field_element(),
+                    whole.sample_field_element(),
+                    "pool {threads}, seed {tag}"
+                );
+            }
+        });
+    }
+}
+
+/// Pace probe (not a gate): the chunked search against the whole-range one at
+/// 18 and 20 bits on Keccak, on this machine's pool. Prints one line a factor.
+/// `cargo test -p crypto --release --features parallel -- --ignored --nocapture
+/// smallest_nonce_pace`.
+#[cfg(feature = "parallel")]
+#[test]
+#[ignore = "a pace probe: prints seconds, asserts only equality"]
+fn smallest_nonce_pace() {
+    use crate::grinding::generate_nonce_smallest_whole_range;
+    for factor in [18u8, 20] {
+        let (mut chunked_s, mut whole_s, mut nonces) = (0.0, 0.0, 0u64);
+        for tag in 0..4u8 {
+            let s = seed(tag.wrapping_add(100));
+            let t = std::time::Instant::now();
+            let a = generate_nonce_smallest::<Keccak>(&s, factor).expect("a nonce");
+            chunked_s += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let b = generate_nonce_smallest_whole_range::<Keccak>(&s, factor).expect("a nonce");
+            whole_s += t.elapsed().as_secs_f64();
+            assert_eq!(a, b, "factor {factor}, seed {tag}");
+            nonces += a;
+        }
+        println!(
+            "SMALLEST NONCE PACE: factor {factor} · threads {} · 4 seeds · nonces scanned {nonces} · \
+             chunked {chunked_s:.3}s · whole range {whole_s:.3}s · ratio {:.1}",
+            rayon::current_num_threads(),
+            whole_s / chunked_s.max(1e-9)
+        );
+    }
+}

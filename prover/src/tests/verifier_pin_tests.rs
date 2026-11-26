@@ -78,6 +78,7 @@ fn a_chain_on_a_domain_off_its_rate_is_refused() {
 /// the tallest stack exactly `n`; BITWISE (21 columns of 2^20 rows) stacks to
 /// 25.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn the_query_count_by_tallest_stack_at_the_default() {
     let q = |shapes: &[(usize, usize)]| chain_config_under(&ZfFormat::DEFAULT, shapes).num_queries;
     assert_eq!(q(&[(21, 20)]), 229);
@@ -97,6 +98,7 @@ fn the_query_count_by_tallest_stack_at_the_default() {
 /// BITWISE's stack (25) and at 27: the count is the (blowup, grind bits) pair's
 /// alone, 229 / 225 / 114 / 112.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn every_accepted_format_runs_its_query_count() {
     for blowup in ["2", "4"] {
         for bits in ["18", "20"] {
@@ -193,6 +195,7 @@ fn small_options() -> BlockOptions {
 /// would derive 226 and 228) is refused by name; and one with every other
 /// table small but BITWISE at its height frames, still at 229.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
     let elf = asm_elf_bytes("sub");
     let format = small_format();
@@ -281,6 +284,7 @@ const MEMORY_WORDS: [&str; 2] = ["split", "fused"];
 /// proof and refuses one made at blowup 4, whose statement binds the other
 /// rate.
 #[test]
+#[cfg_attr(feature = "test-security", ignore = "requires production posture")]
 fn the_block_verifier_reads_no_format_from_its_environment() {
     let name =
         "tests::verifier_pin_tests::the_pinned_presets_hold_under_an_environment_off_the_default";

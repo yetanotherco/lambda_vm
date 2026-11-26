@@ -20,9 +20,11 @@ use crate::tables::types::{FE, FEE, GoldilocksExtension as E, GoldilocksField as
 use super::builder::{Cell, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::hash::HasherKind;
+#[cfg(not(feature = "test-security"))]
+use super::wlfm::WLFM_B64_STACK;
 use super::wlfm::{
-    WLFM_B4_QUERIES, WLFM_B16_STACK, WLFM_B64_STACK, WlfmBuild, WlfmHash, WlfmLevers, WlfmPrep,
-    WlfmProof, WlfmRate, absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under,
+    WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmLevers, WlfmPrep, WlfmProof,
+    WlfmRate, absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under,
     check_coverage, execute_and_fill_unmerged, prepare_wlfm, prove_wlfm, prove_wlfm_traces,
     test_format, verify_wlfm, verify_wlfm_with, wlfm_config, wlfm_config_under, wlfm_program_id,
 };
@@ -126,7 +128,11 @@ fn the_fixture_round_trips_at_the_production_config() {
     let a = &build.artifacts;
     assert_eq!(
         a.config.grind.query,
-        crate::zf_format::PRODUCTION_WHIR_GRIND_BITS
+        if cfg!(feature = "test-security") {
+            crate::security_posture::TEST_GRIND_BITS
+        } else {
+            crate::zf_format::PRODUCTION_WHIR_GRIND_BITS
+        }
     );
     assert_eq!(a.config.log_blowup, 1);
     assert!(!a.stacks.is_empty(), "the program's prefixes are stacked");
@@ -141,6 +147,7 @@ fn the_fixture_round_trips_at_the_production_config() {
 /// The blowup-4 arm round-trips too, at [`WLFM_B4_QUERIES`], and is another
 /// program identity: a proof at one rate is refused by the other's artifacts.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_blowup_4_arm_round_trips_and_is_another_identity() {
     let _unground = test_format::set(None);
     let program = honest();
@@ -193,6 +200,7 @@ fn the_blowup_16_arm_round_trips_and_is_another_identity() {
 /// grind 18 runs Q 39, 22 runs 37, 26 runs 36, each ≥ 128 + log2 6 bits at
 /// the Johnson bound.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_blowup_64_arm_and_its_grind_follow_the_production_rule() {
     use multilinear::whir_chain::FinalPoly;
     let shapes = [(1usize, 23usize)];
@@ -230,11 +238,40 @@ fn the_blowup_64_arm_and_its_grind_follow_the_production_rule() {
     }
 }
 
+#[cfg(feature = "test-security")]
+#[test]
+fn the_wlfm_query_rule_uses_the_test_posture() {
+    use multilinear::whir_chain::FinalPoly;
+    let shapes = [(1, 23)];
+    for rate in [
+        WlfmRate::Two,
+        WlfmRate::Four,
+        WlfmRate::Sixteen,
+        WlfmRate::SixtyFour,
+    ] {
+        let cfg = wlfm_config(rate, &shapes);
+        let rounds = (1..=23).map(|vars| cfg.rounds(vars)).max().unwrap();
+        assert_eq!(cfg.grind.query, 8);
+        assert_eq!(
+            cfg.num_queries,
+            multilinear::query_count::num_queries(cfg.log_blowup, rounds, 32, 8)
+        );
+        for grind in [18, 22, 26] {
+            assert_eq!(
+                wlfm_config_under(rate, FinalPoly::Off, None, Some(grind), &shapes),
+                cfg,
+                "test posture caps the grind at rate {rate:?}"
+            );
+        }
+    }
+}
+
 /// The blowup-64 arm round-trips under the second step's levers (evaluated
 /// columns, the byte-minimising schedule) with its grind set, and the grind
 /// is part of the identity: a proof at one grind is refused by the other's
 /// artifacts.
 #[test]
+#[cfg(not(feature = "test-security"))]
 fn the_blowup_64_arm_round_trips_and_its_grind_is_another_identity() {
     let _unground = test_format::set(None);
     let program = honest();
@@ -318,43 +355,63 @@ fn the_wlfm_format_reads_no_environment() {
 // Refusals
 // =============================================================================
 
-/// A tampered public word is refused: the statement absorbs it, so every
-/// challenge moves and the `LfmPublic` balance is another.
+/// The stacked proof binds its public words, commit-time answers, prepared
+/// openings and table heights. Each mutation starts with the same honest proof.
 #[test]
-fn a_tampered_public_word_is_refused() {
+fn a_stacked_proof_refuses_tampers() {
     let _unground = test_format::set(None);
     let program = honest();
     let build = build(&program, WlfmRate::Two);
     let proof = prove(&program, &build);
+    let a = &build.artifacts;
+    verify_wlfm(a, &proof, &proof.public_words).expect("the honest proof verifies");
+
     let mut claimed = proof.public_words.clone();
     claimed[0].1[0] += FE::one();
-    assert!(verify_wlfm(&build.artifacts, &proof, &claimed).is_err());
+    assert!(
+        verify_wlfm(a, &proof, &claimed).is_err(),
+        "public word value"
+    );
     let mut reindexed = proof.public_words.clone();
     reindexed[1].0 = 7;
-    assert!(verify_wlfm(&build.artifacts, &proof, &reindexed).is_err());
-}
+    assert!(
+        verify_wlfm(a, &proof, &reindexed).is_err(),
+        "public word index"
+    );
 
-/// The commit-time answers on a W-LFM proof: a false one, a missing one and an
-/// extra one are each refused.
-#[test]
-fn a_false_missing_or_extra_commit_time_answer_is_refused() {
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = build(&program, WlfmRate::Two);
-    let proof = prove(&program, &build);
     let mut altered = proof.clone();
     altered.commit_ood[0] += FieldElement::<E>::one();
-    assert!(verify_wlfm(&build.artifacts, &altered, &altered.public_words).is_err());
+    assert!(
+        verify_wlfm(a, &altered, &altered.public_words).is_err(),
+        "false commit-time answer"
+    );
     let mut missing = proof.clone();
     missing.commit_ood.pop();
-    assert!(verify_wlfm(&build.artifacts, &missing, &missing.public_words).is_err());
+    assert!(
+        verify_wlfm(a, &missing, &missing.public_words).is_err(),
+        "missing commit-time answer"
+    );
     let mut extra = proof.clone();
     extra.commit_ood.push(FieldElement::<E>::one());
-    assert!(verify_wlfm(&build.artifacts, &extra, &extra.public_words).is_err());
-    let mut extra_ok = proof;
-    extra_ok.commit_ood.truncate(extra_ok.proof.roots.len());
-    verify_wlfm(&build.artifacts, &extra_ok, &extra_ok.public_words)
-        .unwrap_or_else(|e| panic!("the honest answers verify: {e}"));
+    assert!(
+        verify_wlfm(a, &extra, &extra.public_words).is_err(),
+        "extra commit-time answer"
+    );
+    extra.commit_ood.truncate(extra.proof.roots.len());
+    verify_wlfm(a, &extra, &extra.public_words).expect("the restored answers verify");
+
+    let mut deleted = proof.clone();
+    deleted.prepared.clear();
+    assert!(
+        verify_wlfm(a, &deleted, &deleted.public_words).is_err(),
+        "deleted prepared openings"
+    );
+    let mut restated = a.clone();
+    restated.table_num_vars[1] += 1;
+    assert!(
+        verify_wlfm(&restated, &proof, &proof.public_words).is_err(),
+        "restated table height"
+    );
 }
 
 /// ★ A forged instruction column — the twin's program proved against the
@@ -377,32 +434,6 @@ fn a_forged_instruction_column_is_refused_by_the_prepared_opening() {
         VerifierChecks::ALL,
     )
     .unwrap_or_else(|e| panic!("with the prepared openings skipped the forgery verifies: {e}"));
-}
-
-/// The prepared openings deleted from an honest proof are refused (the
-/// omission, not a reordering).
-#[test]
-fn a_deleted_prepared_opening_is_refused() {
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = build(&program, WlfmRate::Two);
-    let mut proof = prove(&program, &build);
-    proof.prepared.clear();
-    assert!(verify_wlfm(&build.artifacts, &proof, &proof.public_words).is_err());
-}
-
-/// A restated height — artifacts claiming a table one variable taller — is
-/// refused before any proof is read: the config, the groups and the layouts are
-/// the artifacts' own derivation.
-#[test]
-fn a_restated_table_height_is_refused() {
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = build(&program, WlfmRate::Two);
-    let proof = prove(&program, &build);
-    let mut restated = build.artifacts.clone();
-    restated.table_num_vars[1] += 1;
-    assert!(verify_wlfm(&restated, &proof, &proof.public_words).is_err());
 }
 
 /// What a verifier that counted the AIRs' `precomputed_columns()` (empty for
@@ -578,27 +609,42 @@ fn the_evaluated_binding_round_trips_with_no_prepared_chain_and_is_another_ident
             verify_wlfm(a, &added, &added.public_words).is_err(),
             "an evaluated proof with a prepared opening added"
         );
+        match rate {
+            WlfmRate::Two => {
+                the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding(
+                    a, &proof, &stacked,
+                );
+            }
+            WlfmRate::Sixteen => an_evaluated_proof_refuses_a_tampered_answer_or_word(a, &proof),
+            _ => unreachable!("the two rates above"),
+        }
     }
 }
 
 /// An evaluated proof at blowup 16 refuses a false commit-time answer, a
 /// missing one, and a tampered public word.
-#[test]
-fn an_evaluated_proof_refuses_a_tampered_answer_or_word() {
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = evaluated(&program, WlfmRate::Sixteen);
-    let proof = prove(&program, &build);
-    let a = &build.artifacts;
+fn an_evaluated_proof_refuses_a_tampered_answer_or_word(
+    a: &super::wlfm::WlfmArtifacts,
+    proof: &WlfmProof,
+) {
     let mut altered = proof.clone();
     altered.commit_ood[0] += FieldElement::<E>::one();
-    assert!(verify_wlfm(a, &altered, &altered.public_words).is_err());
+    assert!(
+        verify_wlfm(a, &altered, &altered.public_words).is_err(),
+        "evaluated proof: false answer"
+    );
     let mut missing = proof.clone();
     missing.commit_ood.pop();
-    assert!(verify_wlfm(a, &missing, &missing.public_words).is_err());
+    assert!(
+        verify_wlfm(a, &missing, &missing.public_words).is_err(),
+        "evaluated proof: missing answer"
+    );
     let mut claimed = proof.public_words.clone();
     claimed[0].1[0] += FE::one();
-    assert!(verify_wlfm(a, &proof, &claimed).is_err());
+    assert!(
+        verify_wlfm(a, proof, &claimed).is_err(),
+        "evaluated proof: changed word"
+    );
 }
 
 /// ★ A forged instruction column — the twin's program proved against the
@@ -636,20 +682,18 @@ fn a_forged_instruction_column_is_refused_by_the_evaluated_columns() {
 /// over another height, with a changed value, or that mix the two bindings
 /// are refused — the first four before or by the column check, the mixes
 /// before any proof is read.
-#[test]
-fn the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding() {
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = evaluated(&program, WlfmRate::Two);
-    let proof = prove(&program, &build);
-    let a = &build.artifacts;
+fn the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding(
+    a: &super::wlfm::WlfmArtifacts,
+    proof: &WlfmProof,
+    stacked: &WlfmBuild,
+) {
     let t = a
         .counts
         .iter()
         .position(|&c| c > 0)
         .expect("a table with a prefix");
     let refused = |artifacts: &super::wlfm::WlfmArtifacts, why: &str| {
-        let e = verify_wlfm(artifacts, &proof, &proof.public_words).expect_err(why);
+        let e = verify_wlfm(artifacts, proof, &proof.public_words).expect_err(why);
         assert!(e.contains(why), "{why}: {e}");
     };
     let mut short = a.clone();
@@ -667,10 +711,9 @@ fn the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding() {
     values[0] += FE::one();
     changed.evaluated[t][0] = Mle::new(values).expect("a column");
     assert!(
-        verify_wlfm(&changed, &proof, &proof.public_words).is_err(),
+        verify_wlfm(&changed, proof, &proof.public_words).is_err(),
         "a changed instruction value"
     );
-    let stacked = build_wlfm(&program, HASHER, WlfmRate::Two).expect("the stacked build");
     let mut mixed = a.clone();
     mixed.stacks = stacked.artifacts.stacks.clone();
     refused(&mixed, "evaluated artifacts carry prepared stacks");
@@ -753,22 +796,22 @@ fn the_final_polynomial_round_trips_smaller_and_is_another_identity() {
             assert!(final_rounds(&today).is_empty(), "today's chains send none");
             assert!(verify_wlfm(&off.artifacts, &proof, &proof.public_words).is_err());
             assert!(verify_wlfm(&on.artifacts, &today, &today.public_words).is_err());
+            if rate == WlfmRate::Sixteen && prep == WlfmPrep::Stacked {
+                a_final_polynomial_proof_refuses_a_tampered_polynomial(&on.artifacts, &proof);
+            }
         }
     }
 }
 
 /// A final-polynomial W-LFM proof refuses a changed polynomial value, a
 /// changed final value, a tampered commit-time answer and a tampered word.
-#[test]
-fn a_final_polynomial_proof_refuses_a_tampered_polynomial() {
+fn a_final_polynomial_proof_refuses_a_tampered_polynomial(
+    a: &super::wlfm::WlfmArtifacts,
+    proof: &WlfmProof,
+) {
     use multilinear::whir_chain::RoundOpenings;
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = under(&program, WlfmRate::Sixteen, final_levers(WlfmPrep::Stacked));
-    let proof = prove(&program, &build);
-    let a = &build.artifacts;
-    verify_wlfm(a, &proof, &proof.public_words).expect("honest");
-    let (g, p, r) = final_rounds(&proof)[0];
+    verify_wlfm(a, proof, &proof.public_words).expect("honest final polynomial proof");
+    let (g, p, r) = final_rounds(proof)[0];
     let mut poly = proof.clone();
     match &mut poly.proof.columns[g].polys[p].rounds[r].openings {
         RoundOpenings::Extension(o) => o.next[0].values[0] += FieldElement::<E>::one(),
@@ -789,7 +832,7 @@ fn a_final_polynomial_proof_refuses_a_tampered_polynomial() {
     );
     let mut claimed = proof.public_words.clone();
     claimed[0].1[0] += FE::one();
-    assert!(verify_wlfm(a, &proof, &claimed).is_err(), "word");
+    assert!(verify_wlfm(a, proof, &claimed).is_err(), "word");
 }
 
 /// The final polynomial is the compression step's alone: the base block's
@@ -866,6 +909,13 @@ fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
                     bytes.len(),
                     proof_bytes(&proof)
                 );
+                if (rate, prep, final_poly)
+                    == (WlfmRate::Sixteen, WlfmPrep::Stacked, FinalPoly::Off)
+                {
+                    the_compact_decoder_refuses_trailing_truncated_and_tampered_bytes(
+                        &build, &bytes,
+                    );
+                }
             }
         }
     }
@@ -873,27 +923,27 @@ fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
 
 /// The decoder takes exactly one proof's bytes: a trailing byte, any
 /// truncation, and a changed value that decodes are refused or verify false.
-#[test]
-fn the_compact_decoder_refuses_trailing_truncated_and_tampered_bytes() {
-    let _unground = test_format::set(None);
-    let program = honest();
-    let build = build(&program, WlfmRate::Sixteen);
-    let proof = prove(&program, &build);
-    let bytes = super::wire::encode(&proof);
-    let mut trailing = bytes.clone();
+fn the_compact_decoder_refuses_trailing_truncated_and_tampered_bytes(
+    build: &WlfmBuild,
+    bytes: &[u8],
+) {
+    let mut trailing = bytes.to_vec();
     trailing.push(0);
-    assert!(super::wire::decode(&trailing).is_err());
+    assert!(super::wire::decode(&trailing).is_err(), "trailing byte");
     for cut in [0, 1, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
         assert!(super::wire::decode(&bytes[..cut]).is_err(), "cut at {cut}");
     }
     // One byte flipped in the last field element (a public word's lane):
     // either refused by the decoder or refused by the verifier.
-    let mut flipped = bytes.clone();
+    let mut flipped = bytes.to_vec();
     let at = bytes.len() - 3;
     flipped[at] ^= 1;
     match super::wire::decode(&flipped) {
         Err(_) => {}
-        Ok(p) => assert!(verify_wlfm(&build.artifacts, &p, &p.public_words).is_err()),
+        Ok(p) => assert!(
+            verify_wlfm(&build.artifacts, &p, &p.public_words).is_err(),
+            "changed public word in the compact bytes"
+        ),
     }
 }
 

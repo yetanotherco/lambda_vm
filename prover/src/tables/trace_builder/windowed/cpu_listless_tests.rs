@@ -230,37 +230,53 @@ fn built_in(
 /// at windows of 1, 7 and 33 cycles, whatever the room admits (every CPU
 /// chunk, none: each filled on the host from its rebuilt ops, every other),
 /// the windows build the whole-run tables, and their walkers kept no list.
-#[test]
-fn without_the_cpu_list_the_windows_build_the_whole_run_tables() {
+fn assert_listless_tables(window: usize) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     for name in ["all_instructions_64", "test_ecrec", "test_keccak_multi"] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [1, 7, 33] {
-            for walk in [
-                Walk::Owned,
-                Walk::Threads(1),
-                Walk::Threads(3),
-                Walk::History(1, 0),
-                Walk::History(3, 2),
-            ] {
-                for (what, room) in rooms() {
-                    let (traces, without) =
-                        built(&program, &logs, &max_rows, window, walk, room, true, true);
-                    same_traces(&reference, &traces);
-                    let body = (logs.len() - 1) / window;
-                    assert!(
-                        without == body || !matches!(walk, Walk::Owned),
-                        "{name}/{window} {walk:?} {what}: {without} of {body} windows listless"
-                    );
-                    assert!(
-                        without > 0 || body == 0,
-                        "{name}/{window} {walk:?} {what}: no window walked without its list"
-                    );
-                }
+        for walk in [
+            Walk::Owned,
+            Walk::Threads(1),
+            Walk::Threads(3),
+            Walk::History(1, 0),
+            Walk::History(3, 2),
+        ] {
+            for (what, room) in rooms() {
+                let (traces, without) =
+                    built(&program, &logs, &max_rows, window, walk, room, true, true);
+                same_traces(&reference, &traces);
+                let body = (logs.len() - 1) / window;
+                assert!(
+                    without == body || !matches!(walk, Walk::Owned),
+                    "{name}/{window} {walk:?} {what}: {without} of {body} windows listless"
+                );
+                assert!(
+                    without > 0 || body == 0,
+                    "{name}/{window} {walk:?} {what}: no window walked without its list"
+                );
             }
         }
+    }
+}
+
+mod without_the_cpu_list_the_windows_build_the_whole_run_tables {
+    use super::assert_listless_tables;
+
+    #[test]
+    fn window_1() {
+        assert_listless_tables(1);
+    }
+
+    #[test]
+    fn window_7() {
+        assert_listless_tables(7);
+    }
+
+    #[test]
+    fn window_33() {
+        assert_listless_tables(33);
     }
 }
 
@@ -271,8 +287,7 @@ fn without_the_cpu_list_the_windows_build_the_whole_run_tables() {
 /// Through the split walker, on 1 and 3 threads and in record mode, at windows
 /// of 1, 7 and 33 cycles, the windows build the in-row tables the build
 /// without the card makes, and their walkers kept no list.
-#[test]
-fn in_row_without_the_cpu_list_the_windows_build_the_in_row_tables() {
+fn assert_in_row_listless_tables(window: usize) {
     let max_rows = MaxRowsConfig::small();
     for name in [
         "all_instructions_64",
@@ -280,40 +295,57 @@ fn in_row_without_the_cpu_list_the_windows_build_the_in_row_tables() {
         "keep_alive_regs",
     ] {
         let (program, logs) = run(name);
-        for window in [1, 7, 33] {
-            let reference =
-                super::card_records_tests::in_row_windowed(&program, &logs, &max_rows, window);
-            for walk in [
-                Walk::Owned,
-                Walk::Threads(1),
-                Walk::Threads(3),
-                Walk::History(1, 0),
-                Walk::History(3, 2),
-            ] {
-                for (what, room) in rooms() {
-                    let (traces, without) = built_in(
-                        &program,
-                        &logs,
-                        &max_rows,
-                        window,
-                        walk,
-                        room,
-                        (true, true),
-                        RegisterFormat::InRow,
-                    );
-                    same_traces(&reference, &traces);
-                    let body = (logs.len() - 1) / window;
-                    assert!(
-                        without == body || !matches!(walk, Walk::Owned),
-                        "{name}/{window} {walk:?} {what}: {without} of {body} windows listless"
-                    );
-                    assert!(
-                        without > 0 || body == 0,
-                        "{name}/{window} {walk:?} {what}: no window walked without its list"
-                    );
-                }
+        let reference =
+            super::card_records_tests::in_row_windowed(&program, &logs, &max_rows, window);
+        for walk in [
+            Walk::Owned,
+            Walk::Threads(1),
+            Walk::Threads(3),
+            Walk::History(1, 0),
+            Walk::History(3, 2),
+        ] {
+            for (what, room) in rooms() {
+                let (traces, without) = built_in(
+                    &program,
+                    &logs,
+                    &max_rows,
+                    window,
+                    walk,
+                    room,
+                    (true, true),
+                    RegisterFormat::InRow,
+                );
+                same_traces(&reference, &traces);
+                let body = (logs.len() - 1) / window;
+                assert!(
+                    without == body || !matches!(walk, Walk::Owned),
+                    "{name}/{window} {walk:?} {what}: {without} of {body} windows listless"
+                );
+                assert!(
+                    without > 0 || body == 0,
+                    "{name}/{window} {walk:?} {what}: no window walked without its list"
+                );
             }
         }
+    }
+}
+
+mod in_row_without_the_cpu_list_the_windows_build_the_in_row_tables {
+    use super::*;
+
+    #[test]
+    fn window_1() {
+        assert_in_row_listless_tables(1);
+    }
+
+    #[test]
+    fn window_7() {
+        assert_in_row_listless_tables(7);
+    }
+
+    #[test]
+    fn window_33() {
+        assert_in_row_listless_tables(33);
     }
 }
 

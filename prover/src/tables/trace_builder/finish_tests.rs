@@ -43,16 +43,36 @@ pub(super) fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
         }
         None => {
             let main = &t.main_table;
-            let words = (0..main.height)
-                .flat_map(|r| (0..main.width).map(move |c| *main.get(r, c).value()))
+            let words = main.row_major_data()[..main.width * main.height]
+                .iter()
+                .map(|element| *element.value())
                 .collect();
             (main.width, main.height, words)
         }
     }
 }
 
-/// Every table of a build, named, and what the statement reads off it.
-pub(super) fn contents(t: &Traces) -> Vec<(String, String)> {
+/// Compare raw words in row order. Wide tables already store them in that order.
+pub(super) fn main_words_match(a: &Table, b: &Table) -> bool {
+    if let (Some(a), Some(b)) = (a.narrow_main(), b.narrow_main())
+        && a.widths() == b.widths()
+    {
+        return a.rows() == b.rows() && a.data() == b.data();
+    }
+    if a.narrow_main().is_some() || b.narrow_main().is_some() {
+        return shape_and_words(a) == shape_and_words(b);
+    }
+    let (a, b) = (&a.main_table, &b.main_table);
+    let cells = a.width * a.height;
+    (a.width, a.height) == (b.width, b.height)
+        && a.row_major_data()[..cells]
+            .iter()
+            .map(|x| x.value())
+            .eq(b.row_major_data()[..cells].iter().map(|x| x.value()))
+}
+
+/// The tables outside BITWISE, named, and what the statement reads off the build.
+pub(super) fn contents_without_bitwise(t: &Traces) -> Vec<(String, String)> {
     let lists: [(&str, &[Table]); 21] = [
         ("CPU", &t.cpus),
         ("MEMW_R", &t.memw_registers),
@@ -88,7 +108,6 @@ pub(super) fn contents(t: &Traces) -> Vec<(String, String)> {
         out.push((format!("{name} count"), list.len().to_string()));
     }
     for (name, table) in [
-        ("BITWISE", &t.bitwise),
         ("DECODE", &t.decode),
         ("REGISTER", &t.register),
         ("HALT", &t.halt),
@@ -145,7 +164,14 @@ fn oracle<T>(build: impl FnOnce() -> T) -> T {
 }
 
 fn same(what: &str, oracle: &Traces, plan: &Traces) {
-    let (a, b) = (contents(oracle), contents(plan));
+    assert!(
+        main_words_match(&oracle.bitwise, &plan.bitwise),
+        "{what}: BITWISE"
+    );
+    let (a, b) = (
+        contents_without_bitwise(oracle),
+        contents_without_bitwise(plan),
+    );
     assert_eq!(a.len(), b.len(), "{what}: the builds hold different tables");
     for ((name, x), (_, y)) in a.iter().zip(&b) {
         assert_eq!(x, y, "{what}: {name}");
@@ -194,23 +220,48 @@ const PROGRAMS: [&str; 15] = [
     "test_ecrec",
 ];
 
+macro_rules! finish_cases {
+    ($check:ident; $($program:ident),+ $(,)?) => {
+        mod $check {
+            $(
+                #[test]
+                fn $program() {
+                    super::$check(stringify!($program));
+                }
+            )+
+        }
+    };
+}
+
 /// Whole-run builds, at small chunks (every chunked table split) and at the
 /// production sizes: the plan's tables are the oracle's.
-#[test]
-fn the_plan_builds_the_oracles_whole_run_tables() {
+mod the_plan_builds_the_oracles_whole_run_tables {
+    use super::*;
+
+    #[test]
+    fn small_rows() {
+        assert_whole_run_matches_oracle(&MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn four_rows() {
+        assert_whole_run_matches_oracle(&MaxRowsConfig::uniform(4));
+    }
+
+    #[test]
+    fn production_rows() {
+        assert_whole_run_matches_oracle(&MaxRowsConfig::default());
+    }
+}
+
+fn assert_whole_run_matches_oracle(max_rows: &MaxRowsConfig) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for max_rows in [
-        MaxRowsConfig::small(),
-        MaxRowsConfig::uniform(4),
-        MaxRowsConfig::default(),
-    ] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            let build =
-                || Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build");
-            let frozen = oracle(build);
-            same(&format!("{name} whole run"), &frozen, &build());
-        }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        let build =
+            || Traces::from_elf_and_logs(&program, &logs, max_rows, &[]).expect("the build");
+        let frozen = oracle(build);
+        same(&format!("{name} whole run"), &frozen, &build());
     }
 }
 
@@ -261,8 +312,7 @@ fn the_plan_builds_the_oracles_epoch_tables() {
 /// cut pad the whole run, as the oracle does whatever the settings say (cut at
 /// the last real row:
 /// [`a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables`]).
-#[test]
-fn the_plan_builds_the_oracles_windowed_tables() {
+fn the_plan_builds_the_oracles_windowed_tables(name: &str) {
     type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
     let configs: Vec<(&str, Configure)> = vec![
         ("plain", Box::new(|b| b)),
@@ -315,35 +365,49 @@ fn the_plan_builds_the_oracles_windowed_tables() {
         ),
     ];
     for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in [
-            "all_instructions_64",
-            "misalign_sd",
-            "test_keccak_multi",
-            "test_ecsm_multi",
-            "test_commit_split",
-            "test_blake3_absorb",
-        ] {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, configure) in &configs {
-                    let build = || windowed(&program, &logs, &max_rows, window, configure.as_ref());
-                    let frozen = oracle(build);
-                    same(
-                        &format!("{name} window {window} {config}"),
-                        &frozen,
-                        &build(),
-                    );
-                }
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs {
+                let build = || windowed(&program, &logs, &max_rows, window, configure.as_ref());
+                let frozen = oracle(build);
+                same(
+                    &format!("{name} window {window} {config}"),
+                    &frozen,
+                    &build(),
+                );
             }
         }
     }
 }
 
+mod the_plan_builds_the_oracles_windowed_tables {
+    use super::the_plan_builds_the_oracles_windowed_tables;
+
+    macro_rules! cases {
+        ($($program:ident),+ $(,)?) => {
+            $(
+                #[test]
+                fn $program() {
+                    the_plan_builds_the_oracles_windowed_tables(stringify!($program));
+                }
+            )+
+        };
+    }
+
+    cases!(
+        all_instructions_64,
+        misalign_sd,
+        test_keccak_multi,
+        test_ecsm_multi,
+        test_commit_split,
+        test_blake3_absorb,
+    );
+}
+
 /// The delta-coded lists ([`super::delta`]) marked every three ops instead of
 /// every 4096, so nearly every chunk and every p4 slice starts past an index
 /// mark: the windowed builds make the same tables word for word.
-#[test]
-fn the_tables_are_the_same_with_an_index_mark_every_three_ops() {
+fn the_tables_are_the_same_with_an_index_mark_every_three_ops(name: &str) {
     type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
     let configs: Vec<(&str, Configure)> = vec![
         ("plain", Box::new(|b| b)),
@@ -362,27 +426,27 @@ fn the_tables_are_the_same_with_an_index_mark_every_three_ops() {
         ),
     ];
     for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in [
-            "all_instructions_64",
-            "misalign_sd",
-            "test_keccak_multi",
-            "test_ecsm_multi",
-        ] {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, configure) in &configs {
-                    let build = || windowed(&program, &logs, &max_rows, window, configure.as_ref());
-                    let dense = super::delta::with_index_every(3, build);
-                    same(
-                        &format!("{name} window {window} {config}, marks every 3"),
-                        &build(),
-                        &dense,
-                    );
-                }
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs {
+                let build = || windowed(&program, &logs, &max_rows, window, configure.as_ref());
+                let dense = super::delta::with_index_every(3, build);
+                same(
+                    &format!("{name} window {window} {config}, marks every 3"),
+                    &build(),
+                    &dense,
+                );
             }
         }
     }
 }
+
+finish_cases!(the_tables_are_the_same_with_an_index_mark_every_three_ops;
+    all_instructions_64,
+    misalign_sd,
+    test_keccak_multi,
+    test_ecsm_multi,
+);
 
 /// A plan over a collected run, as `build_from_collected` makes one.
 fn plan_of<'a>(
@@ -415,120 +479,117 @@ fn plan_of<'a>(
 /// The header is the oracle's counts, pages, public output and BLAKE3 count
 /// before any table is built; a header that miscounts any one family by one
 /// is refused when the tables are built, not proved.
-#[test]
-fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused() {
+fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused(name: &str) {
     let max_rows = MaxRowsConfig::small();
-    for name in [
-        "all_instructions_64",
-        "test_keccak_multi",
-        "test_ecsm_multi",
-        "test_blake3",
-    ] {
-        let (program, logs) = run(name);
-        let artifacts = DecodeArtifacts::from_elf(&program).expect("the artifacts");
-        let image = build_initial_image(&program, &[]);
-        let register_init = register::register_init_from_entry_point(program.entry_point);
-        let frozen = oracle(|| {
-            Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build")
-        });
-        let collect = || {
-            Traces::collect_epoch(&artifacts, &image, &register_init, &logs, true)
-                .expect("collected")
-        };
-        let CollectedEpoch {
-            ops,
-            memory_state,
-            register_state,
-        } = collect();
-        let plan = plan_of(
-            ops,
-            &memory_state,
-            register_state,
-            &artifacts,
-            &image,
-            &register_init,
-            &max_rows,
-        );
-        let header = plan.header();
-        assert_eq!(
-            counts_of(&header.table_counts),
-            counts_of(&frozen.table_counts()),
-            "{name}: counts"
-        );
-        assert_eq!(
-            format!("{:?}", header.runtime_page_ranges()),
-            format!("{:?}", frozen.runtime_page_ranges()),
-            "{name}: runtime pages"
-        );
-        assert_eq!(
-            header.page_configs.len(),
-            frozen.page_configs.len(),
-            "{name}: pages"
-        );
-        assert_eq!(
-            header.public_output_bytes, frozen.public_output_bytes,
-            "{name}"
-        );
-        assert_eq!(header.num_blake3_ops, frozen.num_blake3_ops, "{name}");
-        same(
-            &format!("{name} planned"),
-            &frozen,
-            &plan.emit_all().expect("the tables"),
-        );
-        // Each family miscounted by one, up or down (where it has a table).
-        for field in 0..22 {
-            for up in [true, false] {
-                let CollectedEpoch {
-                    ops,
-                    memory_state,
-                    register_state,
-                } = collect();
-                let plan = plan_of(
-                    ops,
-                    &memory_state,
-                    register_state,
-                    &artifacts,
-                    &image,
-                    &register_init,
-                    &max_rows,
-                );
-                let mut wrong = plan.header().table_counts.clone();
-                let slot: &mut usize = match field {
-                    0 => &mut wrong.cpu,
-                    1 => &mut wrong.lt,
-                    2 => &mut wrong.memw,
-                    3 => &mut wrong.memw_aligned,
-                    4 => &mut wrong.load,
-                    5 => &mut wrong.mul,
-                    6 => &mut wrong.dvrm,
-                    7 => &mut wrong.shift,
-                    8 => &mut wrong.branch,
-                    9 => &mut wrong.memw_register,
-                    10 => &mut wrong.eq,
-                    11 => &mut wrong.bytewise,
-                    12 => &mut wrong.store,
-                    13 => &mut wrong.cpu32,
-                    14 => &mut wrong.keccak,
-                    15 => &mut wrong.keccak_rnd,
-                    16 => &mut wrong.ecsm,
-                    17 => &mut wrong.ecdas,
-                    18 => &mut wrong.hint,
-                    19 => &mut wrong.copy,
-                    20 => &mut wrong.blake3,
-                    _ => &mut wrong.is_wh,
-                };
-                if !up && *slot == 0 {
-                    continue;
-                }
-                *slot = if up { *slot + 1 } else { *slot - 1 };
-                assert!(
-                    matches!(plan.with_counts(wrong).emit_all(), Err(Error::Prover(_))),
-                    "{name}: count {field} off by one ({up}) was not refused"
-                );
+    let (program, logs) = run(name);
+    let artifacts = DecodeArtifacts::from_elf(&program).expect("the artifacts");
+    let image = build_initial_image(&program, &[]);
+    let register_init = register::register_init_from_entry_point(program.entry_point);
+    let frozen =
+        oracle(|| Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build"));
+    let collect = || {
+        Traces::collect_epoch(&artifacts, &image, &register_init, &logs, true).expect("collected")
+    };
+    let CollectedEpoch {
+        ops,
+        memory_state,
+        register_state,
+    } = collect();
+    let plan = plan_of(
+        ops,
+        &memory_state,
+        register_state,
+        &artifacts,
+        &image,
+        &register_init,
+        &max_rows,
+    );
+    let header = plan.header();
+    assert_eq!(
+        counts_of(&header.table_counts),
+        counts_of(&frozen.table_counts()),
+        "{name}: counts"
+    );
+    assert_eq!(
+        format!("{:?}", header.runtime_page_ranges()),
+        format!("{:?}", frozen.runtime_page_ranges()),
+        "{name}: runtime pages"
+    );
+    assert_eq!(
+        header.page_configs.len(),
+        frozen.page_configs.len(),
+        "{name}: pages"
+    );
+    assert_eq!(
+        header.public_output_bytes, frozen.public_output_bytes,
+        "{name}"
+    );
+    assert_eq!(header.num_blake3_ops, frozen.num_blake3_ops, "{name}");
+    same(
+        &format!("{name} planned"),
+        &frozen,
+        &plan.emit_all().expect("the tables"),
+    );
+    // Each family miscounted by one, up or down (where it has a table).
+    for field in 0..22 {
+        for up in [true, false] {
+            let CollectedEpoch {
+                ops,
+                memory_state,
+                register_state,
+            } = collect();
+            let plan = plan_of(
+                ops,
+                &memory_state,
+                register_state,
+                &artifacts,
+                &image,
+                &register_init,
+                &max_rows,
+            );
+            let mut wrong = plan.header().table_counts.clone();
+            let slot: &mut usize = match field {
+                0 => &mut wrong.cpu,
+                1 => &mut wrong.lt,
+                2 => &mut wrong.memw,
+                3 => &mut wrong.memw_aligned,
+                4 => &mut wrong.load,
+                5 => &mut wrong.mul,
+                6 => &mut wrong.dvrm,
+                7 => &mut wrong.shift,
+                8 => &mut wrong.branch,
+                9 => &mut wrong.memw_register,
+                10 => &mut wrong.eq,
+                11 => &mut wrong.bytewise,
+                12 => &mut wrong.store,
+                13 => &mut wrong.cpu32,
+                14 => &mut wrong.keccak,
+                15 => &mut wrong.keccak_rnd,
+                16 => &mut wrong.ecsm,
+                17 => &mut wrong.ecdas,
+                18 => &mut wrong.hint,
+                19 => &mut wrong.copy,
+                20 => &mut wrong.blake3,
+                _ => &mut wrong.is_wh,
+            };
+            if !up && *slot == 0 {
+                continue;
             }
+            *slot = if up { *slot + 1 } else { *slot - 1 };
+            assert!(
+                matches!(plan.with_counts(wrong).emit_all(), Err(Error::Prover(_))),
+                "{name}: count {field} off by one ({up}) was not refused"
+            );
         }
     }
 }
+
+finish_cases!(the_header_is_the_tables_counts_and_a_wrong_one_is_refused;
+    all_instructions_64,
+    test_keccak_multi,
+    test_ecsm_multi,
+    test_blake3,
+);
 
 /// The four families a block cuts at a fixed number of rows: each one's
 /// tables in a build and its bus interactions.
@@ -542,10 +603,10 @@ fn cut_families(t: &Traces) -> [(&'static str, &[Table], Vec<stark::lookup::BusI
     ]
 }
 
-/// [`contents`] without the five cut families' tables and counts.
+/// The tables outside the cut families and BITWISE, compared separately.
 fn contents_but_the_cut_families(t: &Traces) -> Vec<(String, String)> {
     let cut = ["COPY", "KECCAK", "KECCAK_RND", "ECSM", "ECDAS"];
-    contents(t)
+    contents_without_bitwise(t)
         .into_iter()
         .filter(|(name, _)| {
             name != "counts"
@@ -596,8 +657,10 @@ fn cut_build(
 /// checks have multiplicity 1 (main's multiplicity fix), so each padding row
 /// sends them as `ARE_BYTES[0, 0]`, and the frozen build's BITWISE answers the
 /// left-out tables' rows as well — `ARE_BYTES_PER_ROW` a row, in that one cell.
-#[test]
-fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() {
+fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables(
+    window: usize,
+    packed: bool,
+) {
     let mut left_out = [0usize; 5];
     for name in [
         "all_instructions_64",
@@ -610,66 +673,106 @@ fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() 
     ] {
         let (program, logs) = run(name);
         for cuts in [(1, 1, 1, 1), (2, 2, 16, 4), (2, 4, 2, 2)] {
-            for (window, packed) in [(7, true), (1000, true), (1000, false)] {
-                let what = format!("{name} cuts {cuts:?} window {window} packed {packed}");
-                let build =
-                    || cut_build(&program, &logs, window, cuts, packed, CutPadding::LastTable);
-                let frozen = oracle(build);
-                let last = build();
-                let mut keccak_rnd_rows_left_out = 0usize;
-                for (f, ((family, kept, interactions), (_, today, _))) in cut_families(&last)
-                    .into_iter()
-                    .zip(cut_families(&frozen))
-                    .enumerate()
-                {
-                    is_today_without_its_padding_tables(kept, today, &interactions)
-                        .unwrap_or_else(|e| panic!("{what}: {family}: {e}"));
-                    left_out[f] += today.len() - kept.len();
-                    if family == "KECCAK_RND" {
-                        keccak_rnd_rows_left_out += today[kept.len()..]
-                            .iter()
-                            .map(|t| t.num_rows())
-                            .sum::<usize>();
-                    }
-                }
-                let (a, b) = (
-                    contents_but_the_cut_families(&frozen),
-                    contents_but_the_cut_families(&last),
-                );
-                assert_eq!(a.len(), b.len(), "{what}: the other tables");
-                for ((table, x), (_, y)) in a.iter().zip(&b) {
-                    if table != "BITWISE" {
-                        assert_eq!(x, y, "{what}: {table}");
-                    }
-                }
-                let ((cols, rows, frozen_words), (_, _, words)) = (
-                    shape_and_words(&frozen.bitwise),
-                    shape_and_words(&last.bitwise),
-                );
-                assert_eq!(
-                    (rows, frozen_words.len()),
-                    (rows, words.len()),
-                    "{what}: BITWISE"
-                );
-                let cell = bitwise::row_index(0, 0, 0) * cols + bitwise::cols::MU_ARE_BYTES;
-                for (i, (x, y)) in frozen_words.iter().zip(&words).enumerate() {
-                    if i == cell {
-                        assert_eq!(
-                            *x - *y,
-                            (keccak_rnd::ARE_BYTES_PER_ROW * keccak_rnd_rows_left_out) as u64,
-                            "{what}: BITWISE's ARE_BYTES[0, 0]"
-                        );
-                    } else {
-                        assert_eq!(x, y, "{what}: BITWISE word {i}");
-                    }
+            let what = format!("{name} cuts {cuts:?} window {window} packed {packed}");
+            let build = || cut_build(&program, &logs, window, cuts, packed, CutPadding::LastTable);
+            let frozen = oracle(build);
+            let last = build();
+            let mut keccak_rnd_rows_left_out = 0usize;
+            for (f, ((family, kept, interactions), (_, today, _))) in cut_families(&last)
+                .into_iter()
+                .zip(cut_families(&frozen))
+                .enumerate()
+            {
+                is_today_without_its_padding_tables(kept, today, &interactions)
+                    .unwrap_or_else(|e| panic!("{what}: {family}: {e}"));
+                left_out[f] += today.len() - kept.len();
+                if family == "KECCAK_RND" {
+                    keccak_rnd_rows_left_out += today[kept.len()..]
+                        .iter()
+                        .map(|t| t.num_rows())
+                        .sum::<usize>();
                 }
             }
+            let (a, b) = (
+                contents_but_the_cut_families(&frozen),
+                contents_but_the_cut_families(&last),
+            );
+            assert_eq!(a.len(), b.len(), "{what}: the other tables");
+            for ((table, x), (_, y)) in a.iter().zip(&b) {
+                assert_eq!(x, y, "{what}: {table}");
+            }
+            assert_bitwise_padding_count(
+                &frozen.bitwise,
+                &last.bitwise,
+                (keccak_rnd::ARE_BYTES_PER_ROW * keccak_rnd_rows_left_out) as u64,
+                &what,
+            );
         }
     }
     assert!(
         left_out.iter().all(|&n| n > 0),
         "each cut family left a table of padding rows out somewhere: {left_out:?}"
     );
+}
+
+fn assert_bitwise_padding_count(frozen: &Table, last: &Table, omitted: u64, what: &str) {
+    let row = bitwise::row_index(0, 0, 0);
+    let col = bitwise::cols::MU_ARE_BYTES;
+    if let (Some(frozen), Some(last)) = (frozen.narrow_main(), last.narrow_main())
+        && frozen.widths() == last.widths()
+    {
+        assert_eq!(frozen.rows(), last.rows(), "{what}: BITWISE height");
+        let width = usize::from(frozen.widths()[col]);
+        let cell = frozen.offsets()[col] as usize + row * width;
+        assert!(
+            frozen.data()[..cell] == last.data()[..cell]
+                && frozen.data()[cell + width..] == last.data()[cell + width..],
+            "{what}: BITWISE words outside ARE_BYTES[0, 0]"
+        );
+        assert_eq!(
+            frozen.get(row, col) - last.get(row, col),
+            omitted,
+            "{what}: BITWISE's ARE_BYTES[0, 0]"
+        );
+        return;
+    }
+
+    let (cols, rows, frozen_words) = shape_and_words(frozen);
+    let (last_cols, last_rows, words) = shape_and_words(last);
+    assert_eq!(
+        (cols, rows),
+        (last_cols, last_rows),
+        "{what}: BITWISE shape"
+    );
+    let cell = row * cols + col;
+    assert!(
+        frozen_words[..cell] == words[..cell] && frozen_words[cell + 1..] == words[cell + 1..],
+        "{what}: BITWISE words outside ARE_BYTES[0, 0]"
+    );
+    assert_eq!(
+        frozen_words[cell] - words[cell],
+        omitted,
+        "{what}: BITWISE's ARE_BYTES[0, 0]"
+    );
+}
+
+mod a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables {
+    use super::a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables;
+
+    #[test]
+    fn window_7_packed() {
+        a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables(7, true);
+    }
+
+    #[test]
+    fn window_1000_packed() {
+        a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables(1000, true);
+    }
+
+    #[test]
+    fn window_1000_wide() {
+        a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables(1000, false);
+    }
 }
 
 /// The cut families' tables of a build as (family, tables, rows of each).

@@ -16,7 +16,9 @@ use super::validator::validate;
 use super::word::LfmWord;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("options")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("options")
 }
 
 fn arenas() -> Vec<Vec<LfmWord>> {
@@ -137,7 +139,9 @@ fn different_arena_values_change_the_public_output_not_the_program() {
 
 #[test]
 fn registry_miss_is_a_hard_error() {
-    let opts = GoldilocksCubicProofOptions::with_blowup(8).expect("options");
+    let opts = GoldilocksCubicProofOptions::with_blowup(8)
+        .map(crate::security_posture::stark_options)
+        .expect("options");
     let program = trivial_program();
     let artifacts = build_artifacts(&program, &opts);
     let proved = lfm_prove(&program, &artifacts, &arenas(), &opts).expect("prove");
@@ -4235,7 +4239,9 @@ fn derivation_shape(blowup: usize) -> RegisterDerivationShape {
 /// The inner proof's options at a given blowup — the ones whose REGISTER
 /// commitment is being derived, which are NOT the LFM proof's own options.
 fn inner_options(blowup: usize) -> ProofOptions {
-    let opts = GoldilocksCubicProofOptions::with_blowup(blowup as u8).expect("inner options");
+    let opts = GoldilocksCubicProofOptions::with_blowup(blowup as u8)
+        .map(crate::security_posture::stark_options)
+        .expect("inner options");
     assert_eq!(
         opts.coset_offset, PRODUCTION_COSET_OFFSET,
         "the shape constant must track production's coset offset"

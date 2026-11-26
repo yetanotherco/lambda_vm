@@ -26,32 +26,46 @@ fn options(one_row: OneRowMode) -> ProofOptions {
     o
 }
 
-#[test]
-fn an_out_of_range_trace_length_in_a_block_proof_is_refused() {
+mod an_out_of_range_trace_length_in_a_block_proof_is_refused {
+    use super::*;
+
+    #[test]
+    fn legacy() {
+        super::assert_block_trace_lengths_are_checked(OneRowMode::Off);
+    }
+
+    #[test]
+    fn one_row_dp() {
+        super::assert_block_trace_lengths_are_checked(OneRowMode::Auto);
+    }
+}
+
+fn assert_block_trace_lengths_are_checked(one_row: OneRowMode) {
     let elf = asm_elf_bytes("test_mul_8");
-    for one_row in [OneRowMode::Off, OneRowMode::Auto] {
-        let opts = options(one_row);
-        let mut proof = crate::prove_with_options(&elf, &opts, &MaxRowsConfig::default())
-            .unwrap_or_else(|e| panic!("{one_row:?}: proves: {e:?}"));
-        assert!(
-            matches!(
-                crate::verify_with_options(&proof, &elf, &opts, None, None),
-                Ok(true)
-            ),
-            "{one_row:?}: the control: the honest proof verifies"
-        );
-        for table in 0..proof.proof.proofs.len() {
-            let honest = proof.proof.proofs[table].trace_length;
-            for claimed in [0, 24, 1 << 32, (1 << 63) + honest] {
-                proof.proof.proofs[table].trace_length = claimed;
-                let verdict = crate::verify_with_options(&proof, &elf, &opts, None, None);
-                proof.proof.proofs[table].trace_length = honest;
-                assert!(
-                    !matches!(verdict, Ok(true)),
-                    "{one_row:?}: table {table} at length {claimed} was accepted"
-                );
-            }
+    let opts = options(one_row);
+    let mut proof = crate::prove_with_options(&elf, &opts, &MaxRowsConfig::default())
+        .unwrap_or_else(|e| panic!("{one_row:?}: proves: {e:?}"));
+    assert!(
+        matches!(
+            crate::verify_with_options(&proof, &elf, &opts, None, None),
+            Ok(true)
+        ),
+        "{one_row:?}: the control: the honest proof verifies"
+    );
+    for table in 0..proof.proof.proofs.len() {
+        let honest = proof.proof.proofs[table].trace_length;
+        for claimed in [0, 24, 1 << 32, (1 << 63) + honest] {
+            proof.proof.proofs[table].trace_length = claimed;
+            let verdict = crate::verify_with_options(&proof, &elf, &opts, None, None);
+            proof.proof.proofs[table].trace_length = honest;
+            assert!(
+                !matches!(verdict, Ok(true)),
+                "{one_row:?}: table {table} at length {claimed} was accepted"
+            );
         }
+    }
+    if one_row == OneRowMode::Off {
+        assert_phase_a_rejects_out_of_range_lengths(&elf, &opts, &proof);
     }
 }
 
@@ -101,15 +115,14 @@ fn an_out_of_range_trace_length_in_an_lfm_proof_is_refused() {
 /// directly at the default format on a block proof's own AIRs: it recovers
 /// `(z, α)` from the honest proof and refuses (`None`) the proof with one
 /// table's length patched out of range, before it derives anything from it.
-#[test]
-fn the_phase_a_replay_refuses_an_out_of_range_length() {
+fn assert_phase_a_rejects_out_of_range_lengths(
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    vm: &crate::VmProof,
+) {
     use crate::tables::trace_builder::Traces;
     use stark::proof::view::MultiProofView;
-    let elf_bytes = asm_elf_bytes("test_mul_8");
-    let opts = options(OneRowMode::Off);
-    let vm =
-        crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default()).expect("proves");
-    let program = executor::elf::Elf::load(&elf_bytes).expect("an ELF");
+    let program = executor::elf::Elf::load(elf_bytes).expect("an ELF");
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
         &vm.runtime_page_ranges,
@@ -124,7 +137,7 @@ fn the_phase_a_replay_refuses_an_out_of_range_length() {
             crate::cpu_heights_from_proofs(view, &vm.table_counts, true).expect("the CPU tables");
         let airs = crate::VmAirs::new(
             &program,
-            &opts,
+            opts,
             false,
             &page_configs,
             &vm.table_counts,
@@ -132,7 +145,7 @@ fn the_phase_a_replay_refuses_an_out_of_range_length() {
             None,
             true,
             None,
-            crate::RegisterFiles::halted(&opts, program.entry_point, committed).preprocessed(),
+            crate::RegisterFiles::halted(opts, program.entry_point, committed).preprocessed(),
         );
         let refs = airs.air_refs();
         let mut transcript = crate::hash_pin::block_transcript(&[]);

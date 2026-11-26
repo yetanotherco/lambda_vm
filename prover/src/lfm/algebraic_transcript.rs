@@ -322,7 +322,9 @@ mod tests {
     const ALGEBRAIC: [HasherKind; 2] = [HasherKind::Test, HasherKind::Rpx];
 
     fn options() -> ProofOptions {
-        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+        GoldilocksCubicProofOptions::with_blowup(2)
+            .map(crate::security_posture::stark_options)
+            .expect("blowup=2 is valid")
     }
 
     /// A 32-byte "root" and an 8-byte integer — the only two shapes the STARK
@@ -842,7 +844,11 @@ mod tests {
         // tail), each hit exactly and missed in both directions.
         const LENGTHS: [usize; 11] = [1, 3, 4, 5, 7, 8, 31, 32, 33, 40, 67];
 
+        let opts = options();
         for hasher in ALGEBRAIC {
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+            let mut arenas = Vec::new();
+            let mut expected = Vec::new();
             for len in LENGTHS {
                 // Distinct, high-bit-set bytes: a dropped or misplaced byte
                 // moves the felt rather than colliding with a zero.
@@ -867,7 +873,6 @@ mod tests {
                     })
                     .collect();
 
-                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
                 let arena = b.declare_arena(halves.len() as u32);
                 let half_cells: Vec<Felt> = (0..halves.len())
                     .map(|i| b.hint_felt(arena, i as u32))
@@ -876,15 +881,16 @@ mod tests {
                 t.append_bytes_misaligned(&half_cells, len);
                 let a = t.sample_ext(&mut b);
                 b.public(a.as_cell());
-                let program = compile(b.finish());
+                arenas.push(halves.into_iter().map(base_word).collect());
+                expected.push((len, want));
+            }
 
-                let arena_words: Vec<LfmWord> = halves.iter().map(|h| base_word(*h)).collect();
-                let artifacts = build_artifacts_with_hasher(&program, &options(), hasher);
-                let proved =
-                    lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &options(), hasher)
-                        .expect("the regrouping program must prove");
-
-                let got = proved.public_words[0].1;
+            let program = compile(b.finish());
+            let artifacts = build_artifacts_with_hasher(&program, &opts, hasher);
+            let proved = lfm_prove_with_hasher(&program, &artifacts, &arenas, &opts, hasher)
+                .expect("the regrouping program must prove");
+            assert_eq!(proved.public_words.len(), expected.len());
+            for ((len, want), (_, got)) in expected.into_iter().zip(proved.public_words) {
                 assert_eq!(
                     [got[0], got[1], got[2]],
                     *want.value(),

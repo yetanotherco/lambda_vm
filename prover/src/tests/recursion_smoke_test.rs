@@ -685,10 +685,11 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
     let v = crate::verify_recursion_blob(&padded[4..], &MIN_PROOF_OPTIONS)
         .expect("verify_recursion_blob errored on misaligned buffer");
     assert!(v.ok, "misaligned-buffer verify must also succeed");
+    test_recursion_rejects_corrupted_commitment(&empty_elf_bytes, &inner);
 }
 
 /// Continuation flavor of the roundtrip guard: prove the empty program via
-/// continuations (tiny epochs so the bundle is genuinely multi-epoch), encode
+/// continuations (split into two epochs), encode
 /// the [`recursion::ContinuationGuestInput`] blob, decode it exactly as the
 /// intended `continuation`-feature guest would, and mirror its
 /// `verify_continuation_and_attest` call — a cheap host-side check of the
@@ -698,17 +699,25 @@ fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
     let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
     let inner_input = 10u64.to_le_bytes();
+    let elf = executor::elf::Elf::load(&fib_elf_bytes).unwrap();
+    let cycles = executor::vm::execution::Executor::new(&elf, inner_input.to_vec())
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size_log2 = (cycles - 1).ilog2();
 
     let bundle = crate::continuation::prove_continuation(
         &fib_elf_bytes,
         &inner_input,
-        4,
+        epoch_size_log2,
         &MIN_PROOF_OPTIONS,
     )
     .expect("continuation prove should succeed");
     assert!(
         bundle.num_epochs() > 1,
-        "epoch=2^4 must split fibonacci(10) into multiple epochs for this test to bite"
+        "the round-trip must exercise multiple epochs"
     );
     // Ground truth: the trustless recompute path must accept the bundle.
     let expected_output =
@@ -821,24 +830,15 @@ fn test_recursion_accepts_a_bundle_whose_epochs_carry_different_tables() {
 /// custom prover can supply consistent mismatched roots (see
 /// `recursion_soundness_gap_poc`); the identity binding is the `program_id`
 /// fold, not this check.
-#[test]
-fn test_recursion_rejects_corrupted_commitment() {
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let (vm_proof, _blob) = prove_inner_and_encode_blob(
-        "corrupt-commitment",
-        &empty_elf_bytes,
-        &[],
-        &MIN_PROOF_OPTIONS,
-    );
+fn test_recursion_rejects_corrupted_commitment(empty_elf_bytes: &[u8], vm_proof: &crate::VmProof) {
     let (mut decode_commitment, page_commitments) =
-        recursion::precomputed_commitments(&empty_elf_bytes, &MIN_PROOF_OPTIONS)
+        recursion::precomputed_commitments(empty_elf_bytes, &MIN_PROOF_OPTIONS)
             .expect("precomputed_commitments failed");
     decode_commitment[0] ^= 0xFF;
 
     let ok = crate::verify_with_options(
-        &vm_proof,
-        &empty_elf_bytes,
+        vm_proof,
+        empty_elf_bytes,
         &MIN_PROOF_OPTIONS,
         Some(decode_commitment),
         Some(&page_commitments),
@@ -942,20 +942,26 @@ fn test_recursion_step_markers_observed_in_order() {
     }
 }
 
-/// Execute-only: verify a `blowup=8` proof of fibonacci(10) in-VM.
+/// Execute-only: verify fibonacci(10) in the matching recursion guest.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute() {
+    let preset = if crate::security_posture::TEST_POSTURE {
+        Preset::Min
+    } else {
+        Preset::Blowup8
+    };
     let root = workspace_root();
     let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
 
     let n: u64 = 10;
     let inner_private_input = n.to_le_bytes().to_vec();
 
-    run_recursion_pipeline(
+    run_recursion_pipeline_with_options(
         "recursion-exec-fib",
         &fib_elf_bytes,
         &inner_private_input,
+        preset,
         OuterMode::ExecuteOnly,
     );
 }

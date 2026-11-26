@@ -199,69 +199,73 @@ fn tampers<L: 'static>(c: usize, r: usize) -> Vec<(&'static str, Tamper<L>)> {
 /// proof are refused in execution, the arena building as before. Printed:
 /// instructions and lean compressions, the whole level and group 0's, against
 /// today's form over the same block and first fold.
-#[test]
-fn level_1_executes_over_a_round_form_blake3_base_and_refuses_its_tampers() {
+fn assert_level_1_round_form(folds: WhirFolds) {
     let name = "test_commit_4";
-    for folds in [
-        crate::zf_format::ZfFormat::DEFAULT.whir_folds,
-        WhirFolds::Uniform,
-    ] {
-        let fri = format(B3Rounds::Fri, folds);
-        let w3 = format(B3Rounds::WHIR3, folds);
-        let (elf, today) = base(name, &fri);
-        let (_, honest) = base(name, &w3);
-        let today_plan = plan(&elf, &today, &fri);
-        let w3_plan = plan(&elf, &honest, &w3);
-        let c_fri = level_1_executes(&today_plan, &today);
-        let c_w3 = level_1_executes(&w3_plan, &honest);
-        assert_eq!(c_fri.groups, c_w3.groups, "the same groups");
+    let fri = format(B3Rounds::Fri, folds);
+    let w3 = format(B3Rounds::WHIR3, folds);
+    let (elf, today) = base(name, &fri);
+    let (_, honest) = base(name, &w3);
+    let today_plan = plan(&elf, &today, &fri);
+    let w3_plan = plan(&elf, &honest, &w3);
+    let c_fri = level_1_executes(&today_plan, &today);
+    let c_w3 = level_1_executes(&w3_plan, &honest);
+    assert_eq!(c_fri.groups, c_w3.groups, "the same groups");
+    println!(
+        "LEVEL 1 ROUND FORM {name} {folds:?}: {} groups · instructions {} (today {}) · lean \
+         compressions {} (today {}) · group 0: instructions {} (today {}) · compressions {} \
+         (today {})",
+        c_w3.groups,
+        c_w3.instructions,
+        c_fri.instructions,
+        c_w3.compressions,
+        c_fri.compressions,
+        c_w3.first_instructions,
+        c_fri.first_instructions,
+        c_w3.first_compressions,
+        c_fri.first_compressions,
+    );
+    assert!(
+        c_w3.compressions < c_fri.compressions,
+        "the round form opens no successor"
+    );
+
+    // A plan under one form takes no proof of the other: the successor
+    // blocks are where the round form has none, or missing where today's
+    // needs them.
+    assert!(
+        block_leaf_arena(&w3_plan, &today, 0).is_err(),
+        "a round-form plan over today's proof"
+    );
+    assert!(
+        block_leaf_arena(&today_plan, &honest, 0).is_err(),
+        "today's plan over a round-form proof"
+    );
+
+    let program = w3_plan.closed_block_program().expect("emits");
+    let hasher = hasher(&program);
+    let (c, r) = later_round(&honest);
+    for (what, edit) in tampers(c, r) {
+        let mut proof = honest.clone();
+        edit(&mut proof);
+        let arenas = block_leaf_arena(&w3_plan, &proof, 0)
+            .unwrap_or_else(|e| panic!("{what}: the arena builds: {e}"));
+        let why = execute(&program, &arenas, &hasher);
         println!(
-            "LEVEL 1 ROUND FORM {name} {folds:?}: {} groups · instructions {} (today {}) · lean \
-             compressions {} (today {}) · group 0: instructions {} (today {}) · compressions {} \
-             (today {})",
-            c_w3.groups,
-            c_w3.instructions,
-            c_fri.instructions,
-            c_w3.compressions,
-            c_fri.compressions,
-            c_w3.first_instructions,
-            c_fri.first_instructions,
-            c_w3.first_compressions,
-            c_fri.first_compressions,
+            "LEVEL 1 ROUND FORM TAMPER {folds:?} {what}: {:?}",
+            why.as_ref().err()
         );
-        assert!(
-            c_w3.compressions < c_fri.compressions,
-            "the round form opens no successor"
-        );
-
-        // A plan under one form takes no proof of the other: the successor
-        // blocks are where the round form has none, or missing where today's
-        // needs them.
-        assert!(
-            block_leaf_arena(&w3_plan, &today, 0).is_err(),
-            "a round-form plan over today's proof"
-        );
-        assert!(
-            block_leaf_arena(&today_plan, &honest, 0).is_err(),
-            "today's plan over a round-form proof"
-        );
-
-        let program = w3_plan.closed_block_program().expect("emits");
-        let hasher = hasher(&program);
-        let (c, r) = later_round(&honest);
-        for (what, edit) in tampers(c, r) {
-            let mut proof = honest.clone();
-            edit(&mut proof);
-            let arenas = block_leaf_arena(&w3_plan, &proof, 0)
-                .unwrap_or_else(|e| panic!("{what}: the arena builds: {e}"));
-            let why = execute(&program, &arenas, &hasher);
-            println!(
-                "LEVEL 1 ROUND FORM TAMPER {folds:?} {what}: {:?}",
-                why.as_ref().err()
-            );
-            assert!(why.is_err(), "{what}: level 1 accepted it");
-        }
+        assert!(why.is_err(), "{what}: level 1 accepted it");
     }
+}
+
+#[test]
+fn level_1_round_form_refuses_tampers_with_first_fold() {
+    assert_level_1_round_form(crate::zf_format::ZfFormat::DEFAULT.whir_folds);
+}
+
+#[test]
+fn level_1_round_form_refuses_tampers_with_uniform_folds() {
+    assert_level_1_round_form(WhirFolds::Uniform);
 }
 
 /// ★ Level 1 over a small BLAKE3 base whose GKR ladders step two tree layers
@@ -888,6 +892,7 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
     use super::wlfm::{WlfmRate, wlfm_config_rounds, wlfm_config_under};
     use super::wlfm_leg::{WlfmChild, wlfm_leg_program};
     use multilinear::whir_chain::{check_round_form, check_round_form_union};
+    let target = crate::security_posture::chain_security_bits();
     let shapes = [(20usize, 18usize), (8, 20), (64, 12), (300, 22)];
     let refused = wlfm_config_rounds(
         WlfmRate::Two,
@@ -933,7 +938,7 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
     let mut refused_any = false;
     for k in [2u8, 3, 4, 5, 6] {
         let stamped = wlfm_config_under(WlfmRate::Two, FinalPoly::Off, Some(k), None, &shapes)
-            .with_whir_rounds(3, crate::multilinear_prove::CHAIN_SECURITY_BITS, tallest)
+            .with_whir_rounds(3, target, tallest)
             .expect("a round form");
         let count = check_round_form(&stamped).err();
         let union = check_round_form_union(&stamped, tallest).err();
@@ -970,11 +975,7 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
     // A union bound over chains a few variables short of the tallest.
     let short = a
         .config
-        .with_whir_rounds(
-            3,
-            crate::multilinear_prove::CHAIN_SECURITY_BITS,
-            tallest.saturating_sub(8),
-        )
+        .with_whir_rounds(3, target, tallest.saturating_sub(8))
         .and_then(multilinear::whir_chain::ChainConfig::with_caps_by_queries)
         .expect("a round form");
     let child = WlfmChild {
@@ -998,7 +999,7 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
     resized.num_queries = multilinear::query_count::num_queries(
         resized.log_blowup,
         union,
-        crate::multilinear_prove::CHAIN_SECURITY_BITS,
+        target,
         resized.grind.query,
     );
     check_round_form(&resized).expect("the count is the bound's");

@@ -212,80 +212,121 @@ fn cuts_are_todays(name: &str, program: &Elf, input: &[u8], window: usize, shape
     windows.len()
 }
 
-/// ★ Every asm program and Rust guest, and an ethrex fixture, at windows from
-/// a few cycles to many, batches that cross them, both register formats and
-/// the word memory format: each cut alone and every cut emit the walk's
-/// lists, routing and counts.
-#[test]
-fn the_walk_cuts_emit_today_s_lists() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    let split = |order, format, batch| Shape {
+fn split_shape(order: MemwAlignedOrder, format: RegisterFormat, batch: usize) -> Shape {
+    Shape {
         order,
         format,
         memory: MemoryFormat::Split,
         batch,
-    };
-    let mut windows = 0;
-    for name in PROGRAMS {
-        let (program, _) = run(name);
-        for (window, shape) in [
-            (7, split(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 3)),
+    }
+}
+
+/// ★ Every asm program and Rust guest, and an ethrex fixture, at windows from
+/// a few cycles to many, batches that cross them, both register formats and
+/// the word memory format: each cut alone and every cut emit the walk's
+/// lists, routing and counts.
+mod the_walk_cuts_emit_today_s_lists {
+    use super::*;
+
+    fn asm_split_memory(cases: &[(usize, Shape)]) -> usize {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        let mut windows = 0;
+        for name in PROGRAMS {
+            let (program, _) = run(name);
+            for &(window, shape) in cases {
+                windows += cuts_are_todays(name, &program, &[], window, shape);
+            }
+        }
+        windows
+    }
+
+    #[test]
+    fn asm_split_memory_short_windows() {
+        let windows = asm_split_memory(&[
             (
-                4096,
-                split(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 5),
+                7,
+                split_shape(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 3),
             ),
-            (
-                4096,
-                split(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 2048),
-            ),
-            (33, split(MemwAlignedOrder::Lt, RegisterFormat::InRow, 2048)),
             (
                 33,
-                split(MemwAlignedOrder::Limbs, RegisterFormat::Tokens32, 7),
+                split_shape(MemwAlignedOrder::Lt, RegisterFormat::InRow, 2048),
             ),
-        ] {
-            windows += cuts_are_todays(name, &program, &[], window, shape);
-        }
+            (
+                33,
+                split_shape(MemwAlignedOrder::Limbs, RegisterFormat::Tokens32, 7),
+            ),
+        ]);
+        assert!(windows > 1000, "{windows} windows compared");
     }
-    for name in RUST_GUESTS {
-        let program = rust_elf(name);
-        windows += cuts_are_todays(
-            name,
-            &program,
-            &[],
-            4096,
-            split(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 7),
-        );
+
+    #[test]
+    fn asm_split_memory_long_windows() {
+        asm_split_memory(&[
+            (
+                4096,
+                split_shape(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 5),
+            ),
+            (
+                4096,
+                split_shape(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 2048),
+            ),
+        ]);
     }
-    for name in WORD_PROGRAMS.into_iter().chain(["test_ecrec"]) {
-        let (program, _) = run(name);
-        for (window, batch) in [(7, 3), (4096, 5)] {
+
+    #[test]
+    fn rust_guests() {
+        let mut windows = 0;
+        for name in RUST_GUESTS {
+            let program = rust_elf(name);
             windows += cuts_are_todays(
                 name,
                 &program,
                 &[],
-                window,
-                Shape {
-                    order: MemwAlignedOrder::Limbs,
-                    format: RegisterFormat::InRow,
-                    memory: MemoryFormat::Words,
-                    batch,
-                },
+                4096,
+                split_shape(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 7),
             );
         }
+        assert!(windows > 0, "compared Rust guest windows");
     }
-    let ethrex = rust_elf("ethrex");
-    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
-    let input = std::fs::read(fixtures.join("ethrex_10_transfers.bin")).expect("the fixture");
-    windows += cuts_are_todays(
-        "ethrex_10_transfers",
-        &ethrex,
-        &input,
-        1 << 16,
-        split(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 2048),
-    );
-    assert!(windows > 1000, "{windows} windows compared");
+
+    #[test]
+    fn asm_word_memory() {
+        let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+        let mut windows = 0;
+        for name in WORD_PROGRAMS.into_iter().chain(["test_ecrec"]) {
+            let (program, _) = run(name);
+            for (window, batch) in [(7, 3), (4096, 5)] {
+                windows += cuts_are_todays(
+                    name,
+                    &program,
+                    &[],
+                    window,
+                    Shape {
+                        order: MemwAlignedOrder::Limbs,
+                        format: RegisterFormat::InRow,
+                        memory: MemoryFormat::Words,
+                        batch,
+                    },
+                );
+            }
+        }
+        assert!(windows > 0, "compared word-memory windows");
+    }
+
+    #[test]
+    fn ethrex_transfers() {
+        let ethrex = rust_elf("ethrex");
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
+        let input = std::fs::read(fixtures.join("ethrex_10_transfers.bin")).expect("the fixture");
+        let windows = cuts_are_todays(
+            "ethrex_10_transfers",
+            &ethrex,
+            &input,
+            1 << 16,
+            split_shape(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 2048),
+        );
+        assert!(windows > 0, "compared ethrex windows");
+    }
 }
 
 /// ★ A window that is not the run's last is refused for a halting cycle
@@ -346,35 +387,76 @@ fn a_halting_cycle_before_the_last_window_is_refused_with_or_without_the_prescan
 /// ★ A run built with each cut alone on three walkers and with every cut on
 /// one and on three, under both register formats, hands its chunks out in the order
 /// and builds the tables, row for row, the run without cuts does.
-#[test]
-fn the_walk_cuts_build_today_s_tables() {
+fn assert_walk_cuts_build_the_same_tables(
+    format: RegisterFormat,
+    window: usize,
+    programs: &[&str],
+) {
     // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     let none = WalkCuts::default();
     let mut chunks = 0usize;
-    for name in PROGRAMS {
+    for &name in programs {
         let (program, _) = run(name);
-        for format in [RegisterFormat::InRow, RegisterFormat::Tokens32] {
-            for window in [7, 4096] {
-                let (want, want_order) = built(&program, &max_rows, window, 2, (2, none), format);
-                chunks += want_order.len();
-                for (arm, cuts) in each_part_and_all() {
-                    // Each part on three walkers; every part on one and three.
-                    let walkers: &[usize] = if arm == "all" { &[1, 3] } else { &[3] };
-                    for &walkers in walkers {
-                        let what = format!("{name}/{format:?}/{window}/{arm}/{walkers}");
-                        let (got, order) =
-                            built(&program, &max_rows, window, walkers, (2, cuts), format);
-                        assert_eq!(order, want_order, "{what}: the hand-out");
-                        same_traces(&want, &got);
-                    }
-                }
+        let (want, want_order) = built(&program, &max_rows, window, 2, (2, none), format);
+        chunks += want_order.len();
+        for (arm, cuts) in each_part_and_all() {
+            // Each part on three walkers; every part on one and three.
+            let walkers: &[usize] = if arm == "all" { &[1, 3] } else { &[3] };
+            for &walkers in walkers {
+                let what = format!("{name}/{format:?}/{window}/{arm}/{walkers}");
+                let (got, order) = built(&program, &max_rows, window, walkers, (2, cuts), format);
+                assert_eq!(order, want_order, "{what}: the hand-out");
+                same_traces(&want, &got);
             }
         }
     }
     assert!(chunks > 0, "no chunk handed out");
 }
+
+macro_rules! walk_table_cases {
+    ($name:ident, $format:ident, $window:literal) => {
+        mod $name {
+            use super::*;
+
+            #[test]
+            fn keccak_guests() {
+                assert_walk_cuts_build_the_same_tables(
+                    RegisterFormat::$format,
+                    $window,
+                    &PROGRAMS[..7],
+                );
+            }
+
+            #[test]
+            fn ecrec_guests() {
+                assert_walk_cuts_build_the_same_tables(
+                    RegisterFormat::$format,
+                    $window,
+                    &PROGRAMS[7..],
+                );
+            }
+        }
+    };
+}
+
+walk_table_cases!(walk_cuts_build_the_same_in_row_tables_at_window_7, InRow, 7);
+walk_table_cases!(
+    walk_cuts_build_the_same_in_row_tables_at_window_4096,
+    InRow,
+    4096
+);
+walk_table_cases!(
+    walk_cuts_build_the_same_token_tables_at_window_7,
+    Tokens32,
+    7
+);
+walk_table_cases!(
+    walk_cuts_build_the_same_token_tables_at_window_4096,
+    Tokens32,
+    4096
+);
 
 /// Under `const` a walker's counts are settled only if every CPU op it
 /// counted was routed without its instruction lookups: a walker that routed

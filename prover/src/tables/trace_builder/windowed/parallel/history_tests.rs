@@ -403,31 +403,48 @@ fn walked_from_history_with(
 /// lengths 1, 7, 33 and 4096 (a run in one window: the finish's state from
 /// the run's end alone), checked or not, the windows build
 /// the whole-run tables.
-#[test]
-fn windows_walked_from_history_build_the_whole_run_tables() {
+fn assert_history_windows_build_the_whole_run_tables(window: usize) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     for name in PROGRAMS {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [1, 7, 33, 4096] {
-            for (walkers, recheck) in [(1, 0), (2, 1), (3, 0), (3, 2)] {
-                let traces = walked_from_history(
-                    &program,
-                    &[],
-                    &max_rows,
-                    window,
-                    walkers,
-                    recheck,
-                    Tamper::None,
-                )
-                .unwrap_or_else(|e| {
-                    panic!("{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}")
-                });
-                same_traces(&reference, &traces);
-            }
+        for (walkers, recheck) in [(1, 0), (2, 1), (3, 0), (3, 2)] {
+            let traces = walked_from_history(
+                &program,
+                &[],
+                &max_rows,
+                window,
+                walkers,
+                recheck,
+                Tamper::None,
+            )
+            .unwrap_or_else(|e| {
+                panic!("{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}")
+            });
+            same_traces(&reference, &traces);
         }
     }
+}
+
+#[test]
+fn history_builds_whole_run_tables_at_window_1() {
+    assert_history_windows_build_the_whole_run_tables(1);
+}
+
+#[test]
+fn history_builds_whole_run_tables_at_window_7() {
+    assert_history_windows_build_the_whole_run_tables(7);
+}
+
+#[test]
+fn history_builds_whole_run_tables_at_window_33() {
+    assert_history_windows_build_the_whole_run_tables(33);
+}
+
+#[test]
+fn history_builds_whole_run_tables_at_window_4096() {
+    assert_history_windows_build_the_whole_run_tables(4096);
 }
 
 /// ★ Walked from the executor's history with the ECREC witnesses deferred, on
@@ -466,35 +483,60 @@ fn windows_walked_from_history_deferring_ecrec_build_the_whole_run_tables() {
 /// where they make the rows, on 1 and 3 threads, rechecked or not, at the
 /// small chunks and at chunks of four rows, the windows build the whole-run
 /// tables (the check's re-walk counts nothing).
-#[test]
-fn windows_walked_from_history_counting_where_made_build_the_whole_run_tables() {
+fn assert_windows_walked_from_history_counting_where_made(
+    max_rows: &MaxRowsConfig,
+    windows: [usize; 2],
+) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            let reference = whole(&program, &logs, &max_rows);
-            for window in [1, 7, 33, 4096] {
-                for (walkers, recheck) in [(1, 0), (3, 1)] {
-                    let traces = walked_from_history_with(
-                        &program,
-                        &[],
-                        &max_rows,
-                        window,
-                        walkers,
-                        recheck,
-                        Tamper::None,
-                        false,
-                        true,
-                    )
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}"
-                        )
-                    });
-                    same_traces(&reference, &traces);
-                }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, max_rows);
+        for window in windows {
+            for (walkers, recheck) in [(1, 0), (3, 1)] {
+                let traces = walked_from_history_with(
+                    &program,
+                    &[],
+                    max_rows,
+                    window,
+                    walkers,
+                    recheck,
+                    Tamper::None,
+                    false,
+                    true,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}")
+                });
+                same_traces(&reference, &traces);
             }
         }
+    }
+}
+
+mod windows_walked_from_history_counting_where_made_build_the_whole_run_tables {
+    use super::*;
+
+    #[test]
+    fn small_tables_short_windows() {
+        assert_windows_walked_from_history_counting_where_made(&MaxRowsConfig::small(), [1, 7]);
+    }
+
+    #[test]
+    fn small_tables_long_windows() {
+        assert_windows_walked_from_history_counting_where_made(&MaxRowsConfig::small(), [33, 4096]);
+    }
+
+    #[test]
+    fn uniform_tables_short_windows() {
+        assert_windows_walked_from_history_counting_where_made(&MaxRowsConfig::uniform(4), [1, 7]);
+    }
+
+    #[test]
+    fn uniform_tables_long_windows() {
+        assert_windows_walked_from_history_counting_where_made(
+            &MaxRowsConfig::uniform(4),
+            [33, 4096],
+        );
     }
 }
 

@@ -18,6 +18,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
 
+use super::super::finish_tests::{main_words_match, shape_and_words};
 use super::super::gate::ByteGate;
 use super::super::*;
 use super::{
@@ -47,26 +48,6 @@ fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) 
         let _ = tx.send(f());
     });
     rx.recv_timeout(Duration::from_secs(secs)).ok()
-}
-
-/// A table as (columns, rows, words row-major), held packed or wide.
-fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
-    match t.narrow_main() {
-        Some(packed) => {
-            let columns: Vec<Vec<u64>> = (0..packed.cols()).map(|c| packed.column(c)).collect();
-            let words = (0..packed.rows())
-                .flat_map(|r| columns.iter().map(move |column| column[r]))
-                .collect();
-            (packed.cols(), packed.rows(), words)
-        }
-        None => {
-            let main = &t.main_table;
-            let words = (0..main.height)
-                .flat_map(|r| (0..main.width).map(move |c| *main.get(r, c).value()))
-                .collect();
-            (main.width, main.height, words)
-        }
-    }
 }
 
 /// A build's tables in the run's AIR order (`VmAirs::air_trace_pairs`, HALT
@@ -366,74 +347,65 @@ fn regen_ranges(t: &Traces) -> [std::ops::Range<usize>; 2] {
 /// handed on, word for word and packed byte for byte, for every table of the
 /// two families, in every windowed configuration; a streamed chunk's slot
 /// stays a slot; a family is taken once; nothing is kept unless asked.
-#[test]
-fn the_kept_lists_build_the_finishs_keccak_rnd_and_lt_tables_again() {
+fn assert_kept_lists_rebuild_finish_tables(window: usize, max_rows: &MaxRowsConfig) {
     use super::RegenFamily;
     let mut rebuilt = [0usize; 2];
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in [
-            "test_keccak_multi",
-            "all_instructions_64",
-            "test_ecsm_multi",
-        ] {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, configure) in &configs() {
-                    let what = format!("{name} window {window} {config}");
-                    let (builder, last) =
-                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                    let whole = builder.finish(last).expect("the monolithic finish");
-                    let ranges = regen_ranges(&whole);
-                    let (builder, last) =
-                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                    let (got, regen) = streamed_keeping(builder, last, true);
-                    let mut regen = regen.expect("the lists kept");
-                    for (f, (family, range)) in RegenFamily::ALL.into_iter().zip(ranges).enumerate()
-                    {
-                        let jobs = regen.take(family).expect("the family's jobs");
-                        assert_eq!(jobs.len(), range.len(), "{what}: {family:?}'s tables");
-                        for (j, job) in jobs.into_iter().enumerate() {
-                            let at = range.start + j;
-                            match (job, &got[at].table) {
-                                (None, None) => {}
-                                (Some(job), Some(table)) => {
-                                    let again = job().expect("the job builds again");
-                                    assert_eq!(
-                                        shape_and_words(&again),
-                                        shape_and_words(table),
-                                        "{what}: {family:?}[{j}]"
-                                    );
-                                    assert_eq!(
-                                        again
-                                            .narrow_main()
-                                            .map(|p| (p.widths().to_vec(), p.data().to_vec())),
-                                        table
-                                            .narrow_main()
-                                            .map(|p| (p.widths().to_vec(), p.data().to_vec())),
-                                        "{what}: {family:?}[{j}] packed"
-                                    );
-                                    rebuilt[f] += 1;
-                                }
-                                (job, table) => panic!(
-                                    "{what}: {family:?}[{j}] a job {} against a table {}",
-                                    job.is_some(),
-                                    table.is_some()
-                                ),
-                            }
+    for name in [
+        "test_keccak_multi",
+        "all_instructions_64",
+        "test_ecsm_multi",
+    ] {
+        let (program, logs) = run(name);
+        for (config, configure) in &configs() {
+            let what = format!("{name} window {window} {config}");
+            let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
+            let whole = builder.finish(last).expect("the monolithic finish");
+            let ranges = regen_ranges(&whole);
+            let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
+            let (got, regen) = streamed_keeping(builder, last, true);
+            let mut regen = regen.expect("the lists kept");
+            for (f, (family, range)) in RegenFamily::ALL.into_iter().zip(ranges).enumerate() {
+                let jobs = regen.take(family).expect("the family's jobs");
+                assert_eq!(jobs.len(), range.len(), "{what}: {family:?}'s tables");
+                for (j, job) in jobs.into_iter().enumerate() {
+                    let at = range.start + j;
+                    match (job, &got[at].table) {
+                        (None, None) => {}
+                        (Some(job), Some(table)) => {
+                            let again = job().expect("the job builds again");
+                            assert_eq!(
+                                shape_and_words(&again),
+                                shape_and_words(table),
+                                "{what}: {family:?}[{j}]"
+                            );
+                            assert_eq!(
+                                again
+                                    .narrow_main()
+                                    .map(|p| (p.widths().to_vec(), p.data().to_vec())),
+                                table
+                                    .narrow_main()
+                                    .map(|p| (p.widths().to_vec(), p.data().to_vec())),
+                                "{what}: {family:?}[{j}] packed"
+                            );
+                            rebuilt[f] += 1;
                         }
-                        assert!(
-                            regen.take(family).is_err(),
-                            "{what}: {family:?} taken twice"
-                        );
+                        (job, table) => panic!(
+                            "{what}: {family:?}[{j}] a job {} against a table {}",
+                            job.is_some(),
+                            table.is_some()
+                        ),
                     }
-                    let (builder, last) =
-                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                    assert!(
-                        streamed_keeping(builder, last, false).1.is_none(),
-                        "{what}: kept unasked"
-                    );
                 }
+                assert!(
+                    regen.take(family).is_err(),
+                    "{what}: {family:?} taken twice"
+                );
             }
+            let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
+            assert!(
+                streamed_keeping(builder, last, false).1.is_none(),
+                "{what}: kept unasked"
+            );
         }
     }
     assert!(
@@ -442,57 +414,90 @@ fn the_kept_lists_build_the_finishs_keccak_rnd_and_lt_tables_again() {
     );
 }
 
-/// Every windowed configuration, chunked small and at four rows, windows of 7
-/// and 1000 cycles, budgets of one byte, 2 GiB and none: the streamed finish
-/// hands on, in AIR order, the monolithic finish's tables word for word and
-/// its streamed slots, under its header. Each (row configuration, program)
-/// pair is checked on a thread of its own: the same checks, side by side; the
-/// first failing pair's panic is the test's.
-#[test]
-fn the_stream_is_the_monolithic_finish_in_air_order() {
-    let programs = [
-        "all_instructions_64",
-        "misalign_sd",
-        "test_keccak_multi",
-        "test_ecsm_multi",
-        "test_commit_split",
-        "test_blake3_absorb",
-        "test_dense_pages",
-    ];
-    let pairs: Vec<(MaxRowsConfig, &str)> = [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)]
-        .into_iter()
-        .flat_map(|max_rows| programs.map(|name| (max_rows.clone(), name)))
-        .collect();
-    std::thread::scope(|scope| {
-        let pairs: Vec<_> = pairs
-            .iter()
-            .map(|(max_rows, name)| {
-                scope.spawn(move || the_stream_is_the_finish_for(max_rows, name))
-            })
-            .collect();
-        for pair in pairs {
-            if let Err(panic) = pair.join() {
-                std::panic::resume_unwind(panic);
-            }
+mod the_kept_lists_build_the_finishs_keccak_rnd_and_lt_tables_again {
+    use super::*;
+
+    #[test]
+    fn small_window_7() {
+        assert_kept_lists_rebuild_finish_tables(7, &MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn small_window_1000() {
+        assert_kept_lists_rebuild_finish_tables(1000, &MaxRowsConfig::small());
+    }
+
+    #[test]
+    fn uniform_window_7() {
+        assert_kept_lists_rebuild_finish_tables(7, &MaxRowsConfig::uniform(4));
+    }
+
+    #[test]
+    fn uniform_window_1000() {
+        assert_kept_lists_rebuild_finish_tables(1000, &MaxRowsConfig::uniform(4));
+    }
+}
+
+// Nextest schedules each fixture as its own process.
+macro_rules! stream_cases {
+    ($check:ident; $($program:ident),+ $(,)?) => {
+        mod $check {
+            $(
+                mod $program {
+                    #[test]
+                    fn window_7() {
+                        super::super::$check(stringify!($program), 7);
+                    }
+
+                    #[test]
+                    fn window_1000() {
+                        super::super::$check(stringify!($program), 1000);
+                    }
+                }
+            )+
         }
-    });
+    };
 }
 
-/// [`the_stream_is_the_monolithic_finish_in_air_order`] for one row
-/// configuration and one program.
-fn the_stream_is_the_finish_for(max_rows: &MaxRowsConfig, name: &str) {
-    the_stream_is_the_finish_under(max_rows, name, &configs());
+/// Checks every builder configuration at the small row caps and all budgets.
+fn the_stream_is_the_monolithic_finish_in_air_order_small_rows(name: &str, window: usize) {
+    the_stream_is_the_finish_under(&MaxRowsConfig::small(), name, &[window], &configs());
 }
 
-/// [`the_stream_is_the_finish_for`] under the builder configurations
-/// `configs`.
+stream_cases!(the_stream_is_the_monolithic_finish_in_air_order_small_rows;
+    all_instructions_64,
+    misalign_sd,
+    test_keccak_multi,
+    test_ecsm_multi,
+    test_commit_split,
+    test_blake3_absorb,
+    test_dense_pages,
+);
+
+/// The same checks at a uniform four-row cap.
+fn the_stream_is_the_monolithic_finish_in_air_order_four_rows(name: &str, window: usize) {
+    the_stream_is_the_finish_under(&MaxRowsConfig::uniform(4), name, &[window], &configs());
+}
+
+stream_cases!(the_stream_is_the_monolithic_finish_in_air_order_four_rows;
+    all_instructions_64,
+    misalign_sd,
+    test_keccak_multi,
+    test_ecsm_multi,
+    test_commit_split,
+    test_blake3_absorb,
+    test_dense_pages,
+);
+
+/// Compare the streamed and monolithic finish under the given configurations.
 fn the_stream_is_the_finish_under(
     max_rows: &MaxRowsConfig,
     name: &str,
+    windows: &[usize],
     configs: &[(&'static str, Configure)],
 ) {
     let (program, logs) = run(name);
-    for window in [7, 1000] {
+    for &window in windows {
         for (config, configure) in configs {
             let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
             let whole = builder.finish(last).expect("the monolithic finish");
@@ -512,7 +517,7 @@ fn the_stream_is_the_finish_under(
                     match (&emitted.table, table) {
                         (None, None) => {}
                         (Some(a), Some(b)) => {
-                            assert_eq!(shape_and_words(a), shape_and_words(b), "{what}: table {k}")
+                            assert!(main_words_match(a, b), "{what}: table {k}")
                         }
                         (a, b) => panic!(
                             "{what}: table {k} streamed {} but built {}",
@@ -558,21 +563,24 @@ fn word_configs() -> Vec<(&'static str, Configure)> {
 /// order: its word tables after the fused tables' place and its PAGE_W tables
 /// in PAGE's, word for word, at any budget; and each streamed table is its
 /// AIR's width in the word format's set the verifier builds.
+fn under_the_word_format_the_stream_is_the_monolithic_finish(name: &str, window: usize) {
+    // The ECREC forgery switch stays off while this fixture runs.
+    let _ecrec = (name == "test_ecrec").then(crate::tables::trace_builder::ecrec_forge_free);
+    the_stream_is_the_finish_under(&MaxRowsConfig::small(), name, &[window], &word_configs());
+}
+
+stream_cases!(under_the_word_format_the_stream_is_the_monolithic_finish;
+    fused_mem_cases,
+    all_loadstore_32,
+    misalign_lw,
+    test_copy_ecalls,
+    test_commit_split,
+    test_keccak256,
+    test_ecrec,
+);
+
 #[test]
-fn under_the_word_format_the_stream_is_the_monolithic_finish() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for name in [
-        "fused_mem_cases",
-        "all_loadstore_32",
-        "misalign_lw",
-        "test_copy_ecalls",
-        "test_commit_split",
-        "test_keccak256",
-        "test_ecrec",
-    ] {
-        the_stream_is_the_finish_under(&MaxRowsConfig::small(), name, &word_configs());
-    }
+fn the_word_format_tables_match_the_verifiers_air_shapes() {
     let opts = stark::proof::options::ProofOptions::default_test_options();
     let (program, logs) = run("fused_mem_cases");
     let (_, configure) = word_configs().pop().expect("the block's");
@@ -830,81 +838,96 @@ fn a_stopped_packer_stops_the_emitter() {
 /// it, word for word (BITWISE's multiplicities among them): the monolithic
 /// finish, and the streamed one in waves and sliding, at budgets of one byte
 /// and none. The programs reach LT, BRANCH and BYTEWISE over several chunks.
-#[test]
-fn the_row_lookups_counted_on_the_pool_build_the_same_tables() {
+fn the_row_lookups_counted_on_the_pool_build_the_same_tables(name: &str, window: usize) {
     let max_rows = MaxRowsConfig::small();
-    let words = |t: &Traces| -> Vec<_> {
-        air_order(t)
-            .into_iter()
-            .map(|t| t.map(shape_and_words))
-            .collect()
+    let (program, logs) = run(name);
+    let what = format!("{name} window {window}");
+    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+        b.drop_streamed_ops().expect("before any window")
+    });
+    let whole = builder.finish(last).expect("the monolithic finish");
+    let want = air_order(&whole);
+    let check = |got: Traces, mode: &str| {
+        assert_same_tables(
+            &want,
+            air_order(&got).into_iter(),
+            &format!("{what}: {mode}"),
+        );
     };
-    for name in [
-        "all_instructions_64",
-        "test_keccak_multi",
-        "test_memw_split_ts",
-        "test_copy_ecalls",
-        "test_dense_pages",
-    ] {
-        let (program, logs) = run(name);
-        for window in [7, 1000] {
-            let what = format!("{name} window {window}");
+    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+        b.drop_streamed_ops()
+            .expect("before any window")
+            .p4_rows_on_pool()
+    });
+    check(
+        builder.finish(last).expect("the monolithic finish"),
+        "rows on the pool",
+    );
+    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+        b.drop_streamed_ops()
+            .expect("before any window")
+            .p4_rows_by_parts()
+    });
+    check(
+        builder.finish(last).expect("the monolithic finish"),
+        "rows on the pool by parts",
+    );
+    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+        b.drop_streamed_ops()
+            .expect("before any window")
+            .p4_rows_by_parts()
+            .p4_lookups_direct()
+    });
+    check(
+        builder.finish(last).expect("the monolithic finish"),
+        "LT's and KECCAK's lookups counted directly",
+    );
+    for slide in [false, true] {
+        for budget in [1usize, usize::MAX] {
             let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                b.drop_streamed_ops().expect("before any window")
-            });
-            let want = words(&builder.finish(last).expect("the monolithic finish"));
-            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                b.drop_streamed_ops()
+                let b = b
+                    .drop_streamed_ops()
                     .expect("before any window")
-                    .p4_rows_on_pool()
+                    .p4_rows_on_pool();
+                if slide { b.slide_rest() } else { b }
             });
-            let got = words(&builder.finish(last).expect("the monolithic finish"));
-            assert!(
-                got == want,
-                "{what}: the monolithic finish, rows on the pool"
+            let (_, got, _) = streamed(builder, last, budget);
+            assert_same_tables(
+                &want,
+                got.iter().map(|e| e.table.as_ref()),
+                &format!("{what}, slide {slide}, budget {budget}"),
             );
-            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                b.drop_streamed_ops()
-                    .expect("before any window")
-                    .p4_rows_by_parts()
-            });
-            let got = words(&builder.finish(last).expect("the monolithic finish"));
-            assert!(
-                got == want,
-                "{what}: the monolithic finish, rows on the pool by parts"
-            );
-            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                b.drop_streamed_ops()
-                    .expect("before any window")
-                    .p4_rows_by_parts()
-                    .p4_lookups_direct()
-            });
-            let got = words(&builder.finish(last).expect("the monolithic finish"));
-            assert!(
-                got == want,
-                "{what}: the monolithic finish, LT's and KECCAK's lookups counted directly"
-            );
-            for slide in [false, true] {
-                for budget in [1usize, usize::MAX] {
-                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                        let b = b
-                            .drop_streamed_ops()
-                            .expect("before any window")
-                            .p4_rows_on_pool();
-                        if slide { b.slide_rest() } else { b }
-                    });
-                    let (_, got, _) = streamed(builder, last, budget);
-                    let got: Vec<_> = got
-                        .iter()
-                        .map(|e| e.table.as_ref().map(shape_and_words))
-                        .collect();
-                    assert!(
-                        got == want,
-                        "{what}, slide {slide}, budget {budget}: the tables in AIR order"
-                    );
-                }
-            }
         }
+    }
+}
+
+stream_cases!(the_row_lookups_counted_on_the_pool_build_the_same_tables;
+    all_instructions_64,
+    test_keccak_multi,
+    test_memw_split_ts,
+    test_copy_ecalls,
+    test_dense_pages,
+);
+
+fn assert_same_tables<'a>(
+    want: &[Option<&Table>],
+    got: impl ExactSizeIterator<Item = Option<&'a Table>>,
+    what: &str,
+) {
+    assert_eq!(got.len(), want.len(), "{what}: number of AIR positions");
+    for (position, (got, want)) in got.zip(want.iter().copied()).enumerate() {
+        assert!(
+            table_slot_matches(got, want),
+            "{what}: AIR position {position}"
+        );
+    }
+}
+
+fn table_slot_matches(got: Option<&Table>, want: Option<&Table>) -> bool {
+    match (got, want) {
+        (None, None) => true,
+        (Some(got), Some(want)) => main_words_match(got, want),
+        _ => false,
     }
 }
 
@@ -913,50 +936,42 @@ fn the_row_lookups_counted_on_the_pool_build_the_same_tables() {
 /// budget with at most one byte building at once (one table at a time), hands
 /// on the monolithic finish's tables word for word in AIR order, as the waves
 /// do.
-#[test]
-fn the_sliding_stream_is_the_monolithic_finish_in_air_order() {
+fn the_sliding_stream_is_the_monolithic_finish_in_air_order(name: &str, window: usize) {
     let max_rows = MaxRowsConfig::small();
-    for name in [
-        "misalign_sd",
-        "test_keccak_multi",
-        "test_ecsm_multi",
-        "test_blake3_absorb",
-    ] {
-        let (program, logs) = run(name);
-        for window in [7, 1000] {
-            for (config, configure) in &configs() {
-                let (builder, last) =
-                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
-                    .into_iter()
-                    .map(|t| t.map(shape_and_words))
-                    .collect::<Vec<_>>();
-                for (budget, build) in [
-                    (1usize, None),
-                    (2 << 30, None),
-                    (usize::MAX, None),
-                    (usize::MAX, Some(1)),
-                ] {
-                    let what =
-                        format!("{name} window {window} {config} budget {budget} build {build:?}");
-                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                        configure(b).slide_rest()
-                    });
-                    let (_, got, _) = streamed_capped(builder, last, budget, build);
-                    let got: Vec<_> = got
-                        .iter()
-                        .enumerate()
-                        .map(|(k, e)| {
-                            assert_eq!(e.position, k, "{what}: position {k}");
-                            e.table.as_ref().map(shape_and_words)
-                        })
-                        .collect();
-                    assert!(got == want, "{what}: the tables in AIR order");
-                }
-            }
+    let (program, logs) = run(name);
+    for (config, configure) in &configs() {
+        let (builder, last) = pushed(&program, &logs, &max_rows, window, configure.as_ref());
+        let whole = builder.finish(last).expect("the monolithic finish");
+        let want = air_order(&whole);
+        for (budget, build) in [
+            (1usize, None),
+            (2 << 30, None),
+            (usize::MAX, None),
+            (usize::MAX, Some(1)),
+        ] {
+            let what = format!("{name} window {window} {config} budget {budget} build {build:?}");
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                configure(b).slide_rest()
+            });
+            let (_, got, _) = streamed_capped(builder, last, budget, build);
+            assert_same_tables(
+                &want,
+                got.iter().enumerate().map(|(k, e)| {
+                    assert_eq!(e.position, k, "{what}: position {k}");
+                    e.table.as_ref()
+                }),
+                &what,
+            );
         }
     }
 }
+
+stream_cases!(the_sliding_stream_is_the_monolithic_finish_in_air_order;
+    misalign_sd,
+    test_keccak_multi,
+    test_ecsm_multi,
+    test_blake3_absorb,
+);
 
 /// ★ With KECCAK_RND's tables handed on first
 /// ([`WindowedTraceBuilder::keccak_rnd_first`]) and BITWISE last, the sliding
@@ -967,78 +982,77 @@ fn the_sliding_stream_is_the_monolithic_finish_in_air_order() {
 /// the rest in AIR order, BITWISE last, under a header that says so: every
 /// configuration, windows of 7 and 1000 cycles, budgets of one byte and none,
 /// and one table building at once. In waves the order stays AIR order.
-#[test]
-fn with_keccak_rnd_first_the_sliding_stream_hands_keccak_rnd_on_first() {
+fn the_sliding_stream_hands_keccak_rnd_on_first(name: &str, window: usize) {
     let max_rows = MaxRowsConfig::small();
     let mut reordered_with_tables = 0usize;
-    for name in ["test_keccak_multi", "all_instructions_64"] {
-        let (program, logs) = run(name);
-        for window in [7, 1000] {
-            for (config, configure) in &configs() {
-                let (builder, last) =
-                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
+    let (program, logs) = run(name);
+    for (config, configure) in &configs() {
+        let (builder, last) = pushed(&program, &logs, &max_rows, window, configure.as_ref());
+        let whole = builder.finish(last).expect("the monolithic finish");
+        let want = air_order(&whole);
+        for (slide, budget, build) in [
+            (true, 1usize, None),
+            (true, usize::MAX, None),
+            (true, usize::MAX, Some(1)),
+            (false, usize::MAX, None),
+        ] {
+            let what = format!(
+                "{name} window {window} {config} slide {slide} budget {budget} build \
+                 {build:?}"
+            );
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                let b = configure(b).rest_bitwise_last().keccak_rnd_first();
+                if slide { b.slide_rest() } else { b }
+            });
+            let (header, got, _) = streamed_capped(builder, last, budget, build);
+            let reordered = slide && cfg!(feature = "parallel");
+            assert_eq!(header.keccak_rnd_first, reordered, "{what}: the header");
+            let first: Vec<usize> = if reordered {
+                crate::block_whir::chunked_table_ranges(&header.table_counts)
                     .into_iter()
-                    .map(|t| t.map(shape_and_words))
-                    .collect::<Vec<_>>();
-                for (slide, budget, build) in [
-                    (true, 1usize, None),
-                    (true, usize::MAX, None),
-                    (true, usize::MAX, Some(1)),
-                    (false, usize::MAX, None),
-                ] {
-                    let what = format!(
-                        "{name} window {window} {config} slide {slide} budget {budget} build \
-                         {build:?}"
-                    );
-                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                        let b = configure(b).rest_bitwise_last().keccak_rnd_first();
-                        if slide { b.slide_rest() } else { b }
-                    });
-                    let (header, got, _) = streamed_capped(builder, last, budget, build);
-                    let reordered = slide && cfg!(feature = "parallel");
-                    assert_eq!(header.keccak_rnd_first, reordered, "{what}: the header");
-                    let first: Vec<usize> = if reordered {
-                        crate::block_whir::chunked_table_ranges(&header.table_counts)
-                            .into_iter()
-                            .find(|(family, ..)| *family == "KECCAK_RND")
-                            .map(|(_, range, _)| range.collect())
-                            .expect("KECCAK_RND's range")
-                    } else {
-                        Vec::new()
-                    };
-                    let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
-                    assert_eq!(
-                        positions,
-                        hand_on_order_first(want.len(), &first, reordered.then_some(0)),
-                        "{what}: the hand-on order"
-                    );
-                    let mut seen = positions.clone();
-                    seen.sort_unstable();
-                    assert_eq!(
-                        seen,
-                        (0..want.len()).collect::<Vec<_>>(),
-                        "{what}: every table once"
-                    );
-                    for e in &got {
-                        assert!(
-                            e.table.as_ref().map(shape_and_words) == want[e.position],
-                            "{what}: table {}",
-                            e.position
-                        );
-                    }
-                    if reordered && got.iter().take(first.len()).any(|e| e.table.is_some()) {
-                        reordered_with_tables += 1;
-                    }
-                }
+                    .find(|(family, ..)| *family == "KECCAK_RND")
+                    .map(|(_, range, _)| range.collect())
+                    .expect("KECCAK_RND's range")
+            } else {
+                Vec::new()
+            };
+            let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+            assert_eq!(
+                positions,
+                hand_on_order_first(want.len(), &first, reordered.then_some(0)),
+                "{what}: the hand-on order"
+            );
+            let mut seen = positions.clone();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..want.len()).collect::<Vec<_>>(),
+                "{what}: every table once"
+            );
+            for e in &got {
+                assert!(
+                    table_slot_matches(e.table.as_ref(), want[e.position]),
+                    "{what}: table {}",
+                    e.position
+                );
+            }
+            if reordered && got.iter().take(first.len()).any(|e| e.table.is_some()) {
+                reordered_with_tables += 1;
             }
         }
     }
-    assert!(
-        reordered_with_tables > 0 || !cfg!(feature = "parallel"),
-        "no stream handed a KECCAK_RND table on first"
-    );
+    if name == "test_keccak_multi" {
+        assert!(
+            reordered_with_tables > 0 || !cfg!(feature = "parallel"),
+            "no stream handed a KECCAK_RND table on first"
+        );
+    }
 }
+
+stream_cases!(the_sliding_stream_hands_keccak_rnd_on_first;
+    test_keccak_multi,
+    all_instructions_64,
+);
 
 /// ★ With the page tables handed on next ([`WindowedTraceBuilder::pages_first`])
 /// after KECCAK_RND's and BITWISE last, the sliding stream hands on the
@@ -1287,65 +1301,52 @@ fn the_hand_on_order_puts_first_first_and_last_last() {
 /// cycles, budgets of one byte, 2 GiB and none, and one table building at
 /// once. Without the tails, and in waves, the order stays AIR order and phase
 /// 4 counts as before.
-#[test]
-fn with_bitwise_from_tables_the_stream_is_the_monolithic_finish() {
+fn with_bitwise_from_tables_the_stream_is_the_monolithic_finish(name: &str, window: usize) {
     let max_rows = MaxRowsConfig::small();
     let mut counted_from_tables = 0usize;
-    for name in [
-        "all_instructions_64",
-        "test_keccak_multi",
-        "test_ecsm_multi",
-        "test_blake3_absorb",
-    ] {
-        let (program, logs) = run(name);
-        for window in [7, 1000] {
-            for (config, configure) in &configs() {
-                let (builder, last) =
-                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                // Every configuration but the plain one drops the streamed
-                // chunks' ops, keeping only the tails.
-                let tails = *config != "plain";
-                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
-                    .into_iter()
-                    .map(|t| t.map(shape_and_words))
-                    .collect::<Vec<_>>();
-                for (slide, budget, build) in [
-                    (true, 1usize, None),
-                    (true, 2 << 30, None),
-                    (true, usize::MAX, None),
-                    (true, usize::MAX, Some(1)),
-                    (false, usize::MAX, None),
-                ] {
-                    let what = format!(
-                        "{name} window {window} {config} slide {slide} budget {budget} build \
-                         {build:?}"
-                    );
-                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
-                        let b = configure(b).bitwise_from_tables();
-                        if slide { b.slide_rest() } else { b }
-                    });
-                    let (header, got, _) = streamed_capped(builder, last, budget, build);
-                    let reordered = slide && cfg!(feature = "parallel") && tails;
-                    assert_eq!(header.bitwise_last, reordered, "{what}: BITWISE last");
-                    assert_eq!(
-                        header.bitwise_from_tables, reordered,
-                        "{what}: counted from the tables"
-                    );
-                    counted_from_tables += usize::from(header.bitwise_from_tables);
-                    let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
-                    assert_eq!(
-                        positions,
-                        hand_on_order(want.len(), reordered.then_some(0)),
-                        "{what}: the hand-on order"
-                    );
-                    for e in &got {
-                        assert!(
-                            e.table.as_ref().map(shape_and_words) == want[e.position],
-                            "{what}: table {}",
-                            e.position
-                        );
-                    }
-                }
+    let (program, logs) = run(name);
+    for (config, configure) in &configs() {
+        let (builder, last) = pushed(&program, &logs, &max_rows, window, configure.as_ref());
+        // Every configuration but the plain one drops the streamed
+        // chunks' ops, keeping only the tails.
+        let tails = *config != "plain";
+        let whole = builder.finish(last).expect("the monolithic finish");
+        let want = air_order(&whole);
+        for (slide, budget, build) in [
+            (true, 1usize, None),
+            (true, 2 << 30, None),
+            (true, usize::MAX, None),
+            (true, usize::MAX, Some(1)),
+            (false, usize::MAX, None),
+        ] {
+            let what = format!(
+                "{name} window {window} {config} slide {slide} budget {budget} build \
+                 {build:?}"
+            );
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                let b = configure(b).bitwise_from_tables();
+                if slide { b.slide_rest() } else { b }
+            });
+            let (header, got, _) = streamed_capped(builder, last, budget, build);
+            let reordered = slide && cfg!(feature = "parallel") && tails;
+            assert_eq!(header.bitwise_last, reordered, "{what}: BITWISE last");
+            assert_eq!(
+                header.bitwise_from_tables, reordered,
+                "{what}: counted from the tables"
+            );
+            counted_from_tables += usize::from(header.bitwise_from_tables);
+            let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+            assert_eq!(
+                positions,
+                hand_on_order(want.len(), reordered.then_some(0)),
+                "{what}: the hand-on order"
+            );
+            for e in &got {
+                assert!(
+                    table_slot_matches(e.table.as_ref(), want[e.position]),
+                    "{what}: table {}",
+                    e.position
+                );
             }
         }
     }
@@ -1354,6 +1355,13 @@ fn with_bitwise_from_tables_the_stream_is_the_monolithic_finish() {
         "no stream counted from the tables"
     );
 }
+
+stream_cases!(with_bitwise_from_tables_the_stream_is_the_monolithic_finish;
+    all_instructions_64,
+    test_keccak_multi,
+    test_ecsm_multi,
+    test_blake3_absorb,
+);
 
 /// With BITWISE's lookups from the tables, phase B's LT jobs (from the lists
 /// kept for it) build the finish's LT tables again word for word without
@@ -2450,68 +2458,62 @@ fn block_like(b: WindowedTraceBuilder<'_>, words: bool) -> WindowedTraceBuilder<
 /// after it is built and before it is handed on. Every stream configuration,
 /// the word format's and the block's, both row configurations, windows of 7
 /// and 1000 cycles, in waves and sliding. A miss names its family.
-#[test]
-fn every_unit_states_its_tables_height() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    let programs = [
-        ("all_instructions_64", false),
-        ("misalign_sd", false),
-        ("test_keccak_multi", false),
-        ("test_ecsm_multi", false),
-        ("test_commit_split", false),
-        ("test_blake3_absorb", false),
-        ("test_dense_pages", false),
-        ("fused_mem_cases", true),
-        ("all_loadstore_32", true),
-        ("misalign_lw", true),
-        ("test_copy_ecalls", true),
-        ("test_commit_split", true),
-        ("test_keccak256", true),
-        ("test_ecrec", true),
-    ];
-    let pairs: Vec<(MaxRowsConfig, &str, bool)> =
-        [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)]
-            .into_iter()
-            .flat_map(|max_rows| programs.map(|(name, words)| (max_rows.clone(), name, words)))
-            .collect();
-    let found: Vec<([usize; 2], Vec<String>)> = std::thread::scope(|scope| {
-        let runs: Vec<_> = pairs
-            .iter()
-            .map(|(max_rows, name, words)| {
-                scope.spawn(move || states_its_height_for(max_rows, name, *words))
-            })
-            .collect();
-        runs.into_iter()
-            .map(|run| run.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect()
-    });
-    let exact: usize = found.iter().map(|(n, _)| n[0]).sum();
-    let late: usize = found.iter().map(|(n, _)| n[1]).sum();
-    let misses: Vec<&String> = found.iter().flat_map(|(_, m)| m).collect();
-    let mut by_family: std::collections::BTreeMap<String, (usize, &String)> = Default::default();
-    for m in &misses {
-        let key = m.split(" @ ").next().unwrap_or("").to_string();
-        by_family.entry(key).or_insert((0, m)).0 += 1;
+mod every_unit_states_its_tables_height {
+    use super::*;
+
+    macro_rules! guest {
+        ($case:ident, $name:literal, $words:literal) => {
+            mod $case {
+                use super::*;
+
+                #[test]
+                fn small() {
+                    assert_stated_heights(MaxRowsConfig::small(), $name, $words);
+                }
+
+                #[test]
+                fn uniform_4() {
+                    assert_stated_heights(MaxRowsConfig::uniform(4), $name, $words);
+                }
+            }
+        };
     }
-    let summary: Vec<String> = by_family
-        .iter()
-        .map(|(k, (n, first))| format!("{k}: {n} (first: {first})"))
-        .collect();
-    println!("ROWS STATED: {exact} tables exact, {late} late");
-    assert!(exact > 0 && late > 0, "both kinds were checked");
-    assert!(
-        misses.is_empty(),
-        "{} tables built at other rows than stated:\n{}",
-        misses.len(),
-        summary.join("\n")
-    );
+
+    guest!(all_instructions_64, "all_instructions_64", false);
+    guest!(misalign_sd, "misalign_sd", false);
+    guest!(test_keccak_multi, "test_keccak_multi", false);
+    guest!(test_ecsm_multi, "test_ecsm_multi", false);
+    guest!(split_commit, "test_commit_split", false);
+    guest!(test_blake3_absorb, "test_blake3_absorb", false);
+    guest!(test_dense_pages, "test_dense_pages", false);
+    guest!(fused_mem_cases, "fused_mem_cases", true);
+    guest!(all_loadstore_32, "all_loadstore_32", true);
+    guest!(misalign_lw, "misalign_lw", true);
+    guest!(test_copy_ecalls, "test_copy_ecalls", true);
+    guest!(word_commit, "test_commit_split", true);
+    guest!(test_keccak256, "test_keccak256", true);
+    guest!(test_ecrec, "test_ecrec", true);
+
+    fn assert_stated_heights(max_rows: MaxRowsConfig, name: &str, words: bool) {
+        let _ecrec = (name == "test_ecrec").then(crate::tables::trace_builder::ecrec_forge_free);
+        let ([exact, late], misses) = states_its_height_for(&max_rows, name, words);
+        println!("ROWS STATED: {exact} tables exact, {late} late");
+        assert!(exact + late > 0, "table heights were checked");
+        if name == "all_instructions_64" {
+            assert!(exact > 0 && late > 0, "both kinds were checked");
+        }
+        assert!(
+            misses.is_empty(),
+            "{} tables built at other rows than stated:\n{}",
+            misses.len(),
+            misses.join("\n")
+        );
+    }
 }
 
-/// [`every_unit_states_its_tables_height`] for one row configuration and one
-/// program (`words`: under the word format's configurations): the tables
-/// checked, exact and late, and the misses, each `"FAMILY stated s built b
-/// @ what"`; the stream's own comparison and the finish's count must agree.
+/// For one row configuration and one program, count the exact and late
+/// tables checked and name the mismatched heights. The stream's comparison
+/// and the finish's count must agree.
 fn states_its_height_for(
     max_rows: &MaxRowsConfig,
     name: &str,

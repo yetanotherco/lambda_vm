@@ -79,6 +79,7 @@ pub(super) fn folding_fixture(
     blowup: usize,
 ) -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
     let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(blowup as u8)
+        .map(crate::security_posture::stark_options)
         .expect("a power-of-two blowup is valid");
     folding_fixture_with(num_boundaries, opts)
 }
@@ -1075,7 +1076,7 @@ fn the_fri_join_adds_no_second_point_derivation() {
 ///
 /// There is no vector that tampers `p₀`. It is not an arena value here — it is a
 /// cell the DEEP leg computed — and moving it is
-/// `join_tests::no_tampered_value_can_move_the_fold_without_moving_the_root`'s
+/// `join_tests::the_join_verifies_and_refuses_tampers`'s
 /// subject one leg back. A FRI-side tamper of `p₀` would only be possible in the
 /// standalone driver, where it is hinted for isolation, and would prove nothing
 /// about the joined program.

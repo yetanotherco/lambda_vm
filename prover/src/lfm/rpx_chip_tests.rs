@@ -51,7 +51,9 @@ const PINNED_CONSTRAINTS: usize = 309;
 const PINNED_CELLS_PER_PERMUTATION: u64 = 325;
 
 fn options() -> ProofOptions {
-    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 fn arenas() -> Vec<Vec<LfmWord>> {

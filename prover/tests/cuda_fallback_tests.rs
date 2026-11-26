@@ -13,7 +13,9 @@
 #![cfg(feature = "test-cuda-faults")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
-use lambda_vm_prover::{prove, verify};
+mod common;
+
+use common::{prove, verify};
 use stark::gpu_lde::{
     gpu_batch_invert_calls, gpu_composition_parts_downloads, gpu_device_only_calls,
     gpu_device_only_downgrades, gpu_fri_calls, reset_all_gpu_call_counters,
@@ -33,12 +35,12 @@ use stark::gpu_lde::{
 #[test]
 #[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
 fn gpu_fri_fault_falls_back_to_cpu() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     // Baseline: a clean prove tells us how many GPU FRI commits fire when
     // nothing is forced to fail. A faulted run lands on `clean` or `clean - 1`,
     // never anything else.
     reset_all_gpu_call_counters();
-    let _ = prove(&elf).expect("warm-up");
+    let _ = prove(&elf, &[]).expect("warm-up");
     let clean = gpu_fri_calls();
     assert!(clean > 0, "GPU FRI never ran, cannot test fallback");
 
@@ -48,7 +50,7 @@ fn gpu_fri_fault_falls_back_to_cpu() {
         stark::gpu_lde::schedule_fri_fold_fault(n);
         reset_all_gpu_call_counters();
 
-        let recovered = prove(&elf).expect("prove after fault");
+        let recovered = prove(&elf, &[]).expect("prove after fault");
         // The injection must have been consumed; otherwise this iteration
         // never reached the error path and the checks below are vacuous.
         assert!(
@@ -94,9 +96,9 @@ fn gpu_fri_fault_falls_back_to_cpu() {
 #[test]
 #[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
 fn gpu_batch_invert_fault_falls_back_to_cpu() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let _ = prove(&elf).expect("warm-up");
+    let _ = prove(&elf, &[]).expect("warm-up");
     let clean = gpu_batch_invert_calls();
     assert!(
         clean > 0,
@@ -107,7 +109,7 @@ fn gpu_batch_invert_fault_falls_back_to_cpu() {
         stark::gpu_lde::schedule_inverse_fault(n);
         reset_all_gpu_call_counters();
 
-        let recovered = prove(&elf).expect("prove after fault");
+        let recovered = prove(&elf, &[]).expect("prove after fault");
         assert!(
             stark::gpu_lde::inverse_fault_fired(),
             "injected batch-invert fault #{n} never fired"
@@ -145,7 +147,7 @@ impl Drop for StickyFaultGuard {
 /// empty host part evals) only arm on device-only tables.
 fn warm_up_requiring_device_only(elf: &[u8]) {
     reset_all_gpu_call_counters();
-    let _ = prove(elf).expect("warm-up");
+    let _ = prove(elf, &[]).expect("warm-up");
     assert!(
         gpu_device_only_calls() > 0,
         "device-only residency never fired on the warm-up prove; the cliff \
@@ -162,14 +164,14 @@ fn warm_up_requiring_device_only(elf: &[u8]) {
 #[test]
 #[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
 fn gpu_comp_tree_fault_recovers_device_only_parts() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     warm_up_requiring_device_only(&elf);
 
     // Disarms on scope exit — including a panic in `prove` or a failing assert.
     let _guard = StickyFaultGuard;
     stark::gpu_lde::schedule_comp_tree_fault_sticky(1);
     reset_all_gpu_call_counters();
-    let recovered = prove(&elf).expect("prove with sticky comp-tree fault");
+    let recovered = prove(&elf, &[]).expect("prove with sticky comp-tree fault");
     assert!(
         stark::gpu_lde::comp_tree_fault_fired(),
         "injected comp-tree fault never fired"
@@ -196,14 +198,14 @@ fn gpu_comp_tree_fault_recovers_device_only_parts() {
 #[test]
 #[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
 fn gpu_barycentric_fault_recovers_device_only_trace() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     warm_up_requiring_device_only(&elf);
 
     // Disarms on scope exit — including a panic in `prove` or a failing assert.
     let _guard = StickyFaultGuard;
     stark::gpu_lde::schedule_barycentric_fault_sticky(1);
     reset_all_gpu_call_counters();
-    let recovered = prove(&elf).expect("prove with sticky barycentric fault");
+    let recovered = prove(&elf, &[]).expect("prove with sticky barycentric fault");
     assert!(
         stark::gpu_lde::barycentric_fault_fired(),
         "injected barycentric fault never fired"
@@ -240,14 +242,14 @@ fn gpu_barycentric_fault_recovers_device_only_trace() {
 #[test]
 #[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
 fn gpu_deep_fault_recovers_device_only_trace_and_parts() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     warm_up_requiring_device_only(&elf);
 
     // Disarms on scope exit — including a panic in `prove` or a failing assert.
     let _guard = StickyFaultGuard;
     stark::gpu_lde::schedule_deep_fault_sticky(1);
     reset_all_gpu_call_counters();
-    let recovered = prove(&elf).expect("prove with sticky DEEP fault");
+    let recovered = prove(&elf, &[]).expect("prove with sticky DEEP fault");
     assert!(
         stark::gpu_lde::deep_fault_fired(),
         "injected DEEP fault never fired"

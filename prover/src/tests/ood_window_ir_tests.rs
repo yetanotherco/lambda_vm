@@ -89,7 +89,9 @@ fn assert_ood_window_matches_ir(
 /// equality is asserted for each.
 #[test]
 fn all_table_windows_match_captured_ir() {
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let opts = GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
     let airs = production_airs(&opts);
     assert_eq!(
         airs.len(),

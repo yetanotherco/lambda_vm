@@ -1220,6 +1220,7 @@ pub(crate) struct EpochProof {
 /// `verify_continuation` checks this using only the bundle and the ELF. It derives
 /// rkyv, so it round-trips exactly like a monolithic `VmProof`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[cfg_attr(test, derive(Clone))]
 pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
@@ -3763,7 +3764,7 @@ mod tests {
     fn test_verify_continuation_with_supplied_roots() {
         let elf_bytes = asm_elf_bytes("data_page_touch");
         let opts = ProofOptions::default_test_options();
-        let bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+        let bundle = prove_continuation(&elf_bytes, &[], 6, &opts).unwrap();
 
         let expected = verify_continuation(&elf_bytes, &bundle, &opts)
             .unwrap()
@@ -3844,7 +3845,7 @@ mod tests {
         for name in ["data_page_touch", "all_loadstore_32"] {
             let elf_bytes = asm_elf_bytes(name);
             let opts = ProofOptions::default_test_options();
-            let bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+            let bundle = prove_continuation(&elf_bytes, &[], 6, &opts).unwrap();
             let elf = Elf::load(&elf_bytes).unwrap();
             let page_bases = canonical_page_bases(&bundle.touched_page_bases);
 
@@ -4153,19 +4154,37 @@ mod tests {
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
+    // Run every mutation against a fresh copy of one honest proof. Nextest runs
+    // each test in its own process, so the cases must share one test entry point.
+    #[test]
+    fn test_split_verify_loadstore_tampers() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf = asm_elf_bytes("all_loadstore_32");
+        let input = [];
+        let opts = ProofOptions::default_test_options();
+        let honest = prove_continuation(&elf, &input, 4, &opts).unwrap();
+        test_split_verify_rejects_dropped_last_epoch(&elf, honest.clone());
+        test_split_verify_rejects_reordered_epochs(&elf, honest.clone());
+        test_split_verify_rejects_tampered_register_fini(&elf, honest.clone());
+        test_split_verify_rejects_malformed_register_fini_length(&elf, honest.clone());
+        test_split_verify_rejects_an_epoch_whose_counts_overflow(&elf, honest.clone());
+        test_split_verify_tolerates_reordered_touched_page_bases(&elf, honest.clone());
+        test_split_verify_rejects_dropped_touched_page_base(&elf, honest.clone());
+        test_split_verify_rejects_non_page_aligned_touched_page_base(&elf, honest.clone());
+        test_split_verify_rejects_tampered_l2g_root(&elf, honest);
+    }
+
     // Negative: dropping the final (halting) epoch must be rejected — the new last
     // epoch is non-halting but the verifier builds it as `is_final` (HALT included),
     // so it can't verify. Guards completeness / no-truncation.
-    #[test]
-    fn test_split_verify_rejects_dropped_last_epoch() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_dropped_last_epoch(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.pop();
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
         );
@@ -4174,16 +4193,11 @@ mod tests {
     // Negative: reordering epochs must be rejected — each epoch proof is bound to its
     // 1-based label (and register chain), so a swapped epoch fails to verify. Guards
     // the trusted-enumeration ordering.
-    #[test]
-    fn test_split_verify_rejects_reordered_epochs() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_reordered_epochs(elf_bytes: &[u8], mut bundle: ContinuationProof) {
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.swap(0, 1);
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
         );
@@ -4193,19 +4207,17 @@ mod tests {
     // rejected — the verifier derives the next epoch's INIT from it, so it no longer
     // matches that epoch's committed preprocessed INIT. Guards the cross-epoch
     // register binding (incl. x254).
-    #[test]
-    fn test_split_verify_rejects_tampered_register_fini() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_tampered_register_fini(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(
             bundle.epochs.len() >= 2,
             "need a second epoch to chain into"
         );
         bundle.epochs[0].reg_fini[0] ^= 1;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
         );
@@ -4216,16 +4228,14 @@ mod tests {
     // (untrusted) and indexed by `NUM_REGISTER_ADDRESSES` when building the
     // preprocessed REGISTER commitment, so a short one would otherwise be an
     // out-of-bounds panic in release builds.
-    #[test]
-    fn test_split_verify_rejects_malformed_register_fini_length() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_malformed_register_fini_length(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(!bundle.epochs.is_empty());
         bundle.epochs[0].reg_fini.pop();
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
         );
@@ -4250,12 +4260,11 @@ mod tests {
     /// The epoch counterpart of the overflow branch: `verify_epoch` swallows a
     /// total that wraps as `Ok(false)` where the monolithic verifier returns
     /// `Err`, so a regression there is silent. Nothing reached that arm before.
-    #[test]
-    fn test_split_verify_rejects_an_epoch_whose_counts_overflow() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    fn test_split_verify_rejects_an_epoch_whose_counts_overflow(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         let opts = ProofOptions::default_test_options();
-        let mut bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
         assert!(!bundle.epochs.is_empty());
 
         bundle.epochs[0].table_counts.lt = usize::MAX;
@@ -4264,7 +4273,7 @@ mod tests {
             "the tampered counts must actually wrap, or this tests the wrong branch"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &opts)
+            verify_continuation(elf_bytes, &bundle, &opts)
                 .unwrap()
                 .is_none(),
             "an epoch whose declared counts have no total must be rejected"
@@ -4371,6 +4380,20 @@ mod tests {
         );
     }
 
+    // Run every mutation against a fresh copy of one honest proof. Nextest runs
+    // each test in its own process, so the cases must share one test entry point.
+    #[test]
+    fn test_split_verify_private_input_count_tampers() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf = asm_elf_bytes("test_private_input_xpage");
+        let input = (0u8..16).collect::<Vec<_>>();
+        let opts = ProofOptions::default_test_options();
+        let honest = prove_continuation(&elf, &input, 2, &opts).unwrap();
+        test_split_verify_rejects_deflated_num_private_input_pages(&elf, honest.clone());
+        test_split_verify_rejects_inflated_num_private_input_pages(&elf, honest.clone());
+        test_split_verify_rejects_oversized_num_private_input_pages(&elf, honest);
+    }
+
     // Negative: `num_private_input_pages` is pinned by the committed AIR shape for TOUCHED
     // pages. Deflating it to 0 for a program that reads private input makes the verifier
     // build that touched page preprocessed (ELF-recomputed → zero-init commitment) while
@@ -4378,20 +4401,16 @@ mod tests {
     // committed trace and verification rejects. This is the replacement for the removed
     // tampered-genesis test: it guards the security claim that a wrong count flipping a
     // touched page's preprocessed mode cannot be accepted.
-    #[test]
-    fn test_split_verify_rejects_deflated_num_private_input_pages() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
-        let input: Vec<u8> = (0u8..16).collect();
-        let mut bundle =
-            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
-                .unwrap();
+    fn test_split_verify_rejects_deflated_num_private_input_pages(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(
             bundle.num_private_input_pages > 0,
             "baseline must have a touched private-input page"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_some(),
             "baseline must verify before tampering"
@@ -4399,7 +4418,7 @@ mod tests {
 
         bundle.num_private_input_pages = 0;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none(),
             "deflating the count flips a touched page's preprocessed mode → must reject"
@@ -4412,20 +4431,16 @@ mod tests {
     // NOT catch it) — the count is absorbed into the global proof's Fiat-Shamir statement, so
     // the verifier's challenges diverge from the prover's and `verify_global` rejects. Guards
     // the FS-binding of the count (complements the deflation test's AIR-shape-mismatch path).
-    #[test]
-    fn test_split_verify_rejects_inflated_num_private_input_pages() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
-        let input: Vec<u8> = (0u8..16).collect();
-        let mut bundle =
-            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
-                .unwrap();
+    fn test_split_verify_rejects_inflated_num_private_input_pages(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert_eq!(
             bundle.num_private_input_pages, 1,
             "16 bytes of private input fits in one page"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_some(),
             "baseline must verify before tampering"
@@ -4434,7 +4449,7 @@ mod tests {
         // In-range (well under the max bound) but one more than the true count.
         bundle.num_private_input_pages = 2;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none(),
             "an inflated count diverges the global Fiat-Shamir statement → must reject"
@@ -4558,15 +4573,13 @@ mod tests {
 
     // Negative: `num_private_input_pages` is deserialized/untrusted, so reject a bundle
     // whose count exceeds the max before using it to size/build the global AIRs.
-    #[test]
-    fn test_split_verify_rejects_oversized_num_private_input_pages() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_oversized_num_private_input_pages(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         bundle.num_private_input_pages = page::max_private_input_pages() + 1;
         assert!(matches!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options()),
             Err(Error::InvalidTableCounts(_))
         ));
     }
@@ -4620,18 +4633,16 @@ mod tests {
     // list that is reordered AND has duplicates — but describes the same set — still
     // verifies. (Page-count-independent: duplicating then reversing exercises both dedup
     // and reordering even when the program touches a single page.)
-    #[test]
-    fn test_split_verify_tolerates_reordered_touched_page_bases() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_tolerates_reordered_touched_page_bases(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(
             !bundle.touched_page_bases.is_empty(),
             "baseline must have touched pages"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_some(),
             "baseline must verify"
@@ -4642,7 +4653,7 @@ mod tests {
         scrambled.reverse();
         bundle.touched_page_bases = scrambled;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_some(),
             "a reordered/duplicated same-set page-base list must still verify (canonicalized)"
@@ -4652,25 +4663,23 @@ mod tests {
     // Negative: dropping a genuinely-touched page base removes its GLOBAL_MEMORY table on
     // the verify side, so that page's L2G fini token has no receiver → GlobalMemory bus
     // imbalance (and the global Fiat-Shamir statement diverges) → reject.
-    #[test]
-    fn test_split_verify_rejects_dropped_touched_page_base() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_dropped_touched_page_base(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(
             !bundle.touched_page_bases.is_empty(),
             "baseline must have touched pages"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_some(),
             "baseline must verify before tampering"
         );
         bundle.touched_page_bases.pop();
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none(),
             "a missing touched page base must be rejected"
@@ -4682,18 +4691,16 @@ mod tests {
     // the private-input range can't be built NON-preprocessed with a prover-controlled genesis
     // and ride along as a self-cancelling junk page. Page-count-independent: perturbing any one
     // base by +1 makes it non-aligned.
-    #[test]
-    fn test_split_verify_rejects_non_page_aligned_touched_page_base() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_non_page_aligned_touched_page_base(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(
             !bundle.touched_page_bases.is_empty(),
             "baseline must have touched pages"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_some(),
             "baseline must verify before tampering"
@@ -4701,7 +4708,7 @@ mod tests {
         bundle.touched_page_bases[0] += 1;
         assert!(
             matches!(
-                verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
+                verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options()),
                 Err(Error::MalformedContinuationBundle(_))
             ),
             "a non-page-aligned touched page base is a malformed bundle → must be an Err"
@@ -4713,19 +4720,17 @@ mod tests {
     // claimed `l2g_root` no longer matches what its own proof committed) before the
     // cross-epoch `verify_l2g_commitment_binding_view` ever runs — see
     // `test_split_verify_rejects_global_proof_from_a_different_run` for that.
-    #[test]
-    fn test_split_verify_rejects_tampered_l2g_root() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+    fn test_split_verify_rejects_tampered_l2g_root(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+    ) {
         assert!(
             bundle.epochs.len() >= 2,
             "need multiple epochs to exercise the binding"
         );
         bundle.epochs[0].l2g_root[0] ^= 0xFF;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
         );
@@ -4740,7 +4745,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 3, &crate::recursion::MIN_PROOF_OPTIONS).unwrap();
+            prove_continuation(&elf_bytes, &[], 5, &crate::recursion::MIN_PROOF_OPTIONS).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need multiple epochs to exercise the binding"

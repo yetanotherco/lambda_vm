@@ -100,13 +100,44 @@ pub(super) struct HostSubProof {
     pub(super) points: Vec<(FE, Option<FE>)>,
 }
 
-fn host_sub_proof() -> &'static HostSubProof {
-    use std::sync::OnceLock;
-    static CELL: OnceLock<HostSubProof> = OnceLock::new();
-    CELL.get_or_init(|| {
-        let (air, proof) = real_fixture();
-        build_host_sub_proof(&*air, &proof)
-    })
+#[test]
+fn the_join_verifies_and_refuses_tampers() {
+    let (air, proof) = real_fixture();
+    let host = build_host_sub_proof(&*air, &proof);
+    for (name, check) in [
+        (
+            "trace and query premises",
+            the_join_premises_hold_on_a_real_proof as fn(&HostSubProof),
+        ),
+        (
+            "every query against the host verifier",
+            the_join_matches_the_production_verifier_on_every_query,
+        ),
+        (
+            "joined proof and verification",
+            the_join_proves_and_verifies,
+        ),
+        ("negative controls", the_controls_show_what_the_join_denies),
+        (
+            "shared query bits",
+            the_exposed_bits_are_the_cells_the_walk_consumed,
+        ),
+    ] {
+        eprintln!("join case: {name}");
+        check(&host);
+    }
+    eprintln!("join case: FRI fixture and vector lengths");
+    the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold(&proof);
+    the_fri_shape_predicts_the_real_proofs_vector_lengths(&host, &proof);
+
+    eprintln!("join case: L2G_MEMORY tamper sweep");
+    sweep_tampers(&host, "L2G_MEMORY (3 matrices, depth 2)");
+    let (air, proof) = preprocessed_fixture();
+    let preprocessed = build_host_sub_proof(&*air, &proof);
+    eprintln!("join case: precomputed group order");
+    the_precomputed_group_comes_first_and_that_is_checkable(&preprocessed);
+    eprintln!("join case: PREPROCESSED_FIXTURE tamper sweep");
+    sweep_tampers(&preprocessed, "PREPROCESSED_FIXTURE (4 matrices, depth 6)");
 }
 
 pub(super) fn build_host_sub_proof(
@@ -407,9 +438,7 @@ impl HostSubProof {
 /// (a leaf is a row pair), that the machine's point derivation reproduces
 /// production's `query_challenge_to_evaluation_point` at every one of the
 /// proof's indices, and that the symmetric point really is the negation.
-#[test]
-fn the_join_premises_hold_on_a_real_proof() {
-    let h = host_sub_proof();
+fn the_join_premises_hold_on_a_real_proof(h: &HostSubProof) {
     let s = &h.shape;
     let groups = s.groups();
 
@@ -499,9 +528,7 @@ fn the_join_premises_hold_on_a_real_proof() {
 /// inside the program, so a run in which any leaf failed to reach its root
 /// would not execute at all. That the run produces DEEP values is already the
 /// statement that the values it folded are the committed ones.
-#[test]
-fn the_join_matches_the_production_verifier_on_every_query() {
-    let h = host_sub_proof();
+fn the_join_matches_the_production_verifier_on_every_query(h: &HostSubProof) {
     let all: Vec<usize> = (0..h.iotas.len()).collect();
 
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
@@ -784,6 +811,7 @@ fn join_leg_cost() {
     let perm_cells = super::machine_tests::permutation_cells();
 
     let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(1 << LOG2_BLOWUP)
+        .map(crate::security_posture::stark_options)
         .expect("a power-of-two blowup is valid");
     let airs = crate::test_utils::production_airs(&opts);
     assert_eq!(airs.len(), crate::test_utils::NUM_PRODUCTION_AIRS);
@@ -899,7 +927,9 @@ use super::sub_proof::{
 };
 
 pub(super) fn prove_options() -> stark::proof::options::ProofOptions {
-    stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+    stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid")
 }
 
 /// How a control program differs from the joined one. Each variant is an
@@ -1089,9 +1119,7 @@ impl HostSubProof {
 /// Method rule 2: the executor mirrors the ALU it is checking, so nothing run
 /// so far says the CHIPS agree. One query, because the whole point of this test
 /// is the chips and 219 of them would only repeat the same rows.
-#[test]
-fn the_join_proves_and_verifies() {
-    let h = host_sub_proof();
+fn the_join_proves_and_verifies(h: &HostSubProof) {
     let opts = prove_options();
     let queries = [0usize];
 
@@ -1150,15 +1178,6 @@ fn the_join_proves_and_verifies() {
 /// the four-matrix one is the only fixture in which the precomputed group's own
 /// leaf and path are ever tampered, and its 64-row trace is the only executed
 /// walk in this file deeper than two levels.
-#[test]
-fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
-    sweep_tampers(host_sub_proof(), "L2G_MEMORY (3 matrices, depth 2)");
-    sweep_tampers(
-        preprocessed_sub_proof(),
-        "PREPROCESSED_FIXTURE (4 matrices, depth 6)",
-    );
-}
-
 fn sweep_tampers(h: &HostSubProof, label: &str) {
     use super::proof_arena::{commitments_to_arena, walk_to_root};
 
@@ -1350,9 +1369,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
 /// everywhere else, and each one accepts a reconstruction the production
 /// verifier would not have produced. That is the thing the joined program has
 /// to refuse, and the test above shows it does.
-#[test]
-fn the_controls_show_what_the_join_denies() {
-    let h = host_sub_proof();
+fn the_controls_show_what_the_join_denies(h: &HostSubProof) {
     let q = 0usize;
 
     // ---- Control 1: DEEP folds a parallel copy. -------------------------
@@ -1477,6 +1494,7 @@ fn preprocessed_fixture() -> (
     const NUM_ROWS: usize = 64;
 
     let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
         .expect("blowup=2 is valid");
 
     let build = |commitment: Option<stark::config::Commitment>| {
@@ -1572,15 +1590,6 @@ impl<F: math::field::traits::IsField, E: math::field::traits::IsField>
     }
 }
 
-fn preprocessed_sub_proof() -> &'static HostSubProof {
-    use std::sync::OnceLock;
-    static CELL: OnceLock<HostSubProof> = OnceLock::new();
-    CELL.get_or_init(|| {
-        let (air, proof) = preprocessed_fixture();
-        build_host_sub_proof(&*air, &proof)
-    })
-}
-
 /// ★ The four-group shape, and the witness that the group ORDER is
 /// load-bearing.
 ///
@@ -1590,9 +1599,7 @@ fn preprocessed_sub_proof() -> &'static HostSubProof {
 /// groups in the opposite order, gives a DIFFERENT answer. Without the second
 /// half this test would pass against a main-first emitter, which is the exact
 /// failure mode it exists to prevent.
-#[test]
-fn the_precomputed_group_comes_first_and_that_is_checkable() {
-    let h = preprocessed_sub_proof();
+fn the_precomputed_group_comes_first_and_that_is_checkable(h: &HostSubProof) {
     let groups = h.shape.groups();
 
     assert_eq!(
@@ -1722,9 +1729,9 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
 /// The zero-layer case is not merely an artifact to route around, either — it
 /// is a real production path (small tables fold no further than their terminal)
 /// and the emitted verifier handles it as a first-class shape.
-#[test]
-fn the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold() {
-    let (_air, proof) = real_fixture();
+fn the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold(
+    proof: &stark::proof::stark::MultiProof<Gl, Ext3, ()>,
+) {
     assert_eq!(
         proof.proofs.len(),
         1,
@@ -1778,9 +1785,7 @@ fn the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold() {
 /// on each bit and `pow_bits` selects the point factors on the same bits, so a
 /// bit the emitter actually used is necessarily read by one. A freshly
 /// decomposed second copy would be read by nothing.
-#[test]
-fn the_exposed_bits_are_the_cells_the_walk_consumed() {
-    let h = host_sub_proof();
+fn the_exposed_bits_are_the_cells_the_walk_consumed(h: &HostSubProof) {
     const QUERIES: usize = 3;
 
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
@@ -1833,10 +1838,10 @@ use stark::proof::options::ProofFormat;
 /// actually carries instead, which is the better oracle: `verifier.rs:426-448`
 /// rejects on exactly these two lengths before its query loop runs, and the
 /// spec notes they are the ONLY thing pinning vectors Fiat-Shamir does not bind.
-#[test]
-fn the_fri_shape_predicts_the_real_proofs_vector_lengths() {
-    let (_air, proof) = real_fixture();
-    let h = host_sub_proof();
+fn the_fri_shape_predicts_the_real_proofs_vector_lengths(
+    h: &HostSubProof,
+    proof: &stark::proof::stark::MultiProof<Gl, Ext3, ()>,
+) {
     let opts = prove_options();
     let shape = FriShape::from_options(&opts, h.shape.log2_lde_length);
     shape.check();

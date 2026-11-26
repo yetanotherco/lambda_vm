@@ -222,14 +222,13 @@ const PROGRAMS: [&str; 14] = [
 /// ★ Walked from their entries, at every window length (one cycle, less than a
 /// chunk, exactly a chunk, not a divisor of it, longer than the run), with the
 /// handed-out ops kept or dropped, the windows build the whole-run tables.
-#[test]
-fn windows_walked_from_their_entries_build_the_whole_run_tables() {
+fn assert_windows_walked_from_their_entries(windows: impl Fn(usize) -> [usize; 2]) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     for name in PROGRAMS {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [1, 7, 32, 33, 1000, logs.len()] {
+        for window in windows(logs.len()) {
             for dropped in [false, true] {
                 let traces =
                     walked_from_entries(&program, &max_rows, window.max(1), dropped, Tamper::None)
@@ -237,6 +236,25 @@ fn windows_walked_from_their_entries_build_the_whole_run_tables() {
                 same_traces(&reference, &traces);
             }
         }
+    }
+}
+
+mod windows_walked_from_their_entries_build_the_whole_run_tables {
+    use super::assert_windows_walked_from_their_entries;
+
+    #[test]
+    fn short_windows() {
+        assert_windows_walked_from_their_entries(|_| [1, 7]);
+    }
+
+    #[test]
+    fn medium_windows() {
+        assert_windows_walked_from_their_entries(|_| [32, 33]);
+    }
+
+    #[test]
+    fn long_windows() {
+        assert_windows_walked_from_their_entries(|len| [1000, len]);
     }
 }
 
@@ -272,29 +290,65 @@ fn windows_walked_from_their_entries_deferring_ecrec_build_the_whole_run_tables(
 /// they make the rows, at every window length and at chunks of four rows
 /// (every streamed table handed out), the windows build the whole-run tables;
 /// a build that keeps its windows ignores the mode.
-#[test]
-fn windows_walked_from_their_entries_counting_where_made_build_the_whole_run_tables() {
+fn assert_windows_walked_from_their_entries_counting_where_made(
+    max_rows: &MaxRowsConfig,
+    windows: impl Fn(usize) -> [usize; 2],
+) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            let reference = whole(&program, &logs, &max_rows);
-            for window in [1, 7, 33, logs.len()] {
-                for dropped in [false, true] {
-                    let traces = walked_from_entries_with(
-                        &program,
-                        &max_rows,
-                        window.max(1),
-                        dropped,
-                        Tamper::None,
-                        false,
-                        true,
-                    )
-                    .unwrap_or_else(|e| panic!("{name}, window {window}: {e:?}"));
-                    same_traces(&reference, &traces);
-                }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, max_rows);
+        for window in windows(logs.len()) {
+            for dropped in [false, true] {
+                let traces = walked_from_entries_with(
+                    &program,
+                    max_rows,
+                    window.max(1),
+                    dropped,
+                    Tamper::None,
+                    false,
+                    true,
+                )
+                .unwrap_or_else(|e| panic!("{name}, window {window}: {e:?}"));
+                same_traces(&reference, &traces);
             }
         }
+    }
+}
+
+mod windows_walked_from_their_entries_counting_where_made_build_the_whole_run_tables {
+    use super::*;
+
+    #[test]
+    fn small_tables_short_windows() {
+        assert_windows_walked_from_their_entries_counting_where_made(
+            &MaxRowsConfig::small(),
+            |_| [1, 7],
+        );
+    }
+
+    #[test]
+    fn small_tables_long_windows() {
+        assert_windows_walked_from_their_entries_counting_where_made(
+            &MaxRowsConfig::small(),
+            |len| [33, len],
+        );
+    }
+
+    #[test]
+    fn uniform_tables_short_windows() {
+        assert_windows_walked_from_their_entries_counting_where_made(
+            &MaxRowsConfig::uniform(4),
+            |_| [1, 7],
+        );
+    }
+
+    #[test]
+    fn uniform_tables_long_windows() {
+        assert_windows_walked_from_their_entries_counting_where_made(
+            &MaxRowsConfig::uniform(4),
+            |len| [33, len],
+        );
     }
 }
 
@@ -853,8 +907,7 @@ fn fused_windows_walked_on_threads_build_the_windowed_tables() {
 /// with the walkers routing their windows or not, the windows build the tables
 /// the single walker's windowed build makes: the same word tables, PAGE_W
 /// tables and BITWISE.
-#[test]
-fn word_windows_walked_on_threads_build_the_windowed_tables() {
+fn word_windows_walked_on_threads_build_the_windowed_tables(window: usize) {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     use crate::tables::fused_memory::MemoryFormat;
     use crate::tables::memw_aligned::MemwAlignedOrder;
@@ -897,20 +950,32 @@ fn word_windows_walked_on_threads_build_the_windowed_tables() {
             "{name}: {:?}",
             reference.word_counts()
         );
-        for window in [7, 33] {
-            for walkers in [1, 2, 3] {
-                for light in [0u8, 2] {
-                    let traces =
-                        walked_on_threads_as(&program, &max_rows, window, walkers, None, &|b| {
-                            formats(b)?.light_walk(light)
-                        })
-                        .unwrap_or_else(|e| {
-                            panic!("{name}, window {window}, {walkers} walkers: {e:?}")
-                        });
-                    same_traces(&reference, &traces);
-                }
+        for walkers in [1, 2, 3] {
+            for light in [0u8, 2] {
+                let traces =
+                    walked_on_threads_as(&program, &max_rows, window, walkers, None, &|b| {
+                        formats(b)?.light_walk(light)
+                    })
+                    .unwrap_or_else(|e| {
+                        panic!("{name}, window {window}, {walkers} walkers: {e:?}")
+                    });
+                same_traces(&reference, &traces);
             }
         }
+    }
+}
+
+mod word_windows_walked_on_threads {
+    use super::*;
+
+    #[test]
+    fn window_7() {
+        word_windows_walked_on_threads_build_the_windowed_tables(7);
+    }
+
+    #[test]
+    fn window_33() {
+        word_windows_walked_on_threads_build_the_windowed_tables(33);
     }
 }
 

@@ -507,6 +507,11 @@ fn wlfm_config_first(
         }
         WlfmRate::Two | WlfmRate::Four => {}
     }
+    #[cfg(all(test, feature = "cuda", feature = "test-security"))]
+    if test_format::small_card_stack() {
+        zf.whir_stack = multilinear::whir_chain::StackVars::new(26)
+            .expect("the card test's stack cap is in range");
+    }
     if let Some(bits) = grind {
         zf.whir_grind_bits = bits;
     }
@@ -516,7 +521,7 @@ fn wlfm_config_first(
     };
     let mut config = format.chain_config(shapes);
     if rate == WlfmRate::Four {
-        config.num_queries = WLFM_B4_QUERIES;
+        config.num_queries = crate::security_posture::wlfm_b4_queries(config.num_queries);
     }
     config.format.final_poly = final_poly;
     if let Some(k) = fold {
@@ -623,7 +628,7 @@ pub fn wlfm_config_levers(
     let config = config
         .with_whir_rounds(
             usize::from(shrink),
-            crate::multilinear_prove::CHAIN_SECURITY_BITS,
+            crate::security_posture::chain_security_bits(),
             tallest,
         )
         .and_then(ChainConfig::with_caps_by_queries)
@@ -4042,6 +4047,31 @@ pub(crate) mod test_format {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use multilinear::whir_chain::{ChainConfig, GrindBits};
+
+    // The ignored card identity runs alone. Its builders run on their own
+    // threads, so the stack cap must be visible to the whole test process.
+    #[cfg(all(feature = "cuda", feature = "test-security"))]
+    static SMALL_CARD_STACK: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(all(feature = "cuda", feature = "test-security"))]
+    pub(crate) struct SmallCardStack(bool);
+
+    #[cfg(all(feature = "cuda", feature = "test-security"))]
+    impl Drop for SmallCardStack {
+        fn drop(&mut self) {
+            SMALL_CARD_STACK.store(self.0, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(all(feature = "cuda", feature = "test-security"))]
+    pub(crate) fn use_small_card_stack() -> SmallCardStack {
+        SmallCardStack(SMALL_CARD_STACK.swap(true, Ordering::Relaxed))
+    }
+
+    #[cfg(all(feature = "cuda", feature = "test-security"))]
+    pub(super) fn small_card_stack() -> bool {
+        SMALL_CARD_STACK.load(Ordering::Relaxed)
+    }
 
     thread_local! {
         static UNGROUND: Cell<bool> = const { Cell::new(false) };

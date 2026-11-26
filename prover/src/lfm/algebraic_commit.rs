@@ -1058,7 +1058,9 @@ mod tests {
         use crate::lfm::registry::build_artifacts_with_hasher;
         use stark::proof::options::GoldilocksCubicProofOptions;
 
-        let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+        let opts = GoldilocksCubicProofOptions::with_blowup(2)
+            .map(crate::security_posture::stark_options)
+            .expect("options");
         let program = grinding_leg_program();
         let seed = grinding_seed_bytes();
 
@@ -1111,7 +1113,9 @@ mod tests {
 
         let seed = grinding_seed_bytes();
 
-        let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+        let opts = GoldilocksCubicProofOptions::with_blowup(2)
+            .map(crate::security_posture::stark_options)
+            .expect("options");
         let program = grinding_leg_program();
 
         for (hasher, _, host_accepts) in grinding_members() {
@@ -1183,7 +1187,9 @@ mod tests {
         const NONCE: u64 = 0x0123_4567_89AB_CD00;
 
         fn check<H: AlgebraicHasher>(name: &str) {
-            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+            let opts = GoldilocksCubicProofOptions::with_blowup(2)
+                .map(crate::security_posture::stark_options)
+                .expect("options");
 
             // HOST: the grinding digest through the public `digest` interface.
             let mut d = AlgebraicDigest::<H>::default();
@@ -1289,8 +1295,13 @@ mod tests {
         use stark::proof::options::GoldilocksCubicProofOptions;
 
         fn check<H: AlgebraicHasher>(name: &str) {
-            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+            let opts = GoldilocksCubicProofOptions::with_blowup(2)
+                .map(crate::security_posture::stark_options)
+                .expect("options");
 
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+            let mut arenas = Vec::new();
+            let mut expected = Vec::new();
             for n in [1usize, 4, 8, 9, 12, 16] {
                 let leaf = base_leaf(n);
                 let want =
@@ -1299,7 +1310,6 @@ mod tests {
                 // The program reads the leaf's felts from an arena, four per
                 // word, and hashes them the way a wrap program would.
                 let words = n.div_ceil(4);
-                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
                 let arena = b.declare_arena(words as u32);
                 let felts: Vec<_> = (0..words)
                     .flat_map(|w| {
@@ -1311,7 +1321,6 @@ mod tests {
                 let d = WrapHash::Algebraic.leaf_hash(&mut b, &felts);
                 assert_eq!(d.len(), 1, "{name}: an algebraic digest is ONE cell");
                 b.public(d[0]);
-                let program = compile(b.finish());
 
                 let arena_words: Vec<LfmWord> = (0..words)
                     .map(|w| {
@@ -1320,15 +1329,8 @@ mod tests {
                         })
                     })
                     .collect();
-                let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
-                let proved =
-                    lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &opts, H::KIND)
-                        .expect("the leaf program must prove");
-                assert_eq!(
-                    digest_to_commitment(&proved.public_words[0].1),
-                    want,
-                    "{name}: emitted leaf of {n} felts must equal the host's"
-                );
+                arenas.push(arena_words);
+                expected.push((format!("leaf of {n} felts"), want));
             }
 
             // ★ EXTENSION leaves — the decomposition the call sites rely on.
@@ -1342,7 +1344,6 @@ mod tests {
                 let leaf = ext_leaf(n);
                 let want = <AlgebraicBatchBackend<Ext, H> as IsMerkleTreeBackend>::hash_data(&leaf);
 
-                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
                 let arena = b.declare_arena(n as u32);
                 let felts: Vec<_> = (0..n)
                     .flat_map(|i| {
@@ -1352,7 +1353,6 @@ mod tests {
                     .collect();
                 let d = WrapHash::Algebraic.leaf_hash(&mut b, &felts);
                 b.public(d[0]);
-                let program = compile(b.finish());
 
                 let words: Vec<LfmWord> = leaf
                     .iter()
@@ -1361,14 +1361,8 @@ mod tests {
                         [v[0], v[1], v[2], FE::zero()]
                     })
                     .collect();
-                let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
-                let proved = lfm_prove_with_hasher(&program, &artifacts, &[words], &opts, H::KIND)
-                    .expect("the extension leaf program must prove");
-                assert_eq!(
-                    digest_to_commitment(&proved.public_words[0].1),
-                    want,
-                    "{name}: emitted EXTENSION leaf of {n} elements must equal the host's"
-                );
+                arenas.push(words);
+                expected.push((format!("EXTENSION leaf of {n} elements"), want));
             }
 
             // And the parent.
@@ -1378,27 +1372,26 @@ mod tests {
             let want =
                 <AlgebraicBatchBackend<Base, H> as IsMerkleTreeBackend>::hash_new_parent(&l, &r);
 
-            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
             let arena = b.declare_arena(2);
             let lc = WrapDigest::from_cell(b.hint_word(arena, 0));
             let rc = WrapDigest::from_cell(b.hint_word(arena, 1));
             let d = WrapHash::Algebraic.hash_pair(&mut b, lc, rc);
             b.public(d[0]);
+            arenas.push(vec![commitment_to_digest(&l), commitment_to_digest(&r)]);
+            expected.push(("parent".to_owned(), want));
+
             let program = compile(b.finish());
             let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
-            let proved = lfm_prove_with_hasher(
-                &program,
-                &artifacts,
-                &[vec![commitment_to_digest(&l), commitment_to_digest(&r)]],
-                &opts,
-                H::KIND,
-            )
-            .expect("the parent program must prove");
-            assert_eq!(
-                digest_to_commitment(&proved.public_words[0].1),
-                want,
-                "{name}: emitted parent must equal the host's"
-            );
+            let proved = lfm_prove_with_hasher(&program, &artifacts, &arenas, &opts, H::KIND)
+                .expect("the leaf and parent program must prove");
+            assert_eq!(proved.public_words.len(), expected.len());
+            for ((what, want), (_, got)) in expected.into_iter().zip(proved.public_words) {
+                assert_eq!(
+                    digest_to_commitment(&got),
+                    want,
+                    "{name}: emitted {what} must equal the host's"
+                );
+            }
         }
         for_each_tenant!(check);
     }

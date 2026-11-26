@@ -301,8 +301,7 @@ fn the_whole_run_tables_balance_every_inner_bus() {
 
 /// Windowed builds: streamed chunks counted as they are handed out, KECCAK_RND
 /// cut at the finish under either padding rule, KECCAK / ECSM / ECDAS / COPY cut.
-#[test]
-fn the_windowed_tables_balance_every_inner_bus() {
+fn assert_windowed_buses_balance(max_rows: &MaxRowsConfig, window: usize) {
     type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
     let configs: Vec<(&str, Configure)> = vec![
         ("plain", Box::new(|b| b)),
@@ -334,28 +333,37 @@ fn the_windowed_tables_balance_every_inner_bus() {
         ),
     ];
     let mut failed = Vec::new();
-    for (sizes, max_rows) in [
-        ("small", MaxRowsConfig::small()),
-        ("2^4", MaxRowsConfig::uniform(4)),
-    ] {
-        for name in PROGRAMS {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, configure) in &configs {
-                    let mut traces =
-                        windowed(&program, &logs, &max_rows, window, configure.as_ref());
-                    let left = unbalanced(&program, &mut traces);
-                    if !left.is_empty() {
-                        failed.push(format!(
-                            "{name} {sizes} window {window} {config}: {}",
-                            named(&left)
-                        ));
-                    }
-                }
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        for (config, configure) in &configs {
+            let mut traces = windowed(&program, &logs, max_rows, window, configure.as_ref());
+            let left = unbalanced(&program, &mut traces);
+            if !left.is_empty() {
+                failed.push(format!("{name} window {window} {config}: {}", named(&left)));
             }
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn the_windowed_small_tables_balance_every_inner_bus_at_window_7() {
+    assert_windowed_buses_balance(&MaxRowsConfig::small(), 7);
+}
+
+#[test]
+fn the_windowed_small_tables_balance_every_inner_bus_at_window_1000() {
+    assert_windowed_buses_balance(&MaxRowsConfig::small(), 1000);
+}
+
+#[test]
+fn the_windowed_uniform_tables_balance_every_inner_bus_at_window_7() {
+    assert_windowed_buses_balance(&MaxRowsConfig::uniform(4), 7);
+}
+
+#[test]
+fn the_windowed_uniform_tables_balance_every_inner_bus_at_window_1000() {
+    assert_windowed_buses_balance(&MaxRowsConfig::uniform(4), 1000);
 }
 
 /// MEMW_A's tables in the limbs' form ([`MemwAlignedOrder::Limbs`]) against
@@ -364,8 +372,7 @@ fn the_windowed_tables_balance_every_inner_bus() {
 /// one), MEMW_A sends and takes the very Memory-bus tokens LT's form does (the
 /// limbs give back each old timestamp), and the LT lookups the ALU bus carries
 /// fall by exactly one per active MEMW_A row.
-#[test]
-fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus() {
+fn assert_limbs_tables_send_lts_tokens_and_balance_every_inner_bus(window: usize) {
     use crate::tables::memw_aligned::{self, MemwAlignedOrder};
     let limbs_air = |name: &str| {
         name.starts_with("MEMW_A[")
@@ -415,54 +422,61 @@ fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus() {
     let mut rows_seen = 0usize;
     for name in PROGRAMS {
         let (program, logs) = run(name);
-        for window in [7, 1000] {
-            for dropped in [false, true] {
-                let build = |order: MemwAlignedOrder| {
-                    windowed(&program, &logs, &MaxRowsConfig::small(), window, &|b| {
-                        let b = b.memw_aligned_order(order).expect("before any window");
-                        if dropped {
-                            b.drop_streamed_ops().expect("before any window")
-                        } else {
-                            b
-                        }
-                    })
-                };
-                let what = format!("{name} window {window} dropped {dropped}");
-                let (mut lt, mut limbs) =
-                    (build(MemwAlignedOrder::Lt), build(MemwAlignedOrder::Limbs));
-                let left = unbalanced_with(&program, &mut limbs, &limbs_air);
-                if !left.is_empty() {
-                    failed.push(format!("{what}: {}", named(&left)));
-                }
-                let lt_form = memw_aligned::bus_interactions_for(MemwAlignedOrder::Lt);
-                let limbs_form = memw_aligned::bus_interactions_for(MemwAlignedOrder::Limbs);
-                if sum(&lt.memw_aligneds, &lt_form, BusId::Memory)
-                    != sum(&limbs.memw_aligneds, &limbs_form, BusId::Memory)
-                {
-                    failed.push(format!("{what}: MEMW_A's Memory tokens differ"));
-                }
-                // One LT lookup a row under LT's form (its senders on the ALU
-                // bus), none under the limbs'.
-                let rows: i128 = sum(&lt.memw_aligneds, &lt_form, BusId::Alu).values().sum();
-                assert!(sum(&limbs.memw_aligneds, &limbs_form, BusId::Alu).is_empty());
-                if lt_lookups(&lt) - lt_lookups(&limbs) != rows {
-                    failed.push(format!(
-                        "{what}: LT takes {} lookups under LT's form and {} under the limbs', \
-                         not {rows} fewer",
-                        lt_lookups(&lt),
-                        lt_lookups(&limbs)
-                    ));
-                }
-                rows_seen += rows as usize;
-                let left = unbalanced(&program, &mut lt);
-                if !left.is_empty() {
-                    failed.push(format!("{what} (LT's form): {}", named(&left)));
-                }
+        for dropped in [false, true] {
+            let build = |order: MemwAlignedOrder| {
+                windowed(&program, &logs, &MaxRowsConfig::small(), window, &|b| {
+                    let b = b.memw_aligned_order(order).expect("before any window");
+                    if dropped {
+                        b.drop_streamed_ops().expect("before any window")
+                    } else {
+                        b
+                    }
+                })
+            };
+            let what = format!("{name} window {window} dropped {dropped}");
+            let (mut lt, mut limbs) = (build(MemwAlignedOrder::Lt), build(MemwAlignedOrder::Limbs));
+            let left = unbalanced_with(&program, &mut limbs, &limbs_air);
+            if !left.is_empty() {
+                failed.push(format!("{what}: {}", named(&left)));
+            }
+            let lt_form = memw_aligned::bus_interactions_for(MemwAlignedOrder::Lt);
+            let limbs_form = memw_aligned::bus_interactions_for(MemwAlignedOrder::Limbs);
+            if sum(&lt.memw_aligneds, &lt_form, BusId::Memory)
+                != sum(&limbs.memw_aligneds, &limbs_form, BusId::Memory)
+            {
+                failed.push(format!("{what}: MEMW_A's Memory tokens differ"));
+            }
+            // One LT lookup a row under LT's form (its senders on the ALU
+            // bus), none under the limbs'.
+            let rows: i128 = sum(&lt.memw_aligneds, &lt_form, BusId::Alu).values().sum();
+            assert!(sum(&limbs.memw_aligneds, &limbs_form, BusId::Alu).is_empty());
+            if lt_lookups(&lt) - lt_lookups(&limbs) != rows {
+                failed.push(format!(
+                    "{what}: LT takes {} lookups under LT's form and {} under the limbs', \
+                     not {rows} fewer",
+                    lt_lookups(&lt),
+                    lt_lookups(&limbs)
+                ));
+            }
+            rows_seen += rows as usize;
+            let left = unbalanced(&program, &mut lt);
+            if !left.is_empty() {
+                failed.push(format!("{what} (LT's form): {}", named(&left)));
             }
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert!(rows_seen > 0, "no program made a MEMW_A row");
+}
+
+#[test]
+fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus_at_window_7() {
+    assert_limbs_tables_send_lts_tokens_and_balance_every_inner_bus(7);
+}
+
+#[test]
+fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus_at_window_1000() {
+    assert_limbs_tables_send_lts_tokens_and_balance_every_inner_bus(1000);
 }
 
 /// ★ The in-row register format (`RegisterFormat::InRow`): on the same
@@ -471,8 +485,7 @@ fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus() {
 /// HALT's PC bridge on the REG bus, every inner bus balances — the REG bus is
 /// one of them, closed by REGISTER's verifier-known files — and no table puts
 /// a register token on the Memory bus any more.
-#[test]
-fn the_in_row_register_format_balances_every_inner_bus() {
+fn assert_in_row_register_format_balances_every_inner_bus(window: usize) {
     use crate::tables::register::RegisterFormat;
     type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
     let configs: Vec<(&str, Configure)> = vec![
@@ -489,26 +502,34 @@ fn the_in_row_register_format_balances_every_inner_bus() {
     ] {
         for name in PROGRAMS {
             let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, configure) in &configs {
-                    let mut traces = windowed(&program, &logs, &max_rows, window, &|b| {
-                        configure(b)
-                            .register_format(RegisterFormat::InRow)
-                            .expect("before any window")
-                    });
-                    let (left, tokens) =
-                        unbalanced_in(&program, &mut traces, &|_| None, RegisterFormat::InRow);
-                    if !left.is_empty() || tokens != 0 {
-                        failed.push(format!(
-                            "{name} {sizes} window {window} {config}: {} · register tokens on Memory {tokens}",
-                            named(&left)
-                        ));
-                    }
+            for (config, configure) in &configs {
+                let mut traces = windowed(&program, &logs, &max_rows, window, &|b| {
+                    configure(b)
+                        .register_format(RegisterFormat::InRow)
+                        .expect("before any window")
+                });
+                let (left, tokens) =
+                    unbalanced_in(&program, &mut traces, &|_| None, RegisterFormat::InRow);
+                if !left.is_empty() || tokens != 0 {
+                    failed.push(format!(
+                        "{name} {sizes} window {window} {config}: {} · register tokens on Memory {tokens}",
+                        named(&left)
+                    ));
                 }
             }
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn the_in_row_register_format_balances_every_inner_bus_at_window_7() {
+    assert_in_row_register_format_balances_every_inner_bus(7);
+}
+
+#[test]
+fn the_in_row_register_format_balances_every_inner_bus_at_window_1000() {
+    assert_in_row_register_format_balances_every_inner_bus(1000);
 }
 
 /// ★ The in-row register format's keep-alives: `keep_alive_regs` leaves two
