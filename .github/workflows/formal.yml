@@ -19,6 +19,18 @@ jobs:
     name: Lean build and export check
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # One pattern, shared by the gate below and by the probe that proves the gate fires.
+      # Keeping them as one string is the point: two copies could drift, and then the probe
+      # would be testing something the gate does not use.
+      #
+      # It replaced an exact match on `declaration uses 'sorry'`, with single quotes, which
+      # matched nothing: Lean emits backticks, and it does so on BOTH toolchains this repo
+      # has used -- checked by hand on v4.33.1 and v4.35.0, which print
+      # `declaration uses ` + backtick + `sorry` + backtick. So the check never caught a
+      # sorry here; it is not that the wording changed under us. `[^[:alnum:]]?` accepts a
+      # quote, a backtick or no delimiter at all.
+      SORRY_RE: "declaration uses [^[:alnum:]]?sorry"
     defaults:
       run:
         working-directory: formal
@@ -54,8 +66,98 @@ jobs:
       - name: Fetch Mathlib binaries
         run: lake exe cache get
 
-      - name: Build
-        run: lake build
+      # The gate below is a grep against a compiler message, and a grep that stops matching
+      # fails open: the step passes, the PR goes green, and nothing says the check did
+      # nothing. That is not hypothetical here -- the previous pattern matched no toolchain
+      # this repo ever used. So compile a deliberate `sorry` and require that the pattern
+      # fires on it, which turns a silent failure into a loud one.
+      - name: The sorry gate catches a sorry
+        run: |
+          set -euo pipefail
+          # Built with `lake build`, not with `lean`, because that is what the gate greps.
+          # Lake wraps the compiler's message, and a bare `lean` probe would keep passing if
+          # Lake ever changed that wrapping while the gate went quietly blind. A throwaway
+          # package with no dependencies, on this job's toolchain, needs no network.
+          probe="${RUNNER_TEMP:-/tmp}/sorry-probe"
+          rm -rf "$probe"
+          mkdir -p "$probe"
+          cp lean-toolchain "$probe/lean-toolchain"
+          printf 'name = "probe"\ndefaultTargets = ["Probe"]\n\n[[lean_lib]]\nname = "Probe"\n' > "$probe/lakefile.toml"
+          printf 'theorem sorryProbe : True := by sorry\n' > "$probe/Probe.lean"
+          log="$probe/build.log"
+          # No `|| true`: a build that emits only this warning exits 0, so the only thing it
+          # could hide is a genuine failure, and then the error below would blame the pattern
+          # for something unrelated to it.
+          (cd "$probe" && lake build) > "$log" 2>&1
+          cat "$log"
+          if ! grep -qE "$SORRY_RE" "$log"; then
+            echo "::error::the sorry pattern matches nothing a build of a deliberate sorry emits, so the gate in the next step would let a sorry through"
+            exit 1
+          fi
+          echo "the pattern fires on a real sorry; the gate below is live"
+
+      # `lake build` only *warns* on a `sorry`, so without this check a sorry anywhere in the
+      # library merges green, including in declarations the axiom gate below does not reach.
+      - name: Build, and no sorry anywhere in the library
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/build.log"
+          lake build 2>&1 | tee "$log"
+          if grep -qE "$SORRY_RE" "$log"; then
+            echo "::error::a declaration uses sorry"
+            grep -nE "$SORRY_RE" "$log"
+            exit 1
+          fi
+
+      # `LambdaVM/Axioms.lean` is a list of `#print axioms` lines, one per modelled circuit and
+      # per ensemble theorem. It is not part of the library, so `lake build` does not see it.
+      - name: No sorry, no axioms beyond the standard three
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP:-/tmp}/axioms.txt"
+          # The `sed` below needs the opening `[` and the closing `]` of an axiom list on the
+          # same line to see it at all. `-Dformat.width` is kept as a precaution for a future
+          # toolchain, not because it is what holds the line together: `#print axioms` ignores
+          # it on v4.35.0, and emits the same 111-column lines at width 1 as at width 1000.
+          # The parse check further down is the guard that actually holds.
+          lake env lean -Dformat.width=1000 LambdaVM/Axioms.lean | tee "$report"
+
+          # One report per `#print axioms` line: a renamed or deleted declaration fails here
+          # instead of quietly dropping out of the check.
+          expected=$(grep -c '^#print axioms ' LambdaVM/Axioms.lean || true)
+          got=$(grep -c 'depends on axioms\|does not depend on any axioms' "$report" || true)
+          if [ "$expected" -ne "$got" ]; then
+            echo "::error::expected $expected axiom reports, got $got"
+            exit 1
+          fi
+
+          # `-Dformat.width` above is a width, not a guarantee: a long enough axiom list still
+          # wraps, and then the `sed` below finds no closing `]` and extracts nothing, while the
+          # count above still matches because the phrase sits on the report's first line. So
+          # require that every report with an axiom list was actually parsed.
+          withaxioms=$(grep -c 'depends on axioms' "$report" || true)
+          parsed=$(sed -n 's/.*depends on axioms: \[\(.*\)\]/\1/p' "$report" | wc -l | tr -d ' ')
+          if [ "$withaxioms" -ne "$parsed" ]; then
+            echo "::error::$withaxioms reports carry an axiom list but only $parsed fit on one line; raise -Dformat.width"
+            exit 1
+          fi
+
+          if grep -q 'sorryAx' "$report"; then
+            echo "::error::a modelled circuit or ensemble theorem depends on sorry"
+            exit 1
+          fi
+
+          unexpected=$(
+            sed -n 's/.*depends on axioms: \[\(.*\)\]/\1/p' "$report" \
+              | tr ',' '\n' | sed 's/[[:space:]]//g; /^$/d' | sort -u \
+              | grep -vxF -e propext -e Classical.choice -e Quot.sound || true
+          )
+          if [ -n "$unexpected" ]; then
+            echo "::error::axioms outside propext, Classical.choice, Quot.sound: $(echo $unexpected)"
+            exit 1
+          fi
+
+          echo "$expected declarations checked, no sorry, no extra axioms"
 
       - name: Export is up to date
         run: |

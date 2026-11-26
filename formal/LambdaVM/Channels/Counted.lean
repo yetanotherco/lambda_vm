@@ -11,7 +11,7 @@ public import Mathlib.Tactic.LinearCombination
 
 A deduplicated row pulls its range checks with multiplicity `μ ∈ [0, 255]` (`MU_MAX`, PR #1016).
 Clean's typed channels give the guarantee only to a pull of multiplicity `1`, and require every
-pull to have multiplicity `0` or `1`. `counted N channel` is the raw channel that gives the
+pull to have multiplicity `0` or `1`. `countedCharged N channel` is the raw channel that gives the
 guarantee to a pull of multiplicity `1, …, N` and charges every other nonzero interaction with
 the requirement, as a push.
 
@@ -21,7 +21,14 @@ nonzero multiplicity as a push; `not_consistent` shows the gap is real: over Gol
 `2 ≤ N ≤ 255` and a channel with some message whose guarantee is false, the counted channel is
 not `Consistent`, so it cannot be finished in a `SoundEnsemble` until that premise carries the
 bound. With `N = 1` the counted channel is `Normal`, hence `Consistent`; it is still a channel of
-its own, not `channel.toRaw`.
+its own, not `channel.toRaw`. With the bounded balance `BalancedUpTo N` of the modified Clean
+(the fork's `pr-base-upstream-main`, which `lakefile.toml` pins by sha at `8552c7a1`),
+`consistentUpTo` closes the gap.
+
+This file's `countedCharged` is **not** the fork's `Channel.counted`, which is what `Tables/Lt.lean`,
+`Tables/MinToy.lean` and `Ensembles/CountedSameBus.lean` pull on. On an out-of-range pull this
+file charges the guarantee, like a push; the fork forbids the multiplicity instead. Only
+`Demo.circuit` below uses this one. See the README, "Counted pulls".
 -/
 
 namespace LambdaVM.Counted
@@ -33,7 +40,7 @@ variable {Message : TypeMap} [ProvableType Message]
 def IsPull (N : ℕ) (mult : F) : Prop := ∃ k : ℕ, 1 ≤ k ∧ k ≤ N ∧ mult = (k : F)
 
 /-- `channel` with pulls allowed to carry a count up to `N`. -/
-def counted (N : ℕ) (channel : Channel F Message) : RawChannel F where
+def countedCharged (N : ℕ) (channel : Channel F Message) : RawChannel F where
   name := channel.name
   arity := size Message
   Guarantees mult message data :=
@@ -47,26 +54,26 @@ def counted (N : ℕ) (channel : Channel F Message) : RawChannel F where
 @[circuit_norm]
 def pullIf (N : ℕ) (channel : Channel F Message) (count : Expression F)
     (msg : Message (Expression F)) : Circuit F Unit := fun _ =>
-  ((), [.interact ⟨counted N channel, .pull, count, toElements msg⟩])
+  ((), [.interact ⟨countedCharged N channel, .pull, count, toElements msg⟩])
 
 /-- The provider side: emit `msg` with multiplicity `mult`. -/
 @[circuit_norm]
 def emit (N : ℕ) (channel : Channel F Message) (mult : Expression F)
     (msg : Message (Expression F)) : Circuit F Unit := fun _ =>
-  ((), [.interact ⟨counted N channel, .push, mult, toElements msg⟩])
+  ((), [.interact ⟨countedCharged N channel, .push, mult, toElements msg⟩])
 
 instance {N : ℕ} {channel : Channel F Message} {count : Expression F} :
     ExplicitCircuits (F := F) (pullIf N channel count) where
   output _ _ := ()
   localLength _ _ := 0
-  operations msg _ := [.interact ⟨counted N channel, .pull, count, toElements msg⟩]
-  channelsWithGuarantees _ _ := [counted N channel]
+  operations msg _ := [.interact ⟨countedCharged N channel, .pull, count, toElements msg⟩]
+  channelsWithGuarantees _ _ := [countedCharged N channel]
 
 instance {N : ℕ} {channel : Channel F Message} {mult : Expression F} :
     ExplicitCircuits (F := F) (emit N channel mult) where
   output _ _ := ()
   localLength _ _ := 0
-  operations msg _ := [.interact ⟨counted N channel, .push, mult, toElements msg⟩]
+  operations msg _ := [.interact ⟨countedCharged N channel, .push, mult, toElements msg⟩]
   channelsWithGuarantees _ _ := []
 
 attribute [explicit_circuit_no_unfold] pullIf emit
@@ -76,8 +83,9 @@ multiplicity is not a count. -/
 def PushLike (N : ℕ) (i : Interaction F) : Prop :=
   i.mult ≠ 0 ∧ (i.direction = .pull → ¬ IsPull N i.mult)
 
-/-- `RawChannel.Normal` with the pull multiplicity `1` widened to `1, …, N`. -/
-class Normal (N : ℕ) (channel : RawChannel F) : Prop where
+/-- `RawChannel.Normal` with the pull multiplicity `1` widened to `1, …, N`. Named apart from
+Clean's class because both are in scope here, and `channel.Normal` means Clean's. -/
+class CountedNormal (N : ℕ) (channel : RawChannel F) : Prop where
   grts_of_reqs : ∀ (msg : Vector F channel.arity) (direction : Channel.Direction) (mult : F) data,
     mult ≠ 0 → (direction = .pull → ¬ IsPull N mult) →
     channel.Requirements direction mult msg data →
@@ -85,15 +93,15 @@ class Normal (N : ℕ) (channel : RawChannel F) : Prop where
   grts_of_not_pull : ∀ (msg : Vector F channel.arity) (mult : F) data, ¬ IsPull N mult →
     channel.Guarantees mult msg data
 
-instance (N : ℕ) (channel : Channel F Message) : Normal N (counted N channel) where
+instance (N : ℕ) (channel : Channel F Message) : CountedNormal N (countedCharged N channel) where
   grts_of_reqs := by
     intro msg direction mult data h0 hnp reqs mult' hp
-    cases direction <;> simp only [counted] at reqs ⊢
+    cases direction <;> simp only [countedCharged] at reqs ⊢
     · exact fun _ => reqs h0
     · exact fun _ => reqs h0 (hnp rfl)
   grts_of_not_pull := by
     intro msg mult data hnp
-    simp only [counted]
+    simp only [countedCharged]
     exact fun hp => absurd hp hnp
 
 /-- On a message whose nonzero multiplicities are all counted pulls, the balance is minus a
@@ -170,7 +178,7 @@ theorem exists_push_of_pull (N : ℕ) (interactions : List (Interaction F))
     omega
 
 /-- `RawChannel.Consistent` for a counted channel, under the stronger balance premise. -/
-theorem consistent (N : ℕ) (channel : RawChannel F) [Normal N channel]
+theorem consistent (N : ℕ) (channel : RawChannel F) [CountedNormal N channel]
     (interactions : List (Interaction F)) (data : ProverData F)
     (bound : N * interactions.length < ringChar F ∨ ringChar F = 0)
     (balance : ∀ msg, balanceOf interactions msg = 0)
@@ -183,10 +191,10 @@ theorem consistent (N : ℕ) (channel : RawChannel F) [Normal N channel]
   have a_msg_size : a.msg.size = channel.arity := by rw [a.same_size, a_channel_eq]
   suffices channel.Guarantees a.mult ⟨a.msg, a_msg_size⟩ data by convert this
   by_cases a_pull : IsPull N a.mult
-  case neg => exact Normal.grts_of_not_pull ⟨a.msg, a_msg_size⟩ a.mult data a_pull
+  case neg => exact CountedNormal.grts_of_not_pull ⟨a.msg, a_msg_size⟩ a.mult data a_pull
   obtain ⟨b, b_mem, b_msg_eq, b_ne_zero, b_not_pull⟩ :=
     exists_push_of_pull N interactions bound balance a a_mem hdir a_pull
-  apply Normal.grts_of_reqs ⟨a.msg, a_msg_size⟩ b.direction b.mult data b_ne_zero b_not_pull _
+  apply CountedNormal.grts_of_reqs ⟨a.msg, a_msg_size⟩ b.direction b.mult data b_ne_zero b_not_pull _
     a.mult a_pull
   have ⟨b_channel_eq, b_reqs⟩ := reqs _ b_mem
   symm at b_channel_eq
@@ -203,22 +211,22 @@ lemma isPull_one_iff (mult : F) : IsPull 1 mult ↔ mult = 1 := by
     subst this; simp
   · rintro rfl; exact ⟨1, le_rfl, le_rfl, by simp⟩
 
-instance (channel : Channel F Message) : (counted 1 channel).Normal where
+instance (channel : Channel F Message) : (countedCharged 1 channel).Normal where
   guarantees_of_requirements := by
     rintro ⟨_, a_direction, a_mult, a_msg, a_size⟩ ⟨_, b_direction, b_mult, b_msg, b_size⟩
       data rfl rfl (rfl : a_msg = b_msg) a_pull ⟨b_ne_zero, b_not_one⟩ b_reqs
     cases b_direction <;>
-      simp only [Interaction.Guarantees, Interaction.Requirements, Interaction.msgVector, counted,
+      simp only [Interaction.Guarantees, Interaction.Requirements, Interaction.msgVector, countedCharged,
         isPull_one_iff] at b_reqs ⊢
     · exact fun _ _ => b_reqs b_ne_zero
     · exact fun _ _ => b_reqs b_ne_zero (b_not_one rfl)
   guarantees_of_not_pull := by
     rintro ⟨_, direction, mult, msg, size⟩ data rfl not_pull
     simp only [Interaction.Pull, not_and] at not_pull
-    simp only [Interaction.Guarantees, counted, isPull_one_iff]
+    simp only [Interaction.Guarantees, countedCharged, isPull_one_iff]
     exact fun h_direction h_mult => absurd h_mult (not_pull h_direction)
 
-example (channel : Channel F Message) : (counted 1 channel).Consistent := inferInstance
+example (channel : Channel F Message) : (countedCharged 1 channel).Consistent := inferInstance
 
 end LambdaVM.Counted
 
@@ -233,10 +241,10 @@ pull of `N` as a push of the message, so the pull of `1` is matched; the counted
 both as pulls, and the guarantee of the second is false. -/
 theorem not_consistent (N : ℕ) (hN : 2 ≤ N) (hN' : N ≤ 255)
     (channel : Channel (F p) Message) (m : Message (F p)) (data : ProverData (F p))
-    (hm : ¬ channel.Guarantees m data) : ¬ (counted N channel).Consistent := by
+    (hm : ¬ channel.Guarantees m data) : ¬ (countedCharged N channel).Consistent := by
   rintro ⟨hc⟩
   let mk : F p → Interaction (F p) := fun mult =>
-    ⟨counted N channel, .pull, mult, (toElements m).toArray, by simp [counted]⟩
+    ⟨countedCharged N channel, .pull, mult, (toElements m).toArray, by simp [countedCharged]⟩
   let l := [mk (N : F p), mk 1]
   have hval : ((N : ℕ) : F p).val = N := ZMod.val_natCast_of_lt (lt_p_of_lt_two_pow_40 (by omega))
   have hN0 : (N : F p) ≠ 0 := by
@@ -258,24 +266,51 @@ theorem not_consistent (N : ℕ) (hN : 2 ≤ N) (hN' : N ≤ 255)
         · exact hN0 h
         · exact hN1 h
       · simp [activeCount, l, mk, hmsg]
-  have hreqs : ∀ i ∈ l, i.channel = counted N channel ∧ i.Requirements data := by
+  have hreqs : ∀ i ∈ l, i.channel = countedCharged N channel ∧ i.Requirements data := by
     intro i hi
     simp only [l, List.mem_cons, List.not_mem_nil, or_false] at hi
     rcases hi with rfl | rfl
     · refine ⟨rfl, ?_⟩
-      simp only [Interaction.Requirements, mk, counted, Interaction.msgVector]
+      simp only [Interaction.Requirements, mk, countedCharged, Interaction.msgVector]
       intro _ hnp
       exact absurd ⟨N, by omega, le_rfl, rfl⟩ hnp
     · refine ⟨rfl, ?_⟩
-      simp only [Interaction.Requirements, mk, counted, Interaction.msgVector]
+      simp only [Interaction.Requirements, mk, countedCharged, Interaction.msgVector]
       intro _ hnp
       exact absurd ⟨1, le_rfl, by omega, by simp⟩ hnp
   have hg := hc l data hbal hreqs (mk 1) (by simp [l])
-  simp only [Interaction.Guarantees, mk, counted, Interaction.msgVector] at hg
+  simp only [Interaction.Guarantees, mk, countedCharged, Interaction.msgVector] at hg
   apply hm
   have h := hg trivial ⟨1, le_rfl, by omega, by simp⟩
   convert h
   simp [ProvableType.fromElements_toElements]
+
+/-- With the bounded balance of the modified Clean (`BalancedUpTo N`, the premise `not_consistent`
+asks for), the counted channel is consistent: a pull of `1, …, N` is matched by an interaction
+that is not such a pull, and that interaction's requirement is the guarantee. -/
+instance consistentUpTo (N : ℕ) (channel : Channel (F p) Message) :
+    (countedCharged N channel).ConsistentUpTo N where
+  consistent interactions data balanced reqs a a_mem := by
+    obtain ⟨ a_channel, - ⟩ := reqs a a_mem
+    by_cases a_pull : a.PullUpTo N
+    case neg =>
+      rcases a with ⟨ _, a_direction, a_mult, a_msg, a_size ⟩
+      subst a_channel
+      simp only [Interaction.Guarantees, countedCharged]
+      exact fun h_direction h_count => absurd ⟨ h_direction, h_count ⟩ a_pull
+    obtain ⟨ b, b_mem, b_msg, b_ne_zero, b_not_pull ⟩ := balanced.matchedUpTo a a_mem a_pull
+    obtain ⟨ b_channel, b_reqs ⟩ := reqs b b_mem
+    rcases a with ⟨ _, a_direction, a_mult, a_msg, a_size ⟩
+    rcases b with ⟨ _, b_direction, b_mult, b_msg', b_size ⟩
+    subst a_channel b_channel
+    simp only at b_msg
+    subst b_msg
+    simp only [Interaction.Guarantees, Interaction.Requirements, Interaction.msgVector,
+      countedCharged] at b_reqs ⊢
+    intro _ _
+    cases b_direction with
+    | push => exact b_reqs b_ne_zero
+    | pull => exact b_reqs b_ne_zero (b_not_pull rfl)
 
 end LambdaVM.Counted
 
@@ -302,13 +337,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   main
   Spec r _ _ := r.mu ≠ 0 → r.x.val < 65536
   ProverAssumptions r _ _ := r.mu.val < 256 ∧ r.x.val < 65536
-  channelsWithRequirements := [counted 255 IsHalf]
+  channelsWithRequirements := [countedCharged 255 IsHalf]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨mu, x⟩ := input_var
     simp only [circuit_norm, main, pullIf, areBytesTable]
     grind
   soundness := by
-    circuit_proof_start [main, pullIf, counted, areBytesTable, isHalfTable]
+    circuit_proof_start [main, pullIf, countedCharged, areBytesTable, isHalfTable]
     simp only [AbstractInteraction.Guarantees, AbstractInteraction.Requirements, circuit_norm,
       h_input] at h_holds ⊢
     obtain ⟨⟨h_mu, _⟩, h_x⟩ := h_holds
@@ -319,7 +354,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     refine ⟨fun h0 => h_x (key h0), fun h0 hnp => absurd (key ?_) hnp⟩
     exact h0
   completeness := by
-    circuit_proof_start [main, pullIf, counted, areBytesTable, isHalfTable]
+    circuit_proof_start [main, pullIf, countedCharged, areBytesTable, isHalfTable]
     simp only [AbstractInteraction.Guarantees, circuit_norm, h_input]
     exact ⟨⟨h_assumptions.1, by rw [ZMod.val_zero]; norm_num⟩, fun _ => h_assumptions.2⟩
 
