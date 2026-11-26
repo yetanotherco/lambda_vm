@@ -2528,7 +2528,10 @@ const MAX_WALKERS: usize = 8;
 
 /// The walkers a run takes when `LAMBDA_VM_BLOCK_WALKERS` is unset: the most
 /// whose memory was measured on the largest blocks.
-const DEFAULT_WALKERS: usize = 4;
+const DEFAULT_WALKERS: usize = 6;
+
+/// The walkers `auto` takes below the fifth walker's thread threshold.
+const AUTO_SMALL_WALKERS: usize = 4;
 
 /// The hardware threads from which [`walkers_for_threads`] takes a fifth
 /// walker.
@@ -2536,14 +2539,14 @@ const FIFTH_WALKER_THREADS: usize = 24;
 
 /// The walkers `LAMBDA_VM_BLOCK_WALKERS=auto` takes on a process that sees
 /// `threads` hardware threads: five from [`FIFTH_WALKER_THREADS`] on, else
-/// [`DEFAULT_WALKERS`]. Beside a fifth walker the executor paces the windows
+/// [`AUTO_SMALL_WALKERS`]. Beside a fifth walker the executor paces the windows
 /// on a large box; below, the walkers would take the threads the rest of the
 /// build needs.
 fn walkers_for_threads(threads: usize) -> usize {
     if threads >= FIFTH_WALKER_THREADS {
         5
     } else {
-        DEFAULT_WALKERS
+        AUTO_SMALL_WALKERS
     }
 }
 
@@ -2566,7 +2569,7 @@ fn block_walkers() -> Result<usize, Error> {
     if value.as_deref().map(str::trim) == Some("auto") {
         eprintln!(
             "★ BLOCK WALKERS RULE: auto: {walkers} walkers on {threads} hardware threads \
-             (5 from {FIFTH_WALKER_THREADS} on, else {DEFAULT_WALKERS}) (LAMBDA_VM_BLOCK_WALKERS)"
+             (5 from {FIFTH_WALKER_THREADS} on, else {AUTO_SMALL_WALKERS}) (LAMBDA_VM_BLOCK_WALKERS)"
         );
     }
     Ok(walkers)
@@ -3325,46 +3328,47 @@ fn parse_word_stream(value: Option<&str>) -> Result<bool, Error> {
 /// the same under every one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WordChunks {
-    /// `copy` (the default): every window's rows appended to one list a
+    /// `copy`: every window's rows appended to one list a
     /// family, each chunk copied out of its front.
     Copy,
-    /// `part`: the windows' lists kept as they are, each chunk handed out as
-    /// the parts its rows lie in
+    /// `part` (the default where supported): the windows' lists kept as they
+    /// are, each chunk handed out as the parts its rows lie in
     /// ([`WindowedTraceBuilder::word_chunks_in_place`]).
     Parts,
 }
 
-/// `LAMBDA_VM_WORD_CHUNKS`'s reading: unset, empty or `copy` (the default),
-/// [`WordChunks::Copy`]; `part`, [`WordChunks::Parts`]. Anything else refuses
-/// the prove.
-fn parse_word_chunks(value: Option<&str>) -> Result<WordChunks, Error> {
+/// `LAMBDA_VM_WORD_CHUNKS`'s reading: unset or empty selects the default for
+/// the run, `copy` and `part` explicitly select a mode. Anything else
+/// refuses the prove.
+fn parse_word_chunks(value: Option<&str>) -> Result<Option<WordChunks>, Error> {
     match value.map(str::trim) {
-        None | Some("" | "copy") => Ok(WordChunks::Copy),
-        Some("part") => Ok(WordChunks::Parts),
+        None | Some("") => Ok(None),
+        Some("copy") => Ok(Some(WordChunks::Copy)),
+        Some("part") => Ok(Some(WordChunks::Parts)),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_WORD_CHUNKS={v}: copy (the default: each chunk copied out of one list a \
-             family) or part (each chunk handed out as the windows' parts its rows lie in)"
+            "LAMBDA_VM_WORD_CHUNKS={v}: copy (each chunk copied out of one list a family) or \
+             part (the default where supported: each chunk handed out as the windows' parts its \
+             rows lie in)"
         ))),
     }
 }
 
-/// [`WordChunks::Parts`] hands out the word families' streamed chunks, so it
-/// runs only where they stream: the word memory format with its families cut
-/// as the walk fills them and the streamed ops dropped as handed out. Refused
-/// elsewhere, never ignored.
-fn refuse_word_chunks(
-    chunks: WordChunks,
+/// Default to handing out parts where the word families stream and their ops
+/// are dropped as handed out. An explicit request for parts requires both.
+fn resolve_word_chunks(
+    chunks: Option<WordChunks>,
     word_stream: bool,
     drop_streamed_ops: bool,
-) -> Result<(), Error> {
-    if chunks == WordChunks::Parts && !(word_stream && drop_streamed_ops) {
-        return Err(Error::Prover(format!(
+) -> Result<WordChunks, Error> {
+    match (chunks, word_stream && drop_streamed_ops) {
+        (None | Some(WordChunks::Parts), true) => Ok(WordChunks::Parts),
+        (None, false) | (Some(WordChunks::Copy), _) => Ok(WordChunks::Copy),
+        (Some(WordChunks::Parts), false) => Err(Error::Prover(format!(
             "LAMBDA_VM_WORD_CHUNKS=part needs the word families streamed (the word memory \
              format and LAMBDA_VM_WORD_STREAM on: {word_stream}) and the streamed ops dropped as \
              handed out ({drop_streamed_ops})"
-        )));
+        ))),
     }
-    Ok(())
 }
 
 /// `LAMBDA_VM_LIGHT_WALK`: the walkers' light walk
@@ -9846,21 +9850,20 @@ fn prove_streamed(
             }
         );
     }
-    // How the streamed word families' chunks leave the walk: a word it does
-    // not take refuses the prove, and so does `part` where they do not stream.
-    // The chunks, and so the tables, are the same either way.
+    // The streamed word chunks leave the walk in parts where supported.
+    // Explicit requests for parts need streaming and dropped ops.
     let word_chunks = match deviations.word_chunks {
-        Some(chunks) => chunks,
+        Some(chunks) => Some(chunks),
         None => parse_word_chunks(std::env::var("LAMBDA_VM_WORD_CHUNKS").ok().as_deref())?,
     };
-    refuse_word_chunks(word_chunks, word_stream, options.drop_streamed_ops)?;
+    let word_chunks = resolve_word_chunks(word_chunks, word_stream, options.drop_streamed_ops)?;
     if word_stream {
         eprintln!(
             "★ BLOCK WORD CHUNKS: {} (LAMBDA_VM_WORD_CHUNKS)",
             match word_chunks {
-                WordChunks::Copy => "copy: each chunk copied out of one list a family, the default",
+                WordChunks::Copy => "copy: each chunk copied out of one list a family",
                 WordChunks::Parts =>
-                    "part: each chunk handed out as the windows' parts its rows lie in",
+                    "part: each chunk handed out as the windows' parts its rows lie in, the default",
             }
         );
     }
@@ -14448,22 +14451,21 @@ mod producer_report_tests {
     use super::{
         WordChunks, exec_mode_from, parse_exec_history, parse_exec_history_check,
         parse_exec_stream, parse_light_walk, parse_word_chunks, parse_word_stream,
-        refuse_lean_stream, refuse_word_chunks, resolve_exec_stream,
+        refuse_lean_stream, resolve_exec_stream, resolve_word_chunks,
     };
     use crate::Error;
 
-    /// `LAMBDA_VM_WORD_CHUNKS`: copied unless `part`; any other word refused
-    /// (the branch's `card` among them: not on this line). `part` is refused
-    /// unless the word families stream with their ops dropped as handed out;
-    /// `copy` runs anywhere.
+    /// The default hands out parts when the word families stream and their
+    /// ops are dropped as handed out. `copy` works in either case.
     #[test]
-    fn the_word_chunks_are_copied_unless_handed_out_in_parts() {
+    fn the_word_chunks_default_to_parts_where_supported() {
         for (word, chunks) in [
-            (None, WordChunks::Copy),
-            (Some(""), WordChunks::Copy),
-            (Some(" copy "), WordChunks::Copy),
-            (Some("part"), WordChunks::Parts),
-            (Some(" part "), WordChunks::Parts),
+            (None, None),
+            (Some(""), None),
+            (Some(" "), None),
+            (Some(" copy "), Some(WordChunks::Copy)),
+            (Some("part"), Some(WordChunks::Parts)),
+            (Some(" part "), Some(WordChunks::Parts)),
         ] {
             assert_eq!(parse_word_chunks(word).ok(), Some(chunks), "{word:?}");
         }
@@ -14472,9 +14474,18 @@ mod producer_report_tests {
         }
         for stream in [false, true] {
             for drop in [false, true] {
-                assert!(refuse_word_chunks(WordChunks::Copy, stream, drop).is_ok());
+                let default = if stream && drop {
+                    WordChunks::Parts
+                } else {
+                    WordChunks::Copy
+                };
+                assert_eq!(resolve_word_chunks(None, stream, drop).ok(), Some(default));
                 assert_eq!(
-                    refuse_word_chunks(WordChunks::Parts, stream, drop).is_ok(),
+                    resolve_word_chunks(Some(WordChunks::Copy), stream, drop).ok(),
+                    Some(WordChunks::Copy)
+                );
+                assert_eq!(
+                    resolve_word_chunks(Some(WordChunks::Parts), stream, drop).is_ok(),
                     stream && drop,
                     "part, stream {stream}, drop {drop}"
                 );
@@ -15040,8 +15051,8 @@ mod packer_tests {
 #[cfg(test)]
 mod walkers_knob_tests {
     use super::{
-        CardFill, DEFAULT_WALKERS, Error, MAX_WALKERS, hardware_threads, parse_card_fill,
-        parse_walkers, parse_walkers_on, records_admission, walkers_for_threads,
+        CardFill, Error, MAX_WALKERS, hardware_threads, parse_card_fill, parse_walkers,
+        parse_walkers_on, records_admission, walkers_for_threads,
     };
 
     /// Streamed chunks are held as records only with live regeneration to drop
@@ -15073,15 +15084,15 @@ mod walkers_knob_tests {
         );
     }
 
-    /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is four walkers (the
+    /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is six walkers (the
     /// default); 0 one walker (the rollback); 1 to 8 that many; any other
     /// word refuses the prove.
     #[test]
-    fn the_walkers_knob_defaults_to_4_takes_0_to_8_and_refuses_anything_else() {
+    fn the_walkers_knob_defaults_to_6_takes_0_to_8_and_refuses_anything_else() {
         for (value, walkers) in [
-            (None, 4),
-            (Some(""), 4),
-            (Some(" "), 4),
+            (None, 6),
+            (Some(""), 6),
+            (Some(" "), 6),
             (Some("0"), 0),
             (Some("1"), 1),
             (Some(" 3 "), 3),
@@ -15098,7 +15109,7 @@ mod walkers_knob_tests {
     }
 
     /// `LAMBDA_VM_BLOCK_WALKERS=auto`: five walkers from 24 hardware threads
-    /// on, four below; unset stays four on any box, and a count overrides the
+    /// on, four below; unset takes six on any box, and a count overrides the
     /// rule.
     #[test]
     fn the_walkers_rule_takes_5_from_24_threads_and_4_below() {
@@ -15115,10 +15126,10 @@ mod walkers_knob_tests {
             );
             assert_eq!(
                 parse_walkers_on(None, threads).ok(),
-                Some(DEFAULT_WALKERS),
+                Some(6),
                 "unset on {threads}"
             );
-            assert_eq!(parse_walkers_on(Some("6"), threads).ok(), Some(6));
+            assert_eq!(parse_walkers_on(Some("4"), threads).ok(), Some(4));
         }
         assert!(walkers_for_threads(hardware_threads()) <= MAX_WALKERS);
     }

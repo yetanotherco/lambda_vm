@@ -1,8 +1,8 @@
-//! ★ `LAMBDA_VM_WORD_CHUNKS=part` on real block proves: a word block whose
+//! ★ The default word chunks on real block proves: a word block whose
 //! streamed word families' chunks are handed out as the windows' parts their
 //! rows lie in is the block whose chunks are copied out of one list a family
-//! (the default), alone and beside the host build's other levers (the serial
-//! host work hoisted, every walk cut, both finish steps, the executor's lean
+//! (`LAMBDA_VM_WORD_CHUNKS=copy`), alone and beside the host build's other
+//! levers (the serial host work hoisted, every walk cut, both finish steps, the executor's lean
 //! stream), and with live regeneration rebuilding every streamed chunk
 //! (`RegenMode::Always`): the same partition, heights, counts, word tables,
 //! output and group roots, every proof verifies, and under the deterministic
@@ -152,9 +152,58 @@ fn the_word_chunks_in_parts_prove_the_same_block() {
     }
 }
 
-/// `part` where the word families do not stream is refused, never ignored:
-/// under the split memory format, with the word stream off, and without the
-/// streamed ops dropped as handed out. `copy` proves there.
+/// The production defaults preserve the bytes of both explicit opt-outs.
+#[test]
+#[ignore = "box tier, run alone with deterministic grind and fixed trace hash"]
+fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
+    assert!(crypto::grinding::deterministic());
+    assert_eq!(
+        std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
+        Ok("1")
+    );
+    for knob in ["LAMBDA_VM_WORD_CHUNKS", "LAMBDA_VM_BLOCK_WALKERS"] {
+        assert!(std::env::var_os(knob).is_none(), "run with {knob} unset");
+    }
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let opts = ProofOptions::default_test_options();
+    let format = BlockFormat::production()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
+    let tiny = MaxRowsConfig {
+        mem_load: 4,
+        mem_store: 4,
+        ..MaxRowsConfig::small()
+    };
+    let mut options = super::block_whir_tests::streamed(tiny, 3, 4);
+    options.drop_streamed_ops = true;
+    let prove = |word_chunks, walkers| {
+        let (proof, _) = prove_block_whir_with(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &options,
+            &Deviations {
+                word_chunks,
+                walkers,
+                ..Deviations::default()
+            },
+        )
+        .expect("the word block proves");
+        assert!(
+            proof.word_memory.iter().any(|&n| n > 1),
+            "the walk hands out word chunks"
+        );
+        assert!(verify_block_whir(&proof, &elf, &opts, &format).expect("verify runs"));
+        bytes(&proof)
+    };
+    let default = prove(None, None);
+    assert_eq!(prove(Some(WordChunks::Copy), None), default, "copy");
+    assert_eq!(prove(None, Some(4)), default, "four walkers");
+}
+
+/// Explicit `part` requires streamed and dropped word rows. The default
+/// also handles split memory, the word stream off, and kept ops.
 #[test]
 fn the_word_chunks_in_parts_are_refused_where_the_word_families_do_not_stream() {
     let elf = asm_elf_bytes("fused_mem_cases");
@@ -183,7 +232,7 @@ fn the_word_chunks_in_parts_are_refused_where_the_word_families_do_not_stream() 
         ("the ops kept", words, kept(), Some(true)),
     ];
     for (what, format, options, stream) in cases {
-        let with = |chunks: WordChunks| {
+        let with = |chunks: Option<WordChunks>| {
             prove_block_whir_with(
                 &elf,
                 &[],
@@ -192,17 +241,17 @@ fn the_word_chunks_in_parts_are_refused_where_the_word_families_do_not_stream() 
                 &options,
                 &Deviations {
                     word_stream: stream,
-                    word_chunks: Some(chunks),
+                    word_chunks: chunks,
                     ..Deviations::default()
                 },
             )
             .map(|_| ())
         };
-        let err = with(WordChunks::Parts);
+        let err = with(Some(WordChunks::Parts));
         assert!(
             matches!(&err, Err(crate::Error::Prover(m)) if m.contains("LAMBDA_VM_WORD_CHUNKS=part needs")),
             "{what}: {err:?}"
         );
-        assert!(with(WordChunks::Copy).is_ok(), "{what}: copy proves");
+        assert!(with(None).is_ok(), "{what}: the default proves");
     }
 }
