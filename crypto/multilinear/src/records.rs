@@ -908,20 +908,32 @@ impl Records {
 /// rebuilt a table's records digests them before it fills the table from
 /// them.
 pub fn digest_of(records: &dyn TableRecords) -> [u64; 2] {
+    digest_word_stream(
+        [
+            records.rows() as u64,
+            records.cols() as u64,
+            records.bytes() as u64,
+            0x243f_6a88_85a3_08d3,
+        ],
+        |each| records.fill().words(each),
+    )
+}
+
+/// An order-sensitive, non-cryptographic digest for witness parity.
+/// Every word is visited. Proof verification authenticates the actual witness.
+pub fn digest_words(feed: impl FnOnce(&mut dyn FnMut(u64))) -> [u64; 2] {
+    digest_word_stream([0, 0, 0, 0x243f_6a88_85a3_08d3], feed)
+}
+
+fn digest_word_stream(mut lanes: [u64; 4], feed: impl FnOnce(&mut dyn FnMut(u64))) -> [u64; 2] {
     const K: [u64; 4] = [
         0x9e37_79b9_7f4a_7c15,
         0xc2b2_ae3d_27d4_eb4f,
         0x1656_67b1_9e37_79f9,
         0x85eb_ca77_c2b2_ae63,
     ];
-    let mut lanes = [
-        records.rows() as u64,
-        records.cols() as u64,
-        records.bytes() as u64,
-        0x243f_6a88_85a3_08d3,
-    ];
     let mut i = 0usize;
-    records.fill().words(|w| {
+    feed(&mut |w| {
         let l = i % 4;
         lanes[l] = (lanes[l] ^ w).wrapping_mul(K[l]).rotate_left(31);
         i += 1;

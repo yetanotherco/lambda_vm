@@ -190,7 +190,7 @@ pub fn top_path_counts() -> (u64, u64) {
 /// depth less the tallest cap it may be asked for.
 ///
 /// ★ A PROVER-SIDE MEMORY CHOICE, NOT A FORMAT ONE (see [`TreeTop`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TreeDrop {
     pub device: usize,
     pub host: usize,

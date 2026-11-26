@@ -71,6 +71,7 @@
 
 mod inproc;
 pub use inproc::InprocWorkers;
+pub mod replica;
 #[cfg(test)]
 pub(crate) use inproc::WorkerFault;
 use inproc::{Committed, GroupParts, GroupShape, InprocRequest};
@@ -1168,7 +1169,9 @@ pub fn absorb_roots_and_answers<E, T>(
 /// The proof is the same byte for byte under every choice: a narrow table
 /// keeps its raw words, each column at the bytes its largest needs (1, 2, 4 or
 /// 8), and the card widens them back into the store phase B reads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum Narrowing {
     /// As field elements, eight bytes a cell.
     #[default]
@@ -2403,7 +2406,9 @@ impl Default for ArgueDeviation {
 /// ([`BlockCommitted::with_phase_b_overlap`]). The proof is the same byte for
 /// byte either way: each group proves on its own fork `S_post ‖ g`, so only
 /// when its openings run moves.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum PhaseBOverlap {
     /// One group at a time: its argue, then its openings.
     #[default]
@@ -5345,6 +5350,41 @@ where
         + Default
         + 'static,
 {
+    block_prove_with_front::<F, E, T, H>(
+        committed, config, transcript, prepared, deviations, fork_of, argue, on_group, order,
+        reorder, None,
+    )
+}
+
+// A replica already replayed the global front. The lane still uses the
+// one group's own roots and answers for commit-time and local lookups.
+#[allow(clippy::too_many_arguments)]
+fn block_prove_with_front<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    fork_of: &dyn Fn(usize) -> usize,
+    argue: &ArgueDeviation,
+    on_group: &(dyn Fn(GroupOpened<'_, F, E>) + Sync),
+    order: &[usize],
+    reorder: Option<&PhaseBReorder<'_>>,
+    replica_challenges: Option<inproc::Challenges<E>>,
+) -> Result<BlockProved<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Send
+        + Default
+        + 'static,
+{
     let BlockCommitted {
         mut tables,
         sizes,
@@ -5435,11 +5475,13 @@ where
         root_at += trees;
         answer_at += claims.answers.len();
     }
+    let replica = replica_challenges.is_some();
     let mut verification_inputs = None;
     let (roots, answers, (z, alpha, beta), remote_workers, remote_results) = match inproc {
         None => {
-            let challenges =
-                absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers);
+            let challenges = replica_challenges.unwrap_or_else(|| {
+                absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers)
+            });
             (roots, answers, challenges, None, None)
         }
         Some(request) => {
@@ -6123,7 +6165,7 @@ where
                                             }
                                             None => {
                                                 let (z_g, alpha_g, own) = local_challenges::<E, T>(
-                                                    g,
+                                                    if replica { forks[g] } else { g },
                                                     group_layout,
                                                     group_roots,
                                                     group_answers,

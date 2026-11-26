@@ -37,7 +37,7 @@ use crate::tables::trace_builder::{ChunkJob, RegenBuilder, RegenFamily, RestRege
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// What phase B does with the streamed chunks (`LAMBDA_VM_BLOCK_REGEN`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RegenMode {
     /// `off` (and unset): nothing is recorded or regenerated.
     Off,
@@ -65,7 +65,7 @@ impl RegenMode {
 /// value is refused (an error, never a panic). The production default is
 /// `auto` when the knob is unset ([`production_regen`]).
 pub(crate) fn regen_mode() -> Result<RegenMode, Error> {
-    parse_regen_mode(std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref())
+    parse_regen_mode(super::cluster::tcp::setting("LAMBDA_VM_BLOCK_REGEN").as_deref())
 }
 
 /// [`crate::block_whir::BlockOptions::production`]'s regeneration

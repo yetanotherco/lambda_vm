@@ -138,7 +138,7 @@ struct Reply<T> {
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(super) struct Committed<E: IsField> {
+pub struct Committed<E: IsField> {
     pub roots: Vec<Commitment>,
     pub answers: Vec<FieldElement<E>>,
     pub prepared_roots: Vec<Commitment>,
@@ -146,7 +146,7 @@ pub(super) struct Committed<E: IsField> {
 }
 
 impl<E: IsField> Committed<E> {
-    fn matches(&self, other: &Self) -> bool {
+    pub fn matches(&self, other: &Self) -> bool {
         self.roots == other.roots
             && self.answers == other.answers
             && self.prepared_roots == other.prepared_roots
@@ -154,19 +154,19 @@ impl<E: IsField> Committed<E> {
     }
 }
 
-type Challenges<E> = (FieldElement<E>, FieldElement<E>, FieldElement<E>);
+pub type Challenges<E> = (FieldElement<E>, FieldElement<E>, FieldElement<E>);
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct SealedPlan<E: IsField> {
+pub struct SealedPlan<E: IsField> {
     // Preserve the boundaries between the statement's append_bytes calls.
-    statement: Vec<Vec<u8>>,
-    groups: Vec<Committed<E>>,
+    pub statement: Vec<Vec<u8>>,
+    pub groups: Vec<Committed<E>>,
     // The original prepared-stack order is part of the transcript.
-    derived: Vec<Commitment>,
+    pub derived: Vec<Commitment>,
 }
 
 impl<E: IsField + 'static> SealedPlan<E> {
-    fn front(&self) -> (Vec<Commitment>, Vec<FieldElement<E>>) {
+    pub fn front(&self) -> (Vec<Commitment>, Vec<FieldElement<E>>) {
         let roots: Vec<_> = self
             .groups
             .iter()
@@ -180,7 +180,7 @@ impl<E: IsField + 'static> SealedPlan<E> {
         (roots, answers)
     }
 
-    fn replay<T: IsTranscript<E>>(&self, transcript: &mut T) -> Challenges<E> {
+    pub fn replay<T: IsTranscript<E>>(&self, transcript: &mut T) -> Challenges<E> {
         for bytes in &self.statement {
             transcript.append_bytes(bytes);
         }
@@ -188,7 +188,7 @@ impl<E: IsField + 'static> SealedPlan<E> {
         absorb_roots_answers_and_challenge(transcript, &roots, &self.derived, &answers)
     }
 
-    fn digest(&self) -> Commitment
+    pub fn digest(&self) -> Commitment
     where
         FieldElement<E>: AsBytes,
     {
@@ -228,7 +228,7 @@ struct Bind<E: IsField> {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(super) struct GroupParts<F: IsField, E: IsField> {
+pub struct GroupParts<F: IsField, E: IsField> {
     pub tables: Vec<TableProof<E>>,
     pub argue: Option<BatchedArgue<E>>,
     pub local: Option<LocalArgue<E>>,
@@ -263,7 +263,7 @@ pub(super) struct GroupDone<F: IsField, E: IsField> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct GroupShape {
+pub struct GroupShape {
     pub tables: usize,
     pub chains: usize,
     pub prepared_chains: usize,
@@ -272,7 +272,7 @@ pub(super) struct GroupShape {
 }
 
 impl GroupShape {
-    fn check<F: IsField, E: IsField>(self, parts: &GroupParts<F, E>) -> bool {
+    pub fn check<F: IsField, E: IsField>(self, parts: &GroupParts<F, E>) -> bool {
         let per_table = self.argue == ArgueFormat::PerTable;
         parts.tables.len() == if per_table { self.tables } else { 0 }
             && parts

@@ -187,7 +187,9 @@ impl StreamedCardFill {
 
 /// The tables a windowed build streams: those whose op lists grow in
 /// execution order from their first element.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum StreamTable {
     Cpu,
     MemwRegister,
@@ -1504,6 +1506,12 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// The time the windows took so far.
     pub fn stamps(&self) -> WindowStamps {
         self.stamps
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn trace_seed(mut self, seed: super::super::trace_hash::Seed) -> Self {
+        self.emitted.trace_seed = seed;
+        self
     }
 
     /// How many chunks of each streamed table have been handed out.
@@ -5628,12 +5636,26 @@ impl DeferredChunk {
                 }
             }
             fn fill(&mut self, fill: multilinear::records::RecordsFill<'_>) {
-                fill.words(|word| self.0.update(word.to_le_bytes()));
+                for word in multilinear::records::digest_words(|each| fill.words(each)) {
+                    self.0.update(word.to_le_bytes());
+                }
             }
         }
         let mut digest = Writer(Blake3Std::new());
         match &self.data {
-            DeferredChunkData::Lt(rows) => digest.records(rows),
+            DeferredChunkData::Lt(rows) => {
+                let parts = multilinear::records::digest_words(|each| {
+                    for (op, count) in rows {
+                        each(op.lhs);
+                        each(op.rhs);
+                        each(u64::from(op.signed) | (u64::from(op.invert) << 1));
+                        each(*count);
+                    }
+                });
+                for word in parts {
+                    digest.0.update(word.to_le_bytes());
+                }
+            }
             DeferredChunkData::Job(job) => match &job.ops {
                 ChunkOps::Cpu(ops, _) => digest.records(ops.iter()),
                 ChunkOps::CpuInRow(ops, sides, _) => digest.records(ops.iter().zip(sides.iter())),

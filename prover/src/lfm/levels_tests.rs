@@ -2747,21 +2747,36 @@ fn rta_last_file(
 #[ignore = "cluster archive gate: needs a real CUDA build"]
 fn cluster_stage2_test_commit_4() {
     use super::levels::{prove_block_levels, verify_block_levels_under};
+    if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF") {
+        cluster_stage4_ethrex_base(path);
+        return;
+    }
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = ProofOptions::default_test_options();
-    let run = prove_block_levels(
-        &elf,
-        &[],
-        &opts,
-        &format,
-        &streamed_options(),
-        WlfmFamily::B3,
-        LevelStop::DEFAULT,
-        true,
-        true,
-    )
-    .expect("the BLAKE3 fixture proves");
+    let prove = || {
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+    };
+    use crate::block_whir::cluster_tcp::{Topology, coordinate};
+    let start = std::time::Instant::now();
+    let result = if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY") {
+        let topology = Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
+        coordinate(&topology, prove)
+    } else {
+        prove()
+    };
+    println!("CLUSTER PROVE {:.6}s", start.elapsed().as_secs_f64());
+    let run = result.expect("the BLAKE3 fixture proves");
     assert_eq!(run.proofs.len(), 2);
     verify_block_levels_under(
         &elf,
@@ -2774,6 +2789,84 @@ fn cluster_stage2_test_commit_4() {
     )
     .expect("the verifier derives its own plan and accepts the last level");
     write_identity_files(&run, WlfmFamily::B3);
+}
+
+fn cluster_ethrex_format() -> BlockFormat {
+    let mut format = BlockFormat::pinned();
+    format.zf = format.zf.with_base(BaseFormat::B3_WHIR);
+    format
+}
+
+/// Run the actual Ethereum executor and witness finish, with test security
+/// settings. The assembly fixture covers the two recursion levels.
+fn cluster_stage4_ethrex_base(path: std::ffi::OsString) {
+    use crate::block_whir::{
+        BlockOptions, Deviations,
+        cluster_tcp::{Topology, coordinate},
+        prove_block_whir_with, verify_block_whir,
+    };
+    let elf = std::fs::read(path).expect("read ethrex guest");
+    let input = include_bytes!("../../../executor/tests/ethrex_empty_block.bin");
+    let opts = ProofOptions::default_test_options();
+    let format = cluster_ethrex_format();
+    let options = BlockOptions::production();
+    let prove = || {
+        prove_block_whir_with(
+            &elf,
+            input,
+            &opts,
+            &format,
+            &options,
+            &Deviations::default(),
+        )
+    };
+    let start = std::time::Instant::now();
+    let (proof, _) = crate::base_only::with_blake3_levels(|| {
+        if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY") {
+            let topology =
+                Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
+            coordinate(&topology, prove)
+        } else {
+            prove()
+        }
+    })
+    .expect("the Ethereum fixture proves");
+    println!("CLUSTER PROVE {:.6}s", start.elapsed().as_secs_f64());
+    assert!(
+        crate::base_only::with_blake3_levels(|| verify_block_whir(&proof, &elf, &opts, &format))
+            .unwrap()
+    );
+    if let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).unwrap();
+        std::fs::write(dir.join("base"), bytes.as_slice()).unwrap();
+    }
+}
+
+/// Worker entry point for the same fixture and binary as the coordinator.
+#[test]
+#[ignore = "cluster process worker"]
+fn cluster_stage4_worker() {
+    use crate::block_whir::cluster_tcp::{Topology, serve};
+    let path = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY").expect("worker topology");
+    let topology = Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
+    let id = std::env::var("LAMBDA_VM_TEST_CLUSTER_WORKER")
+        .expect("worker index")
+        .parse()
+        .expect("valid worker index");
+    let format = if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF").is_some() {
+        cluster_ethrex_format()
+    } else {
+        b3_format()
+    };
+    serve(
+        &topology,
+        id,
+        &ProofOptions::default_test_options(),
+        &format,
+    )
+    .expect("worker attempt");
 }
 
 /// Opt-in byte gate shared by the small fixture and the real-block harness.

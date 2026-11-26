@@ -10,6 +10,7 @@
 //! oracle (`finish_oracle`, test-only) checks.
 
 use super::*;
+use crate::tables::trace_hash::with_seed;
 
 /// What a statement reads off a build before any of its tables exists.
 #[derive(Clone)]
@@ -1750,6 +1751,7 @@ impl<'a> FinishPlan<'a> {
         // they all run in one rayon scope. Disk-spill stays sequential: its
         // generate→spill order keeps trace memory bounded.
         let cpu_ops_ref = &cpu_ops;
+        let seed = skip.trace_seed;
         let pack = skip.pack;
         // A packing build writes each table packed as it generates it where the
         // generator can (G-pack, `StreamSkip::gpack`); `packed_by` then finds it
@@ -1844,7 +1846,7 @@ impl<'a> FinishPlan<'a> {
                 skip.tails,
                 true,
                 |start, end| {
-                    let rows = lt_chunk_rows(&lt_ops, &lt_merged, start, end);
+                    let rows = with_seed(seed, || lt_chunk_rows(&lt_ops, &lt_merged, start, end));
                     packed_if(pack, lt::lt_trace_of_rows(&rows, form))
                 },
             )
@@ -1866,7 +1868,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| mul::generate_mul_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || mul::generate_mul_trace_as(ops, form))
+                }),
             )
         };
         let gen_dvrms = || {
@@ -1876,7 +1880,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| dvrm::generate_dvrm_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || dvrm::generate_dvrm_trace_as(ops, form))
+                }),
             )
         };
         let gen_branches = || {
@@ -1886,7 +1892,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| branch::generate_branch_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || branch::generate_branch_trace_as(ops, form))
+                }),
             )
         };
         // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
@@ -1908,7 +1916,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| bytewise::generate_bytewise_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || bytewise::generate_bytewise_trace_as(ops, form))
+                }),
             )
         };
         let gen_stores = || {
@@ -2509,6 +2519,15 @@ impl BitwiseWitness {
         self.histogram.counts()
     }
 
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) fn change_count(&mut self) {
+        use bitwise::{BitwiseOperation, BitwiseOperationType};
+        self.histogram.bump(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            0,
+        ));
+    }
+
     pub(crate) fn materialize(self) -> Table {
         materialize_bitwise(
             &self.histogram,
@@ -2640,11 +2659,15 @@ struct FinishDirect {
 
 fn finish_direct() -> FinishDirect {
     static DIRECT: std::sync::OnceLock<FinishDirect> = std::sync::OnceLock::new();
-    let word = |name: &str| std::env::var(name).ok();
-    *DIRECT.get_or_init(|| FinishDirect {
+    let read = |word: fn(&str) -> Option<String>| FinishDirect {
         page: page_direct_from(word("LAMBDA_VM_FINISH_PAGE_DIRECT").as_deref()),
         bitwise: word("LAMBDA_VM_FINISH_BITWISE_DIRECT").is_some_and(|v| v.trim() == "1"),
-    })
+    };
+    #[cfg(feature = "parallel")]
+    if crate::block_whir::cluster_tcp::witness_settings().is_some() {
+        return read(crate::block_whir::cluster_tcp::setting);
+    }
+    *DIRECT.get_or_init(|| read(|name| std::env::var(name).ok()))
 }
 
 /// [`finish_direct`]'s reading of `LAMBDA_VM_FINISH_PAGE_DIRECT`: unset or any
@@ -2667,6 +2690,12 @@ pub(crate) fn keccak_w_split() -> bool {
     #[cfg(test)]
     if let Some(on) = keccak_w_split_test::on() {
         return on;
+    }
+    #[cfg(feature = "parallel")]
+    if crate::block_whir::cluster_tcp::witness_settings().is_some() {
+        return keccak_w_split_from(
+            crate::block_whir::cluster_tcp::setting("LAMBDA_VM_FINISH_KECCAK_W_SPLIT").as_deref(),
+        );
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3003,6 +3032,7 @@ impl<'a> FinishPlan<'a> {
             cut_line: _,
             cpu_decoded,
         } = self;
+        let seed = skip.trace_seed;
         let pack = skip.pack;
         let gpack = pack && skip.gpack;
         let form = if gpack {
@@ -3459,7 +3489,10 @@ impl<'a> FinishPlan<'a> {
             0,
             false,
             move |ops: &[(MulOperation, bool)]| {
-                packed_if(pack, mul::generate_mul_trace_as(ops, form))
+                packed_if(
+                    pack,
+                    with_seed(seed, || mul::generate_mul_trace_as(ops, form)),
+                )
             },
         )?);
         units.extend(segmented_units(
@@ -3469,7 +3502,10 @@ impl<'a> FinishPlan<'a> {
             0,
             false,
             move |ops: &[(DvrmOperation, bool)]| {
-                packed_if(pack, dvrm::generate_dvrm_trace_as(ops, form))
+                packed_if(
+                    pack,
+                    with_seed(seed, || dvrm::generate_dvrm_trace_as(ops, form)),
+                )
             },
         )?);
         {
@@ -3481,7 +3517,7 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 move |ops: &[BranchOperation]| {
-                    let rows = dedup_rows(ops);
+                    let rows = with_seed(seed, || dedup_rows(ops));
                     if let Some(tables) = &tables {
                         let mut plane = bitwise::BitwisePlane::new();
                         count_branch_table_lookups(&rows, &mut plane);
@@ -3569,7 +3605,7 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 move |ops: &[bytewise::BytewiseOperation]| {
-                    let rows = dedup_rows(ops);
+                    let rows = with_seed(seed, || dedup_rows(ops));
                     if let Some(tables) = &tables {
                         let mut plane = bitwise::BitwisePlane::new();
                         count_bytewise_table_lookups(&rows, &mut plane);
@@ -3831,17 +3867,19 @@ fn lt_units<'a>(
         |start, end| {
             let lt = std::sync::Arc::clone(lt);
             let from_tables = from_tables.clone();
+            let seed = skip.trace_seed;
             let (merge, count_merge) = (skip.lt_merge, lt_count_merge(skip));
             Box::new(move || {
                 // The table and its lookups from one list of rows (a test's
                 // fault counts another).
-                let rows = lt.rows(start, end, merge);
+                let rows = with_seed(seed, || lt.rows(start, end, merge));
                 if count {
                     LT_ROWS_BUILT.add(rows.len(), end - start);
                 }
                 if let Some(tables) = &from_tables {
                     let mut plane = bitwise::BitwisePlane::new();
-                    let other = (count_merge != merge).then(|| lt.rows(start, end, count_merge));
+                    let other = (count_merge != merge)
+                        .then(|| with_seed(seed, || lt.rows(start, end, count_merge)));
                     count_lt_table_lookups(other.as_deref().unwrap_or(&rows), &mut plane);
                     tables.add(&plane)?;
                 }

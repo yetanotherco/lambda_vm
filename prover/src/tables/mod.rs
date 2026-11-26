@@ -180,7 +180,7 @@ pub mod max_rows {
 ///
 /// `Default` uses the production values from [`max_rows`].
 /// [`MaxRowsConfig::small`] uses 2^5 for low-memory testing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MaxRowsConfig {
     pub cpu: usize,
     pub memw: usize,

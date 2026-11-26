@@ -8099,6 +8099,7 @@ struct CollectedOps {
 /// back). All zero — every build but the windowed one — changes nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamSkip {
+    pub(crate) trace_seed: super::trace_hash::Seed,
     pub cpu: usize,
     pub memw_register: usize,
     pub memw_aligned: usize,

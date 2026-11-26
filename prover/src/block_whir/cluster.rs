@@ -1,4 +1,7 @@
-//! Canonical witness handout and host placement for the in-process cluster.
+//! Canonical witness handout and host placement.
+
+pub mod tcp;
+mod wire;
 
 use super::*;
 use crypto::hash::blake3::chain::Blake3Std;
@@ -41,9 +44,15 @@ pub(super) enum Pass<'a, 'p> {
         workers: multilinear_block::InprocWorkers,
         airs: &'a [HostAirs],
     },
+    Tcp(&'p tcp::Coordinator<'p>),
+    #[cfg(test)]
+    Measure {
+        parallel: bool,
+    },
     Worker {
         id: usize,
         plan: &'p Plan,
+        tcp: Option<&'p tcp::Worker<'p>>,
     },
 }
 
@@ -54,9 +63,10 @@ pub(super) type Owned<'a> = Vec<(usize, Committed<'a>)>;
 pub(super) enum Run<'a> {
     Proof(BlockWhirProof<LocalArgues>),
     Worker(Owned<'a>),
+    Served,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct TableDescriptor {
     key: Key,
     name: String,
@@ -69,6 +79,7 @@ pub(super) struct WitnessTable<'a> {
     air: AirRef<'a>,
     shape: (usize, usize),
     data: WitnessData,
+    digest_at_layout: Option<([u8; 32], std::time::Duration)>,
 }
 
 enum WitnessData {
@@ -91,6 +102,7 @@ impl<'a> WitnessTable<'a> {
             air,
             shape,
             data: WitnessData::Trace(trace, check),
+            digest_at_layout: None,
         }))
     }
 
@@ -104,6 +116,7 @@ impl<'a> WitnessTable<'a> {
             air,
             shape,
             data: WitnessData::Bitwise(slot.take()?),
+            digest_at_layout: None,
         })))
     }
 
@@ -119,6 +132,7 @@ impl<'a> WitnessTable<'a> {
             air,
             shape,
             data: WitnessData::Chunk(chunk, form),
+            digest_at_layout: None,
         }))
     }
 
@@ -134,6 +148,7 @@ impl<'a> WitnessTable<'a> {
             air,
             shape,
             data: WitnessData::Local(counts, fault),
+            digest_at_layout: None,
         }))
     }
 
@@ -153,7 +168,25 @@ impl<'a> WitnessTable<'a> {
         }
     }
 
+    /// Hash streamed tables on their layout workers, while the plan and
+    /// committer take earlier groups from the bounded handout.
+    pub fn hash_at_layout(&mut self) {
+        let start = Instant::now();
+        self.digest_at_layout = Some((self.hash_data(), start.elapsed()));
+    }
+
     fn describe(&self) -> TableDescriptor {
+        TableDescriptor {
+            key: self.key,
+            name: self.air.name().to_owned(),
+            shape: self.shape,
+            records: self
+                .digest_at_layout
+                .map_or_else(|| self.hash_data(), |(digest, _)| digest),
+        }
+    }
+
+    fn hash_data(&self) -> [u8; 32] {
         let mut digest = Blake3Std::new();
         match &self.data {
             WitnessData::Local(counts, fault) => {
@@ -174,13 +207,14 @@ impl<'a> WitnessTable<'a> {
             WitnessData::Trace(trace, _) => {
                 if let Some(records) = trace.records_main() {
                     digest.update(b"records");
-                    records
-                        .fill()
-                        .words(|word| digest.update(word.to_le_bytes()));
+                    for word in records.digest() {
+                        digest.update(word.to_le_bytes());
+                    }
                 } else if let Some(packed) = trace.narrow_main() {
                     digest.update(b"packed");
-                    digest.update(packed.widths());
-                    digest.update(packed.data());
+                    for word in stark::regen::digest_of(packed) {
+                        digest.update(word.to_le_bytes());
+                    }
                 } else {
                     digest.update(b"rows");
                     put_words(
@@ -190,12 +224,7 @@ impl<'a> WitnessTable<'a> {
                 }
             }
         }
-        TableDescriptor {
-            key: self.key,
-            name: self.air.name().to_owned(),
-            shape: self.shape,
-            records: digest.finalize().into(),
-        }
+        digest.finalize().into()
     }
 
     pub fn materialize(self) -> Result<CommittedTable<'a, F, E>, Error> {
@@ -222,17 +251,9 @@ impl<'a> WitnessTable<'a> {
 }
 
 fn put_words(digest: &mut Blake3Std, words: impl IntoIterator<Item = u64>) {
-    let mut bytes = [0; 4096];
-    let mut size = 0;
-    for word in words {
-        bytes[size..size + 8].copy_from_slice(&word.to_le_bytes());
-        size += 8;
-        if size == bytes.len() {
-            digest.update(bytes);
-            size = 0;
-        }
+    for part in multilinear::records::digest_words(|each| words.into_iter().for_each(each)) {
+        digest.update(part.to_le_bytes());
     }
-    digest.update(&bytes[..size]);
 }
 
 pub(super) fn local_counts(
@@ -246,6 +267,7 @@ pub(super) fn local_counts(
     local_bytes::local_counts_from_trace(trace, air.bus_interactions(), form).map_err(Error::Prover)
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(super) struct Plan {
     groups: Vec<Vec<TableDescriptor>>,
     pub owners: Vec<usize>,
@@ -254,11 +276,48 @@ pub(super) struct Plan {
     pub terminal_groups: usize,
 }
 
+#[derive(Default)]
+pub(super) struct WitnessDigest(Blake3Std);
+
+impl WitnessDigest {
+    fn group(&mut self, tables: &[TableDescriptor]) -> Result<(), Error> {
+        self.0.update((tables.len() as u64).to_le_bytes());
+        for table in tables {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(table)
+                .map_err(|e| Error::Prover(format!("archive cluster descriptor: {e}")))?;
+            self.put(&bytes);
+        }
+        Ok(())
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        self.0.update((bytes.len() as u64).to_le_bytes());
+        self.0.update(bytes);
+    }
+
+    pub fn finish(mut self, statement: &[Vec<u8>]) -> [u8; 32] {
+        self.0.update((statement.len() as u64).to_le_bytes());
+        for call in statement {
+            self.put(call);
+        }
+        self.0.finalize().into()
+    }
+}
+
 impl Plan {
+    pub fn witness_digest(&self) -> Result<[u8; 32], Error> {
+        let mut digest = WitnessDigest::default();
+        for group in &self.groups {
+            digest.group(group)?;
+        }
+        Ok(digest.finish(&self.statement))
+    }
+
     pub fn collect<'a>(
         groups: impl IntoIterator<Item = CommitAssignment<'a>>,
         workers: usize,
         pin_prepared: bool,
+        parallel_hash: bool,
     ) -> Result<Self, Error> {
         let mut plan = Self {
             groups: Vec::new(),
@@ -269,7 +328,8 @@ impl Plan {
         };
         let mut loads = vec![0u128; workers];
         let mut ready = Vec::with_capacity(workers);
-        for assignment in groups {
+        let mut parity = ParityTiming::default();
+        for mut assignment in groups {
             if assignment.index != plan.groups.len() {
                 return Err(Error::Prover(
                     "cluster coordinator handed out groups out of order".into(),
@@ -296,7 +356,8 @@ impl Plan {
                     .iter()
                     .any(|table| matches!(table.air.name(), "HALT" | "REGISTER")),
             );
-            plan.groups.push(describe(&assignment));
+            plan.groups
+                .push(parity.describe(&mut assignment, parallel_hash));
             plan.owners.push(0);
             ready.push((assignment.index, price, pinned));
             if ready.len() == workers {
@@ -304,6 +365,7 @@ impl Plan {
             }
         }
         place_ready(&mut ready, &mut loads, &mut plan.owners);
+        parity.report("coordinator");
         Ok(plan)
     }
 
@@ -312,20 +374,47 @@ impl Plan {
         worker: usize,
         groups: impl IntoIterator<Item = CommitAssignment<'a>>,
         mut commit: impl FnMut(CommitAssignment<'a>) -> Result<Committed<'a>, Error>,
+        tcp: Option<&tcp::Worker<'_>>,
         #[cfg(test)] fault: Option<Fault>,
-    ) -> Result<Owned<'a>, Error> {
+    ) -> Result<(Owned<'a>, WitnessDigest), Error> {
         let mut owned = Vec::new();
+        let mut digest = WitnessDigest::default();
         let mut seen = 0;
-        for group in groups {
+        let mut parity = ParityTiming::default();
+        for mut group in groups {
+            if let Some(tcp) = tcp {
+                tcp.check_cancelled()?;
+            }
+            #[cfg(test)]
+            if tcp.is_some()
+                && (tcp::fault_is("divergence") || tcp::fault_is("global-balance"))
+                && let Some(bitwise) =
+                    group
+                        .witness
+                        .iter_mut()
+                        .find_map(|table| match &mut table.data {
+                            WitnessData::Bitwise(bitwise) => Some(bitwise),
+                            _ => None,
+                        })
+            {
+                bitwise.change_count();
+            }
             let index = group.index;
-            let got = describe(&group);
+            let got = parity.describe(&mut group, true);
             #[cfg(test)]
             let got = if worker == 0 {
                 Fault::inject(fault, index, got)
             } else {
                 got
             };
-            if index != seen || self.groups.get(index) != Some(&got) {
+            #[cfg(test)]
+            let bypass = tcp.is_some() && tcp::bypass_witness();
+            #[cfg(not(test))]
+            let bypass = false;
+            if index != seen
+                || self.groups.get(index).is_none()
+                || (!bypass && self.groups.get(index) != Some(&got))
+            {
                 let difference = self.groups.get(index).and_then(|expected| {
                     expected.iter().zip(&got).find_map(|(a, b)| {
                         let field = if (a.key, &a.name) != (b.key, &b.name) {
@@ -351,6 +440,9 @@ impl Plan {
                     "cluster replica {worker} disagrees with coordinator on group {index} ({detail})"
                 )));
             }
+            if tcp.is_some() {
+                digest.group(&got)?;
+            }
             if self.owners[index] == worker {
                 owned.push((index, commit(group)?));
             }
@@ -362,13 +454,50 @@ impl Plan {
                 self.groups.len()
             )));
         }
-        Ok(owned)
+        parity.report(&format!("replica {worker}"));
+        Ok((owned, digest))
     }
 }
 
-fn describe(group: &CommitAssignment<'_>) -> Vec<TableDescriptor> {
-    debug_assert!(group.tables.is_empty());
-    group.witness.iter().map(WitnessTable::describe).collect()
+#[derive(Default)]
+struct ParityTiming {
+    at_layout: std::time::Duration,
+    at_admission: std::time::Duration,
+}
+
+impl ParityTiming {
+    fn describe(
+        &mut self,
+        group: &mut CommitAssignment<'_>,
+        parallel: bool,
+    ) -> Vec<TableDescriptor> {
+        debug_assert!(group.tables.is_empty());
+        self.at_layout += group
+            .witness
+            .iter()
+            .filter_map(|table| table.digest_at_layout.map(|(_, elapsed)| elapsed))
+            .sum::<std::time::Duration>();
+        let start = Instant::now();
+        let descriptors = if parallel && group.witness.len() > 1 {
+            group
+                .witness
+                .par_iter_mut()
+                .map(|table| table.describe())
+                .collect()
+        } else {
+            group.witness.iter().map(WitnessTable::describe).collect()
+        };
+        self.at_admission += start.elapsed();
+        descriptors
+    }
+
+    fn report(&self, side: &str) {
+        eprintln!(
+            "BLOCK CLUSTER PARITY: {side} {:.6}s hashing wall at admission · {:.6} summed layout thread-s",
+            self.at_admission.as_secs_f64(),
+            self.at_layout.as_secs_f64(),
+        );
+    }
 }
 
 // A bounded batch of closed groups is ready at each placement. Batch limits
@@ -533,9 +662,11 @@ mod tests {
                 0,
                 [assignment([1, 2])],
                 |_| panic!("a non-owner cannot commit"),
-                None
+                None,
+                None,
             )
             .unwrap()
+            .0
             .is_empty()
         );
         assert!(
@@ -543,9 +674,53 @@ mod tests {
                 0,
                 [assignment([2, 1])],
                 |_| panic!("a non-owner cannot commit"),
-                None
+                None,
+                None,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "large mainnet witness build and parity timing"]
+    fn cluster_parity_mainnet() {
+        let parallel = std::env::var("LAMBDA_VM_TEST_CLUSTER_SERIAL_HASH").as_deref() != Ok("1");
+        let elf =
+            std::fs::read(std::env::var_os("BLOCK_WHIR_ELF").expect("guest ELF path")).unwrap();
+        let input =
+            std::fs::read(std::env::var_os("BLOCK_WHIR_INPUT").expect("private input path"))
+                .unwrap();
+        let opts = ProofOptions::default_test_options();
+        let format = BlockFormat::pinned_with(multilinear::whir_chain::GroupFold::Indexed);
+        let options = BlockOptions::production();
+        let mut airs = HostAirs::new(&opts, &format, &options);
+        if parallel {
+            airs.stream.trace_seed = Some([0; 16]);
+        }
+        let program = Elf::load(&elf).unwrap();
+        let error = prove_streamed_on_host(
+            &program,
+            &elf,
+            &input,
+            1 << options.window_log2.unwrap(),
+            &opts,
+            &format,
+            &options,
+            &Deviations::default(),
+            Pass::Measure { parallel },
+            &airs,
+            &|_, _| {},
+            &|_| {},
+            None,
+            &mut BlockStamps::default(),
+        )
+        .err()
+        .expect("measurement stops at the sealed witness");
+        assert!(
+            error
+                .to_string()
+                .contains("cluster parity measurement complete"),
+            "{error}"
         );
     }
 
