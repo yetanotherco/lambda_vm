@@ -1601,6 +1601,11 @@ fn worker_child(
     })
 }
 
+/// Builds the join from each leaf's early artifacts. A worker's artifacts are
+/// authenticated only by the frame MAC and the plan digest they are bound to,
+/// not by their content: nothing here checks them against the leaf program;
+/// the join executing the leaf verifier over the later proof, then the file
+/// check, do.
 fn build_join_from_artifacts(
     artifacts: mpsc::Receiver<JoinArtifact>,
     owners: &[usize],
