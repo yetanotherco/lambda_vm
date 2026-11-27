@@ -3652,19 +3652,18 @@ pub fn overlap_resident() -> bool {
     })
 }
 
-/// `LAMBDA_VM_LEVELS_NARROW_STORE=1`: under [`UPLOAD_ONCE_ENV`], each retired
-/// prepared stack's store crosses the bus at the bytes its words need: packed
-/// on the host a run of one height at a time and widened on the card into the
-/// same words at the same places
+/// `LAMBDA_VM_LEVELS_NARROW_STORE` (on unless `0`): under [`UPLOAD_ONCE_ENV`],
+/// each retired prepared stack's store crosses the bus at the bytes its words
+/// need, packed on the host a run of one height at a time and widened into the
+/// same words at the same places on the card
 /// ([`multilinear_block::BlockCommitted::with_prepared_store_narrow`]), where
-/// today it crosses at 8 bytes a cell. The same proof. Only the W-LFM prover
-/// reads it. Off by default (and for any word but `1`) until its timing gate.
-/// Read once a process.
+/// the wide upload crosses at 8 bytes a cell. The same proof. Only the W-LFM
+/// prover reads it, once a process.
 pub const NARROW_STORE_ENV: &str = "LAMBDA_VM_LEVELS_NARROW_STORE";
 
-/// [`NARROW_STORE_ENV`]'s word: on only for `1`.
+/// [`NARROW_STORE_ENV`]'s word: on unless it is `0` after trimming.
 pub fn narrow_store_word(word: Option<&str>) -> bool {
-    super::wlfm_knobs::knob_word_on(word)
+    !super::wlfm_knobs::knob_word_off(word)
 }
 
 thread_local! {

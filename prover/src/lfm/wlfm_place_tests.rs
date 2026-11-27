@@ -742,20 +742,20 @@ fn the_overlap_next_columns_knob_is_named_and_on_by_default() {
     }
 }
 
-/// The narrow-store knob's name; it is off by default, and only `1` turns it
-/// on.
+/// The narrow-store knob's name and default, with `0` as the only opt-out.
 #[test]
-fn the_narrow_store_knob_is_named_and_off_by_default() {
+fn the_narrow_store_knob_is_named_and_on_by_default() {
     use super::wlfm::{NARROW_STORE_ENV, narrow_store, narrow_store_word};
     assert_eq!(NARROW_STORE_ENV, "LAMBDA_VM_LEVELS_NARROW_STORE");
     if std::env::var_os(NARROW_STORE_ENV).is_none() {
-        assert!(!narrow_store());
+        assert!(narrow_store());
     }
     for (word, on) in [
-        (None, false),
-        (Some(""), false),
+        (None, true),
+        (Some(""), true),
         (Some("0"), false),
-        (Some("yes"), false),
+        (Some(" 0 "), false),
+        (Some("yes"), true),
         (Some("1"), true),
         (Some(" 1 "), true),
     ] {
@@ -933,9 +933,10 @@ fn assert_narrow_commit_moves_no_bytes(family: WlfmFamily, place: StackPlace) {
             if card && place == StackPlace::CardRetired {
                 assert!(!used.is_empty(), "{tag} {narrow}: a store went up");
                 assert!(
-                    used.iter().all(|s| s.upload_once.prepacked == narrow
+                    used.iter().all(|s| s.upload_once.narrow == narrow
+                        && s.upload_once.prepacked == narrow
                         && (!narrow || s.upload_once.pack_secs == 0.0)),
-                    "{tag} {narrow}: the opening sent the bytes packed before"
+                    "{tag} {narrow}: the opening used the requested store format"
                 );
             } else {
                 assert!(used.is_empty(), "{tag} {narrow}: no store");

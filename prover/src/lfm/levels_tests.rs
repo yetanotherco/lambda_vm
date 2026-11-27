@@ -2433,17 +2433,19 @@ fn the_blake3_driver_with_the_planned_overlap_proves_the_same_level_bytes() {
 
 /// The BLAKE3 driver with every level's prepared stacks retired and each
 /// retired stack's columns put on the card once (`LAMBDA_VM_LEVELS_UPLOAD_ONCE`)
-/// proves the same level bytes as [`prove_levels`] does over the same base with
-/// held stacks; on a card some group used its store and none was refused.
+/// with `LAMBDA_VM_LEVELS_NARROW_STORE` forced off proves the same level bytes
+/// as [`prove_levels`] does over the same base with held stacks. On a card
+/// some group used its wide store and none was refused.
 /// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
 fn the_blake3_driver_uploading_once_proves_the_same_level_bytes() {
     use super::levels::{prove_block_levels, set_stacks_for_test};
-    use super::wlfm::{StackPlace, set_upload_once_for_test};
+    use super::wlfm::{StackPlace, set_narrow_store_for_test, set_upload_once_for_test};
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
+            set_narrow_store_for_test(None);
             set_upload_once_for_test(None);
         }
     }
@@ -2458,6 +2460,7 @@ fn the_blake3_driver_uploading_once_proves_the_same_level_bytes() {
         let _restore = Restore;
         let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
         set_upload_once_for_test(Some(true));
+        set_narrow_store_for_test(Some(false));
         prove_block_levels(
             &elf,
             &[],
@@ -2484,6 +2487,7 @@ fn the_blake3_driver_uploading_once_proves_the_same_level_bytes() {
         stamps.iter().filter(|u| u.planned_out).count()
     );
     assert_eq!(refused, 0, "no store refused by the card");
+    assert!(stamps.iter().all(|u| !u.narrow), "every store went up wide");
     if multilinear::gpu::reserve_budget() > 0 {
         assert!(
             used > 0,
@@ -2509,9 +2513,9 @@ fn the_blake3_driver_uploading_once_proves_the_same_level_bytes() {
 }
 
 /// [`the_blake3_driver_uploading_once_proves_the_same_level_bytes`] with each
-/// store sent narrow (`LAMBDA_VM_LEVELS_NARROW_STORE=1` in the process's
-/// environment, which the test refuses to run without): the same level bytes
-/// as held stacks; on a card some store went up narrow and none was refused.
+/// store sent narrow (the `LAMBDA_VM_LEVELS_NARROW_STORE` default): the same
+/// level bytes as held stacks. On a card some store went up narrow and none
+/// was refused.
 /// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
 #[test]
 #[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind, narrow store"]
@@ -2528,7 +2532,10 @@ fn the_blake3_driver_with_a_narrow_store_proves_the_same_level_bytes() {
         std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
         "the identity needs the deterministic grind"
     );
-    assert!(narrow_store(), "run with LAMBDA_VM_LEVELS_NARROW_STORE=1");
+    assert!(
+        narrow_store(),
+        "unset LAMBDA_VM_LEVELS_NARROW_STORE to run with the default"
+    );
     let format = b3_format();
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = ProofOptions::default_test_options();
