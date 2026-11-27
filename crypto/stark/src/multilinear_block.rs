@@ -4537,13 +4537,19 @@ fn prepared_revive_price(resident: bool, store: u64, over_store: u64, whole: u64
 }
 
 /// What a narrow store adds to its plan ([`store_plan_need`]): the largest
-/// run's packed bytes, at most its words', which sit on the card while that
-/// run widens; nothing for a wide store.
-fn narrow_store_staging(narrow: bool, lens: &[usize]) -> u64 {
-    if narrow {
-        multilinear::narrow::store_staging_bound(lens, multilinear::narrow::STORE_RUN_CELLS)
-    } else {
-        0
+/// run's packed bytes while it widens, bounded by its words when it has yet
+/// to be packed; nothing for a wide store.
+fn narrow_store_staging(
+    narrow: bool,
+    lens: &[usize],
+    packed: Option<&multilinear::gpu::PackedStore>,
+) -> u64 {
+    match (narrow, packed) {
+        (false, _) => 0,
+        (true, Some(packed)) => packed.staging_bytes(),
+        (true, None) => {
+            multilinear::narrow::store_staging_bound(lens, multilinear::narrow::STORE_RUN_CELLS)
+        }
     }
 }
 
@@ -4551,8 +4557,13 @@ fn narrow_store_staging(narrow: bool, lens: &[usize]) -> u64 {
 /// its openings on the store's price: the store's words, and under the narrow
 /// store the largest run's packed bytes, which sit on the card while it
 /// widens ([`narrow_store_staging`]).
-fn store_promise_bytes(words: u64, narrow: bool, lens: &[usize]) -> u64 {
-    words.saturating_add(narrow_store_staging(narrow, lens))
+fn store_promise_bytes(
+    words: u64,
+    narrow: bool,
+    lens: &[usize],
+    packed: Option<&multilinear::gpu::PackedStore>,
+) -> u64 {
+    words.saturating_add(narrow_store_staging(narrow, lens, packed))
 }
 
 /// What the admission asks of `argued`'s retired prepared stack's store:
@@ -4589,6 +4600,7 @@ where
         prepared_store_bytes(q.columns),
         argued.upload_once_narrow,
         &lens,
+        q.packed.filter(|p| p.fits(q.columns)),
     );
     let need = store_plan_need(
         promise,
@@ -4674,8 +4686,9 @@ where
     }
     let bytes = prepared_store_bytes(columns);
     let lens: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    let prepacked = packed.filter(|p| narrow && p.fits(columns));
     upload.need = store_plan_need(
-        bytes.saturating_add(narrow_store_staging(narrow, &lens)),
+        store_promise_bytes(bytes, narrow, &lens, prepacked),
         retired.revive_over_store_card_bytes(config),
         margin,
     );
@@ -4694,28 +4707,23 @@ where
             Some(room) => multilinear::gpu::upload_store_columns_in(columns, room),
             None => multilinear::gpu::upload_store_columns(columns),
         },
-        (false, true) => {
-            let prepacked = packed.filter(|p| p.fits(columns));
-            match (prepacked, promise) {
-                (Some(p), Some(room)) => multilinear::gpu::upload_packed_store_in(p, room),
-                (Some(p), None) => multilinear::gpu::upload_packed_store(p),
-                (None, Some(room)) => {
-                    multilinear::gpu::upload_store_columns_narrow_in(columns, room)
-                }
-                (None, None) => multilinear::gpu::upload_store_columns_narrow(columns),
-            }
-            .map(|(store, stamp)| {
-                upload.narrow = true;
-                upload.prepacked = prepacked.is_some();
-                upload.packed_bytes = stamp.packed_bytes;
-                upload.pack_secs = if prepacked.is_some() {
-                    0.0
-                } else {
-                    stamp.pack_secs
-                };
-                store
-            })
+        (false, true) => match (prepacked, promise) {
+            (Some(p), Some(room)) => multilinear::gpu::upload_packed_store_in(p, room),
+            (Some(p), None) => multilinear::gpu::upload_packed_store(p),
+            (None, Some(room)) => multilinear::gpu::upload_store_columns_narrow_in(columns, room),
+            (None, None) => multilinear::gpu::upload_store_columns_narrow(columns),
         }
+        .map(|(store, stamp)| {
+            upload.narrow = true;
+            upload.prepacked = prepacked.is_some();
+            upload.packed_bytes = stamp.packed_bytes;
+            upload.pack_secs = if prepacked.is_some() {
+                0.0
+            } else {
+                stamp.pack_secs
+            };
+            store
+        }),
     };
     upload.upload_secs = t.elapsed().as_secs_f64();
     match store {
@@ -7738,30 +7746,49 @@ mod upload_once_rule_tests {
         let run = multilinear::narrow::STORE_RUN_CELLS;
         let lens = vec![run / 4; 6];
         let words: u64 = lens.iter().map(|&n| n as u64 * 8).sum();
-        assert_eq!(super::store_promise_bytes(words, false, &lens), words);
+        assert_eq!(super::store_promise_bytes(words, false, &lens, None), words);
         assert_eq!(
-            super::store_promise_bytes(words, true, &lens),
+            super::store_promise_bytes(words, true, &lens, None),
             words + run as u64 * 8
         );
-        assert_eq!(super::store_promise_bytes(u64::MAX, true, &lens), u64::MAX);
+        assert_eq!(
+            super::store_promise_bytes(u64::MAX, true, &lens, None),
+            u64::MAX
+        );
     }
 
-    /// A narrow store's plan adds its largest run's words at 8 bytes (what
-    /// its packed bytes come to at most, on the card while it widens); a wide
-    /// store's adds nothing.
+    /// A narrow store's plan adds its largest run's packed bytes, or the
+    /// bound in words when there is no pack yet. A wide store adds nothing.
     #[test]
     fn a_narrow_stores_plan_holds_its_largest_run_while_it_widens() {
+        use math::field::{element::FieldElement, goldilocks::GoldilocksField};
+
         let run = multilinear::narrow::STORE_RUN_CELLS;
         // A short height, then a tall one cut into a full run and a part.
         let mut lens = vec![1usize << 10; 3];
         lens.extend(std::iter::repeat_n(run / 4, 6));
-        assert_eq!(super::narrow_store_staging(false, &lens), 0);
-        assert_eq!(super::narrow_store_staging(true, &lens), run as u64 * 8);
+        assert_eq!(super::narrow_store_staging(false, &lens, None), 0);
         assert_eq!(
-            super::narrow_store_staging(true, &lens[..3]),
+            super::narrow_store_staging(true, &lens, None),
+            run as u64 * 8
+        );
+        assert_eq!(
+            super::narrow_store_staging(true, &lens[..3], None),
             3 * (1 << 10) * 8
         );
-        assert_eq!(super::narrow_store_staging(true, &[]), 0);
+        assert_eq!(super::narrow_store_staging(true, &[], None), 0);
+
+        // The second run has fewer cells but takes more packed bytes.
+        let tall = [FieldElement::<GoldilocksField>::from(1); 16];
+        let short = [FieldElement::<GoldilocksField>::from(1 << 16); 8];
+        let lens = [tall.len(), short.len()];
+        let packed = multilinear::gpu::pack_store_fields(&[&tall, &short]).expect("packs");
+        assert_eq!(super::narrow_store_staging(false, &lens, Some(&packed)), 0);
+        assert_eq!(super::narrow_store_staging(true, &lens, Some(&packed)), 32);
+        assert_eq!(
+            super::store_promise_bytes(192, true, &lens, Some(&packed)),
+            224
+        );
     }
 }
 

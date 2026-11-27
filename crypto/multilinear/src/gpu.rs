@@ -5389,6 +5389,15 @@ impl PackedStore {
         self.runs.iter().map(|p| p.data().len() as u64).sum()
     }
 
+    /// The largest run's packed bytes, held on the card while it widens.
+    pub fn staging_bytes(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|p| p.data().len() as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The seconds the pack took.
     pub fn pack_secs(&self) -> f64 {
         self.pack_secs
