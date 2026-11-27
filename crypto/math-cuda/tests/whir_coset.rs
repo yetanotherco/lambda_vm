@@ -19,6 +19,7 @@ use std::time::Instant;
 use math_cuda::columns::DeviceColumns;
 use math_cuda::whir_coset::{
     CosetPlan, StackParts, StackSlices, coset_openings, evaluate_resident, evaluate_slices,
+    joint_coset_openings,
 };
 
 const P: u64 = 0xFFFF_FFFF_0000_0001;
@@ -561,6 +562,45 @@ fn peak_mib(run: impl FnOnce()) -> f64 {
     math_cuda::device::drain_and_trim().expect("drain");
     let (_, high) = math_cuda::device::pool_used_bytes().expect("pool");
     (high.max(before) - before) as f64 / (1 << 20) as f64
+}
+
+/// Profile with Nsight Systems for kernel times and Nsight Compute for counters.
+/// The one-card large block requests 229 leaves per group. Its 43 openings
+/// rebuilt 2,503,424 leaves, or about 227 distinct 256-leaf subtrees per group.
+#[test]
+#[ignore = "profile the large block's first-round joint opening on one card"]
+fn large_block_joint_coset_profile() {
+    const NUM_VARS: usize = 27;
+    const LOG_BLOWUP: usize = 1;
+    const QUERIES: usize = 229;
+    const COSETS: usize = 227;
+
+    let leaves = queries_at(NUM_VARS, LOG_BLOWUP, QUERIES, 200);
+    let plan = CosetPlan::new(NUM_VARS, LOG_BLOWUP, LOG_FOLD, KEPT, &leaves).expect("coset plan");
+    assert_eq!(plan.classes().len(), COSETS);
+    let stacks: Vec<_> = (100..104)
+        .map(|seed| {
+            let (store, parts) = production_stack(NUM_VARS, seed);
+            StackSlices::from_resident(&store, &parts, NUM_VARS, LOG_BLOWUP).expect("stack slices")
+        })
+        .collect();
+    let stacks: Vec<_> = stacks.iter().collect();
+    println!(
+        "COSET PROFILE n={NUM_VARS} blowup_log={LOG_BLOWUP} fold={LOG_FOLD} kept={KEPT} queries={QUERIES} cosets={COSETS} stacks={}",
+        stacks.len(),
+    );
+    for rep in 0..env_usize("COSET_PROFILE_REPS", 6) {
+        let start = Instant::now();
+        let opened =
+            joint_coset_openings(&stacks, &plan, &leaves, math_cuda::DeviceHash::Blake3, true)
+                .expect("joint opening");
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        let kinds = opened.in_place.expect("all stacks are read in place");
+        println!(
+            "COSET PROFILE rep={rep} ms={ms:.3} full_tiles={} zero_tiles={} mixed_tiles={}",
+            kinds.full, kinds.zero, kinds.mixed,
+        );
+    }
 }
 
 /// The measurement: one production-shape polynomial (`2^27` values, blowup 4,
