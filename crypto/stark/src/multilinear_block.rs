@@ -581,6 +581,8 @@ pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
 
 mod phase_a_lanes;
 mod zc_lane;
+#[cfg(test)]
+pub(crate) use zc_lane::{RetryEvent, RetryTest};
 
 pub use phase_a_lanes::{LanePolicy, PhaseALanes};
 #[doc(hidden)]
@@ -994,6 +996,10 @@ pub struct BlockLocal {
 pub struct LocalPhaseA {
     pub buses: Vec<u64>,
     pub lane: bool,
+    /// Retry deferred local jobs in gaps on a single commit lane.
+    pub retry: bool,
+    #[cfg(test)]
+    pub(crate) retry_test: Option<zc_lane::RetryTest>,
     /// What each local transcript binds before its challenges:
     /// [`LocalBinding::ALL`] but in a test's mutant phase A.
     #[doc(hidden)]
@@ -2779,10 +2785,7 @@ where
         H: WhirHash,
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
-        let local_lane = local
-            .as_ref()
-            .filter(|local| local.lane)
-            .map(|local| local.buses.clone());
+        let local_lane = local.as_ref().filter(|local| local.lane);
         let lane = ((matches!(probe.mode, CsProbeMode::Lane(_)) || local_lane.is_some())
             && upload_ahead)
             .then(|| zc_lane::ZcLane::<F, E>::new(&probe, config, local_lane))
@@ -2842,6 +2845,7 @@ where
         if let Some(last) = block.stamps.last_mut() {
             last.zc_lane.close_wait = close_wait;
             last.zc_lane.idle = idle;
+            last.zc_lane.retry_enabled = local_lane.is_some_and(|local| local.retry);
         }
         Ok(block)
     }
@@ -2986,8 +2990,14 @@ where
                     }
                     let waited = Instant::now();
                     let Some((index, group)) = incoming.next() else {
+                        if let Some(lane) = lane {
+                            lane.input_ended();
+                        }
                         break;
                     };
+                    if let Some(lane) = lane {
+                        lane.group_arrived(&group);
+                    }
                     let mut stamp = GroupStamps {
                         tables: group.len(),
                         wait_a: waited.elapsed().as_secs_f64(),
@@ -3055,6 +3065,7 @@ where
                     vec![(index, group)]
                 );
             }
+            let retry_wait = lane.map_or(0.0, |lane| lane.wait_for_retry());
             stamp.commit_base = multilinear::gpu::ledger_reserved();
             stamp.commit_pool_before = multilinear::gpu::pool_reserved_now();
             let runs_before = joint_runs();
@@ -3091,7 +3102,7 @@ where
                             let _ = room_tx.send(());
                         };
                         if let Some(lane) = lane {
-                            lane.commit_begins(group_index);
+                            lane.commit_begins(group_index, retry_wait);
                         }
                         let committed = commit_and_retire::<F, E, H, T, _>(
                             group_index,
@@ -3170,7 +3181,15 @@ where
                     let next = incoming.next();
                     let arrived = Instant::now();
                     next_came.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if next.is_none()
+                        && let Some(lane) = lane
+                    {
+                        lane.input_ended();
+                    }
                     let next = next.map(|(index, group)| {
+                        if let Some(lane) = lane {
+                            lane.group_arrived(&group);
+                        }
                         let wide = mem.as_ref().map_or(0, |mem| {
                             let held = group.iter().map(held_bytes).sum();
                             mem.ahead.fetch_add(held, Relaxed);
@@ -3268,7 +3287,10 @@ where
             stamp.ood = committed.ood_secs;
             stamp.ood_counts = committed.ood_counts;
             ood.push(committed.ood);
-            stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
+            stamp.commit_reserved = lane
+                .map_or_else(multilinear::gpu::reserved_window_peak, |lane| {
+                    lane.commit_peak()
+                });
             stamp.commit_pool_after = multilinear::gpu::pool_reserved_now();
             let runs = joint_runs();
             stamp.joint_runs = [

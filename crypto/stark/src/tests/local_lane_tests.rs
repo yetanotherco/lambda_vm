@@ -30,7 +30,8 @@ use super::local_lookup_tests::{
 use crate::multilinear_air::Uniforms;
 use crate::multilinear_block::{
     self, ArgueDeviation, BlockCommitted, BlockProved, CsProbe, GroupStamps, LaneDefer, LaneLimits,
-    LaneState, LocalPhaseA, Narrowing, ZcLaneStamp, local_lane_lines,
+    LaneState, LaneWork, LocalPhaseA, Narrowing, RetryEvent, RetryTest, ZcLaneStamp,
+    local_lane_lines,
 };
 use crate::multilinear_table::{
     CommittedTable, TableLayout,
@@ -150,6 +151,8 @@ fn commit_bound<'a>(
         Some(LocalPhaseA {
             buses: BUSES.to_vec(),
             lane,
+            retry: false,
+            retry_test: None,
             binding,
         }),
     )
@@ -165,6 +168,14 @@ fn prove_placed(
     deviation: ArgueDeviation,
 ) -> Result<BlockProved<Fp, Ext>, MlError> {
     let committed = commit(tables(airs, block), config, placement)?;
+    prove_committed(committed, config, deviation)
+}
+
+fn prove_committed(
+    committed: BlockCommitted<'_, Fp, Ext>,
+    config: &ChainConfig,
+    deviation: ArgueDeviation,
+) -> Result<BlockProved<Fp, Ext>, MlError> {
     let order: Vec<usize> = (0..SIZES.len()).collect();
     let mut transcript = H::sponge();
     multilinear_block::block_prove_in_order::<Fp, Ext, _, H>(
@@ -179,6 +190,231 @@ fn prove_placed(
         &order,
         None,
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryPause {
+    Gap,
+    Arrival,
+    Tail,
+    Off,
+    Full,
+}
+
+fn wait_for(flag: &AtomicUsize, value: usize, timeout: Duration) {
+    let since = Instant::now();
+    while flag.load(SeqCst) < value && since.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn prove_retry(pause: RetryPause) -> BlockProved<Fp, Ext> {
+    let airs = Airs::new(None);
+    let block = Block::honest();
+    let config = config(2, GkrPack::Off);
+    let reference =
+        prove_placed(&airs, &block, &config, Placement::PhaseB, honest()).expect("phase B alone");
+    let mut tables = tables(&airs, &block).into_iter();
+    let groups: Vec<Vec<_>> = SIZES
+        .iter()
+        .map(|&size| tables.by_ref().take(size).collect())
+        .collect();
+    let store_bytes = |g: usize| {
+        groups[g]
+            .iter()
+            .map(|t| (t.num_committed_columns() << t.num_vars()) as u64 * 8)
+            .sum::<u64>()
+    };
+    // Group 0's probe occupies the lane until group 1 is refused for memory.
+    // For the tail, keep the probe queued until both local groups are refused.
+    let limits = LaneLimits {
+        hold_bytes: Some(if pause == RetryPause::Full {
+            0
+        } else {
+            store_bytes(0).max(store_bytes(1))
+        }),
+        hold: if pause == RetryPause::Tail {
+            1
+        } else {
+            LaneLimits::default().hold
+        },
+        ..LaneLimits::default()
+    };
+    let decided = Arc::new(AtomicUsize::new(0));
+    let first_bin = Arc::new(AtomicUsize::new(0));
+    let release_bin = Arc::new(AtomicUsize::new(0));
+    let boundary = Arc::new(AtomicUsize::new(0));
+    let watchdog = Duration::from_secs(5);
+    let observer = RetryTest(Arc::new({
+        let (decided, first_bin, release_bin, boundary) = (
+            decided.clone(),
+            first_bin.clone(),
+            release_bin.clone(),
+            boundary.clone(),
+        );
+        move |event| match event {
+            RetryEvent::WorkerStarted => wait_for(
+                &decided,
+                if pause == RetryPause::Tail { 2 } else { 1 },
+                watchdog,
+            ),
+            RetryEvent::BinStarted(1, 0) => {
+                first_bin.store(1, SeqCst);
+                if matches!(pause, RetryPause::Arrival | RetryPause::Tail) {
+                    wait_for(&release_bin, 1, watchdog);
+                }
+            }
+            RetryEvent::Arrived if pause == RetryPause::Arrival && first_bin.load(SeqCst) == 1 => {
+                release_bin.store(1, SeqCst);
+                // The group has arrived but hasn't uploaded. The retry must
+                // yield here even though the commit hasn't asked for the card.
+                wait_for(&boundary, 1, watchdog);
+            }
+            RetryEvent::BinStarted(1, 1) if pause == RetryPause::Arrival => {
+                boundary.store(1, SeqCst);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            RetryEvent::InputEnded if pause == RetryPause::Tail => release_bin.store(1, SeqCst),
+            RetryEvent::AttemptEnded(1, _) => boundary.store(1, SeqCst),
+            _ => {}
+        }
+    }));
+    let mut groups = groups.into_iter();
+    let mut handed = 0;
+    let producer = std::iter::from_fn(|| {
+        match (handed, pause) {
+            (2, RetryPause::Gap) => wait_for(&boundary, 1, watchdog),
+            (2, RetryPause::Arrival) | (3, RetryPause::Tail) => wait_for(&first_bin, 1, watchdog),
+            (2, RetryPause::Off) => wait_for(&decided, 2, watchdog),
+            (2, RetryPause::Full) => {
+                wait_for(&decided, 2, watchdog);
+                wait_for(&boundary, 1, Duration::from_millis(200));
+            }
+            _ => {}
+        }
+        handed += 1;
+        groups.next()
+    });
+    let committed = BlockCommitted::commit_groups_probed::<H, <H as WhirHash>::Sponge>(
+        producer,
+        &config,
+        TreeDrop::uniform(1),
+        Narrowing::Wide,
+        true,
+        None,
+        None,
+        CsProbe {
+            host: true,
+            decided: Some(decided.clone()),
+            mode: multilinear_block::CsProbeMode::Lane(LaneWork::Zc),
+            limits,
+            ..CsProbe::default()
+        },
+        Some(LocalPhaseA {
+            buses: BUSES.to_vec(),
+            lane: true,
+            retry: pause != RetryPause::Off,
+            retry_test: Some(observer),
+            binding: LocalBinding::ALL,
+        }),
+    )
+    .expect("phase A");
+    let proved = prove_committed(committed, &config, honest()).expect("phase B");
+    let pinned = bytes(&reference);
+    use sha3::{Digest, Sha3_256};
+    assert_eq!(
+        format!("{:x}", Sha3_256::digest(&pinned)),
+        "5a55080caaa49c20007c649ca1b4905b92d38b0a2df35f6e19234e5c57f86157",
+    );
+    assert_eq!(bytes(&proved), pinned);
+    verify_local(&airs, &block, &config, &proved).expect("proof verifies");
+    proved
+}
+
+#[test]
+fn a_memory_deferred_local_job_retries_in_the_producers_pause() {
+    let proved = prove_retry(RetryPause::Gap);
+    let job = proved.3[1].zc_lane;
+    let lines = local_lane_lines(&proved.3);
+    assert!(
+        !lines.contains(" · declined · "),
+        "a retry shell lacked its store: {lines}"
+    );
+    assert_eq!((job.state, job.retries), (LaneState::Ran, 1), "{job:?}");
+    assert!(
+        job.bins_ran > 1 && proved.3[1].local_b.is_empty(),
+        "{job:?}"
+    );
+    assert!(lines.contains(" · retries 1 · retry upload "), "{lines}");
+    assert!(
+        lines.contains(&format!(
+            " · retried 1 groups · bins {} in gaps · retry uploads ",
+            job.bins_ran
+        )),
+        "{lines}"
+    );
+    assert!(lines.contains(" · retries cut short 0"), "{lines}");
+}
+
+#[test]
+fn an_arriving_group_cuts_a_local_retry_short() {
+    let proved = prove_retry(RetryPause::Arrival);
+    let wait = proved.3[2].zc_lane.commit_wait;
+    assert!(
+        wait < 0.1,
+        "the arriving group waited {wait:.3}s behind another retry bin"
+    );
+    check_retry_hand_back(&proved, LaneDefer::Shed);
+}
+
+#[test]
+fn phase_as_end_cuts_a_local_retry_short() {
+    let proved = prove_retry(RetryPause::Tail);
+    check_retry_hand_back(&proved, LaneDefer::Tail);
+}
+
+fn check_retry_hand_back(proved: &BlockProved<Fp, Ext>, why: LaneDefer) {
+    let job = proved.3[1].zc_lane;
+    assert_eq!(job.state, LaneState::Deferred(why), "{job:?}");
+    assert_eq!(
+        (job.retries, job.retries_cut_short, job.bins_ran),
+        (1, 1, 1),
+        "{job:?}"
+    );
+    assert_eq!(proved.3[1].local_b.len(), job.bins - 1);
+    assert!(job.bins > 1);
+}
+
+#[test]
+fn a_local_retry_waits_for_store_room() {
+    let proved = prove_retry(RetryPause::Full);
+    let job = proved.3[1].zc_lane;
+    assert_eq!(
+        job.retries, 0,
+        "a retry uploaded despite the full ledger: {job:?}"
+    );
+    assert_eq!(job.state, LaneState::Deferred(LaneDefer::Memory));
+    assert!(!proved.3[1].local_b.is_empty());
+}
+
+#[test]
+fn local_retries_off_keeps_the_existing_lines() {
+    let proved = prove_retry(RetryPause::Off);
+    let job = proved.3[1].zc_lane;
+    assert_eq!(
+        (job.state, job.retries),
+        (LaneState::Deferred(LaneDefer::Memory), 0)
+    );
+    assert!(!proved.3[1].local_b.is_empty());
+    let lines = local_lane_lines(&proved.3);
+    assert!(
+        lines.contains("BLOCK LOCAL LANE: group 1 · memory · bins 0 of "),
+        "{lines}"
+    );
+    assert!(
+        !lines.contains("retries") && !lines.contains("retried"),
+        "{lines}"
+    );
 }
 
 /// Each local group's lane stamp (groups 1 and 2; group 0 has no local
