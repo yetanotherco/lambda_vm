@@ -444,6 +444,13 @@ where
     let columns: Option<&crate::gpu::ColumnFactors> = None;
     if device.is_none() && columns.is_none() {
         let mut polys = absent()?;
+        #[cfg(feature = "cuda")]
+        if let Some(input) = &fused
+            && crate::gpu_fused::argue_fused()
+            && crate::gpu_fused::worth_fused_rounds(input.r.len())
+        {
+            crate::gpu_fused::ZerocheckDecline::no_factors().note_host(input.r.len());
+        }
         for weight in extra {
             polys.push(weight.materialize()?);
         }
@@ -474,6 +481,8 @@ where
     let weights = lambdas.clone();
     let mut batched = Batched::new(built, rules, lambdas)?;
     let degree = batched.degree().max(1);
+    #[cfg(feature = "cuda")]
+    let mut fused_decline = None;
     if let Some(program) = batched.program() {
         let views: Vec<crate::gpu::WeightView<'_, F>> = if pending {
             waiting.iter().map(Weight::view).collect()
@@ -517,7 +526,8 @@ where
             );
             crate::whir_split::add_tick(&crate::whir_split::ZC_FUSED_TIME, start);
             match attempt {
-                None => {
+                Err(decline) => {
+                    fused_decline = Some(decline);
                     crate::gpu_fused::note_decline();
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED_DECLINED);
                     if check {
@@ -528,8 +538,8 @@ where
                         );
                     }
                 }
-                Some(Err(error)) => return Err(error),
-                Some(Ok((mut rounds, mut point, factors, times))) => {
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok((mut rounds, mut point, factors, times))) => {
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
                     if check {
                         // Today's rounds replay over lifted factors, made now
@@ -610,6 +620,12 @@ where
         batched.prepend(weights)?;
     }
     batched.prepend(absent()?)?;
+    #[cfg(feature = "cuda")]
+    if let Some(decline) = fused_decline
+        && crate::gpu_fused::worth_fused_rounds(batched.num_vars())
+    {
+        decline.note_host(batched.num_vars());
+    }
     let (proof, point) = sumcheck::prove(batched, transcript)?;
     Ok((proof, point, Vec::new()))
 }

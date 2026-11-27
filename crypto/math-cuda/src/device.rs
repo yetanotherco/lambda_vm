@@ -844,7 +844,7 @@ pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
 /// [`reserve`] that never asks the retention for its spare bytes: a caller
 /// beside another proof's work, whose cache it must not take, waits instead.
 pub fn reserve_without_eviction(bytes: u64) -> Option<DeviceReservation> {
-    backend().ok()?.reserve_with(bytes, false)
+    backend().ok()?.reserve_with(bytes, false).ok()
 }
 
 /// Argue-surface device fallbacks: the reservation refusals in math-cuda's
@@ -1613,16 +1613,22 @@ impl Backend {
     /// has a host path. The budget binds only when several proofs share a
     /// card: one of them is enough to fill it.
     pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
+        self.try_reserve(bytes).ok()
+    }
+
+    /// Like [`Self::reserve`], with the ledger bytes free at the refusal.
+    pub fn try_reserve(&self, bytes: u64) -> std::result::Result<DeviceReservation, u64> {
         self.reserve_with(bytes, true)
     }
 
     /// [`Self::reserve`], asking the retention for spare bytes on a miss only
     /// when `evict`.
-    fn reserve_with(&self, bytes: u64, evict: bool) -> Option<DeviceReservation> {
+    fn reserve_with(&self, bytes: u64, evict: bool) -> std::result::Result<DeviceReservation, u64> {
         let mut evicted = !evict;
         let mut held = self.reserved.load(Ordering::Relaxed);
         loop {
-            if held.saturating_add(bytes) > self.vram_budget_bytes() {
+            let budget = self.vram_budget_bytes();
+            if held.saturating_add(bytes) > budget {
                 // ★ Before giving up, ask the retention for spare bytes ONCE. The
                 // retention holds only genuinely-spare leaf layers and gives them
                 // back here, so a real caller (argue) is never displaced by a
@@ -1635,15 +1641,13 @@ impl Backend {
                 // as it would after evicting them.
                 if !evicted {
                     evicted = true;
-                    let deficit = held
-                        .saturating_add(bytes)
-                        .saturating_sub(self.vram_budget_bytes());
+                    let deficit = held.saturating_add(bytes).saturating_sub(budget);
                     if try_evict_retained(deficit, BackendSlot::of(self).index()) > 0 {
                         held = self.reserved.load(Ordering::Relaxed);
                         continue;
                     }
                 }
-                return None;
+                return Err(budget.saturating_sub(held));
             }
             match self.reserved.compare_exchange_weak(
                 held,
@@ -1655,7 +1659,7 @@ impl Backend {
                     // Each card's ledger keeps its own peaks.
                     let slot = BackendSlot::of(self);
                     self.peaks.note(held + bytes);
-                    return Some(DeviceReservation {
+                    return Ok(DeviceReservation {
                         bytes: AtomicU64::new(bytes),
                         slot,
                     });

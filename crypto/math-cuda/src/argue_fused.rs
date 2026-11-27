@@ -239,8 +239,9 @@ impl<'f> FusedZerocheck<'f> {
         folded + weights + slots + partials + (1 << 20)
     }
 
-    /// Sets the session up, or `Ok(None)` when the card's budget refuses it —
-    /// before anything is absorbed, so the caller runs today's rounds.
+    /// Sets the session up, or declines before anything is absorbed. The
+    /// caller supplies the reservation so it can retry a busy card before
+    /// allocating the session.
     ///
     /// `r_tail` and `rho_tail` are `r[2..]` and `ρ[2..]` (three u64 a
     /// coordinate): the grid pass's weights. `second` is a second bus column
@@ -255,6 +256,7 @@ impl<'f> FusedZerocheck<'f> {
         grid_rows: usize,
         gruen_rows: usize,
         second: Option<SecondBus<'_>>,
+        reserve: impl FnOnce(&crate::device::Backend, u64) -> Option<DeviceReservation>,
     ) -> Result<Option<Self>> {
         let rows = source.rows;
         let width = source.width;
@@ -296,7 +298,8 @@ impl<'f> FusedZerocheck<'f> {
         }
         let from_rows = bus_rows::enabled();
         let extra = if from_rows { rows as u64 * 24 } else { 0 };
-        let Some(room) = be.reserve(
+        let Some(room) = reserve(
+            be,
             Self::device_bytes_with(
                 width,
                 rows,

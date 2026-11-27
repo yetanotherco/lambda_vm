@@ -164,7 +164,7 @@ where
                 .or(columns.map(crate::gpu_fused::FusedSource::Columns))
         });
         #[cfg(feature = "cuda")]
-        if let (Some(source), Some(input)) = (source, fused.as_ref())
+        let decline = if let (Some(source), Some(input)) = (source, fused.as_ref())
             && crate::gpu_fused::argue_fused()
         {
             let degree = rules
@@ -176,7 +176,7 @@ where
             let check = crate::gpu_fused::argue_fused_xcheck();
             match crate::gpu_fused::FusedStepper::new(source, input, &lambdas, claim, degree, check)
             {
-                Some(Ok(stepper)) => {
+                Ok(Ok(stepper)) => {
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
                     let batched = crate::batch::Batched::new(Vec::new(), rules, lambdas)?;
                     let long = stepper.long();
@@ -187,21 +187,32 @@ where
                         long,
                     });
                 }
-                Some(Err(error)) => return Err(error),
-                None => {
+                Ok(Err(error)) => return Err(error),
+                Err(decline) => {
                     crate::gpu_fused::note_decline();
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED_DECLINED);
+                    Some(decline)
                 }
             }
-        }
+        } else {
+            fused
+                .as_ref()
+                .filter(|_| crate::gpu_fused::argue_fused())
+                .map(|_| crate::gpu_fused::ZerocheckDecline::no_factors())
+        };
         let _ = (device, columns, &fused, claim, num_vars);
         let mut polys = factors()?;
         for weight in weights {
             polys.push(crate::eq::eq_mle(weight)?);
         }
-        Ok(Self::Host(crate::batch::Batched::new(
-            polys, rules, lambdas,
-        )?))
+        let batched = crate::batch::Batched::new(polys, rules, lambdas)?;
+        #[cfg(feature = "cuda")]
+        if let Some(decline) = decline
+            && crate::gpu_fused::worth_fused_rounds(num_vars)
+        {
+            decline.note_host(num_vars);
+        }
+        Ok(Self::Host(batched))
     }
 
     /// Every factor slot, once all are bound: the trace's, then the weights.

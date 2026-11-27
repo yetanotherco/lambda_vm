@@ -423,6 +423,7 @@ pub(crate) fn faults() -> FusedFaults {
 
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
 static DECLINES: AtomicU64 = AtomicU64::new(0);
+static HOST_ZEROCHECKS: AtomicU64 = AtomicU64::new(0);
 static XCHECKS: AtomicU64 = AtomicU64::new(0);
 static CORNER_CHECKS: AtomicU64 = AtomicU64::new(0);
 
@@ -434,6 +435,98 @@ pub fn fused_sessions() -> u64 {
 /// Tables the fused rounds declined before round 0 (today's ran).
 pub fn fused_declines() -> u64 {
     DECLINES.load(Ordering::Relaxed)
+}
+
+/// Zerochecks that fell back from device setup and ran their full rounds on
+/// the host. The scheduled host tail of a device session is separate.
+pub fn host_zerochecks() -> u64 {
+    HOST_ZEROCHECKS.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct ZerocheckDecline {
+    reason: std::borrow::Cow<'static, str>,
+    asked: u64,
+    free: Option<u64>,
+}
+
+#[cfg(feature = "cuda")]
+impl ZerocheckDecline {
+    fn new(reason: impl Into<std::borrow::Cow<'static, str>>, asked: u64) -> Self {
+        Self {
+            reason: reason.into(),
+            asked,
+            free: None,
+        }
+    }
+
+    pub(crate) fn no_factors() -> Self {
+        Self::new("device factors unavailable", 0)
+    }
+
+    pub(crate) fn note_host(self, vars: usize) {
+        let free = self.free.unwrap_or_else(|| {
+            crate::gpu::reserve_budget().saturating_sub(crate::gpu::ledger_reserved())
+        });
+        let count = HOST_ZEROCHECKS.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!(
+            "[argue] zerocheck on the host: {} · 2^{vars} rows · asked {} B · ledger free {free} B · host zerochecks {count}",
+            self.reason, self.asked,
+        );
+    }
+}
+
+/// A small cube starts on the host by policy.
+#[cfg(feature = "cuda")]
+pub(crate) fn worth_fused_rounds(vars: usize) -> bool {
+    vars >= crate::HOST_CUBE_COMPILED.trailing_zeros() as usize + 2
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static OPENING_RELEASE: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// During an argue beside an opening on the same card, a refused zerocheck
+/// reservation can wait for that opening to drop its working set, then retry.
+/// The opening drops the sender even if it fails or panics.
+#[doc(hidden)]
+pub fn with_opening_release<R>(
+    release: Option<std::sync::mpsc::Receiver<()>>,
+    argue: impl FnOnce() -> R,
+) -> R {
+    #[cfg(feature = "cuda")]
+    let _restore = {
+        struct Restore(Option<std::sync::mpsc::Receiver<()>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OPENING_RELEASE.with(|slot| slot.replace(self.0.take()));
+            }
+        }
+        Restore(OPENING_RELEASE.with(|slot| slot.replace(release)))
+    };
+    #[cfg(not(feature = "cuda"))]
+    drop(release);
+    argue()
+}
+
+#[cfg(feature = "cuda")]
+fn reserve_zerocheck<R>(
+    mut reserve: impl FnMut() -> Result<R, u64>,
+    fits_budget: impl FnOnce() -> bool,
+) -> Result<R, u64> {
+    let free = match reserve() {
+        Ok(room) => return Ok(room),
+        Err(free) => free,
+    };
+    if fits_budget()
+        && let Some(release) = OPENING_RELEASE.with(|slot| slot.take())
+    {
+        let _ = release.recv();
+        return reserve();
+    }
+    Err(free)
 }
 
 /// Fused tables whose every message today's rounds confirmed.
@@ -458,7 +551,13 @@ pub(crate) fn note_xcheck() {
 
 #[doc(hidden)]
 pub fn reset_fused_counters() {
-    for c in [&SESSIONS, &DECLINES, &XCHECKS, &CORNER_CHECKS] {
+    for c in [
+        &SESSIONS,
+        &DECLINES,
+        &HOST_ZEROCHECKS,
+        &XCHECKS,
+        &CORNER_CHECKS,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -539,7 +638,7 @@ pub(crate) type FusedRounds<E> = (
 /// the batch's (`d_C + 1`). `challenge` absorbs a message and draws the next
 /// challenge, as today's device rounds call it.
 ///
-/// `None` is a decline, always before the first message; `Some(Err)` after.
+/// A decline comes before the first message, when the caller can still fall back.
 ///
 /// The rounds are [`FusedStepper`]'s, driven here one after the other; the
 /// batched argue drives the same stepper in lockstep with other tables'.
@@ -553,7 +652,7 @@ pub(crate) fn prove_fused<B, E>(
     degree: usize,
     check_corners: bool,
     mut challenge: impl FnMut(&[FieldElement<E>]) -> FieldElement<E>,
-) -> Option<Result<FusedRounds<E>, crate::Error>>
+) -> Result<Result<FusedRounds<E>, crate::Error>, ZerocheckDecline>
 where
     B: IsField + math::field::traits::IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
@@ -562,7 +661,7 @@ where
     let mut stepper = match FusedStepper::new(source, input, lambdas, claim, degree, check_corners)?
     {
         Ok(stepper) => stepper,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Ok(Err(error)),
     };
     let there = stepper.device_rounds();
     let mut rounds = Vec::with_capacity(there);
@@ -570,20 +669,20 @@ where
     for _ in 0..there {
         let g = match stepper.message() {
             Ok(g) => g,
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Ok(Err(error)),
         };
         let s = challenge(&g);
         if let Err(error) = stepper.bind(&s) {
-            return Some(Err(error));
+            return Ok(Err(error));
         }
         rounds.push(crate::sumcheck::RoundProof { evaluations: g });
         point.push(s);
     }
     let (factors, times) = match stepper.into_factors() {
         Ok(done) => done,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Ok(Err(error)),
     };
-    Some(Ok((rounds, point, factors, times)))
+    Ok(Ok((rounds, point, factors, times)))
 }
 
 /// A table's fused zerocheck rounds, stepped by its caller: the message of the
@@ -640,8 +739,8 @@ where
     E: IsField + 'static,
     FieldElement<E>: Send + Sync,
 {
-    /// Sets the session up and runs the grid pass. `None` is a decline, before
-    /// anything is sent; `Some(Err)` a trace the corner check refuses.
+    /// Sets the session up and runs the grid pass. A decline leaves the
+    /// transcript untouched. The corner check can also reject the proof.
     pub(crate) fn new<B>(
         source: FusedSource<'f>,
         input: &FusedInput<'_, B, E>,
@@ -649,7 +748,7 @@ where
         claim: &FieldElement<E>,
         degree: usize,
         check_corners: bool,
-    ) -> Option<Result<Self, crate::Error>>
+    ) -> Result<Result<Self, crate::Error>, ZerocheckDecline>
     where
         B: IsField + math::field::traits::IsSubFieldOf<E> + 'static,
     {
@@ -658,10 +757,12 @@ where
         use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
         use std::time::Instant;
 
+        let unsupported = || ZerocheckDecline::new("unsupported fused zerocheck", 0);
+
         // Three rules, or five with a second bus.
         let rules = if input.second.is_some() { 5 } else { 3 };
         if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() || lambdas.len() != rules {
-            return None;
+            return Err(unsupported());
         }
         let started = Instant::now();
         let device = source.view();
@@ -670,15 +771,15 @@ where
         let constraints = input.constraints;
         let d = constraints.degree().max(1);
         if degree != d + 1 || input.r.len() != num_vars || input.claim_point.len() < num_vars {
-            return None;
+            return Err(unsupported());
         }
         // Rounds 0 and 1 on the grid, then the later rounds down to where today's
         // hand the cube to the host.
         let there = num_vars.saturating_sub(crate::HOST_CUBE_COMPILED.trailing_zeros() as usize);
         if there < 2 || input.betas.len() != constraints.roots().len() {
-            return None;
+            return Err(unsupported());
         }
-        let lowered = lower_fused(constraints)?;
+        let lowered = lower_fused(constraints).ok_or_else(unsupported)?;
         // A long program's rounds stay on the card past today's crossover
         // ([`zc_device_tail`]), except under the cross-check, which
         // replays today's rounds and so stops where they do.
@@ -699,7 +800,7 @@ where
             &lambdas[1],
             &lambdas[2],
         )
-        .ok()?;
+        .map_err(|e| ZerocheckDecline::new(format!("bus column: {e}"), 0))?;
         if faults().bus
             && let Some((slot, a)) = bus.terms().first().cloned()
         {
@@ -712,13 +813,13 @@ where
             None => None,
             Some(second) => {
                 if second.claim_point.len() < num_vars {
-                    return None;
+                    return Err(unsupported());
                 }
                 let (point, rho) = second
                     .claim_point
                     .split_at(second.claim_point.len() - num_vars);
-                let column =
-                    BusColumn::new(second.interactions, point, &lambdas[3], &lambdas[4]).ok()?;
+                let column = BusColumn::new(second.interactions, point, &lambdas[3], &lambdas[4])
+                    .map_err(|e| ZerocheckDecline::new(format!("bus column: {e}"), 0))?;
                 Some((column, rho.to_vec()))
             }
         };
@@ -733,7 +834,7 @@ where
         if points.len() > math_cuda::argue_fused::MAX_ROWS
             || walked.len() + bus_rows > math_cuda::argue_fused::MAX_ROWS
         {
-            return None;
+            return Err(unsupported());
         }
 
         let raw = |v: &FieldElement<E>| ext3_raw(v);
@@ -744,25 +845,27 @@ where
             }
             Some(out)
         };
-        let betas = flat(input.betas)?;
+        let betas = flat(input.betas).ok_or_else(unsupported)?;
         let slots: Vec<u32> = bus
             .terms()
             .iter()
             .map(|(slot, _)| u32::try_from(*slot).ok())
-            .collect::<Option<_>>()?;
+            .collect::<Option<_>>()
+            .ok_or_else(unsupported)?;
         if slots.iter().any(|&s| s as usize >= device.width)
             || constraints.reads().iter().any(|&s| s >= device.width)
         {
-            return None;
+            return Err(unsupported());
         }
         let coeffs = flat(
             &bus.terms()
                 .iter()
                 .map(|(_, a)| a.clone())
                 .collect::<Vec<_>>(),
-        )?;
-        let r_tail = flat(&input.r[2..])?;
-        let rho_tail = flat(&rho[2..])?;
+        )
+        .ok_or_else(unsupported)?;
+        let r_tail = flat(&input.r[2..]).ok_or_else(unsupported)?;
+        let rho_tail = flat(&rho[2..]).ok_or_else(unsupported)?;
         let program = math_cuda::argue_fused::FusedProgram {
             nodes: &lowered.nodes,
             base_consts: &lowered.base_consts,
@@ -773,7 +876,7 @@ where
         let fused_bus = math_cuda::argue_fused::FusedBus {
             slots: &slots,
             coeffs: &coeffs,
-            constant: raw(bus.constant())?,
+            constant: raw(bus.constant()).ok_or_else(unsupported)?,
         };
         // The second bus's terms, as the first's.
         let second_parts = match &second {
@@ -783,9 +886,10 @@ where
                     .terms()
                     .iter()
                     .map(|(slot, _)| u32::try_from(*slot).ok())
-                    .collect::<Option<_>>()?;
+                    .collect::<Option<_>>()
+                    .ok_or_else(unsupported)?;
                 if slots.iter().any(|&s| s as usize >= device.width) {
-                    return None;
+                    return Err(unsupported());
                 }
                 let coeffs = flat(
                     &column
@@ -793,8 +897,14 @@ where
                         .iter()
                         .map(|(_, a)| a.clone())
                         .collect::<Vec<_>>(),
-                )?;
-                Some((slots, coeffs, raw(column.constant())?, flat(&rho2[2..])?))
+                )
+                .ok_or_else(unsupported)?;
+                Some((
+                    slots,
+                    coeffs,
+                    raw(column.constant()).ok_or_else(unsupported)?,
+                    flat(&rho2[2..]).ok_or_else(unsupported)?,
+                ))
             }
         };
         let second_bus = second_parts
@@ -809,6 +919,8 @@ where
                     rho_tail,
                 },
             );
+        let mut asked = 0;
+        let mut refused = None;
         let mut session = match math_cuda::argue_fused::FusedZerocheck::new(
             device,
             program,
@@ -818,9 +930,30 @@ where
             points.len(),
             walked.len() + 2,
             second_bus,
+            |be, bytes| {
+                asked = bytes;
+                reserve_zerocheck(|| be.try_reserve(bytes), || bytes <= be.vram_budget_bytes())
+                    .map_err(|free| refused = Some(free))
+                    .ok()
+            },
         ) {
             Ok(Some(session)) => session,
-            _ => return None,
+            Ok(None) => {
+                return Err(match refused {
+                    Some(free) => ZerocheckDecline {
+                        reason: "fused session reservation refused".into(),
+                        asked,
+                        free: Some(free),
+                    },
+                    None => unsupported(),
+                });
+            }
+            Err(error) => {
+                return Err(ZerocheckDecline::new(
+                    format!("fused session setup: {error:?}"),
+                    asked,
+                ));
+            }
         };
         // No round slot here: through one the zerocheck's launches ran slower
         // on whole blocks than with today's second launch, unlike the GKR
@@ -831,9 +964,9 @@ where
 
         // ── rounds 0 and 1: one base-field pass ──
         let tick = Instant::now();
-        let Ok((t_sums, u_sums, violation)) = session.grid(&points, keep) else {
-            return None;
-        };
+        let (t_sums, u_sums, violation) = session
+            .grid(&points, keep)
+            .map_err(|error| ZerocheckDecline::new(format!("fused grid: {error:?}"), asked))?;
         if check_corners {
             if let Some(row) = violation
                 && !faults().corners_inert
@@ -841,7 +974,7 @@ where
                 eprintln!(
                     "[argue] FUSED XCHECK: the trace breaks its constraints at row {row} (2^{num_vars} rows)"
                 );
-                return Some(Err(crate::Error::ConstraintViolated { row: row as usize }));
+                return Ok(Err(crate::Error::ConstraintViolated { row: row as usize }));
             }
             CORNER_CHECKS.fetch_add(1, Ordering::Relaxed);
         }
@@ -858,9 +991,12 @@ where
         let second = match second {
             None => None,
             Some((_, rho2)) => {
-                let Ok(Some(u2)) = session.second_grid() else {
-                    return None;
-                };
+                let u2 = session
+                    .second_grid()
+                    .map_err(|error| {
+                        ZerocheckDecline::new(format!("second fused grid: {error:?}"), asked)
+                    })?
+                    .ok_or_else(unsupported)?;
                 Some(SecondState {
                     rho: rho2,
                     u: core::array::from_fn(|b| {
@@ -877,7 +1013,7 @@ where
             slots: lowered.num_slots,
             ..FusedTimes::default()
         };
-        Some(Ok(Self {
+        Ok(Ok(Self {
             session,
             r: input.r.to_vec(),
             rho: rho.to_vec(),
@@ -1172,6 +1308,27 @@ mod tests {
     use math::field::goldilocks::GoldilocksField as Gl;
 
     type FB = FieldElement<Gl>;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_zerocheck_retries_once_when_the_opening_releases_its_room() {
+        let (done, release) = std::sync::mpsc::channel();
+        with_opening_release(Some(release), || {
+            assert_eq!(reserve_zerocheck(|| Ok(1), || true), Ok(1));
+            assert_eq!(reserve_zerocheck::<()>(|| Err(10), || false), Err(10));
+            let mut done = Some(done);
+            let reserve = || {
+                if let Some(done) = done.take() {
+                    drop(done);
+                    Err(10)
+                } else {
+                    Ok(20)
+                }
+            };
+            assert_eq!(reserve_zerocheck(reserve, || true), Ok(20));
+            assert_eq!(reserve_zerocheck::<()>(|| Err(10), || true), Err(10));
+        });
+    }
 
     /// `x·y + 3` and `x − y` as two roots, the second selected by factor 2.
     fn two_roots() -> Constraints<Gl> {

@@ -5724,6 +5724,12 @@ where
                     let uploader = next.map(|next| {
                         scope.spawn(move || on_lane_upload(lane, move || upload_group(next)))
                     });
+                    let (opening_done, opening_release) = if prev.is_some() && !prev_on_own_card {
+                        let (done, release) = std::sync::mpsc::channel();
+                        (Some(done), Some(release))
+                    } else {
+                        (None, None)
+                    };
                     let opener = prev.as_mut().zip(prev_tables).map(|(earlier, its_tables)| {
                         scope.spawn(move || {
                             on_lane_openings(lane, move || -> Result<Opened<F, E>, MlError> {
@@ -5771,6 +5777,10 @@ where
                                         fails,
                                     )
                                 }?;
+                                // Wake the zerocheck after the opening releases
+                                // its room, before running the caller's observer.
+                                drop(stacked);
+                                drop(opening_done);
                                 on_group(GroupOpened {
                                     group: earlier.group,
                                     roots: roots_ref,
@@ -5781,12 +5791,11 @@ where
                                     opening: &opened.opening,
                                     prepared: opened.prepared.as_ref(),
                                 });
-                                drop(stacked);
                                 Ok(opened)
                             })
                         })
                     });
-                    let argue_result = (|| -> Result<(), MlError> {
+                    let run_argue = || -> Result<(), MlError> {
                         if overlap_faults.argue_fails == Some(p) {
                             return Err(MlError::DeviceFailed {
                                 stage: "a test's failed argue",
@@ -5956,7 +5965,9 @@ where
                             }
                         }
                         Ok(())
-                    })();
+                    };
+                    let argue_result =
+                        multilinear::gpu_fused::with_opening_release(opening_release, run_argue);
                     let argue_end = Instant::now();
                     let next_store = uploader.map(|handle| handle.join());
                     let joined = argue_end.elapsed().as_secs_f64();
