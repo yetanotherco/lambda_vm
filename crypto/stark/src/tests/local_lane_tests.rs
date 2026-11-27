@@ -491,6 +491,10 @@ fn the_local_lane_lines_add_up() {
         },
         GroupStamps {
             local_b: vec![1.0],
+            zc_lane: ZcLaneStamp {
+                idle: (0.375, 2, 0.250),
+                ..ZcLaneStamp::default()
+            },
             ..GroupStamps::default()
         },
     ];
@@ -498,15 +502,16 @@ fn the_local_lane_lines_add_up() {
     assert_eq!(
         lines,
         "BLOCK LOCAL LANE: group 1 · ran · bins 2 of 2 in phase A · lane 0.500s · store 3 MiB · \
-         commit wait 0.125s · phase B 0.000s []\n\
+         commit wait 0.125s · phase B 0.000s [] · job start 0.000s · end 2.000s\n\
          BLOCK LOCAL LANE: group 2 · tail · bins 1 of 3 in phase A · lane 0.250s · store 3 MiB · \
-         commit wait 0.125s · phase B 0.750s [0.2500 0.5000]\n\
+         commit wait 0.125s · phase B 0.750s [0.2500 0.5000] · job start 0.000s · end 2.000s\n\
          BLOCK LOCAL LANE: group 3 · off · bins 0 of 1 in phase A · lane 0.000s · store 0 MiB · \
-         commit wait 0.000s · phase B 1.000s [1.0000]\n\
+         commit wait 0.000s · phase B 1.000s [1.0000] · job start 0.000s · end 0.000s\n\
          BLOCK LOCAL LANE SUM: groups 3 · lane jobs 2 · bins 3 of 6 in phase A · ran 1 · deferred \
          hold 0 · memory 0 · tail 1 · shed 0 · no store 0 · stopped 0 · declined 0 · failed 0 · \
          lane 0.750s · phase B 1.750s · commits waited 0.250s (most 0.125s) · last job ended at \
-         2.000s · phase A's end waited 0.000s\n"
+         2.000s · phase A's end waited 0.000s · idle with nothing queued 0.375s in 2 gaps (most 0.250s) · \
+         deferred jobs left 1\n"
     );
     assert_eq!(local_lane_lines(&[GroupStamps::default()]), "");
 }

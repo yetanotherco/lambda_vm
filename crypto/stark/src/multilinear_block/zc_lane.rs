@@ -40,7 +40,11 @@ use super::*;
 type LocalHandOff = Box<dyn Any + Send>;
 
 /// Every group's stamp and every local argue the lane let go of, by group.
-type LaneParts = (Vec<(usize, ZcLaneStamp)>, Vec<(usize, LocalHandOff)>);
+type LaneParts = (
+    Vec<(usize, ZcLaneStamp)>,
+    Vec<(usize, LocalHandOff)>,
+    (f64, usize, f64),
+);
 
 /// The label that opens a lane job's transcript: no proof's transcript opens
 /// with it.
@@ -163,6 +167,8 @@ pub struct ZcLaneStamp {
     /// On the last group only: what phase A's end waited for the lane (the
     /// job under way finishing).
     pub close_wait: f64,
+    /// On the last group only: idle seconds, gaps, and longest gap.
+    pub idle: (f64, usize, f64),
     /// Its constraint sumcheck ran to its end.
     pub zc_ran: bool,
     /// Its bins in the argue's plan, those whose ladders ran (the first ones,
@@ -230,6 +236,8 @@ where
     /// boundary.
     shed: bool,
     closing: bool,
+    idle_since: Option<Instant>,
+    idle: (f64, usize, f64),
     stamps: Vec<(usize, ZcLaneStamp)>,
     /// What each group's commit waited for a unit, by group.
     commit_waits: Vec<(usize, f64)>,
@@ -315,6 +323,8 @@ where
                 unit: false,
                 shed: false,
                 closing: false,
+                idle_since: None,
+                idle: (0.0, 0, 0.0),
                 stamps: Vec::new(),
                 commit_waits: Vec::new(),
                 local: Vec::new(),
@@ -354,6 +364,7 @@ where
     pub(super) fn commit_begins(&self, group: usize) {
         let waited = Instant::now();
         let mut queue = self.lock();
+        Self::end_idle(&mut queue);
         self.committing
             .store(true, std::sync::atomic::Ordering::SeqCst);
         while queue.unit {
@@ -489,8 +500,20 @@ where
 
     /// Phase A's loop ended: the job under way finishes, the rest are dropped.
     pub(super) fn close(&self) {
-        self.lock().closing = true;
+        let mut queue = self.lock();
+        Self::end_idle(&mut queue);
+        queue.closing = true;
+        drop(queue);
         self.wake.notify_all();
+    }
+
+    fn end_idle(queue: &mut LaneQueue<'a, F, E>) {
+        if let Some(since) = queue.idle_since.take() {
+            let secs = since.elapsed().as_secs_f64();
+            queue.idle.0 += secs;
+            queue.idle.1 += 1;
+            queue.idle.2 = queue.idle.2.max(secs);
+        }
     }
 
     /// The lane's thread: runs the jobs until [`Self::close`].
@@ -507,12 +530,14 @@ where
                     if queue.closing {
                         break None;
                     }
-                    if !queue.jobs.is_empty()
-                        && !self.committing.load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        let job = queue.jobs.pop_front();
-                        queue.running = job.as_ref().map(|j| j.stamp.store_bytes);
-                        break job;
+                    if !self.committing.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(job) = queue.jobs.pop_front() {
+                            queue.running = Some(job.stamp.store_bytes);
+                            break Some(job);
+                        }
+                        if !queue.commit_waits.is_empty() {
+                            queue.idle_since.get_or_insert_with(Instant::now);
+                        }
                     }
                     queue = self
                         .wake
@@ -847,7 +872,7 @@ where
                 )),
             }
         }
-        (stamps, local)
+        (stamps, local, queue.idle)
     }
 }
 
@@ -1050,7 +1075,7 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
         let bins = local_bins(s);
         out.push_str(&format!(
             "BLOCK LOCAL LANE: group {g} · {} · bins {} of {bins} in phase A · lane {:.3}s · \
-             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}]\n",
+             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}] · job start {:.3}s · end {:.3}s\n",
             l.state.word(),
             l.bins_ran,
             l.ladders,
@@ -1062,6 +1087,8 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
                 .map(|b| format!("{b:.4}"))
                 .collect::<Vec<_>>()
                 .join(" "),
+            l.started_at,
+            l.ended_at,
         ));
     }
     let count = |state: LaneState| {
@@ -1072,11 +1099,17 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
     };
     let total =
         |f: &dyn Fn(&GroupStamps) -> f64| local.iter().map(|(_, s)| f(s)).fold(0.0, |a, b| a + b);
+    let (idle, gaps, longest) = stamps.last().map_or((0.0, 0, 0.0), |s| s.zc_lane.idle);
+    let deferred_left = local
+        .iter()
+        .filter(|(_, s)| matches!(s.zc_lane.state, LaneState::Deferred(_)) && !s.local_b.is_empty())
+        .count();
     out.push_str(&format!(
         "BLOCK LOCAL LANE SUM: groups {} · lane jobs {} · bins {} of {} in phase A · ran {} · \
          deferred hold {} · memory {} · tail {} · shed {} · no store {} · stopped {} · declined {} · \
          failed {} · lane {:.3}s · phase B {:.3}s · commits waited {:.3}s (most {:.3}s) · last job \
-         ended at {:.3}s · phase A's end waited {:.3}s\n",
+         ended at {:.3}s · phase A's end waited {:.3}s · idle with nothing queued {idle:.3}s in \
+         {gaps} gaps (most {longest:.3}s) · deferred jobs left {deferred_left}\n",
         local.len(),
         local.iter().filter(|(_, s)| s.zc_lane.local).count(),
         local.iter().map(|(_, s)| s.zc_lane.bins_ran).sum::<usize>(),

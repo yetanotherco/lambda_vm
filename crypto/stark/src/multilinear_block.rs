@@ -2828,7 +2828,7 @@ where
             (block, closing.elapsed().as_secs_f64())
         });
         let mut block = block?;
-        let (stamps, started) = lane.into_parts();
+        let (stamps, started, idle) = lane.into_parts();
         for (g, stamp) in stamps {
             if let Some(stamps) = block.stamps.get_mut(g) {
                 stamps.zc_lane = stamp;
@@ -2841,6 +2841,7 @@ where
         }
         if let Some(last) = block.stamps.last_mut() {
             last.zc_lane.close_wait = close_wait;
+            last.zc_lane.idle = idle;
         }
         Ok(block)
     }

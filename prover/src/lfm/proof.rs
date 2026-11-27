@@ -643,8 +643,7 @@ impl LfmFilled {
         &self.public_words
     }
 
-    /// The chips held as their records, for a test that reads or forges them.
-    #[cfg(test)]
+    /// The chips held as their records, for the levels' upload tally.
     pub(crate) fn chips(&self) -> Option<&super::chip_records::LfmChipValues> {
         self.chips.as_ref()
     }

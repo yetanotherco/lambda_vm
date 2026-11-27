@@ -3744,6 +3744,7 @@ pub fn prove_block_levels(
             WlfmFamily::B3 => crate::base_only::with_blake3_levels(prove_base),
         };
         let _ = base_end_ref.set(now());
+        let base_spilled = multilinear::pinned::stats().map_or(0, |p| p.spilled_bytes);
         if let Some(flag) = base_returned_ref {
             flag.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -3789,9 +3790,9 @@ pub fn prove_block_levels(
         };
         let level1 = level1.join();
         let purge = purge.and_then(|p| p.join().ok().flatten());
-        (proved, level1, first, purge, at_base)
+        (proved, level1, first, purge, at_base, base_spilled)
     });
-    let (proved, level1, built_beside, purge, at_base) = result;
+    let (proved, level1, built_beside, purge, at_base, base_spilled) = result;
     times.peak_reset = peak_reset;
     times.purges[3] = purge_at_start;
     if let Some(card) = at_start {
@@ -3802,6 +3803,29 @@ pub fn prove_block_levels(
         times.resident.push(("base end", r));
     }
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
+    let stamp_uploads = |level, before: Vec<(&str, u64, u64)>, values| {
+        let uploads = multilinear::pinned::upload_sources()
+            .into_iter()
+            .zip(before)
+            .filter_map(|((name, bytes, pool), (_, old_bytes, old_pool))| {
+                let bytes = bytes.saturating_sub(old_bytes);
+                let pool = pool.saturating_sub(old_pool);
+                (bytes > 0).then(|| {
+                    format!(
+                        "{name} pool {pool} B pageable {} B",
+                        bytes.saturating_sub(pool)
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let phase_a = base_stamps.pinned.map_or(0, |p| p.spilled_bytes);
+        let now = multilinear::pinned::stats().map_or(0, |p| p.spilled_bytes);
+        eprintln!(
+            "RTA LEVEL {level} UPLOADS: sources [{uploads}] · values [{values}] · \
+             spilled bytes at base phase A {phase_a} · base end {base_spilled} · now {now}"
+        );
+    };
     times.base = base_end.get().copied().unwrap_or_else(now);
     times.builder_end = builder_end.get().copied();
     times.builder_whole_pool = whole_pool_note.get().copied().flatten();
@@ -4091,6 +4115,11 @@ pub fn prove_block_levels(
                 }
             }
         };
+        let values = filled
+            .chips()
+            .map(|chips| chips.upload_values())
+            .unwrap_or_default();
+        let uploads = multilinear::pinned::upload_sources();
         let t = std::time::Instant::now();
         let proved = super::wlfm::prove_wlfm_traces_observed(
             &levels[0].build,
@@ -4110,6 +4139,7 @@ pub fn prove_block_levels(
             prove: t.elapsed().as_secs_f64(),
             end: level1_proved,
         });
+        stamp_uploads(1, uploads, values);
         if let Some(e) = observe_failed
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
@@ -4243,6 +4273,11 @@ pub fn prove_block_levels(
                 committed,
             });
             next = spawn_next(&build, k + 1);
+            let values = filled
+                .chips()
+                .map(|chips| chips.upload_values())
+                .unwrap_or_default();
+            let uploads = multilinear::pinned::upload_sources();
             let t = std::time::Instant::now();
             proofs.push(
                 super::wlfm::prove_wlfm_traces_as(
@@ -4260,6 +4295,7 @@ pub fn prove_block_levels(
                 prove: t.elapsed().as_secs_f64(),
                 end: now(),
             });
+            stamp_uploads(k + 1, uploads, values);
             if k == 1 {
                 let worker = release_worker
                     .map(|worker| worker.join().map_err(|_| "level 2's program drop panicked"))

@@ -258,6 +258,22 @@ impl LfmChipValues {
         self.chips.iter().find(|(k, _)| *k == kind).map(|(_, v)| v)
     }
 
+    /// Each value vector's used bytes and whether its range is in the pool.
+    pub(crate) fn upload_values(&self) -> String {
+        self.chips
+            .iter()
+            .filter(|(_, v)| !matches!(**v, ChipVec::Empty))
+            .map(|(kind, v)| {
+                let words = v.words();
+                let bytes = std::mem::size_of_val(words);
+                let pinned =
+                    bytes > 0 && multilinear::pinned::is_pinned(words.as_ptr().cast(), bytes);
+                format!("{kind:?} {bytes} B pinned {pinned}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The table of `kind`'s rows `[start, start + rows)`, its prefix
     /// `prefix` (`rows` rows of the chip's preprocessed columns): `None` when
     /// these values hold no such chip.
