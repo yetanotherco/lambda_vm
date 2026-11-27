@@ -1601,18 +1601,30 @@ fn build_beside_openings<T: Send>(
 static HOST_LANE_THREADS: AtomicU64 = AtomicU64::new(0);
 
 enum JoinArtifact {
-    Local(WlfmChild, BlockLayout, Option<u8>),
+    Local(Box<WlfmChild>, BlockLayout, Option<u8>, Vec<usize>),
     Worker(usize, LeafArtifacts),
 }
 
-/// The most tables a worker's leaf may state. The join program the
-/// coordinator builds from a worker's stated shapes grows with them (on the
-/// test fixture, 2^24 rows on every table took 12 GiB to build and 2^29 rows
-/// over 32 GiB), so shapes above this cap are refused before any join is
-/// built. Measured on one RTX 5090 (2026-11-27) with two machines: the
-/// largest honest leaf states 59 tables (mainnet block 25481021; 44 to 51 on
-/// 25475471 and 25481021 otherwise). The cap is twice that.
-const MAX_WORKER_LEAF_TABLES: usize = 2 * 59;
+/// The tables an honest leaf states, bounded as a fixed part plus a part a
+/// base group: `HONEST_LEAF_TABLES_FIXED + HONEST_LEAF_TABLES_PER_GROUP *
+/// groups`. Measured on one RTX 5090 (2026-11-27), two machines, mainnet
+/// blocks 25475471 (worker 44 tables over 5 groups, coordinator 50 over 5)
+/// and 25481021 (worker 59 over 10, coordinator 51 over 8), and the test
+/// fixture's one-group leaf (29 tables). Tables do not scale with groups
+/// alone (8.8, 10.0, 5.9, 6.4 and 29 a group): a leaf carries about 30
+/// tables whatever its groups, plus a few a group. The bound meets the median
+/// coordinator's 50 over 5 exactly and covers every other leaf.
+const HONEST_LEAF_TABLES_FIXED: usize = 30;
+const HONEST_LEAF_TABLES_PER_GROUP: usize = 4;
+
+/// The most tables a worker's leaf of `groups` base groups may state: twice
+/// the honest bound above. The join program the coordinator builds from a
+/// worker's stated shapes grows with them (on the test fixture, 2^24 rows on
+/// every table took 12 GiB to build and 2^29 rows over 32 GiB), so shapes
+/// above the cap are refused before any join is built.
+fn max_worker_leaf_tables(groups: usize) -> usize {
+    2 * (HONEST_LEAF_TABLES_FIXED + HONEST_LEAF_TABLES_PER_GROUP * groups)
+}
 
 /// The tallest table a worker's leaf may state, in variables: every honest
 /// leaf in the same measurement had its tallest table at 2^22 rows. The cap
@@ -1620,20 +1632,25 @@ const MAX_WORKER_LEAF_TABLES: usize = 2 * 59;
 const MAX_WORKER_LEAF_TABLE_VARS: u8 = 22 + 2;
 
 /// A worker's leaf artifacts as the join's child, refused above the stated
-/// shape cap ([`MAX_WORKER_LEAF_TABLES`], [`MAX_WORKER_LEAF_TABLE_VARS`]).
-/// Every worker leaf reaches the join through here, early or with its proof.
+/// shape cap for a leaf of `groups` base groups ([`max_worker_leaf_tables`],
+/// [`MAX_WORKER_LEAF_TABLE_VARS`]). `groups` comes from the coordinator's
+/// plan, never from the worker. Every worker leaf reaches the join through
+/// here, early or with its proof.
 fn worker_child(
     artifacts: LeafArtifacts,
+    groups: usize,
     layout: &BlockLayout,
     rounds: Option<u8>,
 ) -> Result<WlfmChild, Error> {
     let artifacts = artifacts.into_artifacts(rounds).map_err(fail)?;
     let tables = artifacts.table_num_vars.len();
     let tallest = artifacts.table_num_vars.iter().max().copied().unwrap_or(0);
-    if !within_worker_leaf_cap(tables, tallest) {
+    if !within_worker_leaf_cap(tables, tallest, groups) {
         return Err(fail(format!(
             "worker leaf shapes above the cap: {tables} tables, the tallest 2^{tallest} rows \
-             (at most {MAX_WORKER_LEAF_TABLES} tables of at most 2^{MAX_WORKER_LEAF_TABLE_VARS} rows)"
+             (at most {} tables for {groups} groups, of at most \
+             2^{MAX_WORKER_LEAF_TABLE_VARS} rows)",
+            max_worker_leaf_tables(groups)
         )));
     }
     Ok(WlfmChild {
@@ -1643,8 +1660,15 @@ fn worker_child(
     })
 }
 
-fn within_worker_leaf_cap(tables: usize, tallest: u8) -> bool {
-    tables <= MAX_WORKER_LEAF_TABLES && tallest <= MAX_WORKER_LEAF_TABLE_VARS
+fn within_worker_leaf_cap(tables: usize, tallest: u8, groups: usize) -> bool {
+    tables <= max_worker_leaf_tables(groups) && tallest <= MAX_WORKER_LEAF_TABLE_VARS
+}
+
+/// Base groups in each leaf of `plan`, in leaf order.
+fn leaf_group_counts(plan: &crate::lfm::whir_block::WhirBlockPlan, leaves: usize) -> Vec<usize> {
+    (0..leaves)
+        .map(|leaf| plan.partition().leaf(leaf).len())
+        .collect()
 }
 
 /// Joins this process built from worker leaves' stated shapes.
@@ -1668,13 +1692,16 @@ fn build_join_from_artifacts(
     let mut remote: Vec<_> = (0..workers).map(|_| None).collect();
     for artifact in artifacts.iter().take(owners.len()) {
         match artifact {
-            JoinArtifact::Local(child, layout, rounds) => local = Some((child, layout, rounds)),
+            JoinArtifact::Local(child, layout, rounds, groups) => {
+                local = Some((*child, layout, rounds, groups))
+            }
             JoinArtifact::Worker(id, artifacts) => remote[id] = Some(artifacts),
         }
     }
-    let (local, layout, rounds) = local.ok_or_else(|| fail("missing local leaf artifacts"))?;
-    let children = leaves_in_order(owners, local_leaf, local, &mut remote, |artifacts| {
-        worker_child(artifacts, &layout, rounds)
+    let (local, layout, rounds, groups) =
+        local.ok_or_else(|| fail("missing local leaf artifacts"))?;
+    let children = leaves_in_order(owners, local_leaf, local, &mut remote, |leaf, artifacts| {
+        worker_child(artifacts, groups[leaf], &layout, rounds)
     })?;
     clock.mark("leaf-artifacts-ready");
     #[cfg(test)]
@@ -1803,9 +1830,10 @@ fn open_levels(
                         if let Some(tx) = local_artifacts.as_ref() {
                             clock.mark("leaf-artifacts-local");
                             tx.send(JoinArtifact::Local(
-                                child.clone(),
+                                Box::new(child.clone()),
                                 plan.child_layout(),
                                 level_rounds(&plan),
+                                leaf_group_counts(&plan, owners.len()),
                             ))
                             .map_err(|_| "join artifact receiver stopped")?;
                         }
@@ -1916,18 +1944,21 @@ fn open_levels(
         return Ok(proof);
     };
     let (local_child, local_proof) = *local;
-    let proofs = leaves_in_order(owners, local_leaf, local_proof, &mut proofs, Ok)?;
+    let proofs = leaves_in_order(owners, local_leaf, local_proof, &mut proofs, |_, proof| {
+        Ok(proof)
+    })?;
     if let Some((children, level)) = built_join {
         return cluster_levels::prove_built_join(level, &children, proofs, clock).map_err(fail);
     }
     let rounds = level_rounds(&plan);
     let layout = plan.child_layout();
+    let groups = leaf_group_counts(&plan, owners.len());
     let children = leaves_in_order(
         owners,
         local_leaf,
         local_child,
         &mut legacy_artifacts,
-        |artifacts| worker_child(artifacts, &layout, rounds),
+        |leaf, artifacts| worker_child(artifacts, groups[leaf], &layout, rounds),
     )?;
     clock.mark("leaf-artifacts-ready");
     #[cfg(test)]
@@ -1983,13 +2014,14 @@ fn take_leaf_reply<R>(
 }
 
 /// The leaves in leaf order: the coordinator's own at `local_leaf`, every
-/// other one a worker's reply, converted. A leaf with no reply is refused.
+/// other one a worker's reply, converted with its leaf index. A leaf with no
+/// reply is refused.
 fn leaves_in_order<L, R>(
     owners: &[usize],
     local_leaf: usize,
     local: L,
     replies: &mut [Option<R>],
-    mut convert: impl FnMut(R) -> Result<L, Error>,
+    mut convert: impl FnMut(usize, R) -> Result<L, Error>,
 ) -> Result<Vec<L>, Error> {
     let mut local = Some(local);
     owners
@@ -2003,7 +2035,7 @@ fn leaves_in_order<L, R>(
                 .get_mut(id)
                 .and_then(Option::take)
                 .ok_or_else(|| fail(format!("missing worker {id} leaf")))?;
-            convert(reply)
+            convert(leaf, reply)
         })
         .collect()
 }
@@ -2536,8 +2568,9 @@ fn faulted_shapes(artifacts: LeafArtifacts, rounds: Option<u8>) -> Result<LeafAr
         });
     }
     if fault_is("too-many-tables-leaf") {
+        // Above the cap for any leaf of up to 100 groups.
         return artifacts.self_consistent(rounds, |_, _, chunks, _| {
-            chunks[0].extend(std::iter::repeat_n(2, MAX_WORKER_LEAF_TABLES + 1));
+            chunks[0].extend(std::iter::repeat_n(2, max_worker_leaf_tables(100) + 1));
         });
     }
     Ok(artifacts)
@@ -3648,15 +3681,26 @@ mod tests {
 
     #[test]
     fn the_worker_leaf_shape_cap_holds_at_its_bounds() {
-        assert_eq!(
-            (MAX_WORKER_LEAF_TABLES, MAX_WORKER_LEAF_TABLE_VARS),
-            (118, 24)
-        );
-        assert!(within_worker_leaf_cap(118, 24));
-        assert!(within_worker_leaf_cap(1, 0));
-        assert!(!within_worker_leaf_cap(119, 24));
-        assert!(!within_worker_leaf_cap(118, 25));
-        assert!(!within_worker_leaf_cap(4096, 31));
+        assert_eq!(MAX_WORKER_LEAF_TABLE_VARS, 24);
+        // Twice the honest bound: 2 * (30 + 4 * groups) tables.
+        for (groups, cap) in [(1, 68), (5, 100), (8, 124), (10, 140)] {
+            assert_eq!(max_worker_leaf_tables(groups), cap, "{groups} groups");
+            assert!(within_worker_leaf_cap(cap, 24, groups), "{groups} groups");
+            assert!(
+                !within_worker_leaf_cap(cap + 1, 24, groups),
+                "{groups} groups"
+            );
+            assert!(!within_worker_leaf_cap(cap, 25, groups), "{groups} groups");
+        }
+        // Every measured honest leaf is within the cap, with twice its tables.
+        for (tables, groups) in [(44, 5), (50, 5), (59, 10), (51, 8), (29, 1)] {
+            assert!(
+                within_worker_leaf_cap(2 * tables, 22, groups),
+                "{tables}/{groups}"
+            );
+        }
+        assert!(within_worker_leaf_cap(1, 0, 1));
+        assert!(!within_worker_leaf_cap(4096, 31, 10));
     }
 
     /// The early leaf build's host lane is one pool for the process: one
@@ -3727,17 +3771,17 @@ mod tests {
     fn a_missing_worker_leaf_is_refused_and_leaves_keep_leaf_order() {
         let owners = [3, 0, 2];
         let mut replies = vec![Some(10), None, None];
-        let error = leaves_in_order(&owners, 0, 30, &mut replies, Ok).unwrap_err();
+        let error = leaves_in_order(&owners, 0, 30, &mut replies, |_, r| Ok(r)).unwrap_err();
         assert!(
             error.to_string().contains("missing worker 2 leaf"),
             "{error}"
         );
         let mut replies = vec![Some(10), None, Some(12)];
-        let leaves = leaves_in_order(&owners, 0, 30, &mut replies, Ok).unwrap();
+        let leaves = leaves_in_order(&owners, 0, 30, &mut replies, |_, r| Ok(r)).unwrap();
         assert_eq!(leaves, [30, 10, 12]);
         assert_eq!(replies, [None, None, None], "every reply is taken once");
         let mut replies = vec![Some(10), None, Some(12)];
-        let error = leaves_in_order(&[3, 0, 9], 0, 30, &mut replies, Ok).unwrap_err();
+        let error = leaves_in_order(&[3, 0, 9], 0, 30, &mut replies, |_, r| Ok(r)).unwrap_err();
         assert!(
             error.to_string().contains("missing worker 9 leaf"),
             "{error}"
