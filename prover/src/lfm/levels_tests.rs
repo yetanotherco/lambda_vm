@@ -3006,9 +3006,9 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// chain's length; 2), `RTA_RUNS` (runs in this process, the first a warm-up;
 /// 1). Prints `RTA …` lines, each run's tagged `run k`; everything is verified
 /// off the clock, as `RTA_VERIFY` says: unset or `all` (the default) every
-/// run; `last` the process's last run alone; `off` no run (`RTA VERIFIED:
-/// skipped` a run skipped: a timing process whose arm the job's identity step
-/// verifies).
+/// run; `light` the base, levels and tamper check on every run, with the
+/// standalone block and last-file checks on the last run alone; `last` all
+/// checks on the last run alone; `off` no checks.
 ///
 /// `RTA_L1_GROUPS=k1,k2,…` measures level 1's prove rate at a chosen size
 /// instead ([`rta_first_groups`]): the base proved once, then one level-1 run
@@ -3071,6 +3071,9 @@ fn rta_a_real_block_through_its_levels() {
     let opts = super::proof::block_base_options();
     match verify {
         RtaVerify::All => {}
+        RtaVerify::Light => println!(
+            "RTA VERIFY: light (RTA_VERIFY=light): standalone checks run on the last run alone"
+        ),
         RtaVerify::Last => {
             println!("RTA VERIFY: last (RTA_VERIFY=last): the process's last run alone verified")
         }
@@ -3123,7 +3126,7 @@ fn rta_a_real_block_through_its_levels() {
             levels,
             beside,
             build_beside,
-            verify.skips(k, runs.max(1)),
+            verify.for_run(k + 1 == runs.max(1)),
         );
     }
     println!("RTA DONE");
@@ -3298,7 +3301,7 @@ fn rta_one_run(
     levels: usize,
     beside: bool,
     build_beside: bool,
-    skip_checks: Option<&str>,
+    verify: RtaRunVerify,
 ) {
     use super::levels::prove_block_levels;
     let (elf, input) = (elf.to_vec(), input.to_vec());
@@ -3772,9 +3775,8 @@ fn rta_one_run(
             .join(" · ")
     );
     // Off the clock: the base (a BLAKE3 one under the test permit), every
-    // level, and the block's verifier, each step's seconds on one line —
-    // unless `RTA_VERIFY` skips this run (`skip_checks`: its word).
-    if let Some(word) = skip_checks {
+    // level, and the standalone checks selected for this run.
+    if let RtaRunVerify::Skip(word) = verify {
         println!("RTA VERIFIED: skipped (RTA_VERIFY={word})");
     } else {
         let t = std::time::Instant::now();
@@ -3789,26 +3791,54 @@ fn rta_one_run(
             ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
         }
         let levels_s = t.elapsed().as_secs_f64();
-        let t = std::time::Instant::now();
-        let ok_last = super::levels::verify_block_levels_under(
-            &elf,
-            &opts,
-            &cfg.format,
-            run.base_proof.statement(),
-            family,
-            LevelStop::Levels(levels),
-            run.proofs.last().expect("a last level"),
-        )
-        .is_ok();
-        let block_s = t.elapsed().as_secs_f64();
-        let t = std::time::Instant::now();
-        let ok_file = rta_last_file(&elf, &opts, cfg, &run, family, levels);
-        let file_s = t.elapsed().as_secs_f64();
-        println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
+        let last = run.proofs.last().expect("a last level");
+        let (block, block_s, ok_standalone, file_s, skipped) = if verify == RtaRunVerify::Full {
+            use super::levels::{derive_levels_last, verifier_level_plan};
+            let t = std::time::Instant::now();
+            let format = super::last_level::last_level(family).unwrap_or_else(|e| panic!("{e}"));
+            let plan = verifier_level_plan(
+                &elf,
+                &cfg.format,
+                run.base_proof.statement(),
+                family,
+                super::merkle_cap::cap_mux(),
+            )
+            .expect("derive the verifier's block plan");
+            // Both proofs use the artifacts independently derived from the
+            // ELF and the base statement. Charge the shared work to block.
+            let derived =
+                derive_levels_last(&plan, family, LevelStop::Levels(levels), format, true)
+                    .expect("derive the verifier's levels");
+            let top = &derived.last().expect("a derived level").build.artifacts;
+            let verify_last = |proof: &super::wlfm::WlfmProof| {
+                verify_wlfm(top, proof, &proof.public_words).is_ok()
+                    && top_claims(&plan, &proof.public_words)
+            };
+            let ok_last = verify_last(last);
+            let block_s = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let ok_file = rta_last_file(last, format, verify_last);
+            (
+                ok_last.to_string(),
+                block_s,
+                ok_last && ok_file,
+                t.elapsed().as_secs_f64(),
+                "",
+            )
+        } else {
+            (
+                "skipped (light)".into(),
+                0.0,
+                true,
+                0.0,
+                " · block and last file skipped (light)",
+            )
+        };
+        println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {block}");
         // A tampered last proof (one published word changed) is refused against
         // the last level's artifacts.
         let t = std::time::Instant::now();
-        let mut tampered = run.proofs.last().expect("a last level").clone();
+        let mut tampered = last.clone();
         if let Some((_, w)) = tampered.public_words.first_mut() {
             w[0] += crate::tables::types::FE::one();
         }
@@ -3818,12 +3848,9 @@ fn rta_one_run(
         println!("RTA TAMPER: a changed word of the last level refused {refused}");
         println!(
             "RTA VERIFY SECONDS: base {base_s:.3}s · levels {levels_s:.3}s · block {block_s:.3}s · \
-             last file {file_s:.3}s · tamper {tamper_s:.3}s"
+             last file {file_s:.3}s · tamper {tamper_s:.3}s{skipped}"
         );
-        assert!(
-            ok_base && ok_levels && ok_last && ok_file,
-            "everything verifies"
-        );
+        assert!(ok_base && ok_levels && ok_standalone, "everything verifies");
         assert!(refused, "a tampered last level is refused");
     }
     // Off the clock, a box row (`RTA_IDENTITY=host`, with
@@ -3895,32 +3922,17 @@ fn print_level_census(k: usize, level: &super::levels::Level, p: &super::wlfm::W
 
 /// The last level's proof as a file in [`super::last_level::last_wire`]'s
 /// encoding: its bytes printed, read back for the process's last-level
-/// format and verified by the block's verifier (the decoded proof must be the
-/// one the prover made). `true` when it verifies.
+/// format and verified against the independently derived artifacts.
 fn rta_last_file(
-    elf: &[u8],
-    opts: &ProofOptions,
-    cfg: &super::whir_block_tree::WhirTreeConfig,
-    run: &super::levels::LevelsRun,
-    family: WlfmFamily,
-    levels: usize,
+    last: &super::wlfm::WlfmProof,
+    format: super::last_level::LastLevel,
+    verify_last: impl FnOnce(&super::wlfm::WlfmProof) -> bool,
 ) -> bool {
-    use super::last_level::{last_level, last_level_file, last_wire, read_last_level_file};
+    use super::last_level::{last_level_file, last_wire, read_last_level_file};
     let wire = last_wire().unwrap_or_else(|e| panic!("{e}"));
-    let format = last_level(family).unwrap_or_else(|e| panic!("{e}"));
-    let last = run.proofs.last().expect("a last level");
     let bytes = last_level_file(last, format, wire).unwrap_or_else(|e| panic!("{e}"));
     let ok = match read_last_level_file(&bytes, format) {
-        Ok(back) => super::levels::verify_block_levels_under(
-            elf,
-            opts,
-            &cfg.format,
-            run.base_proof.statement(),
-            family,
-            LevelStop::Levels(levels),
-            &back,
-        )
-        .is_ok(),
+        Ok(back) => verify_last(&back),
         Err(e) => {
             println!("RTA LAST FILE REFUSED: {e}");
             false
@@ -3934,58 +3946,63 @@ fn rta_last_file(
 }
 
 /// Which runs of [`rta_a_real_block_through_its_levels`] are verified off the
-/// clock (the base, every level, the shipped last-level file, a tampered last level
-/// refused): `RTA_VERIFY` unset, empty or `all` (the default) every run;
-/// `last` the process's last run alone (no run of the process follows a
-/// verify); `off` none. Any other word refuses the process before its first
-/// prove.
+/// clock. The standalone checks may be limited to the last run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RtaVerify {
     All,
+    Light,
     Last,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtaRunVerify {
+    Full,
+    Light,
+    Skip(&'static str),
 }
 
 impl RtaVerify {
     fn from_word(word: Option<&str>) -> Self {
         match word.map(str::trim) {
             None | Some("") | Some("all") => Self::All,
+            Some("light") => Self::Light,
             Some("last") => Self::Last,
             Some("off") => Self::Off,
-            Some(other) => panic!("RTA_VERIFY is all, last or off, not {other:?}"),
+            Some(other) => panic!("RTA_VERIFY is all, light, last or off, not {other:?}"),
         }
     }
 
-    /// `None` when run `k` of `runs` is verified; else the word that skips it.
-    fn skips(self, k: usize, runs: usize) -> Option<&'static str> {
+    fn for_run(self, last: bool) -> RtaRunVerify {
         match self {
-            Self::All => None,
-            Self::Last if k + 1 == runs => None,
-            Self::Last => Some("last"),
-            Self::Off => Some("off"),
+            Self::All => RtaRunVerify::Full,
+            Self::Light | Self::Last if last => RtaRunVerify::Full,
+            Self::Light => RtaRunVerify::Light,
+            Self::Last => RtaRunVerify::Skip("last"),
+            Self::Off => RtaRunVerify::Skip("off"),
         }
     }
 }
 
-/// The harness verifies every run unless told `last` or `off`, `last` verifies
-/// the last run alone, and a word it does not take refuses (a misspelt `off`
-/// must not leave a run verified by surprise, nor a misspelt `all` skip it).
+/// The harness selects checks for each run and refuses unrecognized words.
 #[test]
 fn the_rta_verify_word_verifies_by_default_and_refuses_other_words() {
     for on in [None, Some(""), Some("all"), Some(" all ")] {
         let v = RtaVerify::from_word(on);
         assert_eq!(v, RtaVerify::All, "{on:?}");
-        assert!((0..3).all(|k| v.skips(k, 3).is_none()), "{on:?}");
+        assert_eq!(v.for_run(false), RtaRunVerify::Full, "{on:?}");
+        assert_eq!(v.for_run(true), RtaRunVerify::Full, "{on:?}");
     }
+    let light = RtaVerify::from_word(Some(" light "));
+    assert_eq!(light.for_run(false), RtaRunVerify::Light);
+    assert_eq!(light.for_run(true), RtaRunVerify::Full);
     let last = RtaVerify::from_word(Some("last"));
-    assert_eq!(
-        (0..3).map(|k| last.skips(k, 3)).collect::<Vec<_>>(),
-        [Some("last"), Some("last"), None]
-    );
-    assert_eq!(last.skips(0, 1), None, "one run: it is the last");
+    assert_eq!(last.for_run(false), RtaRunVerify::Skip("last"));
+    assert_eq!(last.for_run(true), RtaRunVerify::Full);
     for off in [Some("off"), Some(" off\n")] {
         let v = RtaVerify::from_word(off);
-        assert!((0..3).all(|k| v.skips(k, 3) == Some("off")), "{off:?}");
+        assert_eq!(v.for_run(false), RtaRunVerify::Skip("off"), "{off:?}");
+        assert_eq!(v.for_run(true), RtaRunVerify::Skip("off"), "{off:?}");
     }
     for bad in ["0", "1", "none", "Off", "skip", "all,off", "first"] {
         assert!(
