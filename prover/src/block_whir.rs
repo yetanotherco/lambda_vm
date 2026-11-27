@@ -916,6 +916,9 @@ pub const B3_BASE_KECCAK_RND: crate::tables::keccak_rnd::KeccakRndForm = if B3_B
 /// byte either way: see [`local_lane_setting`].
 pub const LOCAL_LANE_ENV: &str = "LAMBDA_VM_LOCAL_LANE";
 
+/// `1` lets a single commit lane retry deferred local argues during gaps.
+pub const LOCAL_LANE_RETRY_ENV: &str = "LAMBDA_VM_LOCAL_LANE_RETRY";
+
 /// [`LOCAL_LANE_ENV`]'s value: unset, empty or `1` is on (the lane runs the
 /// local argues); `0` is off (every local argue at its group's turn in phase
 /// B). Anything else is refused.
@@ -9822,6 +9825,7 @@ fn prove_streamed(
         None => local_lane_setting(std::env::var(LOCAL_LANE_ENV).ok().as_deref())
             .map_err(Error::Prover)?,
     };
+    let local_lane_retry = std::env::var(LOCAL_LANE_RETRY_ENV).as_deref() == Ok("1");
     // Where the in-row side records are walked into: a word it does not take
     // refuses the prove.
     let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(
@@ -11448,6 +11452,7 @@ fn prove_streamed(
                         .then(|| multilinear_block::LocalPhaseA {
                             buses: local_bytes::LOCAL_BUSES.to_vec(),
                             lane: local_lane,
+                            retry: local_lane_retry,
                             binding: stark::multilinear_table::batched::LocalBinding::ALL,
                         }),
                 ))
