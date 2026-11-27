@@ -182,13 +182,13 @@ fn cases() -> Vec<Case> {
 enum Arm {
     /// Every codeword, fold, tree and factor on the host: the reference.
     Host,
-    /// Nothing forced: three lean rounds in tile form where a stack takes it,
-    /// the fused fold, each first successor encoded from its bound message.
+    /// Nothing forced: auto lean rounds, the fused fold, and each first
+    /// successor encoded from its bound message.
     Defaults,
     /// The lean rounds in share form (`LAMBDA_VM_WHIR_LEAN_TILES=0`).
     ShareForm,
-    /// The tile form, every round and bound table compared with the share form
-    /// (`=check`).
+    /// Three tiled rounds, every round and bound table compared with the
+    /// share form (`=check`).
     TileCheck,
     /// No lean rounds: every opening written at full width up front.
     Materialised,
@@ -216,6 +216,7 @@ fn force(arm: Arm) {
     });
     gpu::force_lean_rounds(match arm {
         Arm::Materialised => Some(0),
+        Arm::TileCheck => Some(3),
         Arm::Lean(rounds) => Some(rounds),
         _ => None,
     });

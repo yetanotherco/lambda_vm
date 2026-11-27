@@ -92,15 +92,18 @@ fn read(what: &str, cw: math_cuda::Result<math_cuda::whir::DeviceCodeword>) -> V
 }
 
 /// Run `f` under one arm: the fused encoding on or off, the wide NTT on or
-/// off, the wide Möbius transform off. Returns its result and how many
+/// off, the wide Möbius transform off, and the high levels separate from
+/// the NTT. Returns its result and how many
 /// encodings fused and gathered.
 fn arm<R>(fused: bool, ntt: bool, f: impl FnOnce() -> R) -> (R, u64, u64) {
     with_mobius_wide(false, || {
         with_mobius_fused(fused, || {
             with_ntt_wide(ntt, || {
-                let (f0, g0) = (mobius_fused_encodes(), mobius_wide_gathers());
-                let r = f();
-                (r, mobius_fused_encodes() - f0, mobius_wide_gathers() - g0)
+                with_mobius_in_ntt(false, || {
+                    let (f0, g0) = (mobius_fused_encodes(), mobius_wide_gathers());
+                    let r = f();
+                    (r, mobius_fused_encodes() - f0, mobius_wide_gathers() - g0)
+                })
             })
         })
     })

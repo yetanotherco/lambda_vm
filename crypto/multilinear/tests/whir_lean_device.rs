@@ -12,7 +12,7 @@
 //! level), six lean rounds with the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`,
 //! the way back), three lean rounds and the fused fold with every successor
 //! folded (`gpu::encode_successor_in_effect` off, the way back), and the
-//! defaults (three lean rounds, the fused fold, the first successor encoded
+//! defaults (auto lean rounds, the fused fold, the first successor encoded
 //! from the bound message instead of folded). Needs a GPU. Each new path is
 //! asserted TAKEN in its arms and NOT in the others (the call counters), so a
 //! card that declined could not turn this into a comparison of today's path
@@ -26,7 +26,8 @@
 //! tile form, and under `check` every round and every opening's bound tables
 //! compared with the share form on the card, none different. On the first
 //! stack — a column of eight rows, which the form declines — the same arms
-//! prove today's bytes in share form.
+//! prove today's bytes in share form. An auto arm checks six tiled rounds
+//! on the eligible stack and the share-form fallback on the smaller stack.
 #![cfg(feature = "cuda")]
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -140,11 +141,10 @@ enum Arm {
     /// Three lean rounds and the fused fold, every successor folded
     /// (`gpu::encode_successor_in_effect` off).
     Folded,
-    /// Nothing forced: the defaults, three lean rounds in tile form (a block a
-    /// tile), the fused fold and each chain's first successor encoded from its
-    /// bound message.
+    /// Nothing forced: auto lean rounds, the fused fold, and each chain's
+    /// first successor encoded from its bound message.
     Defaults,
-    /// The defaults with the lean rounds' form forced
+    /// Three lean rounds with their form forced
     /// (`LAMBDA_VM_WHIR_LEAN_TILES`): tile form a thread or a block a tile, or
     /// checked against the share form on every round.
     Tiles(gpu::LeanTiles),
@@ -190,15 +190,8 @@ fn prove_arm<H: WhirHash>(
             gpu::force_fused_fold(None);
         }
         Arm::Folded | Arm::Defaults | Arm::Tiles(_) => {
-            gpu::force_lean_rounds(None);
+            gpu::force_lean_rounds((!matches!(arm, Arm::Defaults)).then_some(3));
             gpu::force_fused_fold(None);
-            if std::env::var_os("LAMBDA_VM_WHIR_LEAN_ROUNDS").is_none() {
-                assert_eq!(
-                    gpu::lean_rounds_in_effect(),
-                    3,
-                    "the default is three lean rounds"
-                );
-            }
             if matches!(arm, Arm::Defaults | Arm::Tiles(_) | Arm::Auto) {
                 assert!(
                     gpu::encode_successor_in_effect(),

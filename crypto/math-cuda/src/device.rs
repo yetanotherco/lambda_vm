@@ -4134,7 +4134,7 @@ mod device_state_scan_tests {
     /// knob readings, the card count, the backends themselves, pools of host
     /// threads, host function pointers). A new one fails here until a person
     /// has read it and added it, per the rule.
-    const ONCE_CELLS: [(&str, &str); 39] = [
+    const ONCE_CELLS: [(&str, &str); 41] = [
         ("argue_fused.rs", "ON"),
         ("blake3_whir.rs", "KERNELS"),
         ("card_rows.rs", "BYTES"),
@@ -4174,8 +4174,11 @@ mod device_state_scan_tests {
         ("pinned.rs", "ONCE"),
         ("pinned.rs", "POOL_GIB"),
         ("stream_class.rs", "SETTING"),
+        // The deferred Möbius and last-pass hash settings cache process-wide bools.
+        ("whir.rs", "DEFER_MOBIUS_ENABLED"),
         ("whir.rs", "ENABLED"),
         ("whir.rs", "INSTALLED"),
+        ("whir.rs", "LAST_PASS_HASHES_ENABLED"),
         ("whir_coset.rs", "MODULE"),
     ];
 

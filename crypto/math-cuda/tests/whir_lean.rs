@@ -249,7 +249,7 @@ fn lean_matches_materialised(s: &Stack, resident: bool, rounds_wanted: usize) {
     );
 }
 
-/// The default (three rounds) and `LAMBDA_VM_WHIR_LEAN_ROUNDS=6`, each against
+/// The auto mode's fallback (three rounds) and maximum (six), each against
 /// the session materialised up front (`=0`).
 const ROUNDS: [usize; 2] = [math_cuda::whir_open::LEAN_ROUNDS_DEFAULT, 6];
 

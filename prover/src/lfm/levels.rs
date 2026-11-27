@@ -1822,12 +1822,10 @@ impl Drop for BudgetRelease {
     }
 }
 
-/// `LAMBDA_VM_LEVELS_FREE_BESIDE=1`: level 1's filled program (its
-/// instructions and instruction columns) is let go on the thread that hands
-/// the execution's memory back beside the prove, where it is otherwise freed
-/// on the driver's thread before the prove starts. The same program dropped,
-/// later and elsewhere; the prove never reads it. Off by default (and for any
-/// word but `1`). Read once a process.
+/// Drop level 1's filled program on the thread that hands the execution's
+/// memory back beside the prove. Set `LAMBDA_VM_LEVELS_FREE_BESIDE=0` to drop
+/// it on the driver's thread before proving. The prove never reads it.
+/// Read once a process, with surrounding spaces ignored.
 pub const FREE_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_FREE_BESIDE";
 
 /// A test's [`free_beside`], process wide (0 the knob, 1 off, 2 on).
@@ -1854,7 +1852,7 @@ pub fn free_beside() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(FREE_BESIDE_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(super::wlfm_knobs::env_word(FREE_BESIDE_ENV).as_deref())
     })
 }
 

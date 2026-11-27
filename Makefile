@@ -875,6 +875,9 @@ test-prover-comprehensive-cuda: compile-recursion-elfs
 # fault state. Forced split runs both backends on a single card.
 test-prover-identities-cuda: compile-programs-asm
 	@unset LAMBDA_VM_WORD_CHUNKS LAMBDA_VM_BLOCK_WALKERS; \
+	unset LAMBDA_VM_WHIR_LEAN_ROUNDS LAMBDA_VM_GKR_TREE_SKIP_MIDDLE \
+	    LAMBDA_VM_ENCODE_MOBIUS_IN_NTT LAMBDA_VM_NTT_LAST_PASS_HASHES \
+	    LAMBDA_VM_LEVELS_FREE_BESIDE LAMBDA_VM_LEVELS_PREPARE_PARALLEL; \
 	export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1; \
 	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
 	failed=0; \

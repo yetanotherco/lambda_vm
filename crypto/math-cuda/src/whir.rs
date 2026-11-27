@@ -2664,15 +2664,17 @@ pub fn mobius_fused_encodes() -> u64 {
     MOBIUS_FUSED_ENCODES.load(Ordering::Relaxed)
 }
 
+/// Run the high Möbius levels in the wide NTT. Set
+/// `LAMBDA_VM_ENCODE_MOBIUS_IN_NTT=0` to use separate passes.
 fn defer_mobius(fused: Option<u32>) -> bool {
     fused.is_some_and(|levels| levels > 0)
         && crate::lde_cm::ntt_wide_enabled()
         && MOBIUS_IN_NTT_OVERRIDE
             .with(std::cell::Cell::get)
             .unwrap_or_else(|| {
-                static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *ENABLED.get_or_init(|| {
-                    std::env::var_os("LAMBDA_VM_ENCODE_MOBIUS_IN_NTT").is_some_and(|v| v == "1")
+                static DEFER_MOBIUS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *DEFER_MOBIUS_ENABLED.get_or_init(|| {
+                    std::env::var_os("LAMBDA_VM_ENCODE_MOBIUS_IN_NTT").is_none_or(|v| v != "0")
                 })
             })
 }
@@ -3797,14 +3799,15 @@ pub struct StreamedJointStep<'a> {
 pub struct StreamedJointAbsorbed(Option<crate::device::DeviceReservation>);
 
 /// Whether a streamed base commitment can hash its last pass from tiles.
+/// Set `LAMBDA_VM_NTT_LAST_PASS_HASHES=0` to hash in a separate pass.
 #[doc(hidden)]
 pub fn ntt_last_pass_hashes(log_n: u32, log_folding: usize, log_blowup: usize) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST_PASS_HASHES_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     NTT_LAST_PASS_HASHES_OVERRIDE
         .with(std::cell::Cell::get)
         .unwrap_or_else(|| {
-            *ENABLED.get_or_init(|| {
-                std::env::var_os("LAMBDA_VM_NTT_LAST_PASS_HASHES").is_some_and(|v| v == "1")
+            *LAST_PASS_HASHES_ENABLED.get_or_init(|| {
+                std::env::var_os("LAMBDA_VM_NTT_LAST_PASS_HASHES").is_none_or(|v| v != "0")
             })
         })
         && log_folding == 6

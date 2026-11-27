@@ -512,18 +512,17 @@ const LEAN_BLOCK: u32 = 256;
 /// covers.
 const LEAN_MAX_SHARES: usize = 0xFFFF;
 
-/// Rounds a stacked opening runs over its shares before it materialises its
-/// factors at `2^(n − rounds)`, when `LAMBDA_VM_WHIR_LEAN_ROUNDS` does not say
-/// otherwise. Every setting proves the same values.
+/// Fallback count for the stacked prover's default `LAMBDA_VM_WHIR_LEAN_ROUNDS=auto`.
+/// The prover takes six rounds when its tile plan and commit-time overlay
+/// allow it. Every setting proves the same values.
 ///
 /// Three bounds the cost of openings in share form, which scan the stack
-/// once per lean round. The stacked prover also accepts `auto`: six when
-/// its tile plan and commit-time overlay allow it, three otherwise.
+/// once per lean round, and sizes the opening's scratch reservation in auto mode.
 pub const LEAN_ROUNDS_DEFAULT: usize = 3;
 
-/// `LAMBDA_VM_WHIR_LEAN_ROUNDS`'s value read: a count, clamped to the widest
-/// fold ([`crate::whir::FUSED_MAX_FOLD`]); unset or not a number is
-/// [`LEAN_ROUNDS_DEFAULT`].
+/// Parse a fixed round count, clamped to the widest fold
+/// ([`crate::whir::FUSED_MAX_FOLD`]). A missing or invalid count returns
+/// [`LEAN_ROUNDS_DEFAULT`]. The stacked prover selects auto mode separately.
 pub fn lean_rounds_setting(value: Option<&str>) -> usize {
     value
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1804,10 +1803,10 @@ mod tests {
         }
     }
 
-    /// Three lean rounds unless the knob says otherwise; 7 or more is the
-    /// widest fold; unreadable is the default.
+    /// An unreadable fixed count falls back to three. Counts of seven or
+    /// more take the widest fold.
     #[test]
-    fn three_lean_rounds_by_default_and_the_knob_clamps_to_the_widest_fold() {
+    fn the_fixed_lean_round_count_falls_back_to_three_and_clamps_to_the_widest_fold() {
         use crate::whir::FUSED_MAX_FOLD;
         assert_eq!(LEAN_ROUNDS_DEFAULT, 3);
         assert_eq!(lean_rounds_setting(None), 3);
@@ -1986,7 +1985,7 @@ mod tests {
     }
 
     /// The production chain's shape at `2^n`: first6 then four, 400 columns,
-    /// the default lean rounds.
+    /// the fallback lean round count.
     fn production(n: usize) -> OpeningShape {
         OpeningShape {
             num_vars: n,
@@ -2071,8 +2070,8 @@ mod tests {
     }
 
     /// ★ A grouped chain's turn, in numbers: its round 0 holds every
-    /// polynomial's factors at once — `P'·3C/16` at the default three lean
-    /// rounds, beside one polynomial's share-form opening as the last is
+    /// polynomial's factors at once — `P'·3C/16` at the three-round fallback,
+    /// beside one polynomial's share-form opening as the last is
     /// written — where a per-polynomial chain's turn is its first fold's,
     /// `23/64 C`. A run of one is a per-polynomial chain's turn exactly; a run
     /// of `P'` never holds less than its `P'` factors; and at six lean rounds,

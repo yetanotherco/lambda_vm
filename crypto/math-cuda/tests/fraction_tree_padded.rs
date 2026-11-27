@@ -101,7 +101,8 @@ fn the_double_ladder_tree_keeps_exactly_the_levels_it_reads() {
         let real = interactions * rows;
         let height = full.trailing_zeros() as usize;
         let (p, q) = padded(real, full, 0x1234 + interactions as u64);
-        let dense = DeviceFractionTree::build(&p, &q).expect("dense tree");
+        let dense =
+            gkr::with_skip_middle(false, || DeviceFractionTree::build(&p, &q)).expect("dense tree");
         let stream = be.next_stream();
         gkr::with_skip_middle(true, || {
             let sparse = DeviceFractionTree::build(&p, &q).expect("compact tree");
@@ -147,7 +148,10 @@ fn the_double_ladder_tree_keeps_exactly_the_levels_it_reads() {
             .expect("column input plan");
             let (p, q) = gkr::input_from_columns(&stream, &columns.slice(..), rows, &plan, true)
                 .expect("separate input pass");
-            let dense = DeviceFractionTree::from_device(stream.clone(), p, q).expect("dense tree");
+            let dense = gkr::with_skip_middle(false, || {
+                DeviceFractionTree::from_device(stream.clone(), p, q)
+            })
+            .expect("dense tree");
             gkr::with_skip_middle(true, || {
                 for padding in [false, true] {
                     let ((p, q), top) = gkr::input_fold2_from_columns(
@@ -182,12 +186,12 @@ fn assert_kept_levels(dense: &DeviceFractionTree, sparse: &DeviceFractionTree, h
     assert_eq!(dense.num_layers(), sparse.num_layers());
     assert_eq!(dense.output().unwrap(), sparse.output().unwrap());
     for level in 0..height {
+        let dense_layer = dense
+            .layer_to_host(level)
+            .expect("dense tree keeps every level");
         assert_eq!(sparse.layer_num_vars(level), level);
         if level % 2 == 0 {
-            assert_eq!(
-                dense.layer_to_host(level).unwrap(),
-                sparse.layer_to_host(level).unwrap()
-            );
+            assert_eq!(dense_layer, sparse.layer_to_host(level).unwrap());
         } else {
             assert!(
                 sparse.layer_to_host(level).is_err(),

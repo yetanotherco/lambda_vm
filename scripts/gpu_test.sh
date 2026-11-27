@@ -23,6 +23,11 @@ set -euo pipefail
 
 export SYSROOT_DIR="${SYSROOT_DIR:-/opt/lambda-vm-sysroot}"
 
+# Run the tier with the production defaults for the one-card levers.
+unset LAMBDA_VM_WHIR_LEAN_ROUNDS LAMBDA_VM_GKR_TREE_SKIP_MIDDLE \
+    LAMBDA_VM_ENCODE_MOBIUS_IN_NTT LAMBDA_VM_NTT_LAST_PASS_HASHES \
+    LAMBDA_VM_LEVELS_FREE_BESIDE LAMBDA_VM_LEVELS_PREPARE_PARALLEL
+
 log() { printf '\n=== %s ===\n' "$*"; }
 
 # --- GPU toolchain sanity (fail loudly rather than silently falling back to CPU) ---

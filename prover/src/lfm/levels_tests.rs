@@ -1127,26 +1127,36 @@ fn the_blake3_driver_with_its_packs_at_once_proves_the_same_level_bytes() {
 
 /// ★ Level 1's validator with its checks at once
 /// (`LAMBDA_VM_LEVELS_VALIDATE_AT_ONCE`) and its program let go beside the
-/// prove (`LAMBDA_VM_LEVELS_FREE_BESIDE`): a small BLAKE3 block driven with
-/// both on proves each level's bytes as [`prove_levels`] does over the same
-/// base. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+/// prove (`LAMBDA_VM_LEVELS_FREE_BESIDE`), with parallel table preparation
+/// (`LAMBDA_VM_LEVELS_PREPARE_PARALLEL`). Both settings of the release and
+/// preparation knobs preserve the level bytes with the validator at once.
+/// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1` and runs alone.
 #[test]
-#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+#[ignore = "proves both settings; box tier, deterministic grind"]
 fn the_blake3_driver_validating_at_once_and_freeing_beside_proves_the_same_level_bytes() {
     use super::levels::{set_free_beside_for_test, set_validate_at_once_for_test};
+    use super::wlfm::set_prepare_parallel_for_test;
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
             set_validate_at_once_for_test(None);
             set_free_beside_for_test(None);
+            set_prepare_parallel_for_test(None);
         }
     }
     let _restore = Restore;
     set_validate_at_once_for_test(Some(true));
-    set_free_beside_for_test(Some(true));
-    let run = driven_under_chain_steps(ChainSteps::default());
-    assert!(run.times.release.1, "level 1's program freed beside");
-    assert!(run.proofs.len() >= 2, "level 2 too");
+    for on in [false, true] {
+        set_free_beside_for_test(Some(on));
+        set_prepare_parallel_for_test(Some(on));
+        let run = driven_under_chain_steps(ChainSteps::default());
+        assert_eq!(run.times.release.1, on, "level 1 freed beside");
+        assert!(run.proofs.len() >= 2, "level 2 too");
+        assert_eq!(run.times.stamps.len(), run.proofs.len());
+        for stamp in &run.times.stamps {
+            assert_eq!(stamp.prep_parallel, on, "parallel table preparation");
+        }
+    }
 }
 
 /// ★ Level 1's validator joined after its fill
@@ -2602,27 +2612,18 @@ fn the_fill_beside_knob_is_named_and_on_by_default() {
     assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }
 
-/// The validator-at-once and free-beside knobs' names; both off by default
-/// (and for any word but `1`), a test's setting read back.
+/// The validator-at-once and free-beside knobs' names and defaults.
 #[test]
-fn the_validate_at_once_and_free_beside_knobs_are_named_and_off_by_default() {
-    use super::levels::{
-        FREE_BESIDE_ENV, VALIDATE_AT_ONCE_ENV, free_beside, set_free_beside_for_test,
-        set_validate_at_once_for_test, validate_at_once,
-    };
+fn the_validate_at_once_and_free_beside_knobs_are_named_and_have_expected_defaults() {
+    use super::levels::{FREE_BESIDE_ENV, VALIDATE_AT_ONCE_ENV, free_beside, validate_at_once};
     assert_eq!(VALIDATE_AT_ONCE_ENV, "LAMBDA_VM_LEVELS_VALIDATE_AT_ONCE");
     assert_eq!(FREE_BESIDE_ENV, "LAMBDA_VM_LEVELS_FREE_BESIDE");
     if std::env::var_os(VALIDATE_AT_ONCE_ENV).is_none() {
         assert!(!validate_at_once(), "validate at once off by default");
     }
     if std::env::var_os(FREE_BESIDE_ENV).is_none() {
-        assert!(!free_beside(), "free beside off by default");
+        assert!(free_beside(), "free beside on by default");
     }
-    set_validate_at_once_for_test(Some(true));
-    set_free_beside_for_test(Some(true));
-    assert!(validate_at_once() && free_beside());
-    set_validate_at_once_for_test(None);
-    set_free_beside_for_test(None);
 }
 
 /// The validator-after-the-fill and builder-whole-pool knobs' names; both off

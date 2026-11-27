@@ -3384,10 +3384,10 @@ fn the_whir_block_tree_on_a_real_block() {
         math_cuda::device::tree_download_totals().line(),
         math_cuda::device::staging_totals().pair_waits
     );
-    // The base's stacked openings: the lean rounds in effect
-    // (`LAMBDA_VM_WHIR_LEAN_ROUNDS`, default 3) and how many openings took them.
+    // The scratch reservation covers the three-round fallback in auto mode.
+    // The opening log reports which stacks took six.
     println!(
-        "W3 WHIR LEAN: {} rounds · lean opens {} of {}",
+        "W3 WHIR LEAN: reservation for {} lean rounds · lean opens {} of {}",
         multilinear::gpu::lean_rounds_in_effect(),
         multilinear::gpu::lean_open_calls(),
         multilinear::gpu::open_calls()

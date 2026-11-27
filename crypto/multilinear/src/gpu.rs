@@ -814,9 +814,9 @@ pub fn encode_successor_in_effect() -> bool {
     }
 }
 
-/// The rounds a stacked opening runs over its shares, as this process reads
-/// `LAMBDA_VM_WHIR_LEAN_ROUNDS` (or a test's override). `0` in a build without
-/// a device, where no opening runs there.
+/// The lean round count used to reserve opening scratch. Under the default
+/// `LAMBDA_VM_WHIR_LEAN_ROUNDS=auto`, the reservation covers three rounds and
+/// eligible stacks can take six. Builds without CUDA return `0`.
 pub fn lean_rounds_in_effect() -> usize {
     #[cfg(feature = "cuda")]
     {
@@ -1979,16 +1979,20 @@ pub fn carry_bytes(cells: usize) -> u64 {
     return (4 * cells) as u64 * 24;
 }
 
-/// Applies the compact tree layout to the current bin's builds when its
-/// ladder skips the odd levels below the input and
-/// `LAMBDA_VM_GKR_TREE_SKIP_MIDDLE=1` is set.
+/// Applies the compact tree layout to bins whose double ladder skips the odd
+/// levels below the input. Set `LAMBDA_VM_GKR_TREE_SKIP_MIDDLE=0` to keep every
+/// level. The word is read once, with surrounding spaces ignored.
 pub fn with_gkr_tree_layout<R>(ladder: crate::gkr_lockstep::GkrLadder, f: impl FnOnce() -> R) -> R {
     #[cfg(feature = "cuda")]
     {
         static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let skip = ladder == crate::gkr_lockstep::GkrLadder::Double
             && *SKIP.get_or_init(|| {
-                std::env::var("LAMBDA_VM_GKR_TREE_SKIP_MIDDLE").is_ok_and(|v| v.trim() == "1")
+                crate::logup::knob_on_unless_zero(
+                    std::env::var("LAMBDA_VM_GKR_TREE_SKIP_MIDDLE")
+                        .ok()
+                        .as_deref(),
+                )
             });
         math_cuda::gkr::with_skip_middle(skip, f)
     }
@@ -7257,11 +7261,10 @@ enum OpeningState {
     Gone,
 }
 
-/// Rounds a stacked opening runs over its shares before materialising its
-/// factors (`LAMBDA_VM_WHIR_LEAN_ROUNDS`, `0..=6`; default 3 since ULTRA 129,
-/// [`math_cuda::whir_open::LEAN_ROUNDS_DEFAULT`] says why; `=6` is the way
-/// back). `0` materialises at full width up front, which is the path before
-/// this existed; every setting proves the same values.
+/// Fallback lean round count for `LAMBDA_VM_WHIR_LEAN_ROUNDS=auto`, the
+/// default. An eligible tiled stack takes six rounds. A numeric setting
+/// pins the count (capped at six), with `0` materialising at full width up
+/// front. Every setting proves the same values.
 ///
 /// The factors at full width are the weight and the lifted message, `2·2^n`
 /// extension values — 1.5× the committed base codeword, plus the base staging
@@ -7306,14 +7309,37 @@ fn lean_rounds_mode() -> LeanRounds {
     static SET: std::sync::OnceLock<LeanRounds> = std::sync::OnceLock::new();
     *SET.get_or_init(|| {
         let value = std::env::var("LAMBDA_VM_WHIR_LEAN_ROUNDS").ok();
-        match value.as_deref().map(str::trim) {
-            Some("auto") => LeanRounds::Auto,
-            value => LeanRounds::Fixed(math_cuda::whir_open::lean_rounds_setting(value)),
-        }
+        lean_rounds_mode_word(value.as_deref())
     })
 }
 
-/// Overrides [`LEAN_ROUNDS_DEFAULT`] / `LAMBDA_VM_WHIR_LEAN_ROUNDS` for the
+#[cfg(feature = "cuda")]
+fn lean_rounds_mode_word(value: Option<&str>) -> LeanRounds {
+    match value.map(str::trim) {
+        None | Some("auto") => LeanRounds::Auto,
+        value => LeanRounds::Fixed(math_cuda::whir_open::lean_rounds_setting(value)),
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[test]
+fn lean_rounds_default_to_auto_and_zero_materialises_up_front() {
+    assert!(matches!(lean_rounds_mode_word(None), LeanRounds::Auto));
+    assert!(matches!(
+        lean_rounds_mode_word(Some(" auto ")),
+        LeanRounds::Auto
+    ));
+    assert!(matches!(
+        lean_rounds_mode_word(Some("0")),
+        LeanRounds::Fixed(0)
+    ));
+    assert!(matches!(
+        lean_rounds_mode_word(Some("3")),
+        LeanRounds::Fixed(3)
+    ));
+}
+
+/// Overrides `LAMBDA_VM_WHIR_LEAN_ROUNDS` for the
 /// whole process — for a parity test that proves both ways in one binary.
 /// `None` restores the environment's setting. Not for production callers.
 #[doc(hidden)]

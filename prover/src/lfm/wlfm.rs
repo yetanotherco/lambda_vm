@@ -2797,6 +2797,9 @@ fn prove_traces_under<H: WhirHash>(
             at += n;
         }
     }
+    // Sample the caller's setting before Rayon can move a table to another
+    // thread. Tests can override narrow packing on the caller's thread.
+    let pack_chips_narrow = narrow_chips();
     let prepare_table = |(t, ((air, table), &(width, num_vars)))| {
         let t: usize = t;
         let name = stark::traits::AIR::name(air);
@@ -2862,7 +2865,7 @@ fn prove_traces_under<H: WhirHash>(
             packed.map_err(|e| format!("{name}: {e}"))
         };
         let committed = match table {
-            TableIn::Wide(trace) if narrow_chips() => CommittedTable::from_narrow(
+            TableIn::Wide(trace) if pack_chips_narrow => CommittedTable::from_narrow(
                 layout,
                 pack_narrow(
                     trace.main_table.row_major_data(),
@@ -3827,12 +3830,27 @@ pub fn prepare_par() -> bool {
 }
 
 /// Prepare a filled level's proof tables in parallel, using layouts made at build time.
+/// Set `LAMBDA_VM_LEVELS_PREPARE_PARALLEL=0` to prepare them serially.
+/// Read once a process, with surrounding spaces ignored.
 pub const PREPARE_PARALLEL_ENV: &str = "LAMBDA_VM_LEVELS_PREPARE_PARALLEL";
 
+#[cfg(test)]
+static PREPARE_PARALLEL_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// Override preparation across the driver and its worker threads. Run the test alone.
+#[cfg(test)]
+pub(super) fn set_prepare_parallel_for_test(on: Option<bool>) {
+    *PREPARE_PARALLEL_FOR_TEST.lock().unwrap() = on;
+}
+
 fn prepare_parallel() -> bool {
+    #[cfg(test)]
+    if let Some(on) = *PREPARE_PARALLEL_FOR_TEST.lock().unwrap() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(
+        !super::wlfm_knobs::knob_word_off(
             super::wlfm_knobs::env_word(PREPARE_PARALLEL_ENV).as_deref(),
         )
     })
