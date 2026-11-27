@@ -1000,10 +1000,10 @@ fn a_word_block_with_cut_word_families_proves_and_verifies() {
 /// knob `LAMBDA_VM_WORD_CHUNKS=part`). At word caps of 4 rows, so every
 /// family with rows cuts into chunks; on a CPU run and on runs that call
 /// COPY, keccak256 and ECREC.
-#[test]
-fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
-    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
-    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+fn assert_streamed_word_families(name: &str) {
+    use crate::tables::trace_builder::StreamTable;
+
+    let _ecrec = (name == "test_ecrec_stream").then(crate::tables::trace_builder::ecrec_forge_free);
     let words = format(MemoryFormat::Words);
     let tiny = MaxRowsConfig {
         mem_load: 4,
@@ -1011,65 +1011,101 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
         ..MaxRowsConfig::small()
     };
     let opts = ProofOptions::default_test_options();
-    for name in [
-        "fused_mem_cases",
-        "test_copy_ecalls",
-        "test_keccak256",
-        "test_ecrec",
-    ] {
-        let elf = asm_elf_bytes(name);
-        let prove_with = |stream: bool, in_place: bool| {
-            let mut options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
-            options.drop_streamed_ops = in_place;
-            prove_block_whir_with(
-                &elf,
-                &[],
-                &opts,
-                &words,
-                &options,
-                &Deviations {
-                    word_stream: Some(stream),
-                    word_chunks: Some(if in_place {
-                        crate::block_whir::WordChunks::Parts
-                    } else {
-                        crate::block_whir::WordChunks::Copy
-                    }),
-                    ..Deviations::default()
-                },
-            )
-            .unwrap_or_else(|e| panic!("{name} stream {stream} in place {in_place}: {e:?}"))
-            .0
-        };
-        let built = prove_with(false, false);
-        for in_place in [false, true] {
-            let streamed = prove_with(true, in_place);
+    let elf = asm_elf_bytes(name);
+    let prove_with = |stream: bool, in_place: bool| {
+        let mut options = super::block_whir_tests::streamed(tiny.clone(), 3, 3);
+        options.drop_streamed_ops = in_place;
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &opts,
+            &words,
+            &options,
+            &Deviations {
+                word_stream: Some(stream),
+                word_chunks: Some(if in_place {
+                    crate::block_whir::WordChunks::Parts
+                } else {
+                    crate::block_whir::WordChunks::Copy
+                }),
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{name} stream {stream} in place {in_place}: {e:?}"))
+    };
+    let (built, built_stamps) = prove_with(false, false);
+    match name {
+        "test_keccak256_stream" => assert!(built.table_counts.keccak_rnd > 1),
+        "test_ecrec_stream" => {
+            assert!(built.table_counts.ecrec > 0 && built.table_counts.ecdas > 0)
+        }
+        _ => {}
+    }
+    for in_place in [false, true] {
+        let (streamed, stamps) = prove_with(true, in_place);
+        assert!(
+            stamps.streamed.1 > built_stamps.streamed.1,
+            "{name} {in_place}: word chunks handed out during the walk"
+        );
+        if in_place {
+            let handout = &stamps.windows.handout;
             assert!(
-                matches!(verify_block_whir(&streamed, &elf, &opts, &words), Ok(true)),
-                "{name} {in_place}"
-            );
-            assert_eq!(
-                format!("{:?}", streamed.table_counts),
-                format!("{:?}", built.table_counts),
-                "{name}: the counts"
-            );
-            assert_eq!(
-                streamed.word_memory, built.word_memory,
-                "{name}: the word tables"
-            );
-            assert_eq!(
-                streamed.table_num_vars, built.table_num_vars,
-                "{name}: the heights"
-            );
-            assert_eq!(
-                streamed.public_output, built.public_output,
-                "{name}: the output"
+                StreamTable::WORDS
+                    .iter()
+                    .any(|table| handout.chunks[table.position()] > 0),
+                "{name}: word chunks handed out as parts"
             );
             assert!(
-                streamed.word_memory.iter().any(|&n| n > 1),
-                "{name}: a family cut into several tables"
+                StreamTable::WORDS
+                    .iter()
+                    .all(|table| handout.copied[table.position()] == 0),
+                "{name}: word chunks copy no rows"
             );
         }
+        assert!(
+            matches!(verify_block_whir(&streamed, &elf, &opts, &words), Ok(true)),
+            "{name} {in_place}"
+        );
+        assert_eq!(
+            format!("{:?}", streamed.table_counts),
+            format!("{:?}", built.table_counts),
+            "{name}: the counts"
+        );
+        assert_eq!(
+            streamed.word_memory, built.word_memory,
+            "{name}: the word tables"
+        );
+        assert_eq!(
+            streamed.table_num_vars, built.table_num_vars,
+            "{name}: the heights"
+        );
+        assert_eq!(
+            streamed.public_output, built.public_output,
+            "{name}: the output"
+        );
+        assert!(
+            streamed.word_memory.iter().any(|&n| n > 1),
+            "{name}: a family cut into several tables"
+        );
     }
+}
+
+mod a_word_block_with_streamed_word_families_states_the_finish_built_block {
+    macro_rules! guests {
+        ($($name:ident),+ $(,)?) => {$(
+            #[test]
+            fn $name() {
+                super::assert_streamed_word_families(stringify!($name));
+            }
+        )+};
+    }
+
+    guests!(
+        fused_mem_cases,
+        test_copy_ecalls,
+        test_keccak256_stream,
+        test_ecrec_stream
+    );
 }
 
 /// Two pages of private input.

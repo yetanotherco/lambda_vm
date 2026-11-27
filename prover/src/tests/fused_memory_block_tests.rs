@@ -246,7 +246,8 @@ fn a_fused_block_filled_from_its_records_moves_no_byte() {
 /// unchanged verifier refuses it on the bus balance (the CPU's request and the
 /// moved row's memory tokens no longer cancel), and with the balance check
 /// alone switched off it would accept it: the balance is the check that
-/// refuses. The control, the same block with no fault, verifies.
+/// refuses. A shared honest control holds streamed chunks of both families
+/// as rows and verifies.
 #[test]
 fn a_wrong_fused_table_is_refused_by_the_verifier() {
     use crate::block_whir::{BlockRefusal, verify_block_whir_traced};
@@ -260,45 +261,66 @@ fn a_wrong_fused_table_is_refused_by_the_verifier() {
         ..MaxRowsConfig::small()
     };
     let elf = asm_elf_bytes("fused_mem_cases");
-    for family in ["MEM_LOAD", "MEM_STORE"] {
-        let mut rows = RowFamilies::NONE;
-        match family {
-            "MEM_LOAD" => rows.mem_load = true,
-            _ => rows.mem_store = true,
-        }
-        let proved = |fault: u64| {
-            let mut o = super::block_whir_tests::streamed(max_rows.clone(), 5, 3);
-            o.drop_streamed_ops = true;
-            let (proof, stamps) = prove_block_whir_with(
-                &elf,
-                &[],
-                &opts,
-                &fused(),
-                &o,
-                &Deviations {
-                    card_fill_streamed_fault: fault,
-                    card_fill_rows: Some(rows),
-                    // Regeneration is off here, and parked records need it: kept.
-                    records_keep: Some(true),
-                    ..super::block_whir_tests::streamed_records(false, false)
-                },
-            )
-            .unwrap_or_else(|e| {
-                panic!("{family}: the prover refused ({e:?}): the verifier was never asked")
-            });
-            let c = stamps.windows.card_fill;
-            let held = match family {
-                "MEM_LOAD" => c.mem_load[0],
-                _ => c.mem_store[0],
-            };
-            assert!(held > 0, "{family}: no chunk held as rows: {c:?}");
-            proof
-        };
-        let honest = proved(0);
-        assert!(verifies(&honest, &elf, &fused()), "{family}: the control");
-        let forged = proved(4);
+    let format = fused();
+    let proved = |rows: RowFamilies, fault| {
+        let mut o = super::block_whir_tests::streamed(max_rows.clone(), 5, 3);
+        o.drop_streamed_ops = true;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &o,
+            &Deviations {
+                card_fill_streamed_fault: fault,
+                card_fill_rows: Some(rows),
+                // Regeneration is off here, and parked records need it: kept.
+                records_keep: Some(true),
+                ..super::block_whir_tests::streamed_records(false, false)
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!("{rows:?}: the prover refused ({e:?}): the verifier was never asked")
+        });
+        let c = stamps.windows.card_fill;
+        assert!(
+            !rows.mem_load || c.mem_load[0] > 0,
+            "no MEM_LOAD chunk held as rows: {c:?}"
+        );
+        assert!(
+            !rows.mem_store || c.mem_store[0] > 0,
+            "no MEM_STORE chunk held as rows: {c:?}"
+        );
+        proof
+    };
+    let honest = proved(
+        RowFamilies {
+            mem_load: true,
+            mem_store: true,
+            ..RowFamilies::NONE
+        },
+        0,
+    );
+    assert!(verifies(&honest, &elf, &format), "the shared control");
+    for (family, rows) in [
+        (
+            "MEM_LOAD",
+            RowFamilies {
+                mem_load: true,
+                ..RowFamilies::NONE
+            },
+        ),
+        (
+            "MEM_STORE",
+            RowFamilies {
+                mem_store: true,
+                ..RowFamilies::NONE
+            },
+        ),
+    ] {
+        let forged = proved(rows, 4);
         let traced = |checks| {
-            verify_block_whir_traced(&forged, &elf, &opts, &fused(), false, checks)
+            verify_block_whir_traced(&forged, &elf, &opts, &format, false, checks)
                 .unwrap_or_else(|e| panic!("{family}: the statement did not frame: {e:?}"))
         };
         let refusal = traced(VerifierChecks::ALL);

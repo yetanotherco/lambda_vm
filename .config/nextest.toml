@@ -7,17 +7,17 @@ test-threads = 8
 [profile.cuda.junit]
 path = "junit.xml"
 
-# A heavy test claims every runner slot. The first four cases proved whole
-# blocks or levels and reached 3.6–4.8 GiB on a single RTX 5090. Earlier GPU gates also marked
+# A heavy test claims every runner slot. The first four filter entries cover
+# block and level proofs that reached 3.6–4.8 GiB on a single RTX 5090. Earlier GPU gates also marked
 # the remaining cases as large. The production-posture target runs serially.
 # Run the exclusive cases first so they can claim all slots without draining
 # the worker pool in the middle of the suite.
 [[profile.cuda.overrides]]
 filter = '''
 package(=lambda-vm-prover) & (
-    test(=tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier)
-    | test(=tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block)
-    | test(=tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block)
+    test(~tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier::)
+    | test(~tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::)
+    | test(~tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::)
     | test(=lfm::levels_tests::the_pinned_blake3_base_and_both_levels_verify_at_test_security)
     | test(/::(card_built_words_on_a_real_block_write_todays_words|card_rows_on_a_real_block_write_todays_words|the_real_blocks_words_decode_to_the_walks_rows)$/)
     | test(/::(a_batched_block_leaf_refuses_a_tampered_witness|a_p1_block_leaf_refuses_a_tampered_witness|a_small_blocks_leaves_stream_in_pieces_to_their_execute)$/)

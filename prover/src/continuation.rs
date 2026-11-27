@@ -4123,35 +4123,24 @@ mod tests {
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
-    // Round-trip: a bundle from prove_continuation verifies on its own (only the
-    // bundle + ELF) and reconstructs the exact run-wide output.
+    // A bundle verifies from the ELF alone, both directly and after the rkyv
+    // round-trip used by the CLI's `prove`/`verify --continuations` path.
     #[test]
     fn test_split_verify_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
-        let bundle =
-            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
-        let out = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
-            .unwrap();
-        assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
-    }
+        let opts = ProofOptions::default_test_options();
+        let bundle = prove_continuation(&elf_bytes, &[], 4, &opts).unwrap();
+        let expected = Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]);
 
-    // A bundle survives an rkyv round-trip and still verifies to the same output —
-    // the serialization path the CLI's `prove`/`verify --continuations` relies on.
-    #[test]
-    fn test_continuation_rkyv_roundtrip() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_commit_split");
-        let bundle =
-            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
+        let out = verify_continuation(&elf_bytes, &bundle, &opts).unwrap();
+        assert_eq!(out.as_deref(), expected, "the freshly proved bundle");
 
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
         let restored: ContinuationProof =
             rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
-
-        let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
-            .unwrap();
-        assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        let out = verify_continuation(&elf_bytes, &restored, &opts).unwrap();
+        assert_eq!(out.as_deref(), expected, "the archived and restored bundle");
     }
 
     // Run every mutation against a fresh copy of one honest proof. Nextest runs
