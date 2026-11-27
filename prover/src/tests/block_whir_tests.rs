@@ -796,69 +796,88 @@ fn the_rest_is_cut_into_waves_within_the_budget() {
 /// arm ([`finish_keccak_rnd`]): on a card build with b1 and b2 both on it would
 /// otherwise be handed out during the windows in groups of its own (its
 /// tables cut and filled from their records), which the other arms cannot do.
-#[test]
-fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
-    let elf = asm_elf_bytes("test_keccak_multi");
+fn assert_rest_waves_and_finish_packing(workers: usize) {
+    let elf = asm_elf_bytes("test_keccak256_stream");
     let format = many_groups();
-    for workers in [0usize, 3] {
-        // (b1, b2)
-        let proved = |b1: bool, b2: bool| {
-            // Rows of 2^5, the least a KECCAK_RND table takes: it spans several.
-            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-            o.layout_workers = workers;
-            o.finish_keccak_rnd_chunks = b1;
-            o.rest_layout_bytes = b1.then_some(1 << 16);
-            o.pack_finished = b2;
-            let (proof, stamps) = prove_block_whir_with(
-                &elf,
-                &[],
-                &ProofOptions::default_test_options(),
-                &format,
-                &o,
-                &Deviations {
-                    keccak_rnd_first: Some(false),
-                    pages_first: Some(false),
-                    ..finish_keccak_rnd()
-                },
-            )
-            .expect("prove");
-            assert!(
-                verify(&proof, &elf, &format),
-                "b1 {b1}, b2 {b2}, {workers} workers"
-            );
-            (proof, stamps)
-        };
-        let (before, before_stamps) = proved(false, false);
+    // (b1, b2)
+    let proved = |b1: bool, b2: bool| {
+        // Rows of 2^5, the least a KECCAK_RND table takes: it spans several.
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.layout_workers = workers;
+        o.finish_keccak_rnd_chunks = b1;
+        o.rest_layout_bytes = b1.then_some(1 << 16);
+        o.pack_finished = b2;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                keccak_rnd_first: Some(false),
+                pages_first: Some(false),
+                ..finish_keccak_rnd()
+            },
+        )
+        .expect("prove");
         assert!(
-            before.table_counts.keccak_rnd > 1,
-            "KECCAK_RND is one table: nothing was split"
+            verify(&proof, &elf, &format),
+            "b1 {b1}, b2 {b2}, {workers} workers"
         );
-        assert_eq!(before_stamps.layout.packed_rest.0, 0);
-        for (b1, b2) in [(true, false), (false, true), (true, true)] {
-            let (after, stamps) = proved(b1, b2);
-            let what = format!("b1 {b1}, b2 {b2}, {workers} workers");
-            assert_eq!(before.groups, after.groups, "{what}: the partition");
-            assert_eq!(before.table_num_vars, after.table_num_vars, "{what}");
-            assert_eq!(
-                format!("{:?}", before.table_counts),
-                format!("{:?}", after.table_counts),
-                "{what}"
+        (proof, stamps)
+    };
+    let (before, before_stamps) = proved(false, false);
+    assert!(
+        before.table_counts.keccak_rnd > 1,
+        "KECCAK_RND is one table: nothing was split"
+    );
+    assert_eq!(before_stamps.layout.packed_rest.0, 0);
+    for (b1, b2) in [(true, false), (false, true), (true, true)] {
+        let (after, stamps) = proved(b1, b2);
+        let what = format!("b1 {b1}, b2 {b2}, {workers} workers");
+        assert_eq!(before.groups, after.groups, "{what}: the partition");
+        assert_eq!(before.table_num_vars, after.table_num_vars, "{what}");
+        assert_eq!(
+            format!("{:?}", before.table_counts),
+            format!("{:?}", after.table_counts),
+            "{what}"
+        );
+        if b1 && workers > 0 {
+            assert!(
+                stamps
+                    .layout
+                    .marks
+                    .iter()
+                    .any(|&(mark, _)| mark == "rest first received"),
+                "{what}: the rest reaches the sliding finish"
             );
-            if b2 {
-                assert!(
-                    stamps.layout.packed_rest.0 > 0,
-                    "{what}: no table was laid out narrow"
-                );
-            }
-            if crypto::grinding::deterministic() {
-                let bytes = |p: &BlockWhirProof| {
-                    rkyv::to_bytes::<rkyv::rancor::Error>(p)
-                        .expect("serialize")
-                        .to_vec()
-                };
-                assert_eq!(bytes(&before), bytes(&after), "{what}: the proof");
-            }
         }
+        if b2 {
+            assert!(
+                stamps.layout.packed_rest.0 > 0,
+                "{what}: no table was laid out narrow"
+            );
+        }
+        if crypto::grinding::deterministic() {
+            let bytes = |p: &BlockWhirProof| {
+                rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                    .expect("serialize")
+                    .to_vec()
+            };
+            assert_eq!(bytes(&before), bytes(&after), "{what}: the proof");
+        }
+    }
+}
+
+mod the_rest_in_waves_and_the_finish_packed_move_no_byte {
+    #[test]
+    fn inline() {
+        super::assert_rest_waves_and_finish_packing(0);
+    }
+
+    #[test]
+    fn layout_workers() {
+        super::assert_rest_waves_and_finish_packing(3);
     }
 }
 
@@ -3155,14 +3174,27 @@ fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
 /// The finish keeps only the streamed chunks' tails, as the block does.
 #[test]
 fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
-    let elf = asm_elf_bytes("all_instructions_64");
+    let elf = asm_elf_bytes("test_bitwise_table_sources");
     let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    let max_rows = MaxRowsConfig {
+        cpu: 4,
+        ..MaxRowsConfig::small()
+    };
+    let mut o = streamed(max_rows, 5, 2);
     o.layout_workers = 3;
     o.drop_streamed_ops = true;
     assert!(o.rest_streams(), "the rest streams");
     let proved = |what: &str, deviations: Deviations| {
-        let proof = prove_with(&elf, &format, &o, &deviations);
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &deviations,
+        )
+        .expect("prove");
+        assert!(stamps.streamed.1 > 0, "{what}: no chunk handed out");
         assert!(verify(&proof, &elf, &format), "{what}");
         proof
     };
@@ -3181,6 +3213,8 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
             ..Deviations::default()
         },
     );
+    let counts = &from_tables.table_counts;
+    assert!(counts.lt > 0 && counts.branch > 0 && counts.bytewise > 0);
     assert_eq!(from_tables.groups, from_ops.groups, "the partition");
     assert_eq!(
         from_tables.proof.roots, from_ops.proof.roots,
@@ -4289,27 +4323,35 @@ fn a_page_opened_at_another_tables_point_is_refused() {
 #[test]
 fn a_wrongly_committed_prepared_stack_is_refused() {
     use crate::block_whir::StackTamper;
-    let (elf, honest) = dense_block(&Deviations::default());
-    let prepared = prepared_of(&elf, &honest, &one_group());
-    let (a, b) = (prepared[1].0, prepared[2].0);
-    let mut tampers = vec![Deviations {
-        prepared_stack: vec![StackTamper::ColumnsOf { table: a, from: b }],
-        ..Default::default()
-    }];
-    if group_of(&honest, a) == group_of(&honest, b) {
-        tampers.push(Deviations {
-            prepared_stack: vec![StackTamper::Swap(a, b)],
-            ..Default::default()
-        });
-    }
-    tampers.push(Deviations {
+    let format = one_group();
+    let (elf, wrong_decode) = dense_block(&Deviations {
         other_prepared: true,
         ..Default::default()
     });
-    for deviations in &tampers {
-        let (_, wrong) = dense_block(deviations);
-        assert!(!verify(&wrong, &elf, &one_group()));
-        assert!(!verify_skipping_prepared(&wrong, &elf, &one_group()));
+    let assert_refused = |wrong: &BlockWhirProof| {
+        assert!(!verify(wrong, &elf, &format));
+        assert!(!verify_skipping_prepared(wrong, &elf, &format));
+    };
+    assert_refused(&wrong_decode);
+
+    // Changing the prepared DECODE root leaves the statement and partition
+    // intact. Use that proof's statement to locate both prepared pages.
+    let prepared = prepared_of(&elf, &wrong_decode, &format);
+    let (a, b) = (prepared[1].0, prepared[2].0);
+    assert_eq!(
+        group_of(&wrong_decode, a),
+        group_of(&wrong_decode, b),
+        "both prepared pages must share a stack for the swap case"
+    );
+    for tamper in [
+        StackTamper::ColumnsOf { table: a, from: b },
+        StackTamper::Swap(a, b),
+    ] {
+        let (_, wrong) = dense_block(&Deviations {
+            prepared_stack: vec![tamper],
+            ..Default::default()
+        });
+        assert_refused(&wrong);
     }
 }
 
@@ -6866,8 +6908,7 @@ fn row_counts(c: &crate::tables::trace_builder::CardFillStamps) -> [[usize; 2]; 
 /// and stores at every width (laid out inline and on workers) and one that
 /// stores and shifts. (No small program makes four MEMW ops; a real block's
 /// MEMW chunks are the card test's and the gate's.)
-#[test]
-fn row_families_filled_from_their_rows_move_no_byte() {
+fn assert_row_families_from_rows(name: &str, workers: usize, fills: &[&str]) {
     let _fills = records_fill_lock();
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
@@ -6875,98 +6916,103 @@ fn row_families_filled_from_their_rows_move_no_byte() {
             .expect("serialize")
             .to_vec()
     };
-    // Each program, its layouts, and the families it fills a chunk of.
-    for (name, layouts, fills) in [
-        (
-            "all_loadstore_32",
-            &[0usize, 3][..],
-            &["memw_a", "load", "store"][..],
-        ),
-        (
-            "test_ecsm_multi",
-            &[3][..],
-            &["memw_a", "store", "shift"][..],
-        ),
-    ] {
-        let elf = asm_elf_bytes(name);
-        for &workers in layouts {
-            let proved = |deviations: Deviations| {
-                let mut o = streamed(rows_max(), 5, 3);
-                o.layout_workers = workers;
-                o.drop_streamed_ops = true;
-                let (proof, stamps) = prove_block_whir_with(
-                    &elf,
-                    &[],
-                    &ProofOptions::default_test_options(),
-                    &format,
-                    &o,
-                    &deviations,
-                )
-                .expect("prove");
-                assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
-                (proof, stamps)
-            };
-            let (host, host_stamps) = proved(Deviations {
-                card_fill: Some(false),
-                card_fill_streamed: Some([false, false]),
-                card_fill_rows: Some(RowFamilies::NONE),
-                ..finish_keccak_rnd()
-            });
-            let off = host_stamps.windows.card_fill;
-            assert!(
-                row_counts(&off).iter().all(|f| *f == [0, 0]) && off.records_bytes == 0,
-                "knob off: {off:?}"
+    let elf = asm_elf_bytes(name);
+    let proved = |deviations: Deviations| {
+        let mut o = streamed(rows_max(), 5, 3);
+        o.layout_workers = workers;
+        o.drop_streamed_ops = true;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &deviations,
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
+        (proof, stamps)
+    };
+    let (host, host_stamps) = proved(Deviations {
+        card_fill: Some(false),
+        card_fill_streamed: Some([false, false]),
+        card_fill_rows: Some(RowFamilies::NONE),
+        ..finish_keccak_rnd()
+    });
+    let off = host_stamps.windows.card_fill;
+    assert!(
+        row_counts(&off).iter().all(|f| *f == [0, 0]) && off.records_bytes == 0,
+        "knob off: {off:?}"
+    );
+    assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
+    for rest in [false, true] {
+        let what = format!("{name}, {workers} workers, the rest {rest}");
+        // Regeneration is off here, and parked records need it: kept.
+        let (card, stamps) = proved(Deviations {
+            card_fill: Some(rest),
+            card_fill_streamed: Some([rest, rest]),
+            records_keep: Some(true),
+            ..row_records(RowFamilies::ALL)
+        });
+        let c = stamps.windows.card_fill;
+        assert_eq!(c.room_out, None, "{what}: {c:?}");
+        for (family, counts) in ROW_NAMES.iter().zip(row_counts(&c)) {
+            assert_eq!(counts[1], 0, "{what}: {family} on the host: {c:?}");
+            assert_eq!(
+                counts[0] > 0,
+                fills.contains(family),
+                "{what}: {family} held: {c:?}"
             );
-            assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
-            for rest in [false, true] {
-                let what = format!("{name}, {workers} workers, the rest {rest}");
-                // Regeneration is off here, and parked records need it: kept.
-                let (card, stamps) = proved(Deviations {
-                    card_fill: Some(rest),
-                    card_fill_streamed: Some([rest, rest]),
-                    records_keep: Some(true),
-                    ..row_records(RowFamilies::ALL)
-                });
-                let c = stamps.windows.card_fill;
-                assert_eq!(c.room_out, None, "{what}: {c:?}");
-                for (family, counts) in ROW_NAMES.iter().zip(row_counts(&c)) {
-                    assert_eq!(counts[1], 0, "{what}: {family} on the host: {c:?}");
-                    assert_eq!(
-                        counts[0] > 0,
-                        fills.contains(family),
-                        "{what}: {family} held: {c:?}"
-                    );
-                }
-                let rows: usize = row_counts(&c).iter().map(|f| f[0]).sum();
-                let held = (c.cpu[0] + c.memw_r[0] + rows + stamps.layout.records_rest.0) as u64;
-                let (on_card, on_host) = stamps.records_fills;
-                if cfg!(feature = "cuda") {
-                    // At its commit and at its argument on the card; at this
-                    // size a commit under the card's floor encodes on the host
-                    // from the host's fill, once a table.
-                    assert!(
-                        (held..=2 * held).contains(&on_card) && on_host <= held,
-                        "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
-                    );
-                } else {
-                    assert_eq!(
-                        (on_card, on_host),
-                        (0, held),
-                        "{what}: each on the host once"
-                    );
-                }
-                assert_eq!(host.groups, card.groups, "{what}: the partition");
-                assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
-                assert_eq!(
-                    format!("{:?}", host.table_counts),
-                    format!("{:?}", card.table_counts),
-                    "{what}"
-                );
-                if crypto::grinding::deterministic() {
-                    assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
-                }
-            }
         }
+        let rows: usize = row_counts(&c).iter().map(|f| f[0]).sum();
+        let held = (c.cpu[0] + c.memw_r[0] + rows + stamps.layout.records_rest.0) as u64;
+        let (on_card, on_host) = stamps.records_fills;
+        if cfg!(feature = "cuda") {
+            // At its commit and at its argument on the card; at this
+            // size a commit under the card's floor encodes on the host
+            // from the host's fill, once a table.
+            assert!(
+                (held..=2 * held).contains(&on_card) && on_host <= held,
+                "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
+            );
+        } else {
+            assert_eq!(
+                (on_card, on_host),
+                (0, held),
+                "{what}: each on the host once"
+            );
+        }
+        assert_eq!(host.groups, card.groups, "{what}: the partition");
+        assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
+        assert_eq!(
+            format!("{:?}", host.table_counts),
+            format!("{:?}", card.table_counts),
+            "{what}"
+        );
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
+        }
+    }
+}
+
+mod row_families_filled_from_their_rows_move_no_byte {
+    #[test]
+    fn load_store_inline() {
+        super::assert_row_families_from_rows("all_loadstore_32", 0, &["memw_a", "load", "store"]);
+    }
+
+    #[test]
+    fn load_store_layout_workers() {
+        super::assert_row_families_from_rows("all_loadstore_32", 3, &["memw_a", "load", "store"]);
+    }
+
+    #[test]
+    fn store_shift_layout_workers() {
+        super::assert_row_families_from_rows(
+            "test_record_store_shift",
+            3,
+            &["memw_a", "store", "shift"],
+        );
     }
 }
 

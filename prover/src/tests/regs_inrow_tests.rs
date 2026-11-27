@@ -285,8 +285,17 @@ fn in_row_build_as(
     logs: &[executor::vm::logs::Log],
     format: &BlockFormat,
 ) -> crate::tables::trace_builder::Traces {
+    in_row_build_with_rows(program, logs, format, &MaxRowsConfig::small())
+}
+
+fn in_row_build_with_rows(
+    program: &executor::elf::Elf,
+    logs: &[executor::vm::logs::Log],
+    format: &BlockFormat,
+    max_rows: &MaxRowsConfig,
+) -> crate::tables::trace_builder::Traces {
     use crate::tables::trace_builder::WindowedTraceBuilder;
-    let mut builder = WindowedTraceBuilder::new(program, &[], &MaxRowsConfig::small())
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
         .and_then(|b| b.register_format(RegisterFormat::InRow))
         .and_then(|b| b.memw_aligned_order(format.memw_aligned))
         .map(|b| b.keccak_rnd_form(format.keccak_rnd))
@@ -412,102 +421,145 @@ fn refused_by(
     (!(named && whole)).then(|| format!("every check: {all:?} · without {check:?}: {off:?}"))
 }
 
-/// ★ Box: the in-row forgeries proved (`tables::trace_builder::
-/// in_row_forgery_tests`, which reads each on the buses): every forged build
-/// proves, and the block verifier refuses it at the check it targets, and
-/// verifies it with that check off. Cases on the same program share one
-/// honest proof. Each forged build has BITWISE's `IS_HALF` counts recounted,
-/// as its prover would, so a stale count cannot be what refuses it. With the
-/// PC chain run past the exit call (HALT's pc `(1, 0)`) among them, against
-/// the honest exit 0 of the program without its first exit.
-#[test]
-fn in_row_forgeries_are_refused_by_the_block_verifier() {
-    use crate::tables::trace_builder::in_row_forgery_tests::{
-        Forgery, forge, program_of, recount_is_half, with_verifier_files,
-    };
-    use crate::tests::halt_pc_forgery_poc::{
-        FORGED_ROWS, GUEST, forged_logs, patched_elf, run_logs,
-    };
+/// Build with the verifier's fixed register files, for the in-row
+/// forgeries below and their honest controls.
+fn forgery_fixture(
+    elf: &[u8],
+    logs: &[executor::vm::logs::Log],
+    max_rows: &MaxRowsConfig,
+) -> (executor::elf::Elf, crate::tables::trace_builder::Traces) {
+    use crate::tables::trace_builder::in_row_forgery_tests::with_verifier_files;
+    let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+    let mut traces = in_row_build_with_rows(&program, logs, &in_row(), max_rows);
+    with_verifier_files(&program, &mut traces);
+    (program, traces)
+}
+
+/// Every forged build proves and is refused by its target check alone. The
+/// cases on one program share a verified honest control and recount BITWISE's
+/// IS_HALF for every forged build, so a stale count cannot cause the refusal.
+fn assert_forgery_cases(
+    name: &str,
+    max_rows: MaxRowsConfig,
+    cases: &[crate::tables::trace_builder::in_row_forgery_tests::Forgery],
+) {
+    use crate::tables::trace_builder::in_row_forgery_tests::{Forgery, forge, recount_is_half};
     let format = in_row();
-    let run = |elf: &[u8], logs: Option<Vec<executor::vm::logs::Log>>| {
-        let program = executor::elf::Elf::load(elf).expect("the ELF loads");
-        let logs = logs.unwrap_or_else(|| run_logs(elf));
-        let mut traces = in_row_build_as(&program, &logs, &format);
-        with_verifier_files(&program, &mut traces);
-        (program, traces)
-    };
-    let mut honest_controls = std::collections::BTreeMap::new();
+    let elf = asm_elf_bytes(name);
+    let logs = crate::tests::halt_pc_forgery_poc::run_logs(&elf);
+    let (program, mut honest) = forgery_fixture(&elf, &logs, &max_rows);
+    let proof = prove_built(&program, &elf, &mut honest, &format).expect("the honest build proves");
+    assert!(
+        verifies(&proof, &elf, &format),
+        "{name}: the honest build verifies"
+    );
+    drop(honest);
+
     let mut wrong = Vec::new();
-    let mut refused = 0;
-    for forgery in [
-        Forgery::SlotSelfLoop,
-        Forgery::SlotCycle,
-        Forgery::SlotPastReach,
-        Forgery::ResidualSelfLoop,
-        Forgery::KeepAliveChangesValue,
-        Forgery::WrongOldRd,
-        Forgery::KeepAliveInventsValue,
-        Forgery::ReadWithoutRequester,
-    ] {
+    for &forgery in cases {
         let check = match forgery {
             Forgery::KeepAliveChangesValue => Check::Constraint,
             _ => Check::Balance,
         };
-        let (elf, honest_proof) = honest_controls
-            .entry(program_of(forgery))
-            .or_insert_with(|| {
-                let elf = asm_elf_bytes(program_of(forgery));
-                let (program, mut honest) = run(&elf, None);
-                let proof = prove_built(&program, &elf, &mut honest, &format)
-                    .expect("the honest build proves");
-                (elf, proof)
-            });
-        assert!(
-            verifies(honest_proof, elf, &format),
-            "{forgery:?}: the honest build verifies"
-        );
-        let (program, mut forged) = run(elf, None);
+        let (program, mut forged) = forgery_fixture(&elf, &logs, &max_rows);
         forge(forgery, &mut forged);
         let recounted = recount_is_half(&program, &mut forged);
         let proof =
-            prove_built(&program, elf, &mut forged, &format).expect("the forged build proves");
-        match refused_by(&proof, elf, &format, check) {
-            None => refused += 1,
-            Some(read) => wrong.push(format!("{forgery:?}: {read}")),
+            prove_built(&program, &elf, &mut forged, &format).expect("the forged build proves");
+        if let Some(read) = refused_by(&proof, &elf, &format, check) {
+            wrong.push(format!("{forgery:?}: {read}"));
         }
         println!("IN-ROW FORGERY {forgery:?}: {recounted} IS_HALF value(s) recounted, {check:?}");
     }
-    // The PC chain past the exit call.
-    let patched = patched_elf(&asm_elf_bytes(GUEST));
-    let (program, mut honest) = run(&patched, None);
-    let proof =
-        prove_built(&program, &patched, &mut honest, &format).expect("the honest exit proves");
-    assert!(
-        verifies(&proof, &patched, &format),
-        "the patched program's exit 0 verifies"
-    );
-    let elf = asm_elf_bytes(GUEST);
-    let (program, mut forged) = run(&elf, Some(forged_logs(&elf, FORGED_ROWS)));
-    crate::tables::types::VmTable::set_dword_wl(
-        &mut forged.halt.main_table,
-        0,
-        halt::cols::PC_0,
-        1,
-    );
-    with_verifier_files(&program, &mut forged);
-    let recounted = recount_is_half(&program, &mut forged);
-    let proof = prove_built(&program, &elf, &mut forged, &format).expect("the forged run proves");
-    match refused_by(&proof, &elf, &format, Check::Balance) {
-        None => refused += 1,
-        Some(read) => wrong.push(format!("the PC chain past the exit: {read}")),
-    }
-    println!("IN-ROW FORGERY PC chain past the exit: {recounted} IS_HALF value(s) recounted");
     assert!(
         wrong.is_empty(),
         "forgeries not refused by their check alone:\n{}",
         wrong.join("\n")
     );
-    println!("IN-ROW FORGERIES REFUSED: {refused}, each by its check alone");
+}
+
+mod in_row_forgeries_are_refused_by_the_block_verifier {
+    use super::*;
+    use crate::tables::trace_builder::in_row_forgery_tests::Forgery;
+
+    #[test]
+    fn cpu_slots_and_residual_reads() {
+        assert_forgery_cases(
+            "all_instructions_64",
+            MaxRowsConfig::small(),
+            &[
+                Forgery::SlotSelfLoop,
+                Forgery::ResidualSelfLoop,
+                Forgery::WrongOldRd,
+            ],
+        );
+    }
+
+    fn assert_keep_alive_cases(cases: &[Forgery]) {
+        // Keep a gap beyond the slot's 16-bit reach with a shorter loop
+        // and fewer tables. forge() requires the keep-alive and checks
+        // that removing it still takes the slot past that reach.
+        assert_forgery_cases(
+            "keep_alive_regs_min",
+            MaxRowsConfig::uniform(1 << 10),
+            cases,
+        );
+    }
+
+    #[test]
+    fn keep_alive_timestamps() {
+        assert_keep_alive_cases(&[Forgery::SlotCycle, Forgery::SlotPastReach]);
+    }
+
+    #[test]
+    fn keep_alive_values() {
+        assert_keep_alive_cases(&[
+            Forgery::KeepAliveChangesValue,
+            Forgery::KeepAliveInventsValue,
+            Forgery::ReadWithoutRequester,
+        ]);
+    }
+
+    #[test]
+    fn pc_chain_past_exit() {
+        use crate::tables::trace_builder::in_row_forgery_tests::{
+            recount_is_half, with_verifier_files,
+        };
+        use crate::tests::halt_pc_forgery_poc::{
+            FORGED_ROWS, GUEST, forged_logs, patched_elf, run_logs,
+        };
+        let format = in_row();
+        let max_rows = MaxRowsConfig::small();
+        let elf = asm_elf_bytes(GUEST);
+        let patched = patched_elf(&elf);
+        let (program, mut honest) = forgery_fixture(&patched, &run_logs(&patched), &max_rows);
+        let proof =
+            prove_built(&program, &patched, &mut honest, &format).expect("the honest exit proves");
+        assert!(
+            verifies(&proof, &patched, &format),
+            "the patched program's exit 0 verifies"
+        );
+
+        let (program, mut forged) =
+            forgery_fixture(&elf, &forged_logs(&elf, FORGED_ROWS), &max_rows);
+        crate::tables::types::VmTable::set_dword_wl(
+            &mut forged.halt.main_table,
+            0,
+            halt::cols::PC_0,
+            1,
+        );
+        with_verifier_files(&program, &mut forged);
+        let recounted = recount_is_half(&program, &mut forged);
+        let proof =
+            prove_built(&program, &elf, &mut forged, &format).expect("the forged run proves");
+        let read = refused_by(&proof, &elf, &format, Check::Balance);
+        assert!(
+            read.is_none(),
+            "the PC chain past the exit: {}",
+            read.unwrap_or_default()
+        );
+        println!("IN-ROW FORGERY PC chain past the exit: {recounted} IS_HALF value(s) recounted");
+    }
 }
 
 /// ★ Box: REGISTER's files are the verifier's under the in-row register
