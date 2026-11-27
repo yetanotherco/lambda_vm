@@ -1334,6 +1334,18 @@ fn tallest_at<const VARS: u32>(
     rows_mut(chunks, lean).for_each(|n| *n = 1 << VARS);
 }
 
+/// `TABLES` stated tables, each at `2^VARS` rows.
+fn stated_at<const TABLES: usize, const VARS: u32>(
+    hash: &mut usize,
+    chips: &mut [bool; 3],
+    chunks: &mut Vec<Vec<usize>>,
+    lean: &mut B3lShape,
+) {
+    tallest_at::<VARS>(hash, chips, chunks, lean);
+    let others = rows_mut(chunks, lean).count() - chunks[0].len();
+    chunks[0] = vec![1 << VARS; TABLES.saturating_sub(others).max(1)];
+}
+
 /// 4096 stated tables, each at `2^VARS` rows.
 fn most_chunks_at<const VARS: u32>(
     hash: &mut usize,
@@ -1341,9 +1353,7 @@ fn most_chunks_at<const VARS: u32>(
     chunks: &mut Vec<Vec<usize>>,
     lean: &mut B3lShape,
 ) {
-    tallest_at::<VARS>(hash, chips, chunks, lean);
-    let rows = rows_mut(chunks, lean).count();
-    chunks[0] = vec![1 << VARS; 4096 - rows + chunks[0].len()];
+    stated_at::<4096, VARS>(hash, chips, chunks, lean);
 }
 
 /// The early join builds the join program from the shapes a worker states,
@@ -1358,7 +1368,11 @@ fn the_join_build_cost_of_every_admitted_worker_shape() {
     let layout = f.plan.child_layout();
     let rounds = level_rounds(&f.plan);
     let [a, b] = leaves();
-    let sized: [(&str, Reshape); 12] = [
+    let sized: [(&str, Reshape); 16] = [
+        ("59 stated tables at 2^22 rows", stated_at::<59, 22>),
+        ("118 stated tables at 2^22 rows", stated_at::<118, 22>),
+        ("110 stated tables at 2^24 rows", stated_at::<110, 24>),
+        ("118 stated tables at 2^24 rows", stated_at::<118, 24>),
         ("every table at 2^2 rows", tallest_at::<2>),
         ("every table at 2^8 rows", tallest_at::<8>),
         ("every table at 2^16 rows", tallest_at::<16>),
@@ -1419,7 +1433,18 @@ fn the_join_build_cost_of_every_admitted_worker_shape() {
             _ => "unknown".into(),
         };
         let outcome = built.as_ref().map(|_| "built").map_err(String::as_str);
-        println!("JOIN BUILD COST {name}: {outcome:?} in {seconds:.3} s, peak +{peak}");
+        println!(
+            "JOIN BUILD COST {name}: {outcome:?} in {seconds:.3} s, peak +{peak}, \
+             {} tables, tallest 2^{}",
+            children[1].artifacts.table_num_vars.len(),
+            children[1]
+                .artifacts
+                .table_num_vars
+                .iter()
+                .max()
+                .copied()
+                .unwrap_or(0)
+        );
         drop(built);
     }
 }
