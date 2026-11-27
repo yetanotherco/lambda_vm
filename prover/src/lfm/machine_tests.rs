@@ -3246,10 +3246,9 @@ const R1F_SHAPE: MerkleOpeningShape = MerkleOpeningShape {
 
 /// The opening and its recovered leaf index, resolved once per test binary.
 ///
-/// The index costs a `2^depth` sweep (~4 s at depth 20) because `iota` is a
-/// transcript challenge and is not in the proof; see
-/// [`MainTraceOpening::indices_that_verify`]. Sharing it across the tests that
-/// need it keeps that to one sweep.
+/// The index search covers `2^depth` possibilities because `iota` is a
+/// transcript challenge and is absent from the proof. Binary paths share
+/// their common folds in [`MainTraceOpening::indices_that_verify`].
 fn r1f_opening() -> &'static (MainTraceOpening, usize) {
     use std::sync::OnceLock;
     static CELL: OnceLock<(MainTraceOpening, usize)> = OnceLock::new();
@@ -3302,6 +3301,19 @@ fn real_opening_is_a_usable_tamper_target() {
         !opening.verifies_at(index ^ 1),
         "flipping the low index bit must break production's check"
     );
+    // A short prefix of the real path lets the production verifier check
+    // the search's complete result, including the order of the index bits.
+    let mut prefix = MainTraceOpening {
+        root: opening.root,
+        values: opening.values.clone(),
+        num_columns: opening.num_columns,
+        siblings: opening.siblings[..5].to_vec(),
+    };
+    prefix.root =
+        super::proof_arena::walk_to_root(prefix.leaf_hash(), index & 31, &prefix.siblings);
+    let want: Vec<_> = (0..32).filter(|&i| prefix.verifies_at(i)).collect();
+    assert_eq!(prefix.indices_that_verify(), want, "prefix index search");
+
     println!(
         "R1f target: epoch {R1F_EPOCH} table {R1F_TABLE} query {R1F_QUERY} — \
          {} columns, row pair = {} values, depth {}, index {index}",

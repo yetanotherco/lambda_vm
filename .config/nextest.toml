@@ -30,14 +30,6 @@ package(=lambda-vm-prover) & (
 threads-required = "num-test-threads"
 priority = 100
 
-# Start the longest host cases while there are still other tests ready to run.
-[[profile.cuda.overrides]]
-filter = '''
-    test(=tests::constraint_set_tests_a::ecrec::ecrec_constraint_set_folder_capture_agree)
-    | test(=tests::windowed_builder_tests::dropping_the_streamed_ops_builds_the_same_tables)
-'''
-priority = 50
-
 [[profile.cuda.overrides]]
 filter = "all()"
 test-group = "cuda"

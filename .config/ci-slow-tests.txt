@@ -11,7 +11,6 @@
 lambda-vm-prover continuation::tests::an_out_of_range_trace_length_in_a_continuation_is_refused  # 72.7 s on N12: multi-epoch proof and every first, final and global table's length tamper
 lambda-vm-prover tests::trace_length_tests::an_out_of_range_trace_length_in_a_block_proof_is_refused::one_row_dp  # Full blowup-4 DP proof and length mutations through the phase A verifier
 lambda-vm-prover tests::host_hoist_block_tests::the_host_hoist_proves_the_same_block  # 156.0 s on N12: full host-hoist proof comparisons
-lambda-vm-prover tests::constraint_set_tests_a::ecrec::ecrec_constraint_set_folder_capture_agree  # 162.5 s on N12: whole ECREC constraint set and folder capture
 lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block  # 450.9 s on N12: six full word-format blocks with and without regeneration
 lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block  # 621.2 s on N12: full word-format proof comparisons with host levers and walker schedules
 lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_filled_from_its_records_moves_no_byte  # 81.2 s on N12: full fused-block trace paths and byte comparison
@@ -244,7 +243,6 @@ lambda-vm-prover lfm::machine_tests::continuation_fixture_generates_two_epochs  
 lambda-vm-prover tests::multiplicity_forgery_poc::lt_honest_control_verifies  # 86 s
 lambda-vm-prover lfm::machine_tests::the_derivation_extends_a_non_u32_register_value_demonstrating_hazard  # 85 s
 lambda-vm-prover lfm::epoch_tests::the_from_proof_constructor_rejects_a_tampered_bundle  # 85 s
-lambda-vm-prover tests::windowed_builder_tests::dropping_the_streamed_ops_builds_the_same_tables  # 84 s
 lambda-vm-prover tests::block_onechain_tests::a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host  # 84 s
 lambda-vm-prover tests::multiplicity_forgery_poc::lt_unanswered_forged_claim_is_rejected  # 84 s
 lambda-vm-prover tests::multiplicity_forgery_poc::mul_honest_control_verifies  # 84 s
@@ -310,7 +308,6 @@ lambda-vm-prover lfm::machine_tests::transcript_replay_proves_and_verifies  # 62
 lambda-vm-prover lfm::leaf_tests::fri_toy_rejects_a_fixture_built_under_another_hasher  # 61 s
 lambda-vm-prover tests::block_whir_tests::a_tampered_bus_output_is_refused  # 61 s
 lambda-vm-prover lfm::machine_tests::tampered_keccak_output_half_rejects  # 61 s
-lambda-vm-prover tests::constraint_set_tests_a::ecsm::ecsm_constraint_set_folder_capture_agree  # 60 s
 lambda-vm-prover continuation::halt_continuation_poc::poc_control_patched_program_continuation_verifies  # 58 s
 lambda-vm-prover tests::block_whir_tests::a_block_with_a_negative_keccak_multiplicity_is_refused  # 58 s
 lambda-vm-prover tests::block_whir_tests::the_statement_bytes_are_what_absorb_block_appends  # 58 s

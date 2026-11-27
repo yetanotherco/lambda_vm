@@ -45,5 +45,7 @@ mod tests;
 pub use artifact::{AirShape, ArtifactError, ArtifactMeta, ArtifactNode, ConstraintArtifact};
 pub use builder::{Expr, IrBuilder};
 pub use device::{DeviceNode, DeviceProgram, eval_device_program};
+#[cfg(any(test, feature = "test-utils"))]
+pub use interp::eval_program_base_roots;
 pub use interp::{eval_program, eval_program_base, eval_program_roots, eval_program_verifier};
 pub use ir::{ConstraintProgram, Dim, Op};

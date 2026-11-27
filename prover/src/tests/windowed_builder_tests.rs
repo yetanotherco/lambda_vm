@@ -824,6 +824,24 @@ fn windowed_streaming(
     (traces, most, streamed)
 }
 
+fn padded_drop_rows() -> MaxRowsConfig {
+    MaxRowsConfig {
+        cpu: 24,
+        ..MaxRowsConfig::small()
+    }
+}
+
+fn one_op_drop_rows() -> MaxRowsConfig {
+    // The rarer tables get a handful of ops per program. Give them one op a chunk.
+    MaxRowsConfig {
+        memw: 1,
+        load: 1,
+        shift: 1,
+        store: 1,
+        ..MaxRowsConfig::uniform(4)
+    }
+}
+
 /// ★ Dropping each streamed chunk's ops as it leaves builds the whole-run
 /// tables, table for table, at every window length, through `push` and through
 /// the split (the derived LT ops kept compact and LT's ops kept as segments,
@@ -833,89 +851,110 @@ fn windowed_streaming(
 /// chunks of 24 rows, whose dropped chunks each pad 8 rows, and with chunks of 4
 /// rows (one op for the rarer tables), so that every streamed table drops
 /// chunks.
-#[test]
-fn dropping_the_streamed_ops_builds_the_same_tables() {
-    let small = MaxRowsConfig::small();
-    let padded = MaxRowsConfig {
-        cpu: 24,
-        ..MaxRowsConfig::small()
-    };
-    let tiny = MaxRowsConfig::uniform(4);
-    // The rarer tables (MEMW holds only misaligned and mixed-timestamp
-    // accesses and width-1 register writes) get a handful of ops per program:
-    // one op a chunk.
-    let one_op = MaxRowsConfig {
-        memw: 1,
-        load: 1,
-        shift: 1,
-        store: 1,
-        ..MaxRowsConfig::uniform(4)
-    };
-    let mut dropped = std::collections::BTreeSet::new();
-    for (name, max_rows) in [
-        ("sub", &small),
-        ("all_instructions_64", &small),
-        ("test_keccak", &small),
-        ("test_keccak_multi", &small),
-        ("all_instructions_64", &padded),
-        ("test_keccak_multi", &padded),
-        ("all_instructions_64", &tiny),
-        ("test_keccak_multi", &tiny),
-        ("misalign_sd", &one_op),
-        ("test_commit_split", &one_op),
-        ("all_loadstore_32", &one_op),
-        ("all_instructions_64", &one_op),
-    ] {
-        let max_rows = max_rows.clone();
-        let (program, logs) = run(name);
-        let reference = whole(&program, &logs, &max_rows);
-        let want = lt_multiplicities(&reference.lts);
-        for window in [1, 7, 32, 33, 1000, logs.len()] {
-            let window = window.max(1);
-            let (lt_streamed, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
-                b.stream_memw_lt()
-            });
-            for split in [false, true] {
-                let (dropping, held, streamed) =
-                    windowed_streaming(&program, &logs, &max_rows, window, split, |b| {
-                        b.drop_streamed_ops().expect("before any window")
-                    });
-                assert!(
-                    held.is_some() || logs.len() <= window + 1,
-                    "{name}/{window}"
-                );
-                dropped.extend(streamed);
-                same_traces(&reference, &dropping);
-                if !split {
-                    // The finish as it was: the derived LT ops held at 24
-                    // bytes each and LT's ops concatenated (the A arms); and
-                    // the compact ops concatenated. The same tables.
-                    let (raw, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
-                        b.drop_streamed_ops()
-                            .expect("before any window")
-                            .raw_memw_lt()
-                            .expect("before any window")
-                            .concat_lt()
-                    });
-                    same_traces(&reference, &raw);
-                    let (concat, _) =
-                        windowed_with(&program, &logs, &max_rows, window, false, |b| {
-                            b.drop_streamed_ops()
-                                .expect("before any window")
-                                .concat_lt()
-                        });
-                    same_traces(&reference, &concat);
-                }
-                let (both, _) = windowed_with(&program, &logs, &max_rows, window, split, |b| {
-                    b.stream_memw_lt()
-                        .drop_streamed_ops()
-                        .expect("before any window")
+fn check_dropping_the_streamed_ops(name: &str, max_rows: MaxRowsConfig) {
+    let (program, logs) = run(name);
+    let reference = whole(&program, &logs, &max_rows);
+    let want = lt_multiplicities(&reference.lts);
+    // Any window as long as the log takes the same finish-only path.
+    let windows = [1, 7, 32, 33, 1000]
+        .into_iter()
+        .filter(|&window| window < logs.len())
+        .chain([logs.len()]);
+    for window in windows {
+        let (lt_streamed, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
+            b.stream_memw_lt()
+        });
+        for split in [false, true] {
+            let (dropping, held, _) =
+                windowed_streaming(&program, &logs, &max_rows, window, split, |b| {
+                    b.drop_streamed_ops().expect("before any window")
                 });
-                same_traces(&lt_streamed, &both);
-                assert!(
-                    lt_multiplicities(&both.lts) == want,
-                    "{name}/{window}: LT multiplicities"
-                );
+            assert!(
+                held.is_some() || logs.len() <= window + 1,
+                "{name}/{window}"
+            );
+            same_traces(&reference, &dropping);
+            if !split {
+                // The finish as it was: the derived LT ops held at 24
+                // bytes each and LT's ops concatenated (the A arms); and
+                // the compact ops concatenated. The same tables.
+                let (raw, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
+                    b.drop_streamed_ops()
+                        .expect("before any window")
+                        .raw_memw_lt()
+                        .expect("before any window")
+                        .concat_lt()
+                });
+                same_traces(&reference, &raw);
+                let (concat, _) = windowed_with(&program, &logs, &max_rows, window, false, |b| {
+                    b.drop_streamed_ops()
+                        .expect("before any window")
+                        .concat_lt()
+                });
+                same_traces(&reference, &concat);
+            }
+            let (both, _) = windowed_with(&program, &logs, &max_rows, window, split, |b| {
+                b.stream_memw_lt()
+                    .drop_streamed_ops()
+                    .expect("before any window")
+            });
+            same_traces(&lt_streamed, &both);
+            assert!(
+                lt_multiplicities(&both.lts) == want,
+                "{name}/{window}: LT multiplicities"
+            );
+        }
+    }
+}
+
+mod dropping_the_streamed_ops_builds_the_same_tables {
+    use super::*;
+
+    macro_rules! fixtures {
+        ($($case:ident: $guest:literal, $rows:expr;)*) => {
+            $(
+                #[test]
+                fn $case() {
+                    check_dropping_the_streamed_ops($guest, $rows);
+                }
+            )*
+        };
+    }
+
+    fixtures! {
+        sub: "sub", MaxRowsConfig::small();
+        instructions: "all_instructions_64", MaxRowsConfig::small();
+        keccak: "test_keccak", MaxRowsConfig::small();
+        keccak_multi: "test_keccak_multi", MaxRowsConfig::small();
+        instructions_padded: "all_instructions_64", padded_drop_rows();
+        keccak_multi_padded: "test_keccak_multi", padded_drop_rows();
+        instructions_tiny: "all_instructions_64", MaxRowsConfig::uniform(4);
+        keccak_multi_tiny: "test_keccak_multi", MaxRowsConfig::uniform(4);
+        misaligned: "misalign_sd", one_op_drop_rows();
+        commit_split: "test_commit_split", one_op_drop_rows();
+        all_loadstore: "all_loadstore_32", one_op_drop_rows();
+        instructions_one_op: "all_instructions_64", one_op_drop_rows();
+    }
+}
+
+#[test]
+fn the_streamed_fixtures_drop_each_table_family() {
+    let mut dropped = std::collections::BTreeSet::new();
+    let max_rows = one_op_drop_rows();
+    for name in [
+        "misalign_sd",
+        "test_commit_split",
+        "all_loadstore_32",
+        "all_instructions_64",
+    ] {
+        let (program, logs) = run(name);
+        let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+            .expect("the builder")
+            .drop_streamed_ops()
+            .expect("before any window");
+        for cycle in logs[..logs.len() - 1].chunks(1) {
+            for chunk in builder.push(cycle).expect("a window") {
+                dropped.insert(format!("{:?}", chunk.table));
             }
         }
     }

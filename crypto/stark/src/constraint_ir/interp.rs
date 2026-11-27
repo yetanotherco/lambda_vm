@@ -145,7 +145,37 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
-    let values = run(
+    let values = run_base_row(prog, main_row);
+    let root = prog.roots[constraint_idx];
+    values[root as usize].as_base()
+}
+
+/// Evaluate all base roots in one forward pass over a main-only row.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn eval_program_base_roots<F, E>(
+    prog: &ConstraintProgram<F, E>,
+    main_row: &[FieldElement<F>],
+) -> Vec<FieldElement<F>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let values = run_base_row(prog, main_row);
+    prog.roots
+        .iter()
+        .map(|&root| values[root as usize].as_base())
+        .collect()
+}
+
+fn run_base_row<F, E>(
+    prog: &ConstraintProgram<F, E>,
+    main_row: &[FieldElement<F>],
+) -> Vec<Value<F, E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    run(
         prog,
         |main, _offset, row, col| {
             assert!(main, "aux leaves are not part of the minimal algebraic set");
@@ -155,9 +185,7 @@ where
         |_idx| panic!("challenge leaves are not part of the minimal algebraic set"),
         |_idx| panic!("alpha_power leaves are not part of the minimal algebraic set"),
         || panic!("table_offset leaves are not part of the minimal algebraic set"),
-    );
-    let root = prog.roots[constraint_idx];
-    values[root as usize].as_base()
+    )
 }
 
 /// Evaluate every root of `prog` on one base-field main row, with the LogUp

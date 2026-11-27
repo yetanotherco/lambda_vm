@@ -274,8 +274,8 @@ impl MainTraceOpening {
     /// preprocessed commitments come from `air.precomputed_commitment()`). Since
     /// the path, the leaf and the root are all fixed by the proof, the index is
     /// nonetheless determined by them, so recovering it by exhaustion asks the
-    /// proof rather than inventing an answer — and the oracle doing the asking
-    /// is production's `verify_merkle_path_from_leaf_hash`, not a local model.
+    /// proof. Each fold uses the same parent hash and child order as
+    /// production's `verify_merkle_path_from_leaf_hash`.
     ///
     /// The result is a LIST because a degenerate tree has several: a table
     /// whose trace is mostly padding commits identical rows, so identical
@@ -283,12 +283,59 @@ impl MainTraceOpening {
     /// used for an index-tamper vector must have exactly one — otherwise
     /// "flip an index bit" is not a tamper at all. Callers assert that.
     ///
-    /// Costs `2^depth` path walks; fine at the fixture's depths, not a
-    /// mechanism anything but a fixture should use.
+    /// Compute each binary path prefix once. Indices that share low bits
+    /// follow the same folds until the first bit where they differ.
     pub fn indices_that_verify(&self) -> Vec<usize> {
-        (0..(1usize << self.depth()))
-            .filter(|i| self.verifies_at(*i))
-            .collect()
+        use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+        let leaf = self.leaf_hash();
+        if MainBackend::ARITY != 2 {
+            return (0..(1usize << self.depth()))
+                .filter(|&index| {
+                    verify_merkle_path_from_leaf_hash::<MainBackend>(
+                        &self.siblings,
+                        &self.root,
+                        index,
+                        leaf,
+                    )
+                })
+                .collect();
+        }
+
+        fn search(
+            node: Commitment,
+            siblings: &[Commitment],
+            root: &Commitment,
+            index: usize,
+            bit: usize,
+            matches: &mut Vec<usize>,
+        ) {
+            if let Some((sibling, rest)) = siblings.split_first() {
+                search(
+                    MainBackend::hash_new_parent(&node, sibling),
+                    rest,
+                    root,
+                    index,
+                    bit + 1,
+                    matches,
+                );
+                search(
+                    MainBackend::hash_new_parent(sibling, &node),
+                    rest,
+                    root,
+                    index | (1 << bit),
+                    bit + 1,
+                    matches,
+                );
+            } else if &node == root {
+                matches.push(index);
+            }
+        }
+
+        let mut matches = Vec::new();
+        search(leaf, &self.siblings, &self.root, 0, 0, &mut matches);
+        matches.sort_unstable();
+        matches
     }
 
     /// The leaf's field elements as arena words: one base word each, since the

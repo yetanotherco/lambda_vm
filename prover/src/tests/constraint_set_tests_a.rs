@@ -11,7 +11,7 @@
 //! tree-measured degree does not EXCEED its declared `meta.degree`.
 
 use math::field::element::FieldElement;
-use stark::constraint_ir::eval_program_base;
+use stark::constraint_ir::eval_program_base_roots;
 use stark::constraints::builder::{
     CaptureBuilder, ConstraintSet, ProverEvalFolder, RootKind, VerifierEvalFolder,
     num_base_from_meta,
@@ -125,10 +125,11 @@ where
         }
 
         // --- capture → flatten → interpret == ProverEvalFolder (base) ---
-        for (i, expected) in base_out.iter().enumerate() {
+        let interpreted = eval_program_base_roots(&prog, &row);
+        assert_eq!(interpreted.len(), base_out.len(), "[{label}] root count");
+        for (i, (actual, expected)) in interpreted.iter().zip(&base_out).enumerate() {
             assert_eq!(
-                &eval_program_base(&prog, i, &row),
-                expected,
+                actual, expected,
                 "[{label}] interpreter mismatch, constraint {i}, trial {trial}"
             );
         }
