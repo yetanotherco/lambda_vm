@@ -1229,6 +1229,29 @@ fn rows_mut<'a>(
 
 type Reshape = fn(&mut usize, &mut [bool; 3], &mut Vec<Vec<usize>>, &mut B3lShape);
 
+/// Shapes a hostile worker may state for its leaf; the first is the honest
+/// leaf's shapes with placeholder prepared roots.
+fn hostile_reshapes() -> [(&'static str, Reshape); 6] {
+    [
+        ("placeholder prepared roots", |_, _, _, _| {}),
+        ("one row a table", |_, _, chunks, lean| {
+            rows_mut(chunks, lean).for_each(|n| *n = 1)
+        }),
+        ("the tallest table", |_, _, chunks, lean| {
+            rows_mut(chunks, lean)
+                .for_each(|n| *n = 1 << crate::multilinear_prove::MAX_STATED_TABLE_VARS)
+        }),
+        ("the most chunks", |_, _, chunks, lean| {
+            let rows = rows_mut(chunks, lean).count();
+            chunks[0] = vec![2; 4096 - rows + chunks[0].len()];
+        }),
+        ("the other hash chunk count", |hash, _, _, _| {
+            *hash = 3 - *hash
+        }),
+        ("every chip", |_, chips, _, _| *chips = [true; 3]),
+    ]
+}
+
 #[test]
 fn hostile_self_consistent_worker_shapes_are_an_error_not_a_panic() {
     let f = fixture();
@@ -1251,26 +1274,8 @@ fn hostile_self_consistent_worker_shapes_are_an_error_not_a_panic() {
     )
     .unwrap();
     verify_shipment(&f.elf, f.base.statement().to_owned(), &proof, Some(&f.map)).unwrap();
-    let cases: [(&str, Reshape); 6] = [
-        ("placeholder prepared roots", |_, _, _, _| {}),
-        ("one row a table", |_, _, chunks, lean| {
-            rows_mut(chunks, lean).for_each(|n| *n = 1)
-        }),
-        ("the tallest table", |_, _, chunks, lean| {
-            rows_mut(chunks, lean)
-                .for_each(|n| *n = 1 << crate::multilinear_prove::MAX_STATED_TABLE_VARS)
-        }),
-        ("the most chunks", |_, _, chunks, lean| {
-            let rows = rows_mut(chunks, lean).count();
-            chunks[0] = vec![2; 4096 - rows + chunks[0].len()];
-        }),
-        ("the other hash chunk count", |hash, _, _, _| {
-            *hash = 3 - *hash
-        }),
-        ("every chip", |_, chips, _, _| *chips = [true; 3]),
-    ];
     let mut admitted = 0;
-    for (name, reshape) in cases {
+    for (name, reshape) in hostile_reshapes() {
         let forged =
             match LeafArtifacts::from_build(&b.0.artifacts).self_consistent(rounds, reshape) {
                 Ok(forged) => forged,
@@ -1299,6 +1304,124 @@ fn hostile_self_consistent_worker_shapes_are_an_error_not_a_panic() {
         assert!(shipped.is_err(), "{name}: a file shipped");
     }
     assert!(admitted >= 4, "only {admitted} shapes were admitted");
+}
+
+/// This process's resident set and its peak since the last reset, in KiB
+/// (Linux only).
+fn resident_kib() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))?
+            .trim()
+            .strip_suffix(" kB")?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some((field("VmRSS:")?, field("VmHWM:")?))
+}
+
+/// Every stated table at `2^VARS` rows.
+#[allow(clippy::ptr_arg)] // a `Reshape`
+fn tallest_at<const VARS: u32>(
+    _: &mut usize,
+    _: &mut [bool; 3],
+    chunks: &mut Vec<Vec<usize>>,
+    lean: &mut B3lShape,
+) {
+    rows_mut(chunks, lean).for_each(|n| *n = 1 << VARS);
+}
+
+/// 4096 stated tables, each at `2^VARS` rows.
+fn most_chunks_at<const VARS: u32>(
+    hash: &mut usize,
+    chips: &mut [bool; 3],
+    chunks: &mut Vec<Vec<usize>>,
+    lean: &mut B3lShape,
+) {
+    tallest_at::<VARS>(hash, chips, chunks, lean);
+    let rows = rows_mut(chunks, lean).count();
+    chunks[0] = vec![1 << VARS; 4096 - rows + chunks[0].len()];
+}
+
+/// The early join builds the join program from the shapes a worker states,
+/// before any proof and beside the coordinator's own leaf. This prints the
+/// cost of `build_join` (compile and build) on each shape `into_artifacts`
+/// admits, the largest at once included: seconds and the peak resident set
+/// above the start (Linux, after `/proc/self/clear_refs` resets the peak).
+#[test]
+#[ignore = "measurement: the join build on every admitted worker shape"]
+fn the_join_build_cost_of_every_admitted_worker_shape() {
+    let f = fixture();
+    let layout = f.plan.child_layout();
+    let rounds = level_rounds(&f.plan);
+    let [a, b] = leaves();
+    let sized: [(&str, Reshape); 12] = [
+        ("every table at 2^2 rows", tallest_at::<2>),
+        ("every table at 2^8 rows", tallest_at::<8>),
+        ("every table at 2^16 rows", tallest_at::<16>),
+        ("every table at 2^20 rows", tallest_at::<20>),
+        ("every table at 2^24 rows", tallest_at::<24>),
+        ("every table at 2^29 rows", tallest_at::<29>),
+        ("every table at 2^30 rows", tallest_at::<30>),
+        ("the most chunks at 2^2 rows", most_chunks_at::<2>),
+        ("the most chunks at 2^8 rows", most_chunks_at::<8>),
+        ("the most chunks at 2^16 rows", most_chunks_at::<16>),
+        ("the most chunks at 2^20 rows", most_chunks_at::<20>),
+        ("the most chunks at 2^29 rows", most_chunks_at::<29>),
+    ];
+    let cases = [("the honest leaf's own artifacts", None)]
+        .into_iter()
+        .chain(
+            hostile_reshapes()
+                .into_iter()
+                .chain(sized)
+                .map(|(name, reshape)| (name, Some(reshape))),
+        );
+    // One process a case past a memory cap: `LV_JOIN_COST_ONLY` names it.
+    let only = std::env::var("LV_JOIN_COST_ONLY").ok();
+    for (name, reshape) in cases {
+        if only.as_deref().is_some_and(|only| only != name) {
+            continue;
+        }
+        let artifacts = match reshape {
+            None => Ok(LeafArtifacts::from_build(&b.0.artifacts)),
+            Some(reshape) => {
+                LeafArtifacts::from_build(&b.0.artifacts).self_consistent(rounds, reshape)
+            }
+        }
+        .and_then(|artifacts| artifacts.into_artifacts(rounds));
+        let artifacts = match artifacts {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                println!("JOIN BUILD COST {name}: not admitted ({error})");
+                continue;
+            }
+        };
+        let child = WlfmChild {
+            artifacts,
+            num_public_words: layout.total(),
+            cap_mux: Some(CapMux::Packed),
+        };
+        let children = [a.0.clone(), child];
+        let reset = std::fs::write("/proc/self/clear_refs", "5").is_ok();
+        let before = resident_kib();
+        let start = std::time::Instant::now();
+        let built = build_join(&children, &layout, rounds, LAST, Clock::default());
+        let seconds = start.elapsed().as_secs_f64();
+        let after = resident_kib();
+        let peak = match (reset, before, after) {
+            (true, Some((rss, _)), Some((_, hwm))) => {
+                format!("{:.1} MiB", hwm.saturating_sub(rss) as f64 / 1024.0)
+            }
+            _ => "unknown".into(),
+        };
+        let outcome = built.as_ref().map(|_| "built").map_err(String::as_str);
+        println!("JOIN BUILD COST {name}: {outcome:?} in {seconds:.3} s, peak +{peak}");
+        drop(built);
+    }
 }
 
 #[cfg(feature = "cuda")]
