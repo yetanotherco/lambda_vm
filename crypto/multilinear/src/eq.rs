@@ -19,9 +19,24 @@ pub fn eq_evals<F: IsField>(r: &[FieldElement<F>]) -> Vec<FieldElement<F>>
 where
     FieldElement<F>: Send + Sync,
 {
+    eq_evals_with::<F, true>(r)
+}
+
+pub(crate) fn eq_evals_serial<F: IsField>(r: &[FieldElement<F>]) -> Vec<FieldElement<F>>
+where
+    FieldElement<F>: Send + Sync,
+{
+    eq_evals_with::<F, false>(r)
+}
+
+fn eq_evals_with<F: IsField, const PARALLEL: bool>(r: &[FieldElement<F>]) -> Vec<FieldElement<F>>
+where
+    FieldElement<F>: Send + Sync,
+{
     let mut table = vec![FieldElement::<F>::zero(); 1usize << r.len()];
     // The length is `2^r.len()` by construction.
-    eq_evals_into(r, &FieldElement::<F>::one(), &mut table).expect("the table is sized for r");
+    eq_evals_into_with::<F, PARALLEL>(r, &FieldElement::<F>::one(), &mut table)
+        .expect("the table is sized for r");
     table
 }
 
@@ -33,6 +48,17 @@ where
 /// inside a bigger one (a stacked polynomial's weight, say) hands over that
 /// range and pays no copy.
 pub fn eq_evals_into<F: IsField>(
+    r: &[FieldElement<F>],
+    by: &FieldElement<F>,
+    dst: &mut [FieldElement<F>],
+) -> Result<(), Error>
+where
+    FieldElement<F>: Send + Sync,
+{
+    eq_evals_into_with::<F, true>(r, by, dst)
+}
+
+fn eq_evals_into_with<F: IsField, const PARALLEL: bool>(
     r: &[FieldElement<F>],
     by: &FieldElement<F>,
     dst: &mut [FieldElement<F>],
@@ -60,7 +86,7 @@ where
             *l = &*l * &one_minus;
         };
         #[cfg(feature = "parallel")]
-        if half >= crate::SERIAL_BELOW {
+        if PARALLEL && half >= crate::SERIAL_BELOW {
             lo.par_iter_mut().zip(hi.par_iter_mut()).for_each(scale);
         } else {
             lo.iter_mut().zip(hi.iter_mut()).for_each(scale);

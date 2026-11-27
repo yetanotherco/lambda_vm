@@ -758,7 +758,23 @@ struct TablePairs<'a, E: IsField> {
 /// A bus pair's interactions and the point its claim sits at.
 type BusPair<'a, E> = (&'a [Interaction<E>], &'a [FieldElement<E>]);
 
-impl<E: IsField> TablePairs<'_, E> {
+impl<'a, E: IsField> TablePairs<'a, E> {
+    fn buses(&self) -> impl Iterator<Item = (usize, BusPair<'a, E>)> {
+        [(1, self.global), (3, self.local)]
+            .into_iter()
+            .filter_map(|(first, pair)| pair.map(|pair| (first, pair)))
+    }
+
+    fn rule_powers(&self) -> impl Iterator<Item = usize> {
+        std::iter::once(0).chain(self.buses().flat_map(|(first, _)| [first, first + 1]))
+    }
+
+    fn row_points(&self, vars: usize) -> Result<Vec<&'a [FieldElement<E>]>, MlError> {
+        self.buses()
+            .map(|(_, (interactions, point))| logup::claim_row_point(interactions, point, vars))
+            .collect()
+    }
+
     /// The table's own claimed sum, `Σ_j λ^j·claim_j` over its rules: the
     /// zerocheck's 0, `λ·p̃ + λ²·q̃` for the global pair and `λ³·p̃^L + λ⁴·q̃^L`
     /// for the local one, each when present.
@@ -783,6 +799,50 @@ impl<E: IsField> TablePairs<'_, E> {
 /// (the `eq` weights after the zerocheck's, in order).
 type TableRules<'a, E> = (Vec<Rule<'a, E>>, Vec<usize>, Vec<Vec<FieldElement<E>>>);
 
+/// The table's compiled rules in transcript order, with no trace or device work.
+fn table_programs<F, E>(
+    statement: &TableStatement<'_, F, E>,
+    pairs: &TablePairs<'_, E>,
+    beta: &FieldElement<E>,
+    parallel_weights: bool,
+) -> Result<Vec<multilinear::program::Program<E>>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + 'static,
+{
+    let (weight_r, weight_z) = weight_slots(statement.kinds.len());
+    let shape = statement.shape;
+    let betas = multilinear_air::beta_powers(beta, shape.num_roots());
+    let mut programs = vec![shape.program(&betas, weight_r)?];
+    for (i, (_, (interactions, claim_point))) in pairs.buses().enumerate() {
+        programs.extend(logup::claim_programs(
+            interactions,
+            claim_point,
+            statement.num_vars,
+            weight_z + i,
+            parallel_weights,
+        )?);
+    }
+    Ok(programs)
+}
+
+fn compile_table_rules<'a, F, E>(
+    statement: &TableStatement<'_, F, E>,
+    pairs: &TablePairs<'a, E>,
+    beta: &FieldElement<E>,
+) -> Result<Vec<Rule<'a, E>>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + 'static,
+{
+    let degrees = std::iter::once(statement.shape.degree() + 1).chain(std::iter::repeat(2));
+    Ok(table_programs(statement, pairs, beta, true)?
+        .into_iter()
+        .zip(degrees)
+        .map(|(program, degree)| Rule::compiled(degree, program))
+        .collect())
+}
+
 /// A table's rules, one function for both sides: the zerocheck at `λ^0`
 /// over the weight slot `eq(ξ)`; then, when present, the global bus's two
 /// rules at `λ^1, λ^2` and the local bus's two at `λ^3, λ^4`, each pair at
@@ -797,25 +857,28 @@ where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + 'static,
 {
-    let (weight_r, mut weight_z) = weight_slots(statement.kinds.len());
-    let shape = statement.shape;
-    let betas = multilinear_air::beta_powers(beta, shape.num_roots());
-    let zerocheck = Rule::compiled(shape.degree() + 1, shape.program(&betas, weight_r)?);
-    let mut rules = vec![zerocheck];
-    let mut powers = vec![0];
-    let mut points = Vec::new();
-    for (pair, first) in [(&pairs.global, 1), (&pairs.local, 3)] {
-        let Some((interactions, claim_point)) = pair else {
-            continue;
-        };
-        let bus = logup::claim_statements(interactions, claim_point, statement.num_vars, weight_z)?;
-        rules.push(bus.numerator);
-        rules.push(bus.denominator);
-        powers.extend([first, first + 1]);
-        points.push(bus.row_point);
-        weight_z += 1;
-    }
-    Ok((rules, powers, points))
+    let rules = compile_table_rules(statement, pairs, beta)?;
+    let points = pairs
+        .row_points(statement.num_vars)?
+        .into_iter()
+        .map(<[_]>::to_vec)
+        .collect();
+    Ok((rules, pairs.rule_powers().collect(), points))
+}
+
+fn combined_table_program<F, E>(
+    statement: &TableStatement<'_, F, E>,
+    pairs: &TablePairs<'_, E>,
+    beta: &FieldElement<E>,
+    lambdas: &[FieldElement<E>],
+) -> Result<multilinear::program::Program<E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + 'static,
+{
+    let programs = table_programs(statement, pairs, beta, false)?;
+    let programs: Vec<_> = programs.iter().collect();
+    multilinear::program::combine(&programs, lambdas)
 }
 
 /// A table's three rules and its bus's row point.
@@ -1432,97 +1495,140 @@ where
             Where::Device => table.trace.device_factors(),
         })
         .collect();
-    let mut polys = Vec::with_capacity(tables.len());
-    for (t, table) in tables.iter().enumerate() {
-        let n = table.num_vars();
-        let pairs = TablePairs {
+    let pairs: Vec<_> = (0..tables.len())
+        .map(|t| TablePairs {
             global: global_lists[t].zip(claims[t].as_ref().map(|c| c.point.as_slice())),
             local: local
                 .and_then(|local| local.interactions[t].as_deref())
                 .zip(local_claims[t].as_ref().map(|c| c.point.as_slice())),
-        };
-        let (rules, rule_powers, eq_points) = table_rules(&statements[t], &pairs, &beta)?;
-        let xi_t = if faults.suffix_xi == Some(t) {
-            &xi[num_vars_max - n..]
-        } else {
-            &xi[..n]
-        };
-        let lambdas: Vec<FieldElement<E>> = rule_powers
-            .iter()
-            .map(|&j| lambda_powers[j].clone())
-            .collect();
-        let claim = pairs.claimed(&lambda_powers, claims[t].as_ref(), local_claims[t].as_ref());
-        let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
-        // The fused rounds take the table's bus pairs as its rules come: one
-        // bus (the global, or a purely local table's local) at `λ, λ²` with
-        // three lambdas, or the global then the local at `λ³, λ⁴` with five.
-        let fused_buses = match (&pairs.global, &pairs.local) {
-            (Some(bus), None) | (None, Some(bus)) => Some((*bus, None)),
-            (Some(global), Some(local)) => Some((*global, Some(*local))),
-            (None, None) => None,
-        };
-        let fused = constraints[t].as_ref().zip(fused_buses).map(
-            |(constraints, ((interactions, claim_point), second))| {
-                multilinear::gpu_fused::FusedInput {
-                    constraints,
-                    betas: &betas,
-                    interactions,
-                    claim_point,
-                    r: xi_t,
-                    columns: columns[t].as_ref(),
-                    second: second.map(|(interactions, claim_point)| {
-                        multilinear::gpu_fused::SecondInput {
-                            interactions,
-                            claim_point,
-                        }
-                    }),
+        })
+        .collect();
+    let scoped_rules =
+        at == Where::Device && std::env::var("LAMBDA_VM_ARGUE_SCOPED_RULES").as_deref() == Ok("1");
+    let (constraint, point, tail, factor_values) = std::thread::scope(|scope| {
+        // The card needs the lowered constraints and bus columns during setup.
+        // Only the host tail needs the combined rule program.
+        let mut workers = Vec::new();
+        if scoped_rules {
+            workers.extend(pairs.iter().enumerate().map(|(t, pairs)| {
+                let constraints = constraints[t].as_ref()?;
+                // The lowering emits one instruction per step and one per root.
+                let steps = constraints.steps().len() + constraints.roots().len();
+                if steps < multilinear::gpu_fused::DEVICE_TAIL_MIN_STEPS
+                    || (device[t].is_none() && columns[t].is_none())
+                    || (pairs.global.is_none() && pairs.local.is_none())
+                {
+                    return None;
                 }
+                let statement = &statements[t];
+                let beta = &beta;
+                let lambdas: Vec<_> = pairs
+                    .rule_powers()
+                    .map(|j| lambda_powers[j].clone())
+                    .collect();
+                Some(front_loaded::ScopedBatch {
+                    degree: full_shapes[t].degree,
+                    program: scope
+                        .spawn(move || combined_table_program(statement, pairs, beta, &lambdas)),
+                })
+            }));
+        }
+        let mut workers = workers.into_iter();
+        let mut polys = Vec::with_capacity(tables.len());
+        for (t, table) in tables.iter().enumerate() {
+            let n = table.num_vars();
+            let pairs = &pairs[t];
+            let rules = match workers.next().flatten() {
+                Some(worker) => front_loaded::TableRules::Scoped(worker),
+                None => front_loaded::TableRules::Immediate(compile_table_rules(
+                    &statements[t],
+                    pairs,
+                    &beta,
+                )?),
+            };
+            let lambdas = pairs
+                .rule_powers()
+                .map(|j| lambda_powers[j].clone())
+                .collect();
+            let eq_points = pairs.row_points(n)?;
+            let xi_t = if faults.suffix_xi == Some(t) {
+                &xi[num_vars_max - n..]
+            } else {
+                &xi[..n]
+            };
+            let claim = pairs.claimed(&lambda_powers, claims[t].as_ref(), local_claims[t].as_ref());
+            let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
+            // The fused rounds take the table's bus pairs as its rules come: one
+            // bus (the global, or a purely local table's local) at `λ, λ²` with
+            // three lambdas, or the global then the local at `λ³, λ⁴` with five.
+            let fused_buses = match (&pairs.global, &pairs.local) {
+                (Some(bus), None) | (None, Some(bus)) => Some((*bus, None)),
+                (Some(global), Some(local)) => Some((*global, Some(*local))),
+                (None, None) => None,
+            };
+            let fused = constraints[t].as_ref().zip(fused_buses).map(
+                |(constraints, ((interactions, claim_point), second))| {
+                    multilinear::gpu_fused::FusedInput {
+                        constraints,
+                        betas: &betas,
+                        interactions,
+                        claim_point,
+                        r: xi_t,
+                        columns: columns[t].as_ref(),
+                        second: second.map(|(interactions, claim_point)| {
+                            multilinear::gpu_fused::SecondInput {
+                                interactions,
+                                claim_point,
+                            }
+                        }),
+                    }
+                },
+            );
+            let mut weight_points: Vec<&[FieldElement<E>]> = vec![xi_t];
+            weight_points.extend(eq_points);
+            polys.push(front_loaded::TableRounds::new_with_rules(
+                rules,
+                lambdas,
+                &claim,
+                &weight_points,
+                n,
+                device[t].as_deref(),
+                columns[t].as_ref(),
+                fused,
+                || table.trace.factors(),
+            )?);
+        }
+        split.zc_setup += started.elapsed().as_secs_f64();
+        split.ledger_zc = multilinear::gpu::ledger_reserved();
+        // What an earlier argue on this thread left, so the line below is this one's.
+        multilinear::gpu_fused::take_tail();
+        let started = std::time::Instant::now();
+        let (constraint, point) = front_loaded::prove_with(
+            &mut polys,
+            &weights,
+            degree_max,
+            transcript,
+            PaddingFault {
+                scaled: faults.scaled_padding,
             },
-        );
-        let mut weight_points: Vec<&[FieldElement<E>]> = vec![xi_t];
-        weight_points.extend(eq_points.iter().map(Vec::as_slice));
-        polys.push(front_loaded::TableRounds::new(
-            rules,
-            lambdas,
-            &claim,
-            &weight_points,
-            n,
-            device[t].as_deref(),
-            columns[t].as_ref(),
-            fused,
-            || table.trace.factors(),
-        )?);
-    }
-    split.zc_setup += started.elapsed().as_secs_f64();
-    split.ledger_zc = multilinear::gpu::ledger_reserved();
-    // What an earlier argue on this thread left, so the line below is this one's.
-    multilinear::gpu_fused::take_tail();
-    let started = std::time::Instant::now();
-    let (constraint, point) = front_loaded::prove_with(
-        &mut polys,
-        &weights,
-        degree_max,
-        transcript,
-        PaddingFault {
-            scaled: faults.scaled_padding,
-        },
-    )?;
-    split.zc_rounds += started.elapsed().as_secs_f64();
-    LAST_ZC_SECS.with(|cell| cell.set(split.zc_setup + split.zc_rounds));
-    let tail = multilinear::gpu_fused::take_tail();
-    let mut factor_values = Vec::with_capacity(tables.len());
-    for (table, poly) in tables.iter().zip(&polys) {
-        let values = table
-            .kinds()
-            .iter()
-            .zip(poly.polys())
-            .filter(|(kind, _)| kind.source().is_some())
-            .map(|(_, factor)| factor.as_constant().cloned())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(MlError::NoVariablesLeft)?;
-        factor_values.push(values);
-    }
-    drop(polys);
+        )?;
+        split.zc_rounds += started.elapsed().as_secs_f64();
+        LAST_ZC_SECS.with(|cell| cell.set(split.zc_setup + split.zc_rounds));
+        let tail = multilinear::gpu_fused::take_tail();
+        let mut factor_values = Vec::with_capacity(tables.len());
+        for (table, poly) in tables.iter().zip(&polys) {
+            let values = table
+                .kinds()
+                .iter()
+                .zip(poly.polys())
+                .filter(|(kind, _)| kind.source().is_some())
+                .map(|(_, factor)| factor.as_constant().cloned())
+                .collect::<Option<Vec<_>>>()
+                .ok_or(MlError::NoVariablesLeft)?;
+            factor_values.push(values);
+        }
+        Ok::<_, MlError>((constraint, point, tail, factor_values))
+    })?;
     drop(device);
     drop(columns);
     for table in tables {

@@ -208,6 +208,83 @@ fn commit<'a>(
     CommittedTables::commit(tables, cfg).expect("committed")
 }
 
+#[test]
+fn scoped_table_rules_join_every_program() {
+    use front_loaded::{RoundStepper, ScopedBatch, TableRounds, TableRules};
+    use std::{sync::mpsc, time::Duration};
+
+    let airs = airs();
+    let table = table(&airs.add, &columns(2, 0)[1]);
+    let statement = table.statement();
+    let n = statement.num_vars;
+    let global = [Interaction::new(Affine::factor(0), Affine::factor(1))];
+    let local = [Interaction::new(Affine::factor(1), Affine::factor(2))];
+    let rho = vec![ExtE::from(3); n];
+    let sigma = vec![ExtE::from(5); n];
+    let pairs = TablePairs {
+        global: Some((&global, &rho)),
+        local: Some((&local, &sigma)),
+    };
+    let beta = ExtE::from(7);
+    let lambdas = multilinear::challenge_powers(&ExtE::from(11), 5);
+    let xi = vec![ExtE::from(13); n];
+    let weights = [xi.as_slice(), rho.as_slice(), sigma.as_slice()];
+    let claim = ExtE::zero();
+    let degree = ArgueShape::of(&statement).degree;
+    let factors = table.trace.factors().unwrap();
+    let rules = compile_table_rules(&statement, &pairs, &beta).unwrap();
+    let mut eager = TableRounds::new::<Fp, _>(
+        rules,
+        lambdas.clone(),
+        &claim,
+        &weights,
+        n,
+        None,
+        None,
+        None,
+        || Ok(factors.clone()),
+    )
+    .unwrap();
+    let expected = eager.round(degree).unwrap();
+
+    std::thread::scope(|scope| {
+        let (allow_finish, wait_to_finish) = mpsc::channel();
+        let (joining, started_join) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let worker_lambdas = &lambdas;
+        let worker = scope.spawn(move || {
+            let programs = combined_table_program(&statement, &pairs, &beta, worker_lambdas);
+            wait_to_finish.recv().unwrap();
+            programs
+        });
+        let lambdas = lambdas.clone();
+        scope.spawn(move || {
+            joining.send(()).unwrap();
+            let message = TableRounds::new_with_rules::<Fp, _>(
+                TableRules::Scoped(ScopedBatch {
+                    degree,
+                    program: worker,
+                }),
+                lambdas,
+                &claim,
+                &weights,
+                n,
+                None,
+                None,
+                None,
+                || Ok(factors),
+            )
+            .and_then(|mut rounds| rounds.round(degree));
+            finished.send(message).unwrap();
+        });
+        started_join.recv().unwrap();
+        let early = result.recv_timeout(Duration::from_millis(25));
+        allow_finish.send(()).unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(result.recv().unwrap().unwrap(), expected);
+    });
+}
+
 fn prove(
     committed: &CommittedTables<'_, Fp, Ext, KeccakWhir>,
     cfg: &ChainConfig,

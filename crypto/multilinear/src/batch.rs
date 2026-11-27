@@ -139,6 +139,19 @@ pub struct Batched<'a, F: IsField> {
 }
 
 impl<'a, F: IsField + 'static> Batched<'a, F> {
+    /// A compiled batch whose factors will come from the device at the host tail.
+    pub(crate) fn from_program(degree: usize, program: Program<F>) -> Self {
+        Self {
+            polys: Vec::new(),
+            rules: Vec::new(),
+            lambdas: Vec::new(),
+            num_vars: 0,
+            degree,
+            program: Some(program),
+            dispatch: false,
+        }
+    }
+
     /// `lambdas` weights the statements; there must be one per rule.
     pub fn new(
         polys: Vec<Mle<F>>,
