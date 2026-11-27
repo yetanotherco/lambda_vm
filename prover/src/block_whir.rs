@@ -30,6 +30,7 @@ use executor::vm::execution::Executor;
 use executor::vm::shadow::{ShadowCheck, WindowStart};
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
+use multilinear::pinned::PoolClass;
 use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly, GkrLadder, GroupFold};
 use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
@@ -5124,7 +5125,10 @@ impl GroupStack {
     /// [`Self::packed`] made now: the stack's columns packed narrow, on
     /// whatever pool the caller runs this on.
     pub(crate) fn pack_narrow(&mut self) {
-        self.packed = multilinear::gpu::pack_store(&multilinear::stacking::borrow(&self.columns));
+        self.packed = multilinear::gpu::pack_store(
+            &multilinear::stacking::borrow(&self.columns),
+            crate::lfm::chip_records::levels_pool_class(),
+        );
     }
 
     /// The positions and prefix lengths needed to open the stack.
@@ -5420,7 +5424,7 @@ impl GroupStack {
             && !multilinear::gpu::columns_disabled())
         .then(|| match self.packed.take().filter(|p| p.fits(&borrowed)) {
             Some(p) => Some((p, true)),
-            None => multilinear::gpu::pack_store(&borrowed).map(|p| (p, false)),
+            None => multilinear::gpu::pack_store(&borrowed, PoolClass::Shared).map(|p| (p, false)),
         })
         .flatten()
         .map(|(store, ahead)| NarrowCommit {

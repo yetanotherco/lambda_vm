@@ -28,13 +28,14 @@ use std::sync::Arc;
 
 use math::field::traits::IsPrimeField;
 use multilinear::narrow::NarrowColumns;
+use multilinear::pinned::PoolClass;
 use multilinear::records::{LfmValues, RecordsFill, TableRecords};
 
 use crate::tables::types::{FE, GoldilocksField};
 
 #[cfg(test)]
 use super::chips;
-use super::executor::{BaluRow, LfmRecords, SelectRow, XaluRow};
+use super::executor::{BaluRow, LfmRecords, SelectRow, XaluRow, levels_values_pinned};
 use super::layout;
 use super::word::LfmWord;
 
@@ -222,13 +223,25 @@ impl LfmChipValues {
                 .enumerate()
                 .fold(0u64, |v, (i, b)| v | (b.canonical() & 1) << i)
         };
-        #[cfg(feature = "parallel")]
-        let values: Vec<u64> = {
-            use rayon::prelude::*;
-            bitdec.par_iter().map(value).collect()
+        let values: Vec<u64> = if levels_values_pinned() {
+            let mut values = multilinear::pinned::levels_vec(bitdec.len());
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                bitdec.par_iter().map(value).collect_into_vec(&mut values);
+            }
+            #[cfg(not(feature = "parallel"))]
+            values.extend(bitdec.iter().map(value));
+            values
+        } else {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                bitdec.par_iter().map(value).collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            bitdec.iter().map(value).collect()
         };
-        #[cfg(not(feature = "parallel"))]
-        let values: Vec<u64> = bitdec.iter().map(value).collect();
         drop(bitdec);
         let chips = ChipKind::ALL
             .iter()
@@ -438,6 +451,19 @@ pub(crate) fn host_columns(
     columns
 }
 
+/// `LAMBDA_VM_LEVELS_POOL_CLASS=1` puts chip prefixes and narrow stack packs
+/// in the levels' own pool arena. Read once per process.
+pub(crate) fn levels_pool_class() -> PoolClass {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON
+        .get_or_init(|| std::env::var("LAMBDA_VM_LEVELS_POOL_CLASS").is_ok_and(|word| word == "1"))
+    {
+        PoolClass::Levels
+    } else {
+        PoolClass::Shared
+    }
+}
+
 /// A table's prefix packed narrow from its columns (every one the table's
 /// height): canonical words, each column at the bytes its largest word needs,
 /// the columns in parallel. `None` when the columns are not one height.
@@ -464,7 +490,7 @@ pub(crate) fn pack_prefix(columns: &[&[FE]]) -> Option<NarrowColumns> {
     #[cfg(not(feature = "parallel"))]
     let packed: Vec<(u8, Vec<u8>)> = columns.iter().map(pack_one).collect();
     let total: usize = packed.iter().map(|(_, b)| b.len()).sum();
-    let mut data = multilinear::pinned::with_pinned(total, || Vec::with_capacity(total));
+    let mut data = levels_pool_class().with_pinned(total, || Vec::with_capacity(total));
     let mut widths = Vec::with_capacity(packed.len());
     for (w, bytes) in packed {
         widths.push(w);

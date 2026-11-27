@@ -29,6 +29,49 @@ pub fn with_pinned_logs<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// [`with_pinned`] for the recursion levels' upload buffers: one arena for
+/// their builders and executors, whichever thread makes the allocation.
+pub fn with_pinned_levels<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "cuda")]
+    let _scope = math_cuda::pinned::scope_in(math_cuda::pinned::PoolClass::Levels, bytes);
+    #[cfg(not(feature = "cuda"))]
+    let _ = bytes;
+    f()
+}
+
+/// A level's value vector. With the pool ready, reserve at least its minimum
+/// allocation size for a nonempty buffer, so even the small public vector
+/// bypasses jemalloc's thread cache. The caller still writes only `capacity`
+/// elements.
+pub fn levels_vec<T>(capacity: usize) -> Vec<T> {
+    #[cfg(feature = "cuda")]
+    {
+        let width = size_of::<T>();
+        if capacity > 0 && width > 0 && ready() {
+            let capacity = capacity.max(math_cuda::pinned::MIN_BYTES.div_ceil(width));
+            return with_pinned_levels(capacity * width, || Vec::with_capacity(capacity));
+        }
+    }
+    Vec::with_capacity(capacity)
+}
+
+/// The pool arena to use when packing data for upload.
+#[derive(Clone, Copy)]
+pub enum PoolClass {
+    Shared,
+    Levels,
+}
+
+impl PoolClass {
+    /// Run the buffer allocation in the selected arena.
+    pub fn with_pinned<T>(self, bytes: usize, f: impl FnOnce() -> T) -> T {
+        match self {
+            Self::Shared => with_pinned(bytes, f),
+            Self::Levels => with_pinned_levels(bytes, f),
+        }
+    }
+}
+
 /// A list in the page-locked pool gives its capacity past its length back,
 /// once nothing grows it: pool it would hold and never write. In place, so it
 /// stays page-locked; a list outside the pool is left as it is. The bytes
@@ -144,6 +187,7 @@ pub fn stats() -> Option<Stats> {
             lock_seconds: s.lock_seconds,
             carved_bytes: s.carved_bytes,
             spilled_bytes: s.spilled_bytes,
+            levels_spilled_bytes: s.levels_spilled_bytes,
             upload_bytes: s.upload_bytes,
             upload_pinned: s.upload_pinned,
             pending_most: s.pending_most,
@@ -169,6 +213,8 @@ pub struct Stats {
     /// was spent.
     pub carved_bytes: u64,
     pub spilled_bytes: u64,
+    /// Pageable bytes taken by the levels' arena, included in `spilled_bytes`.
+    pub levels_spilled_bytes: u64,
     /// Bytes a group's upload sent, and how many came from the pool.
     pub upload_bytes: u64,
     pub upload_pinned: u64,

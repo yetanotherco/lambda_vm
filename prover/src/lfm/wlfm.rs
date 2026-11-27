@@ -1830,7 +1830,10 @@ impl WlfmPrebuild {
             stacks
                 .iter()
                 .map(|stack| {
-                    multilinear::gpu::pack_store(&multilinear::stacking::borrow(&stack.columns))
+                    multilinear::gpu::pack_store(
+                        &multilinear::stacking::borrow(&stack.columns),
+                        super::chip_records::levels_pool_class(),
+                    )
                 })
                 .collect()
         })

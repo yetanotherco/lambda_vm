@@ -5418,19 +5418,23 @@ impl PackedStore {
 /// ([`crate::narrow::store_runs`]), each packed on the host
 /// ([`crate::narrow::NarrowColumns::pack_par`]). `None` unless `F` is
 /// Goldilocks, or for no columns.
-pub fn pack_store<F>(columns: &[&crate::mle::Mle<F>]) -> Option<PackedStore>
+pub fn pack_store<F>(
+    columns: &[&crate::mle::Mle<F>],
+    class: crate::pinned::PoolClass,
+) -> Option<PackedStore>
 where
     F: math::field::traits::IsField + 'static,
 {
     let evals: Vec<&[math::field::element::FieldElement<F>]> =
         columns.iter().map(|c| c.evals()).collect();
-    pack_store_fields(&evals)
+    pack_store_fields(&evals, class)
 }
 
 /// [`pack_store`] of columns held as field elements (a prepared stack's
 /// before its commit makes them `Mle`s): the same bytes for the same words.
 pub fn pack_store_fields<F>(
     columns: &[&[math::field::element::FieldElement<F>]],
+    class: crate::pinned::PoolClass,
 ) -> Option<PackedStore>
 where
     F: math::field::traits::IsField + 'static,
@@ -5453,7 +5457,7 @@ where
     let lens: Vec<usize> = raw.iter().map(|c| c.len()).collect();
     let runs = crate::narrow::store_runs(&lens, crate::narrow::STORE_RUN_CELLS)
         .into_iter()
-        .map(|run| crate::narrow::NarrowColumns::pack_par(&raw[run]))
+        .map(|run| crate::narrow::NarrowColumns::pack_par(&raw[run], class))
         .collect::<Option<_>>()?;
     Some(PackedStore {
         runs,
@@ -5567,7 +5571,7 @@ where
     if !cfg!(feature = "cuda") || columns_disabled() {
         return None;
     }
-    upload_packed_store(&pack_store(columns)?)
+    upload_packed_store(&pack_store(columns, crate::pinned::PoolClass::Shared)?)
 }
 
 /// [`upload_store_columns_narrow`] into a promise taken before (as
@@ -5582,7 +5586,10 @@ where
     if !cfg!(feature = "cuda") || columns_disabled() {
         return None;
     }
-    upload_packed_store_in(&pack_store(columns)?, room)
+    upload_packed_store_in(
+        &pack_store(columns, crate::pinned::PoolClass::Shared)?,
+        room,
+    )
 }
 
 /// Whether `LAMBDA_VM_NO_GPU_COLUMNS` keeps every column store off the card

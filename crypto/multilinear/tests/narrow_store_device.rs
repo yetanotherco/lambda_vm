@@ -78,7 +78,8 @@ fn a_narrow_store_holds_the_wide_stores_words_and_its_refusal_is_no_argue_fallba
         stamp.packed_bytes, stamp.pack_secs, stamp.upload_secs
     );
     // The same runs copied through the pinned staging: the same words.
-    let packed = gpu::pack_store(&refs).expect("the columns pack");
+    let packed =
+        gpu::pack_store(&refs, multilinear::pinned::PoolClass::Shared).expect("the columns pack");
     let (staged, _) = gpu::upload_packed_store_staged(&packed).expect("the staged store goes up");
     assert!(
         staged.download().expect("the staged store reads back") == a,

@@ -117,6 +117,8 @@ pub enum PoolClass {
     /// window's buffer freed after one run is the next run's, where a new
     /// thread bound to another shared arena would carve more of the pool.
     ExecLogs,
+    /// The recursion levels' upload buffers, on any builder or executor thread.
+    Levels,
 }
 
 /// Binds this thread to one of the shared arenas for an allocation of
@@ -139,6 +141,7 @@ pub fn scope_in(class: PoolClass, bytes: usize) -> Scope {
     let mine = match class {
         PoolClass::Shared => arenas.ids[thread_slot() % ARENAS],
         PoolClass::ExecLogs => arenas.logs,
+        PoolClass::Levels => arenas.levels,
     };
     match thread_arena() {
         Some(previous) if set_thread_arena(mine) => {
@@ -583,6 +586,8 @@ pub struct Stats {
     /// hooks once it was spent (pageable).
     pub carved_bytes: u64,
     pub spilled_bytes: u64,
+    /// Pageable bytes taken by the levels' arena, included in `spilled_bytes`.
+    pub levels_spilled_bytes: u64,
     /// Bytes [`note_upload`] saw, and how many of them came from the pool.
     pub upload_bytes: u64,
     pub upload_pinned: u64,
@@ -611,6 +616,7 @@ pub fn stats() -> Stats {
         lock_seconds: LOCK_NANOS.load(Ordering::Relaxed) as f64 * 1e-9,
         carved_bytes: CURSOR.load(Ordering::Relaxed) as u64,
         spilled_bytes: SPILLED_BYTES.load(Ordering::Relaxed),
+        levels_spilled_bytes: LEVELS_SPILLED_BYTES.load(Ordering::Relaxed),
         upload_bytes: UPLOAD_BYTES.load(Ordering::Relaxed),
         upload_pinned: UPLOAD_PINNED.load(Ordering::Relaxed),
         pending_most: PENDING_MOST.load(Ordering::Relaxed),
@@ -626,6 +632,7 @@ pub fn stats() -> Stats {
 static POOL_LOCKED: AtomicU64 = AtomicU64::new(0);
 static LOCK_NANOS: AtomicU64 = AtomicU64::new(0);
 static SPILLED_BYTES: AtomicU64 = AtomicU64::new(0);
+static LEVELS_SPILLED_BYTES: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_PINNED: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicU64 = AtomicU64::new(0);
@@ -670,15 +677,17 @@ struct Arenas {
     ids: [u32; ARENAS],
     /// [`PoolClass::ExecLogs`]'s arena.
     logs: u32,
+    /// [`PoolClass::Levels`]'s arena.
+    levels: u32,
     /// jemalloc's thread-cache ceiling: an allocation at or under it can come
     /// from a cache of any arena, and never binds.
     tcache_max: usize,
 }
 
 impl Arenas {
-    /// Every arena of the pool's: the shared ones and the logs'.
+    /// Every arena of the pool's, shared and dedicated.
     fn all(&self) -> impl Iterator<Item = u32> + '_ {
-        self.ids.iter().copied().chain(std::iter::once(self.logs))
+        self.ids.iter().copied().chain([self.logs, self.levels])
     }
 }
 
@@ -694,6 +703,7 @@ fn arenas_if_made() -> Option<&'static Arenas> {
 }
 
 static ARENAS_MADE: OnceLock<Option<Arenas>> = OnceLock::new();
+static LEVELS_ARENA: AtomicU32 = AtomicU32::new(u32::MAX);
 
 fn make_arenas() -> Option<Arenas> {
     // SAFETY: each control is read or written with a value of its own type
@@ -724,7 +734,7 @@ fn make_arenas() -> Option<Arenas> {
         if rc != 0 {
             return None;
         }
-        let mut made = [0u32; ARENAS + 1];
+        let mut made = [0u32; ARENAS + 2];
         for id in &mut made {
             let mut hooks = HOOKS.0.get();
             let mut len = std::mem::size_of::<u32>();
@@ -764,9 +774,12 @@ fn make_arenas() -> Option<Arenas> {
         }
         let mut ids = [0u32; ARENAS];
         ids.copy_from_slice(&made[..ARENAS]);
+        let levels = made[ARENAS + 1];
+        LEVELS_ARENA.store(levels, Ordering::Relaxed);
         Some(Arenas {
             ids,
             logs: made[ARENAS],
+            levels,
             tcache_max,
         })
     }
@@ -962,6 +975,9 @@ unsafe extern "C" fn hook_alloc(
         return ptr;
     }
     SPILLED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    if arena_ind == LEVELS_ARENA.load(Ordering::Relaxed) {
+        LEVELS_SPILLED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
     let k = NCHUNKS.fetch_add(1, Ordering::AcqRel);
     if k < MAX_CHUNKS {
         let chunk = &CHUNKS[k];
@@ -1378,6 +1394,31 @@ mod tests {
         // The same address: the freed extent taken again, not more of the
         // pool (the cursor itself moves under the module's other tests).
         assert_eq!(again, first, "the freed buffer, taken again");
+    }
+
+    #[test]
+    fn the_levels_arena_is_one_for_every_thread_and_reuses_a_freed_buffer() {
+        let arenas = on();
+        let allocate = || {
+            std::thread::spawn(|| {
+                let bytes = 40 << 20;
+                let ptr = {
+                    let _scope = scope_in(PoolClass::Levels, bytes);
+                    take(bytes)
+                };
+                let (address, arena) = (ptr as usize, arena_of(ptr));
+                assert!(is_pinned(ptr.cast(), bytes));
+                give(ptr, bytes);
+                (address, arena)
+            })
+            .join()
+            .expect("a builder thread")
+        };
+        let (first, arena) = allocate();
+        assert_eq!(arena, arenas.levels, "the levels' own arena");
+        // Reusing the same range requires no new carve. Other tests can move
+        // the pool's cursor when this test runs in the same process as them.
+        assert_eq!(allocate(), (first, arena), "reuse on another thread");
     }
 
     /// Many threads taking scoped allocations at once (as the executor's

@@ -105,6 +105,60 @@ fn the_chip_records_are_off_by_default_and_on_for_one_alone() {
     assert!(filled.chips().is_some(), "on: the chips held as records");
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn the_levels_values_knob_pins_every_record_vector() {
+    const KNOB: &str = "LAMBDA_VM_LEVELS_VALUES_PINNED";
+    const CHILD: &str = "LAMBDA_VM_LEVELS_VALUES_TEST_CHILD";
+    const TEST: &str = "lfm::chip_records_tests::the_levels_values_knob_pins_every_record_vector";
+
+    // The lock and both knobs are process-wide. Run the real executor and
+    // fold with each setting and with the prefix knob unset.
+    if std::env::var_os(CHILD).is_none() {
+        for word in [None, Some("1"), Some(" 1 ")] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("test binary"));
+            cmd.args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove("LAMBDA_VM_LEVELS_POOL_CLASS")
+                .env_remove(KNOB);
+            if let Some(word) = word {
+                cmd.env(KNOB, word);
+            }
+            let output = cmd.output().expect("run the test in a child process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{KNOB}={word:?}:\n{stdout}\n{stderr}"
+            );
+        }
+        return;
+    }
+
+    math_cuda::pinned::set_lock(|_, _| true);
+    assert_eq!(math_cuda::pinned::set_pool_gib_for_tests(1), 1);
+    let pool = math_cuda::pinned::lock_pool().expect("lock the stand-in pool");
+    assert_eq!((pool.pieces, pool.refused), (1, 0));
+    let word = std::env::var(KNOB).ok();
+    let pinned = word.as_deref() == Some("1");
+    let program = every_chip(37, 77);
+    let mut exec = execute(&program, &arenas(), &HASHER).expect("executes");
+    let values = LfmChipValues::take(&mut exec.records).upload_values();
+    let mut vectors = values.split(", ");
+    for kind in [
+        "Balu", "Xalu", "Select", "Bitdec", "Lanes", "Hint", "Public",
+    ] {
+        let vector = vectors.next().expect("a record vector");
+        let (bytes, status) = vector
+            .strip_prefix(&format!("{kind} "))
+            .and_then(|v| v.split_once(" B pinned "))
+            .expect("the record vector's size and pool status");
+        assert!(bytes.parse::<usize>().expect("bytes") > 0, "{vector}");
+        assert_eq!(status, if pinned { "true" } else { "false" }, "{vector}");
+    }
+    assert!(vectors.next().is_none(), "{values}");
+}
+
 /// A fill that holds its chips as records is refused by the STARK prove:
 /// their traces are empty there.
 #[test]

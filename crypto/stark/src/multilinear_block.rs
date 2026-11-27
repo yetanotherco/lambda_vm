@@ -7782,7 +7782,11 @@ mod upload_once_rule_tests {
         let tall = [FieldElement::<GoldilocksField>::from(1); 16];
         let short = [FieldElement::<GoldilocksField>::from(1 << 16); 8];
         let lens = [tall.len(), short.len()];
-        let packed = multilinear::gpu::pack_store_fields(&[&tall, &short]).expect("packs");
+        let packed = multilinear::gpu::pack_store_fields(
+            &[&tall, &short],
+            multilinear::pinned::PoolClass::Shared,
+        )
+        .expect("packs");
         assert_eq!(super::narrow_store_staging(false, &lens, Some(&packed)), 0);
         assert_eq!(super::narrow_store_staging(true, &lens, Some(&packed)), 32);
         assert_eq!(

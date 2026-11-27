@@ -3820,10 +3820,13 @@ pub fn prove_block_levels(
             .collect::<Vec<_>>()
             .join(", ");
         let phase_a = base_stamps.pinned.map_or(0, |p| p.spilled_bytes);
-        let now = multilinear::pinned::stats().map_or(0, |p| p.spilled_bytes);
+        let pool = multilinear::pinned::stats().unwrap_or_default();
+        let now = pool.spilled_bytes;
+        let levels_spilled = pool.levels_spilled_bytes;
         eprintln!(
             "RTA LEVEL {level} UPLOADS: sources [{uploads}] · values [{values}] · \
-             spilled bytes at base phase A {phase_a} · base end {base_spilled} · now {now}"
+             spilled bytes at base phase A {phase_a} · base end {base_spilled} · now {now} · \
+             levels arena spilled bytes {levels_spilled}"
         );
     };
     times.base = base_end.get().copied().unwrap_or_else(now);

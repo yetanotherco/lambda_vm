@@ -22,6 +22,7 @@ use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::Is
 use rayon::prelude::*;
 
 use crate::mle::Mle;
+use crate::pinned::PoolClass;
 
 /// Narrow tables widened on the host, and their cells, since the process
 /// started: a device path widens on the card, so on a block these count only
@@ -89,6 +90,10 @@ impl NarrowColumns {
     /// Pack columns of raw words, every one `rows` long. `None` when they are
     /// not all one height.
     pub fn pack(columns: &[&[u64]]) -> Option<Self> {
+        Self::pack_in(columns, PoolClass::Shared)
+    }
+
+    fn pack_in(columns: &[&[u64]], class: PoolClass) -> Option<Self> {
         let rows = columns.first().map_or(0, |c| c.len());
         if columns.iter().any(|c| c.len() != rows) {
             return None;
@@ -99,7 +104,7 @@ impl NarrowColumns {
             .collect();
         let total = rows * widths.iter().map(|&w| w as usize).sum::<usize>();
         // The bytes a group's upload reads: page-locked when that is on.
-        let mut data = crate::pinned::with_pinned(total, || Vec::with_capacity(total));
+        let mut data = class.with_pinned(total, || Vec::with_capacity(total));
         for (column, &w) in columns.iter().zip(&widths) {
             for word in column.iter() {
                 data.extend_from_slice(&word.to_le_bytes()[..w as usize]);
@@ -111,7 +116,7 @@ impl NarrowColumns {
     /// [`Self::pack`] on the pool: each column's largest word, then its
     /// bytes, in blocks of rows at once. The same bytes as [`Self::pack`].
     #[cfg(feature = "parallel")]
-    pub fn pack_par(columns: &[&[u64]]) -> Option<Self> {
+    pub fn pack_par(columns: &[&[u64]], class: PoolClass) -> Option<Self> {
         const BLOCK: usize = 1 << 16;
         let rows = columns.first().map_or(0, |c| c.len());
         if columns.iter().any(|c| c.len() != rows) {
@@ -130,7 +135,7 @@ impl NarrowColumns {
             .collect();
         let total = rows * widths.iter().map(|&w| w as usize).sum::<usize>();
         // The bytes a store's upload reads: page-locked when that is on.
-        let mut data = crate::pinned::with_pinned(total, || vec![0u8; total]);
+        let mut data = class.with_pinned(total, || vec![0u8; total]);
         let mut parts: Vec<(&[u64], usize, &mut [u8])> = Vec::with_capacity(columns.len());
         let mut rest = data.as_mut_slice();
         for (column, &w) in columns.iter().zip(&widths) {
@@ -148,8 +153,8 @@ impl NarrowColumns {
 
     /// [`Self::pack`] (no pool without `parallel`).
     #[cfg(not(feature = "parallel"))]
-    pub fn pack_par(columns: &[&[u64]]) -> Option<Self> {
-        Self::pack(columns)
+    pub fn pack_par(columns: &[&[u64]], class: PoolClass) -> Option<Self> {
+        Self::pack_in(columns, class)
     }
 
     /// [`Self::pack`] of a row-major trace: the `cols`-wide rows of words
@@ -643,7 +648,7 @@ mod tests {
                 })
                 .collect();
             let raw: Vec<&[u64]> = columns.iter().map(Vec::as_slice).collect();
-            let par = NarrowColumns::pack_par(&raw).expect("one height");
+            let par = NarrowColumns::pack_par(&raw, PoolClass::Shared).expect("one height");
             assert_eq!(
                 Some(&par),
                 NarrowColumns::pack(&raw).as_ref(),
@@ -651,7 +656,7 @@ mod tests {
             );
             assert_eq!(par.widths(), &[1, 1, 2, 2, 4, 4, 8, 8], "{rows} rows");
         }
-        assert!(NarrowColumns::pack_par(&[&[1, 2], &[3]]).is_none());
+        assert!(NarrowColumns::pack_par(&[&[1, 2], &[3]], PoolClass::Shared).is_none());
     }
 
     /// A store's columns cut into runs: each run one height, in order, every

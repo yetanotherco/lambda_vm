@@ -232,6 +232,24 @@ pub struct LfmRecords {
     pub cap_read: Vec<CapReadRow>,
 }
 
+/// `LAMBDA_VM_LEVELS_VALUES_PINNED=1` allocates the uploaded value vectors in
+/// the levels' pool arena. Read once per process on a card build.
+pub(super) fn levels_values_pinned() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(feature = "cuda")
+        && *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_LEVELS_VALUES_PINNED").is_ok_and(|word| word == "1")
+        })
+}
+
+fn level_values_vec<T>(capacity: usize, pinned: bool) -> Vec<T> {
+    if pinned {
+        multilinear::pinned::levels_vec(capacity)
+    } else {
+        Vec::with_capacity(capacity)
+    }
+}
+
 impl LfmRecords {
     /// Records sized from the census the compiler already holds.
     ///
@@ -247,6 +265,7 @@ impl LfmRecords {
     /// ~log2(rows) times per proof — a few hundred MB of memcpy and ~20 large
     /// `mremap`s under the process allocator, on every concurrent worker at once.
     fn with_capacity(groups: &LfmColumnGroups, hash16: bool) -> Self {
+        let pinned = levels_values_pinned();
         let (narrow, wide) = if hash16 {
             (0, groups.hash.real_rows)
         } else {
@@ -254,17 +273,17 @@ impl LfmRecords {
         };
         LfmRecords {
             num_consts: 0,
-            balu: Vec::with_capacity(groups.balu.real_rows),
-            xalu: Vec::with_capacity(groups.xalu.real_rows),
-            select: Vec::with_capacity(groups.select.real_rows),
+            balu: level_values_vec(groups.balu.real_rows, pinned),
+            xalu: level_values_vec(groups.xalu.real_rows, pinned),
+            select: level_values_vec(groups.select.real_rows, pinned),
             bitdec: Vec::with_capacity(groups.bitdec.real_rows),
             hash: Vec::with_capacity(narrow),
             hash16: Vec::with_capacity(wide),
             keccak: Vec::with_capacity(groups.keccak.real_rows),
             blake3: Vec::with_capacity(groups.blake3.real_rows),
-            lanes: Vec::with_capacity(groups.lanes.real_rows),
-            hint: Vec::with_capacity(groups.hint.real_rows),
-            public: Vec::with_capacity(groups.public.real_rows),
+            lanes: level_values_vec(groups.lanes.real_rows, pinned),
+            hint: level_values_vec(groups.hint.real_rows, pinned),
+            public: level_values_vec(groups.public.real_rows, pinned),
             b3l: Vec::with_capacity(groups.b3l.real_rows),
             mux: Vec::with_capacity(groups.mux.real_rows),
             cap: Vec::with_capacity(groups.cap.real_rows),
