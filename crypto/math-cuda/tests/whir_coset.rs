@@ -331,15 +331,15 @@ fn the_production_like_stacks_have_every_tile_kind() {
 /// ★ The stack read where it lies is the assembled stack: the cosets equal
 /// word for word, raw (the same arithmetic over the same words), and equal
 /// the re-encoded codeword at every block's leaves; the tiles' kinds add up.
-/// At blowups 4 and 2, stacks of `2^16` (4-value tiles), `2^20` (64) and
-/// `2^24` (256, two rest bits), three layouts each: [`stack`]'s, a
+/// At blowups 4 and 2, stacks of `2^16` (4-value tiles), `2^17` (8),
+/// `2^20` (64) and `2^24` (256, two rest bits), three layouts each: [`stack`]'s, a
 /// production-like one ([`production_stack`]: short columns, ends mid-tile,
 /// alignment gaps, junk between the columns in the store) and a 15 % zero
 /// tail ([`tail_stack`]).
 #[test]
 fn coset_blocks_read_in_place_equal_the_assembled_stack() {
     for (log_blowup, count) in [(LOG_BLOWUP, 114usize), (1, 229)] {
-        for (num_vars, seed) in [(16usize, 21u64), (20, 22), (24, 23)] {
+        for (num_vars, seed) in [(16usize, 21u64), (17, 24), (20, 22), (24, 23)] {
             let (bench, bench_parts, _) = stack(num_vars, seed);
             let (production, production_parts) = production_stack(num_vars, seed);
             let (tail, tail_parts) = tail_stack(num_vars, seed);
@@ -578,6 +578,11 @@ fn large_block_joint_coset_profile() {
     let leaves = queries_at(NUM_VARS, LOG_BLOWUP, QUERIES, 200);
     let plan = CosetPlan::new(NUM_VARS, LOG_BLOWUP, LOG_FOLD, KEPT, &leaves).expect("coset plan");
     assert_eq!(plan.classes().len(), COSETS);
+    let (regs, local, blocks) =
+        math_cuda::whir_coset::tile_fold_resources(&plan).expect("tile fold resources");
+    println!(
+        "COSET PROFILE tile_regs_per_thread={regs} tile_local_bytes_per_thread={local} tile_blocks_per_sm={blocks}"
+    );
     let stacks: Vec<_> = (100..104)
         .map(|seed| {
             let (store, parts) = production_stack(NUM_VARS, seed);

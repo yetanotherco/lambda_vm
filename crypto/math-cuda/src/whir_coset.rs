@@ -59,6 +59,7 @@ struct Module {
     _module: Arc<CudaModule>,
     fold_tiles: CudaFunction,
     fold_tiles_parts: CudaFunction,
+    fold_tiles_parts_regs: CudaFunction,
     tile_map: CudaFunction,
     fold_rest: CudaFunction,
     mobius_level: CudaFunction,
@@ -80,6 +81,7 @@ fn module() -> Result<&'static Module> {
     let m = Module {
         fold_tiles: module.load_function("coset_fold_tiles")?,
         fold_tiles_parts: module.load_function("coset_fold_tiles_parts")?,
+        fold_tiles_parts_regs: module.load_function("coset_fold_tiles_parts_regs")?,
         tile_map: module.load_function("coset_tile_map")?,
         fold_rest: module.load_function("coset_fold_rest")?,
         mobius_level: module.load_function("coset_mobius_level")?,
@@ -89,6 +91,34 @@ fn module() -> Result<&'static Module> {
         _module: module,
     };
     Ok(cell.get_or_init(|| m))
+}
+
+fn tile_regs_enabled(plan: &CosetPlan) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    plan.tile_levels >= 3
+        && *ENABLED.get_or_init(|| {
+            std::env::var_os("LAMBDA_VM_WHIR_COSET_TILE_REGS").is_some_and(|v| v == "1")
+        })
+}
+
+/// Registers/thread, local bytes/thread and blocks/SM for the in-place tile
+/// kernel selected for this plan, with its actual dynamic shared memory.
+#[doc(hidden)]
+pub fn tile_fold_resources(plan: &CosetPlan) -> Result<(i32, i32, u32)> {
+    let m = module()?;
+    let kernel = if tile_regs_enabled(plan) {
+        &m.fold_tiles_parts_regs
+    } else {
+        &m.fold_tiles_parts
+    };
+    let regs = kernel.num_regs()?;
+    let local = kernel.local_size_bytes()?;
+    let blocks = kernel.occupancy_max_active_blocks_per_multiprocessor(
+        BLOCK,
+        plan.tile_shared_bytes(),
+        None,
+    )?;
+    Ok((regs, local, blocks))
 }
 
 fn fmul(a: u64, b: u64) -> u64 {
@@ -342,6 +372,29 @@ impl CosetPlan {
     fn tile_shared_bytes(&self) -> usize {
         let total = self.gammas.len();
         8 * (total + 2 * self.buf_len + self.slab_rows() * TILES_PER_BLOCK) + 4 * total
+    }
+
+    /// The register fold traverses levels 0–2 from parent to children.
+    /// Each parent has at most two children. Pack their one-based row indices
+    /// into its original parent-table entry, leaving levels 3 and up intact.
+    fn tile_parents_regs(&self) -> Vec<u32> {
+        let mut links = self.parents.clone();
+        links[..self.level_offset[2] as usize].fill(0);
+        for level in 1..=2 {
+            let prev = self.level_offset[level - 1] as usize;
+            let off = self.level_offset[level] as usize;
+            for row in 0..self.level_count[level] {
+                let slot = &mut links[prev + self.parents[off + row as usize] as usize];
+                // The whole table fits in the tile's shared memory budget.
+                debug_assert!(row < u16::MAX as u32);
+                if *slot == 0 {
+                    *slot = row + 1;
+                } else {
+                    *slot |= (row + 1) << 16;
+                }
+            }
+        }
+        links
     }
 
     /// Bytes the device evaluation allocates for a polynomial: the assembled
@@ -658,7 +711,9 @@ fn evaluate_from(
     let last = plan.slab_rows();
     let count = htod_or_trim(stream, &plan.level_count)?;
     let offset = htod_or_trim(stream, &plan.level_offset)?;
-    let parents = htod_or_trim(stream, &plan.parents)?;
+    let tile_regs = matches!(&tiles_from, Tiles::InPlace { .. }) && tile_regs_enabled(plan);
+    let register_links = tile_regs.then(|| plan.tile_parents_regs());
+    let parents = htod_or_trim(stream, register_links.as_deref().unwrap_or(&plan.parents))?;
     let gammas = htod_or_trim(stream, &plan.gammas)?;
     // SAFETY: the tile kernel writes every (class, tile) entry.
     let mut slab = unsafe { alloc_or_trim::<u64>(stream, last * tiles) }?;
@@ -695,6 +750,11 @@ fn evaluate_from(
             drop(f);
         }
         Tiles::InPlace { data, parts } => {
+            let fold = if tile_regs {
+                &m.fold_tiles_parts_regs
+            } else {
+                &m.fold_tiles_parts
+            };
             // A stack with no part (all zeros) still uploads one word a
             // table: a zero-length upload is not an allocation.
             let upload = |v: &[u64]| {
@@ -724,7 +784,7 @@ fn evaluate_from(
                         shared_mem_bytes: 0,
                     })?;
                 stream
-                    .launch_builder(&m.fold_tiles_parts)
+                    .launch_builder(fold)
                     .arg(data)
                     .arg(&map)
                     .arg(&off)
@@ -1377,11 +1437,13 @@ mod tests {
             parts: &StackParts,
             data: &[u64],
             cap: Option<usize>,
+            regs: bool,
         ) -> (Vec<u64>, Vec<u32>) {
             let tiles = plan.tiles();
             let map = tile_map(parts, plan.tile_levels, tiles, cap);
             let mut slab = vec![0u64; plan.slab_rows() * tiles];
-            fold_tiles_parts(plan, data, &map, parts, &mut slab, cap);
+            let links = (regs && plan.tile_levels >= 3).then(|| plan.tile_parents_regs());
+            fold_tiles_parts(plan, data, &map, parts, &mut slab, cap, links.as_deref());
             let len = plan.classes.len() * plan.coset_len();
             (finish(plan, &slab, 0, len, cap), map)
         }
@@ -1438,8 +1500,43 @@ mod tests {
             map
         }
 
-        /// `coset_fold_tiles_parts`, a block's tiles in turn as in
-        /// [`fold_tiles`].
+        /// The register prefix, one independent set of eight values at a time.
+        fn fold_tile_regs(
+            plan: &CosetPlan,
+            links: &[u32],
+            tile: &[u64],
+            out: &mut [u64],
+            stride: usize,
+        ) {
+            let off1 = plan.level_offset[1] as usize;
+            let off2 = plan.level_offset[2] as usize;
+            for (j, values) in tile.chunks_exact(8).enumerate() {
+                for (root, &children) in links[..off1].iter().enumerate() {
+                    let l0: [u64; 4] = std::array::from_fn(|x| {
+                        fold(values[2 * x], values[2 * x + 1], plan.gammas[root])
+                    });
+                    for child in [children & 0xffff, children >> 16] {
+                        if child == 0 {
+                            break;
+                        }
+                        let child = off1 + child as usize - 1;
+                        let g1 = plan.gammas[child];
+                        let lo = fold(l0[0], l0[1], g1);
+                        let hi = fold(l0[2], l0[3], g1);
+                        let grandchildren = links[child];
+                        for row in [grandchildren & 0xffff, grandchildren >> 16] {
+                            if row == 0 {
+                                break;
+                            }
+                            let row = row as usize - 1;
+                            out[row * stride + j] = fold(lo, hi, plan.gammas[off2 + row]);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The in-place kernels, a block's tiles in turn as in [`fold_tiles`].
         fn fold_tiles_parts(
             plan: &CosetPlan,
             data: &[u64],
@@ -1447,6 +1544,7 @@ mod tests {
             parts: &StackParts,
             slab: &mut [u64],
             cap: Option<usize>,
+            links: Option<&[u32]>,
         ) {
             const TILES: usize = TILES_PER_BLOCK;
             let levels = plan.tile_levels;
@@ -1459,6 +1557,7 @@ mod tests {
                 let mut bufs = [vec![0u64; buf_len], vec![0u64; buf_len]];
                 let mut fin = vec![0u64; last_count * TILES];
                 let tile = 1usize << levels;
+                let mut values = vec![0u64; tile];
                 for first in (block * TILES..num_tiles).step_by(grid * TILES) {
                     for i in 0..TILES {
                         let at = first + i;
@@ -1474,7 +1573,7 @@ mod tests {
                         }
                         let base = (at as u64) << levels;
                         if kind == MIXED {
-                            for x in 0..tile {
+                            for (x, value) in values.iter_mut().enumerate() {
                                 let e = base + x as u64;
                                 let upto = parts_upto(&parts.off, e);
                                 let mut v = 0;
@@ -1484,16 +1583,27 @@ mod tests {
                                         v = data[(parts.at[p] + (e - parts.off[p])) as usize];
                                     }
                                 }
-                                bufs[0][x] = v;
+                                *value = v;
                             }
                         } else {
                             let p = kind as usize;
                             let src = (parts.at[p] + (base - parts.off[p])) as usize;
-                            bufs[0][..tile].copy_from_slice(&data[src..src + tile]);
+                            values.copy_from_slice(&data[src..src + tile]);
                         }
+                        let start = if let Some(links) = links {
+                            if levels == 3 {
+                                fold_tile_regs(plan, links, &values, &mut fin[i..], TILES);
+                            } else {
+                                fold_tile_regs(plan, links, &values, &mut bufs[0], tile >> 3);
+                            }
+                            3
+                        } else {
+                            bufs[0][..tile].copy_from_slice(&values);
+                            0
+                        };
                         let (mut inp, mut out) = (0usize, 1usize);
-                        let mut width = tile;
-                        for t in 0..levels {
+                        let mut width = tile >> start;
+                        for t in start..levels {
                             let cnt = plan.level_count[t] as usize;
                             let off = plan.level_offset[t] as usize;
                             let log_half = levels - 1 - t;
@@ -1916,21 +2026,24 @@ mod tests {
     ) -> TileKinds {
         let n = plan.num_vars;
         let placed = StackParts::new(parts, n, data.len()).expect("the parts place");
-        let (got, map) = emulate::kernels_in_place(plan, &placed, data, None);
+        let (got, map) = emulate::kernels_in_place(plan, &placed, data, None, false);
         let whole = assembled(n, parts, data);
         let reference = emulate::kernels(plan, &whole);
         assert_eq!(
             got, reference,
             "{what}: in place and assembled, word for word"
         );
-        for cap in [1, 2, 7] {
-            let (capped, capped_map) = emulate::kernels_in_place(plan, &placed, data, Some(cap));
-            assert_eq!(capped, got, "{what}: in place, {cap} blocks a kernel");
-            assert_eq!(capped_map, map, "{what}: the map at {cap} blocks");
+        for cap in [None, Some(1), Some(2), Some(7)] {
+            for regs in [false, true] {
+                let (capped, capped_map) =
+                    emulate::kernels_in_place(plan, &placed, data, cap, regs);
+                assert_eq!(capped, got, "{what}: in place, {cap:?} blocks, regs {regs}");
+                assert_eq!(capped_map, map, "{what}: the map at {cap:?} blocks");
+            }
             assert_eq!(
-                emulate::kernels_capped(plan, &whole, Some(cap)),
+                emulate::kernels_capped(plan, &whole, cap),
                 reference,
-                "{what}: assembled, {cap} blocks a kernel"
+                "{what}: assembled, {cap:?} blocks a kernel"
             );
         }
         assert_eq!(
@@ -1959,6 +2072,11 @@ mod tests {
     #[test]
     fn the_stack_read_in_place_is_the_assembled_stack() {
         let mut rng = Rng(31);
+        // Three levels feed the slab directly, with sparse child rows.
+        let plan = CosetPlan::new(9, 2, 3, 3, &[0, 8, 24, 31]).expect("plan");
+        let (parts, data) = store_layout(9, &[7, 3, 5, 2], 3, rng.next());
+        in_place_is_the_assembled_stack(&plan, &parts, &data, "three sparse levels");
+
         for (num_vars, log_blowup, log_fold, kept) in [(12, 2, 2, 2), (16, 1, 2, 3), (11, 2, 3, 3)]
         {
             let num_leaves = 1u64 << (num_vars + log_blowup - log_fold);
