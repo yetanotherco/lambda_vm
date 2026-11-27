@@ -696,6 +696,9 @@ fn derive_join(
 thread_local! {
     /// Shipments this thread checked with the levels verifier.
     pub(crate) static FILE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The errors this thread's range attempts fell back on, oldest first.
+    pub(crate) static FALLBACK_ERRORS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A statement and its verified last-level file, ready for publication.
@@ -905,6 +908,8 @@ pub fn prove_cluster_block_levels_unchecked<'elf>(
             eprintln!(
                 "CLUSTER TCP: {error}; starting a fresh range reference attempt (fallback {count})"
             );
+            #[cfg(test)]
+            FALLBACK_ERRORS.with(|errors| errors.borrow_mut().push(error.clone()));
             return prove_range_levels_reference_unchecked(elf, input, options, family, cuts);
         }
         Err(error) => return Err(error),

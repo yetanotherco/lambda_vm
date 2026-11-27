@@ -2328,6 +2328,21 @@ impl Worker<'_> {
                 None => prebuild(&plan, leaf)?,
             };
             let early_join = setting(EARLY_JOIN_ENV).as_deref() == Some("1");
+            // Test faults on the early frame (worker 0 only): it is sent unasked,
+            // twice, after the proof, for another plan or program, alone, or just
+            // before the worker exits. Each must end in a refusal.
+            #[cfg(test)]
+            let send_early = early_join || fault_is("early-unasked");
+            #[cfg(not(test))]
+            let send_early = early_join;
+            let send_artifacts = |plan: Digest32, artifacts: LeafArtifacts| {
+                self.socket.send(
+                    deadline,
+                    self.attempt,
+                    Kind::LeafArtifacts,
+                    &LeafArtifactsReply { plan, artifacts },
+                )
+            };
             let (child, proof) = cluster_levels::prove_leaf_with_artifacts(
                 &plan,
                 leaf,
@@ -2335,48 +2350,76 @@ impl Worker<'_> {
                 &arena,
                 self.clock,
                 |child| {
-                    if early_join {
-                        self.socket
-                            .send(
-                                deadline,
-                                self.attempt,
-                                Kind::LeafArtifacts,
-                                &LeafArtifactsReply {
-                                    plan: bind.digest,
-                                    artifacts: LeafArtifacts::from_build(&child.artifacts),
-                                },
-                            )
-                            .map_err(|e| e.to_string())?;
+                    #[cfg(test)]
+                    if fault_is("early-proof-first") {
+                        return Ok(());
+                    }
+                    if send_early {
+                        #[allow(unused_mut)]
+                        let mut bound = bind.digest;
+                        #[cfg(test)]
+                        if fault_is("early-other-plan") {
+                            bound[0] ^= 1;
+                        }
+                        let artifacts = LeafArtifacts::from_build(&child.artifacts);
+                        #[cfg(all(test, feature = "test-security"))]
+                        let artifacts = if fault_is("early-other-program") {
+                            artifacts.self_consistent(level_rounds(&plan), |_, _, _, _| {})?
+                        } else {
+                            artifacts
+                        };
+                        send_artifacts(bound, artifacts).map_err(|e| e.to_string())?;
                         self.clock.mark("leaf-artifacts-sent");
+                        #[cfg(test)]
+                        if fault_is("early-duplicate") {
+                            send_artifacts(bound, LeafArtifacts::from_build(&child.artifacts))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        #[cfg(test)]
+                        if fault_is("early-artifacts-exit") {
+                            eprintln!("CLUSTER TEST: worker exits after its early artifacts");
+                            std::process::exit(0);
+                        }
                     }
                     Ok(())
                 },
             )
             .map_err(fail)?;
-            if early_join {
-                self.socket.send(
-                    deadline,
-                    self.attempt,
-                    Kind::Leaf,
-                    &LeafProofReply {
-                        plan: bind.digest,
-                        proof,
-                    },
-                )
-            } else {
-                self.socket.send(
-                    deadline,
-                    self.attempt,
-                    Kind::Leaf,
-                    &LeafReply {
-                        plan: bind.digest,
-                        artifacts: LeafArtifacts::from_build(&child.artifacts),
-                        proof,
-                    },
-                )
+            #[cfg(test)]
+            let skip_proof = fault_is("early-artifacts-only");
+            #[cfg(not(test))]
+            let skip_proof = false;
+            if !skip_proof {
+                if early_join {
+                    self.socket.send(
+                        deadline,
+                        self.attempt,
+                        Kind::Leaf,
+                        &LeafProofReply {
+                            plan: bind.digest,
+                            proof,
+                        },
+                    )
+                } else {
+                    self.socket.send(
+                        deadline,
+                        self.attempt,
+                        Kind::Leaf,
+                        &LeafReply {
+                            plan: bind.digest,
+                            artifacts: LeafArtifacts::from_build(&child.artifacts),
+                            proof,
+                        },
+                    )
+                }
+                .map_err(fail)?;
+                self.clock.mark("leaf-sent");
             }
-            .map_err(fail)?;
-            self.clock.mark("leaf-sent");
+            #[cfg(test)]
+            if fault_is("early-proof-first") {
+                send_artifacts(bind.digest, LeafArtifacts::from_build(&child.artifacts))
+                    .map_err(fail)?;
+            }
         }
         self.socket
             .write_frame(deadline, Kind::OpenedAll, self.attempt, &[])

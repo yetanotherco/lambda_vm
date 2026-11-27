@@ -1575,4 +1575,115 @@ mod tcp {
             "{error}"
         );
     }
+
+    fn knob(name: &str) -> bool {
+        std::env::var(name).as_deref() == Ok("1")
+    }
+
+    /// The early-frame cases run in the tier's pass with the opt-in knobs set.
+    fn assert_early_join() {
+        use crate::block_whir::cluster_tcp::EARLY_JOIN_ENV;
+        assert!(knob(EARLY_JOIN_ENV), "run with {EARLY_JOIN_ENV}=1");
+        for var in [
+            "LAMBDA_VM_DETERMINISTIC_GRIND",
+            "LAMBDA_VM_FIXED_TRACE_HASH",
+        ] {
+            assert!(knob(var), "{var}");
+        }
+    }
+
+    /// The one-process reference of the two-leaf cut, proved once a process.
+    fn reference_file() -> &'static [u8] {
+        static FILE: OnceLock<Vec<u8>> = OnceLock::new();
+        FILE.get_or_init(|| {
+            let elf = crate::test_utils::asm_elf_bytes("test_commit_split");
+            prove_range_levels_reference(&elf, &[], &options(), FAMILY, &[2])
+                .unwrap()
+                .file
+        })
+    }
+
+    /// The attempt with worker 0's `fault` fails with `reason`, and the
+    /// fallback's checked file is the one-process reference, byte for byte.
+    fn falls_back(fault: Option<&str>, reason: &str) {
+        use crate::block_whir::cluster_tcp::local_fallbacks;
+        let fallbacks = local_fallbacks();
+        let seen = FALLBACK_ERRORS.with(|errors| errors.borrow().len());
+        let checks = FILE_CHECKS.with(std::cell::Cell::get);
+        let file = proof_with(&[2], fault, true)
+            .unwrap_or_else(|e| panic!("{fault:?}: the fallback returned no file: {e}"));
+        assert_eq!(FILE_CHECKS.with(std::cell::Cell::get), checks + 1);
+        assert_eq!(local_fallbacks(), fallbacks + 1, "{fault:?}: no fallback");
+        let errors = FALLBACK_ERRORS.with(|errors| errors.borrow()[seen..].to_vec());
+        assert!(
+            errors.len() == 1 && errors[0].contains(reason),
+            "{fault:?}: expected {reason:?}, fell back on {errors:?}"
+        );
+        assert_eq!(file.file, reference_file(), "{fault:?}");
+        let elf = crate::test_utils::asm_elf_bytes("test_commit_split");
+        verify_cluster_block_levels_file(&elf, file.statement.view(), FAMILY, &file.file)
+            .expect("the fallback file verifies");
+    }
+
+    #[test]
+    #[ignore = "GPU tier (default knobs): early artifacts nobody asked for"]
+    fn early_artifacts_are_refused_when_early_join_is_off() {
+        use crate::block_whir::cluster_tcp::EARLY_JOIN_ENV;
+        assert!(!knob(EARLY_JOIN_ENV), "run with {EARLY_JOIN_ENV} unset");
+        falls_back(Some("early-unasked"), "unexpected early leaf artifacts");
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): early artifacts sent twice"]
+    fn early_join_refuses_duplicate_artifacts() {
+        assert_early_join();
+        falls_back(
+            Some("early-duplicate"),
+            "unexpected, duplicate or stale worker leaf",
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): the leaf proof before its artifacts"]
+    fn early_join_refuses_a_proof_before_its_artifacts() {
+        assert_early_join();
+        falls_back(
+            Some("early-proof-first"),
+            "leaf proof arrived before its artifacts",
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): early artifacts bound to another plan"]
+    fn early_join_refuses_artifacts_for_another_plan() {
+        assert_early_join();
+        falls_back(
+            Some("early-other-plan"),
+            "unexpected, duplicate or stale worker leaf",
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): early artifacts and no proof"]
+    fn a_worker_that_sends_artifacts_and_no_proof_falls_back_to_a_checked_reference() {
+        assert_early_join();
+        falls_back(Some("early-artifacts-only"), "missing worker 0 leaf");
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): early artifacts, then the worker exits"]
+    fn a_worker_that_exits_after_its_artifacts_falls_back_to_a_checked_reference() {
+        assert_early_join();
+        falls_back(Some("early-artifacts-exit"), "worker 0 leaf");
+    }
+
+    /// Self-consistent artifacts of another program (placeholder prepared
+    /// roots, the id they hash to), then the honest proof: the join of those
+    /// artifacts does not run over that proof, and the attempt falls back.
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): early artifacts of another program"]
+    fn early_artifacts_of_another_program_never_ship() {
+        assert_early_join();
+        falls_back(Some("early-other-program"), "");
+    }
 }
