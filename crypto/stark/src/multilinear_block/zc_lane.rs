@@ -1334,6 +1334,12 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
 /// seconds at the group's turn in phase B (the bins the lane left, in plan
 /// order). With the lane off every bin runs in phase B, so a lane-off run's
 /// per-bin seconds price the bins a lane-on run of the same block ran.
+///
+/// With retries enabled (the block prover's single commit lane default),
+/// `BLOCK LOCAL LANE` includes each group's retry count and upload time.
+/// `BLOCK LOCAL LANE SUM` includes the number of groups retried, bins run
+/// in gaps, total retry upload time, and retries cut short by a new commit
+/// group or the end of phase A. Retry fields are omitted with retries off.
 #[doc(hidden)]
 pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
     let local: Vec<(usize, &GroupStamps)> = stamps

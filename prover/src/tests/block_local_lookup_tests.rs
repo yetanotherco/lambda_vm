@@ -11,8 +11,8 @@
 
 use crate::block_whir::{
     self, BlockFormat, BlockWhirProof, Deviations, LocalArgues, b3_base_local_setting,
-    block_format_tag, local_lane_setting, prove_block_whir_local_with, prove_block_whir_with,
-    verify_block_whir,
+    block_format_tag, local_lane_retry_setting, local_lane_setting, prove_block_whir_local_with,
+    prove_block_whir_with, verify_block_whir,
 };
 use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::tables::local_bytes;
@@ -146,6 +146,16 @@ fn the_local_lane_knob_reads_on_or_off() {
     assert_eq!(local_lane_setting(Some("0")), Ok(false));
     for bad in ["on", "off", "2", "true", "lane", "01"] {
         assert!(local_lane_setting(Some(bad)).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn the_local_lane_retry_knob_defaults_on_and_only_zero_turns_it_off() {
+    for value in [None, Some(""), Some(" 1 "), Some("off"), Some("00")] {
+        assert!(local_lane_retry_setting(value), "{value:?}");
+    }
+    for value in ["0", " \t0\n"] {
+        assert!(!local_lane_retry_setting(Some(value)), "{value:?}");
     }
 }
 
@@ -427,7 +437,8 @@ fn the_recursion_derives_a_plan_over_a_base_under_local_lookups() {
 /// and it verifies. Phase A takes every table's digest from its own layout,
 /// and the prove refuses digests that are not the verifier's from its AIRs,
 /// so both proves pin them. On a card the lane runs local bins beside the
-/// commits; on the host a group has no store on the card and every job is
+/// commits and can retry memory-deferred jobs in gaps by default. On the
+/// host a group has no store on the card and every job is
 /// left to phase B. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1` (one grind
 /// nonce for both proves).
 #[test]

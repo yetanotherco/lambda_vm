@@ -151,6 +151,7 @@ fn commit_bound<'a>(
         Some(LocalPhaseA {
             buses: BUSES.to_vec(),
             lane,
+            // These placement tests pin how the first attempt is handled.
             retry: false,
             retry_test: None,
             binding,
@@ -334,6 +335,7 @@ fn prove_retry(pause: RetryPause) -> BlockProved<Fp, Ext> {
 #[test]
 fn a_memory_deferred_local_job_retries_in_the_producers_pause() {
     let proved = prove_retry(RetryPause::Gap);
+    assert!(proved.3.last().unwrap().zc_lane.retry_enabled);
     let job = proved.3[1].zc_lane;
     let lines = local_lane_lines(&proved.3);
     assert!(
@@ -400,6 +402,7 @@ fn a_local_retry_waits_for_store_room() {
 #[test]
 fn local_retries_off_keeps_the_existing_lines() {
     let proved = prove_retry(RetryPause::Off);
+    assert!(!proved.3.last().unwrap().zc_lane.retry_enabled);
     let job = proved.3[1].zc_lane;
     assert_eq!(
         (job.state, job.retries),

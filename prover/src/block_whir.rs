@@ -916,8 +916,15 @@ pub const B3_BASE_KECCAK_RND: crate::tables::keccak_rnd::KeccakRndForm = if B3_B
 /// byte either way: see [`local_lane_setting`].
 pub const LOCAL_LANE_ENV: &str = "LAMBDA_VM_LOCAL_LANE";
 
-/// `1` lets a single commit lane retry deferred local argues during gaps.
+/// Lets a single commit lane retry local argues deferred for memory during
+/// gaps between commits. On by default; set to `0` to give the deferred bins
+/// to phase B. Inert when the local lane is off or there are two commit lanes.
 pub const LOCAL_LANE_RETRY_ENV: &str = "LAMBDA_VM_LOCAL_LANE_RETRY";
+
+/// [`LOCAL_LANE_RETRY_ENV`]'s value: on unless it is `0` after trimming.
+pub(crate) fn local_lane_retry_setting(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
 
 /// [`LOCAL_LANE_ENV`]'s value: unset, empty or `1` is on (the lane runs the
 /// local argues); `0` is off (every local argue at its group's turn in phase
@@ -9825,7 +9832,8 @@ fn prove_streamed(
         None => local_lane_setting(std::env::var(LOCAL_LANE_ENV).ok().as_deref())
             .map_err(Error::Prover)?,
     };
-    let local_lane_retry = std::env::var(LOCAL_LANE_RETRY_ENV).as_deref() == Ok("1");
+    let local_lane_retry =
+        local_lane_retry_setting(std::env::var(LOCAL_LANE_RETRY_ENV).ok().as_deref());
     // Where the in-row side records are walked into: a word it does not take
     // refuses the prove.
     let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(

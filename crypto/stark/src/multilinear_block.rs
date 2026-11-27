@@ -996,7 +996,9 @@ pub struct BlockLocal {
 pub struct LocalPhaseA {
     pub buses: Vec<u64>,
     pub lane: bool,
-    /// Retry deferred local jobs in gaps on a single commit lane.
+    /// Retry local jobs deferred for memory in gaps on a single commit lane.
+    /// The block prover enables this by default. This requires `lane` and
+    /// applies only through `commit_groups_probed`.
     pub retry: bool,
     #[cfg(test)]
     pub(crate) retry_test: Option<zc_lane::RetryTest>,
@@ -2767,8 +2769,9 @@ where
     /// local challenges are taken right after its commit; with
     /// [`LocalPhaseA::lane`] and `upload_ahead` the lane runs the local
     /// groups' bins beside the commits (its limits, and a test's host lane,
-    /// are `probe`'s), and phase B runs the bins left. The bytes are the same
-    /// either way.
+    /// are `probe`'s). [`LocalPhaseA::retry`] lets the lane retry jobs deferred
+    /// for memory between commits. Phase B runs the bins left. Placement
+    /// preserves the proof bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_groups_probed<H, T>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,

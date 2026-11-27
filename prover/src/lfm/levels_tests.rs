@@ -3016,6 +3016,9 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// run; `light` the base, levels and tamper check on every run, with the
 /// standalone block and last-file checks on the last run alone; `last` all
 /// checks on the last run alone; `off` no checks.
+/// `LAMBDA_VM_LOCAL_LANE_RETRY=0` runs a single commit lane without idle-gap
+/// retries. With the default enabled, `BLOCK LOCAL LANE SUM` reports retry
+/// activity when the base uses local lookups and runs the local lane.
 ///
 /// `RTA_L1_GROUPS=k1,k2,…` measures level 1's prove rate at a chosen size
 /// instead ([`rta_first_groups`]): the base proved once, then one level-1 run
