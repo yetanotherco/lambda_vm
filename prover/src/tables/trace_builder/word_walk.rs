@@ -93,6 +93,22 @@ impl WordRows {
         ]
     }
 
+    /// The seven word tables' buffers and their live bytes before a batch.
+    pub(super) fn buffers(&self) -> [(*const (), usize); WORD_ROW_LISTS - 1] {
+        fn buffer<T>(rows: &[T]) -> (*const (), usize) {
+            (rows.as_ptr().cast(), std::mem::size_of_val(rows))
+        }
+        [
+            buffer(&self.load8),
+            buffer(&self.store8),
+            buffer(&self.loadw),
+            buffer(&self.storew),
+            buffer(&self.load2w),
+            buffer(&self.store2w),
+            buffer(&self.memw),
+        ]
+    }
+
     /// The bytes its lists take on the heap (capacities).
     pub(crate) fn heap_bytes(&self) -> usize {
         vec_heap_bytes(&self.load8)
@@ -125,7 +141,15 @@ impl WordRows {
                 *n += len;
             }
         }
-        let mut out = WordRows {
+        let mut out = Self::with_capacities(lens);
+        for part in parts {
+            out.append(part);
+        }
+        out
+    }
+
+    pub(super) fn with_capacities(lens: [usize; WORD_ROW_LISTS]) -> Self {
+        Self {
             load8: Vec::with_capacity(lens[0]),
             store8: Vec::with_capacity(lens[1]),
             loadw: Vec::with_capacity(lens[2]),
@@ -134,17 +158,13 @@ impl WordRows {
             store2w: Vec::with_capacity(lens[5]),
             memw: Vec::with_capacity(lens[6]),
             copy: Vec::with_capacity(lens[7]),
-        };
-        for part in parts {
-            out.append(part);
         }
-        out
     }
 
     /// The BITWISE lookups of every row past `from` (each family's count of
     /// rows already counted), counted into `histogram`: the rows' lookups are
     /// in-walk lookups, as LOAD's are.
-    pub(crate) fn count_bitwise_into(
+    pub(crate) fn count_bitwise_into<const DIRECT: bool>(
         &self,
         from: [usize; WORD_ROW_LISTS],
         histogram: &mut BitwiseHistogram,
@@ -156,16 +176,32 @@ impl WordRows {
             row.count_bitwise_into(histogram);
         }
         for row in &self.loadw[from[2]..] {
-            row.count_bitwise_into(histogram);
+            if DIRECT {
+                row.count_bitwise_into(histogram);
+            } else {
+                row.count_bitwise_into_listed(histogram);
+            }
         }
         for row in &self.storew[from[3]..] {
-            row.count_bitwise_into(histogram);
+            if DIRECT {
+                row.count_bitwise_into(histogram);
+            } else {
+                row.count_bitwise_into_listed(histogram);
+            }
         }
         for row in &self.load2w[from[4]..] {
-            row.count_bitwise_into(histogram);
+            if DIRECT {
+                row.count_bitwise_into(histogram);
+            } else {
+                row.count_bitwise_into_listed(histogram);
+            }
         }
         for row in &self.store2w[from[5]..] {
-            row.count_bitwise_into(histogram);
+            if DIRECT {
+                row.count_bitwise_into(histogram);
+            } else {
+                row.count_bitwise_into_listed(histogram);
+            }
         }
         for row in &self.memw[from[6]..] {
             row.count_bitwise_into(histogram);

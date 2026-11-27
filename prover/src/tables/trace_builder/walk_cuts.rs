@@ -1,8 +1,9 @@
 //! `LAMBDA_VM_WALK_CUTS`: work taken out of the window walkers' loop, part by
 //! part. Every part emits the same lists and counts the same lookups, so the
 //! tables and the proof's bytes are the same with any part on or off. Unset
-//! (or empty), every part is on, the default; `none` turns every part off,
-//! and a list of parts turns on those alone.
+//! (or empty), the four original parts are on, as with `all`. The newer
+//! parts must be named explicitly. `none` turns every part off, and a list
+//! of parts turns on those alone.
 //!
 //! - `prescan`: a window's logs are no longer read once ahead of the walk for
 //!   a halting cycle; the collect refuses such a cycle as it reads the log,
@@ -16,11 +17,14 @@
 //! - `slots`: where the walker counts and lists none of the in-walk lookups,
 //!   each in-row register slot's range lookup is counted where it is made
 //!   instead of listed, counted after the batch and dropped.
+//! - `rows-sized`: size the seven word tables' lists from the last window
+//!   this walker walked.
+//! - `count-direct`: count word and shift lookups without heap lists.
 
 use crate::Error;
 
 /// The parts of `LAMBDA_VM_WALK_CUTS` that are on. The knob's default is
-/// every part ([`WalkCuts::all`]); this type's `Default` is no part
+/// the four original parts ([`WalkCuts::all`]); this type's `Default` is no part
 /// ([`WalkCuts::none`]), the walk as before the knob, which a builder made
 /// without the knob (`WindowedTraceBuilder::new`) takes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,30 +37,36 @@ pub struct WalkCuts {
     pub one_loop: bool,
     /// The register slots' lookups counted where made.
     pub slots: bool,
+    /// Size the word tables' lists from the last window.
+    pub rows_sized: bool,
+    /// Count word and shift lookups without heap lists.
+    pub count_direct: bool,
 }
 
 impl WalkCuts {
     /// The knob's words.
-    pub(crate) const WORDS: &'static str = "prescan, const, one-loop, slots";
+    pub(crate) const WORDS: &'static str =
+        "prescan, const, one-loop, slots, rows-sized, count-direct";
 
     /// No part on: the walk as before the knob.
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// Every part on: the knob's default.
+    /// The four original parts, as selected by the knob's `all` and default.
     pub fn all() -> Self {
         Self {
             prescan: true,
             constant: true,
             one_loop: true,
             slots: true,
+            ..Self::none()
         }
     }
 
-    /// The knob's reading: unset or empty, every part (the default);
-    /// `none`, no part; else a comma-separated list of the parts that are on,
-    /// or `all`. A word it does not take refuses the prove.
+    /// The knob's reading: unset, empty or `all` selects the original parts.
+    /// `none` selects no part. In a comma-separated list, `all` adds the
+    /// original parts; each other word enables its own part.
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, Error> {
         let mut cuts = Self::none();
         let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
@@ -67,16 +77,25 @@ impl WalkCuts {
         }
         for word in value.split(',').map(str::trim) {
             match word {
-                "all" => cuts = Self::all(),
+                "all" => {
+                    cuts = Self {
+                        rows_sized: cuts.rows_sized,
+                        count_direct: cuts.count_direct,
+                        ..Self::all()
+                    };
+                }
                 "prescan" => cuts.prescan = true,
                 "const" => cuts.constant = true,
                 "one-loop" => cuts.one_loop = true,
                 "slots" => cuts.slots = true,
+                "rows-sized" => cuts.rows_sized = true,
+                "count-direct" => cuts.count_direct = true,
                 _ => {
                     return Err(Error::Prover(format!(
                         "LAMBDA_VM_WALK_CUTS={value}: a comma-separated list of {}, all, or \
-                         none (unset: every part, the default)",
-                        Self::WORDS
+                         none (unset: {original})",
+                        Self::WORDS,
+                        original = Self::all().describe(),
                     )));
                 }
             }
@@ -96,6 +115,8 @@ impl WalkCuts {
             (self.constant, "const"),
             (self.one_loop, "one-loop"),
             (self.slots, "slots"),
+            (self.rows_sized, "rows-sized"),
+            (self.count_direct, "count-direct"),
         ]
         .into_iter()
         .filter_map(|(on, word)| on.then_some(word))
@@ -114,7 +135,7 @@ pub(crate) fn each_part_and_all() -> Vec<(&'static str, WalkCuts)> {
     WalkCuts::WORDS
         .split(", ")
         .map(|word| (word, WalkCuts::parse(Some(word)).expect("its own word")))
-        .chain([("all", WalkCuts::all())])
+        .chain([("all", WalkCuts::parse(Some(WalkCuts::WORDS)).unwrap())])
         .collect()
 }
 
@@ -122,12 +143,12 @@ pub(crate) fn each_part_and_all() -> Vec<(&'static str, WalkCuts)> {
 mod tests {
     use super::WalkCuts;
 
-    /// Unset, empty or blank is every part (the default); `none` is no
-    /// part, the walk as before the knob; the type's `Default` is no part.
     #[test]
-    fn the_walk_cuts_knob_unset_or_empty_is_every_part_and_none_is_no_part() {
-        for value in [None, Some(""), Some("  ")] {
-            assert_eq!(WalkCuts::parse(value).ok(), Some(WalkCuts::all()));
+    fn the_walk_cuts_knob_defaults_to_the_original_four_parts() {
+        for value in [None, Some(""), Some("  "), Some("all")] {
+            let cuts = WalkCuts::parse(value).unwrap();
+            assert_eq!(cuts.describe(), "prescan,const,one-loop,slots");
+            assert!(!cuts.rows_sized && !cuts.count_direct);
         }
         for value in ["none", " none "] {
             assert_eq!(WalkCuts::parse(Some(value)).ok(), Some(WalkCuts::none()));
@@ -136,8 +157,7 @@ mod tests {
         assert_eq!(WalkCuts::none().describe(), "none");
     }
 
-    /// Each word sets its part alone; `all` sets every part; anything else
-    /// refuses the prove.
+    /// Each part's word enables it alone. Unknown words refuse the prove.
     #[test]
     fn the_walk_cuts_knob_takes_its_words_and_refuses_the_rest() {
         let one = |word: &str| WalkCuts::parse(Some(word)).expect(word);
@@ -171,8 +191,28 @@ mod tests {
             }
         );
         assert_eq!(one("prescan,const, one-loop ,slots"), WalkCuts::all());
-        assert_eq!(WalkCuts::parse(Some("all")).ok(), Some(WalkCuts::all()));
-        assert_eq!(WalkCuts::all().describe(), WalkCuts::WORDS.replace(' ', ""));
+        assert_eq!(
+            one("rows-sized"),
+            WalkCuts {
+                rows_sized: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            one("count-direct"),
+            WalkCuts {
+                count_direct: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            one("rows-sized,count-direct,all"),
+            one("all,rows-sized,count-direct")
+        );
+        assert_eq!(
+            one(WalkCuts::WORDS).describe(),
+            WalkCuts::WORDS.replace(' ', "")
+        );
         for bad in [
             "pre-scan",
             "prescan,",

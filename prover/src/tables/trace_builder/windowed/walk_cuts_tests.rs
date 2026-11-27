@@ -15,7 +15,7 @@ use executor::vm::logs::Log;
 
 use super::super::{HistoryOverlay, MemoryState, RegisterState, WalkCuts, WalkSizes};
 use super::light_walk_tests::{
-    PROGRAMS, RUST_GUESTS, WORD_PROGRAMS, built, counted, dbg, lists, rust_elf,
+    PROGRAMS, RUST_GUESTS, WORD_PROGRAMS, built, built_with_memory, counted, dbg, lists, rust_elf,
 };
 use super::{LogSource, WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window};
 use crate::Error;
@@ -129,7 +129,25 @@ fn cuts_are_todays(name: &str, program: &Elf, input: &[u8], window: usize, shape
     let builder = WindowedTraceBuilder::new(program, input, &max_rows).expect("the builder");
     let decode = Arc::clone(&builder.decode);
     drop(builder);
-    let arms = each_part_and_all();
+    let mut arms = each_part_and_all();
+    let default = WalkCuts::parse(None).unwrap();
+    arms.extend([
+        ("defaults", default),
+        (
+            "defaults,rows-sized",
+            WalkCuts {
+                rows_sized: true,
+                ..default
+            },
+        ),
+        (
+            "defaults,count-direct",
+            WalkCuts {
+                count_direct: true,
+                ..default
+            },
+        ),
+    ]);
     let levels = [(true, true), (false, false)];
     // By level: the walk without cuts, then each arm.
     let mut counts: Vec<Vec<WalkCounts>> = levels
@@ -316,16 +334,88 @@ mod the_walk_cuts_emit_today_s_lists {
     #[test]
     fn ethrex_transfers() {
         let ethrex = rust_elf("ethrex");
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
-        let input = std::fs::read(fixtures.join("ethrex_10_transfers.bin")).expect("the fixture");
+        let input = ethrex_transfers_input();
         let windows = cuts_are_todays(
             "ethrex_10_transfers",
             &ethrex,
             &input,
             1 << 16,
-            split_shape(MemwAlignedOrder::Limbs, RegisterFormat::InRow, 2048),
+            Shape {
+                order: MemwAlignedOrder::Limbs,
+                format: RegisterFormat::InRow,
+                memory: MemoryFormat::Words,
+                batch: 2048,
+            },
         );
         assert!(windows > 0, "compared ethrex windows");
+    }
+}
+
+fn ethrex_transfers_input() -> Vec<u8> {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
+    std::fs::read(fixtures.join("ethrex_10_transfers.bin")).expect("the fixture")
+}
+
+#[test]
+fn assert_walk_cuts_build_the_same_tables_for_word_memory_and_ethrex_transfers() {
+    let (assembly, _) = run("fused_mem_cases");
+    let ethrex = rust_elf("ethrex");
+    let transfers = ethrex_transfers_input();
+    let default = WalkCuts::parse(None).unwrap();
+    let cuts = [
+        WalkCuts {
+            rows_sized: true,
+            ..default
+        },
+        WalkCuts {
+            count_direct: true,
+            ..default
+        },
+        WalkCuts {
+            rows_sized: true,
+            count_direct: true,
+            ..default
+        },
+    ];
+    for (name, program, input, window, max_rows) in [
+        (
+            "word memory",
+            &assembly,
+            &[][..],
+            7,
+            MaxRowsConfig::uniform(4),
+        ),
+        (
+            "ethrex transfers",
+            &ethrex,
+            transfers.as_slice(),
+            1 << 16,
+            MaxRowsConfig::uniform(1 << 16),
+        ),
+    ] {
+        let build = |walkers, cuts| {
+            built_with_memory(
+                program,
+                input,
+                &max_rows,
+                window,
+                walkers,
+                (2, cuts),
+                (RegisterFormat::InRow, MemoryFormat::Words),
+            )
+        };
+        let (want, want_order) = build(1, default);
+        assert!(!want_order.is_empty(), "{name}: streamed chunks");
+        for walkers in [1, 3, 6] {
+            for cuts in std::iter::once(default).chain(cuts) {
+                let (got, order) = build(walkers, cuts);
+                assert_eq!(
+                    order, want_order,
+                    "{name}, {walkers} walkers, {cuts:?}: the hand-out"
+                );
+                same_traces(&want, &got);
+            }
+        }
     }
 }
 
@@ -510,4 +600,84 @@ fn counts_settled_under_const_must_route_every_op_they_count() {
     let mut plain = counts(vec![3, 0, 2], 0);
     plain.settle(&decode).expect("nothing to settle");
     assert!(plain.histogram.is_none(), "settled without const");
+}
+
+#[test]
+fn rows_sized_reuses_seven_buffers_for_an_equal_window_and_can_grow() {
+    use super::super::{WalkOutputs, word_walk::WordRows};
+    use crate::tables::{
+        mem_load2w::Load2WRow,
+        mem_load8::Load8Row,
+        mem_loadw::LoadWRow,
+        mem_store2w::Store2WRow,
+        mem_store8::Store8Row,
+        mem_storew::StoreWRow,
+        memw_w::{MemwWordRow, MessageKind},
+    };
+
+    let fill = |rows: &mut WordRows, multiple| {
+        rows.load8
+            .resize(191 * multiple, Load8Row::new(8, 42, 0, 1).unwrap());
+        rows.store8
+            .resize(307 * multiple, Store8Row::new(8, 42, 0, 1, 2).unwrap());
+        rows.loadw
+            .resize(109 * multiple, LoadWRow::new(8, 42, 0, 2, true, 1).unwrap());
+        rows.storew
+            .resize(89 * multiple, StoreWRow::new(8, 42, 0, 2, 1, 2).unwrap());
+        rows.load2w.resize(
+            53 * multiple,
+            Load2WRow::new(15, 42, [0, 1], 2, true, [1, 2]).unwrap(),
+        );
+        rows.store2w.resize(
+            29 * multiple,
+            Store2WRow::new(15, 42, [0, 1], 2, 1, [1, 2]).unwrap(),
+        );
+        rows.memw.resize(
+            71 * multiple,
+            MemwWordRow::new(MessageKind::Access, 8, 42, 0, 1, 2).unwrap(),
+        );
+    };
+    let cycles = 8192;
+    let window = |sizes: &WalkSizes, sized| {
+        WalkOutputs::for_walk_sized(cycles, false, sizes, sized, MemwAlignedOrder::Limbs)
+    };
+    let mut first = window(&WalkSizes::default(), true);
+    assert_eq!(first.word_rows.heap_bytes(), 0);
+    fill(&mut first.word_rows, 1usize);
+    let sizes = WalkSizes::of(&first, cycles);
+    let mut equal = window(&sizes, true);
+    let allocations = |rows: &WordRows| {
+        (
+            rows.buffers().map(|(ptr, _)| ptr),
+            [
+                rows.load8.capacity(),
+                rows.store8.capacity(),
+                rows.loadw.capacity(),
+                rows.storew.capacity(),
+                rows.load2w.capacity(),
+                rows.store2w.capacity(),
+                rows.memw.capacity(),
+            ],
+        )
+    };
+    let before = allocations(&equal.word_rows);
+    fill(&mut equal.word_rows, 1usize);
+    assert_eq!(
+        allocations(&equal.word_rows),
+        before,
+        "no word-row list moved or grew"
+    );
+    assert_eq!(equal.word_rows, first.word_rows);
+    for (&n, cap) in first.word_rows.lens().iter().zip(before.1) {
+        assert!(
+            (n..=n + n / 8 + 16).contains(&cap),
+            "{n} rows, capacity {cap}"
+        );
+    }
+    assert_eq!(equal.word_rows.copy.capacity(), 0);
+    let mut heavy = window(&sizes, true);
+    let mut control = window(&sizes, false);
+    fill(&mut heavy.word_rows, 2usize);
+    fill(&mut control.word_rows, 2usize);
+    assert_eq!(heavy.word_rows, control.word_rows);
 }

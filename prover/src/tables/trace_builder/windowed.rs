@@ -1766,7 +1766,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             logs: None,
             made: None,
             routed: None,
-            times: None,
+            times: WalkTimes::default(),
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -2127,14 +2127,14 @@ pub struct WalkedWindow {
     /// ([`WindowedTraceBuilder::light_walk`] at 2); `None` when the
     /// accumulator routes it.
     routed: Option<super::RoutedSegments>,
-    /// Its walk's parts timed, under [`WALK_TIMES_ENV`]; `None` otherwise.
-    times: Option<WalkTimes>,
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    times: WalkTimes,
 }
 
 /// `LAMBDA_VM_WALK_TIMES=1`: each window's walk timed by its parts
 /// ([`WalkTimes`]), summed over the run on the `BLOCK WALKERS` line. A
 /// measurement: the walk, its lists and the tables are the same either way;
-/// unset or any other word, nothing is timed and the line is today's.
+/// unset or any other word omits the per-part times from the line.
 pub(crate) const WALK_TIMES_ENV: &str = "LAMBDA_VM_WALK_TIMES";
 
 /// Whether the walk's parts are timed ([`WALK_TIMES_ENV`]).
@@ -2359,6 +2359,7 @@ mod walk_times_tests {
             count_rows: 1.5,
             count_shift: 2.5,
             count_listed: 0.25,
+            regrown_word_row_bytes: 32,
         };
         let mut sum = WalkTimes::default();
         sum.add(&one);
@@ -2376,6 +2377,7 @@ mod walk_times_tests {
                 count_rows: 3.0,
                 count_shift: 5.0,
                 count_listed: 0.5,
+                regrown_word_row_bytes: 64,
             }
         );
     }
@@ -2399,6 +2401,8 @@ pub struct WalkTimes {
     pub count_rows: f64,
     pub count_shift: f64,
     pub count_listed: f64,
+    /// Live word-row bytes before batches that moved their buffers.
+    pub regrown_word_row_bytes: usize,
 }
 
 impl WalkTimes {
@@ -2414,6 +2418,7 @@ impl WalkTimes {
         self.count_rows += other.count_rows;
         self.count_shift += other.count_shift;
         self.count_listed += other.count_listed;
+        self.regrown_word_row_bytes += other.regrown_word_row_bytes;
     }
 
     /// The parts as the `BLOCK WALKERS` line prints them.
@@ -2436,12 +2441,6 @@ impl WalkTimes {
 }
 
 impl WalkedWindow {
-    /// Its walk's parts timed ([`WALK_TIMES_ENV`]); `None` when untimed.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub(crate) fn times(&self) -> Option<&WalkTimes> {
-        self.times.as_ref()
-    }
-
     /// A digest of everything the window's walk emitted, its CPU ops and
     /// every list (the in-row register format's side records among them),
     /// through their `Debug` forms: two walks that emit the same give the
@@ -2726,7 +2725,13 @@ fn walk_window(
         batch_len(batch, cycles)
     });
     // Without `lookups`, the accumulator counts them (`absorb`).
-    let mut walk = WalkOutputs::for_walk_sized(cycles, lookups, sizes, order);
+    let mut walk = WalkOutputs::for_walk_sized(
+        cycles,
+        lookups,
+        sizes,
+        cuts.rows_sized && memory_format == MemoryFormat::Words,
+        order,
+    );
     walk.memw.registers = register_format;
     walk.memw.memory = memory_format;
     if register_format == crate::tables::register::RegisterFormat::InRow
@@ -2760,6 +2765,7 @@ fn walk_window(
     let pad_bytes = pad.walker;
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
+    let mut regrown_word_row_bytes = 0;
     while from < cycles {
         let part = source.batch(from, batch.min(cycles - from))?;
         let start = if list { cpu_ops.len() } else { 0 };
@@ -2780,6 +2786,7 @@ fn walk_window(
             Some(counts) if cuts.slots && !lookups => Some(counts.histogram_mut()),
             _ => None,
         };
+        let buffers = walk.word_rows.buffers();
         super::collect_window_ops_into(
             &cpu_ops[start..],
             decode,
@@ -2790,6 +2797,11 @@ fn walk_window(
             defer_ecrec,
             slot_counts,
         )?;
+        for ((before, bytes), (after, _)) in buffers.into_iter().zip(walk.word_rows.buffers()) {
+            if before != after {
+                regrown_word_row_bytes += bytes;
+            }
+        }
         if pad_bytes > 0 {
             WALK_PAD.with(|buf| {
                 let (buf, at, seed) = (
@@ -2815,6 +2827,7 @@ fn walk_window(
                 &walk,
                 marks,
                 (!one_loop).then_some(&mut *last_ecall),
+                cuts.count_direct,
                 times.as_mut(),
             );
             // A walk that lists no lookup of its own still lists each in-row
@@ -2855,6 +2868,8 @@ fn walk_window(
     if !list {
         cpu_ops = Vec::new();
     }
+    let mut times = times.unwrap_or_default();
+    times.regrown_word_row_bytes = regrown_word_row_bytes;
     Ok(WalkedWindow {
         cpu_ops,
         first,
@@ -2985,6 +3000,7 @@ impl WalkCounts {
     /// One batch's: `cpu_ops`, its CPU ops' DECODE lookups and its last ECALL
     /// into `last_ecall` (`None`: the routing counts them, `one-loop`); and
     /// the rows `walk` gained from `marks` on.
+    #[allow(clippy::too_many_arguments)]
     fn count_batch(
         &mut self,
         decode: &DecodeTable,
@@ -2992,6 +3008,7 @@ impl WalkCounts {
         walk: &WalkOutputs,
         marks: BatchMarks,
         last_ecall: Option<&mut Option<(u64, u64)>>,
+        count_direct: bool,
         times: Option<&mut WalkTimes>,
     ) {
         // Its parts timed into `times` when the walk is timed.
@@ -3024,8 +3041,13 @@ impl WalkCounts {
             row.count_bitwise_into(histogram);
         }
         // And the word tables' rows'.
-        walk.word_rows
-            .count_bitwise_into(marks.word_rows, histogram);
+        if count_direct {
+            walk.word_rows
+                .count_bitwise_into::<true>(marks.word_rows, histogram);
+        } else {
+            walk.word_rows
+                .count_bitwise_into::<false>(marks.word_rows, histogram);
+        }
         memw_register::collect_bitwise_from_memw_register(
             &walk.memw.register_rows[marks.register_rows..],
             histogram,
@@ -3037,9 +3059,12 @@ impl WalkCounts {
             &walk.memw.aligned[marks.aligned..],
         ));
         let t2 = t0.map(|_| std::time::Instant::now());
-        histogram.add_ops(&shift::collect_bitwise_from_shift(
-            &walk.shift_ops[marks.shift..],
-        ));
+        let shifts = &walk.shift_ops[marks.shift..];
+        if count_direct {
+            shift::count_bitwise_from_shift(shifts, histogram);
+        } else {
+            histogram.add_ops(&shift::collect_bitwise_from_shift(shifts));
+        }
         if let (Some(t), Some(t0), Some(t1), Some(t2)) = (times, t0, t1, t2) {
             t.count_loop += (t1 - t0).as_secs_f64();
             t.count_rows += (t2 - t1).as_secs_f64();
@@ -3341,7 +3366,7 @@ impl Accumulator<'_> {
                 .iter()
                 .for_each(|row| row.count_bitwise_into(histogram));
             walk.word_rows
-                .count_bitwise_into([0; super::word_walk::WORD_ROW_LISTS], histogram);
+                .count_bitwise_into::<false>([0; super::word_walk::WORD_ROW_LISTS], histogram);
         }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
@@ -4539,7 +4564,7 @@ impl Kept {
             logs,
             made: _,
             routed: _,
-            times: _,
+            ..
         } = window;
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs

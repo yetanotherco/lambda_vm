@@ -3662,7 +3662,11 @@ struct ProducerWaits {
 impl ProducerWaits {
     /// Adds the time since `since` to `wait`.
     fn add(wait: &std::sync::atomic::AtomicU64, since: Instant) {
-        let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Self::add_duration(wait, since.elapsed());
+    }
+
+    fn add_duration(wait: &std::sync::atomic::AtomicU64, duration: std::time::Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         wait.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -10800,6 +10804,9 @@ fn prove_streamed(
                         // finish's, as on one walker.
                         ledger.walk.store(builder.state_bytes(), Relaxed);
                     }
+                    let (recv, send) = report.producer_waits();
+                    ProducerWaits::add_duration(&waits.walker_recv, std::time::Duration::from_secs_f64(recv));
+                    ProducerWaits::add_duration(&waits.walker_send, std::time::Duration::from_secs_f64(send));
                     eprintln!("{}", report.line());
                     report.last
                 } else {

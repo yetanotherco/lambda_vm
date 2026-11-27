@@ -51,8 +51,8 @@ use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{FE, GoldilocksExtension, GoldilocksField, VmTable};
 use super::word_cpu::{
-    FLAG_SIGNED, FLAG_W2, FLAG_W4, FLAG_W8, WordClass, bit, carries, carry_constraints, dispatch,
-    flags, limb_lookups, load_result, msb8, one_hot_constraints, pair_lookups, placed,
+    FLAG_SIGNED, FLAG_W2, FLAG_W4, FLAG_W8, Lookups, WordClass, bit, carries, carry_constraints,
+    dispatch, flags, limb_lookups, load_result, msb8, one_hot_constraints, pair_lookups, placed,
     second_word_key, sum, word_class, word_key,
 };
 use super::word_memory::{
@@ -200,9 +200,34 @@ impl Load2WRow {
         ops.into_iter()
     }
 
-    /// [`Self::bitwise_ops`] counted into `histogram`.
+    /// The same lookups in a fixed-capacity list for the walker's count.
+    #[inline]
+    pub(crate) fn bitwise_ops_direct(&self) -> Lookups<13> {
+        let bytes = self.bytes();
+        let mut ops = Lookups::new();
+        ops.extend(pair_lookups(&bytes));
+        if self.width < 8 {
+            let top = bytes[self.offset() + usize::from(self.width) - 1];
+            ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::Msb8,
+                top,
+            ));
+        }
+        ops.extend(limb_lookups(self.steps[0]));
+        ops.extend(limb_lookups(self.steps[1]));
+        ops
+    }
+
     #[inline]
     pub(crate) fn count_bitwise_into(&self, histogram: &mut BitwiseHistogram) {
+        for op in self.bitwise_ops_direct() {
+            histogram.bump(op);
+        }
+    }
+
+    /// [`Self::bitwise_ops`] counted into `histogram`.
+    #[inline]
+    pub(crate) fn count_bitwise_into_listed(&self, histogram: &mut BitwiseHistogram) {
         for op in self.bitwise_ops() {
             histogram.bump(op);
         }
