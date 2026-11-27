@@ -158,7 +158,11 @@ fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
         std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").as_deref(),
         Ok("1")
     );
-    for knob in ["LAMBDA_VM_WORD_CHUNKS", "LAMBDA_VM_BLOCK_WALKERS"] {
+    for knob in [
+        "LAMBDA_VM_WORD_CHUNKS",
+        "LAMBDA_VM_BLOCK_WALKERS",
+        "LAMBDA_VM_WALK_CUTS",
+    ] {
         assert!(std::env::var_os(knob).is_none(), "run with {knob} unset");
     }
     let elf = asm_elf_bytes("fused_mem_cases");
@@ -173,7 +177,7 @@ fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
     };
     let mut options = super::block_whir_tests::streamed(tiny, 3, 4);
     options.drop_streamed_ops = true;
-    let prove = |word_chunks, walkers| {
+    let prove = |word_chunks, walkers, walk_cuts| {
         let (proof, _) = prove_block_whir_with(
             &elf,
             &[],
@@ -183,6 +187,7 @@ fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
             &Deviations {
                 word_chunks,
                 walkers,
+                walk_cuts,
                 ..Deviations::default()
             },
         )
@@ -194,9 +199,22 @@ fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
         assert!(verify_block_whir(&proof, &elf, &opts, &format).expect("verify runs"));
         bytes(&proof)
     };
-    let default = prove(None, None);
-    assert_eq!(prove(Some(WordChunks::Copy), None), default, "copy");
-    assert_eq!(prove(None, Some(4)), default, "four walkers");
+    let default = prove(None, None, None);
+    assert_eq!(prove(Some(WordChunks::Copy), None, None), default, "copy");
+    assert_eq!(prove(None, Some(4), None), default, "four walkers");
+    for (rows_sized, count_direct) in [(true, false), (false, true), (true, true)] {
+        let cuts = WalkCuts {
+            rows_sized,
+            count_direct,
+            ..WalkCuts::all()
+        };
+        assert_eq!(
+            prove(None, None, Some(cuts)),
+            default,
+            "{}",
+            cuts.describe()
+        );
+    }
 }
 
 /// Explicit `part` requires streamed and dropped word rows. The default

@@ -965,113 +965,275 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
 // Bitwise operation collection
 // =========================================================================
 
-use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 
 /// Collect BITWISE table lookups needed by a set of shift operations.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
     // No deduplication: each operation has μ=1, matching generate_shift_trace.
     let mut bitwise_ops = Vec::new();
-
     for op in operations {
-        let aux = op.compute_aux();
-        let left = !op.direction;
-        let right = op.direction;
+        for_each_lookup(op, |lookup| bitwise_ops.push(lookup));
+    }
+    bitwise_ops
+}
 
-        // C14: MSB16[in[3]] | signed
-        if op.signed {
-            let x = (op.in_halves[3] & 0xFF) as u8;
-            let y = (op.in_halves[3] >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
+pub(crate) fn count_bitwise_from_shift(
+    operations: &[ShiftOperation],
+    histogram: &mut BitwiseHistogram,
+) {
+    for op in operations {
+        for_each_lookup(op, |lookup| histogram.bump(lookup));
+    }
+}
+
+#[inline]
+fn for_each_lookup(op: &ShiftOperation, mut emit: impl FnMut(BitwiseOperation)) {
+    let aux = op.compute_aux();
+    let left = !op.direction;
+    let right = op.direction;
+
+    // C14: MSB16[in[3]] | signed
+    if op.signed {
+        let x = (op.in_halves[3] & 0xFF) as u8;
+        let y = (op.in_halves[3] >> 8) as u8;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
+            x,
+            y,
+        ));
+    }
+
+    // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
+    if left {
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            op.shift,
+            15,
+        ));
+    }
+
+    // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
+    if right {
+        let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
+        let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            complement,
+            15,
+        ));
+    }
+
+    // C3: ZERO[bit_shift] | μ (= 1)
+    emit(BitwiseOperation::zero(aux.bit_shift as u32));
+
+    // C4.i + C7: HWSL paired lookups | 1-zbs
+    // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
+    // from the same input in a single bus interaction.
+    if !aux.zbs {
+        for i in 0..4 {
+            let x = (op.in_halves[i] & 0xFF) as u8;
+            let y = (op.in_halves[i] >> 8) as u8;
+            emit(BitwiseOperation::shift_op(
+                BitwiseOperationType::Hwsl,
                 x,
                 y,
-            ));
-        }
-
-        // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
-        if left {
-            bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::ByteAluAnd,
-                op.shift,
-                15,
-            ));
-        }
-
-        // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
-        if right {
-            let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
-            let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
-            bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::ByteAluAnd,
-                complement,
-                15,
-            ));
-        }
-
-        // C3: ZERO[bit_shift] | μ (= 1)
-        bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
-
-        // C4.i + C7: HWSL paired lookups | 1-zbs
-        // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
-        // from the same input in a single bus interaction.
-        if !aux.zbs {
-            for i in 0..4 {
-                let x = (op.in_halves[i] & 0xFF) as u8;
-                let y = (op.in_halves[i] >> 8) as u8;
-                bitwise_ops.push(BitwiseOperation::shift_op(
-                    BitwiseOperationType::Hwsl,
-                    x,
-                    y,
-                    aux.bit_shift,
-                ));
-            }
-            // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
-            let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
-            let ext_x = (extension & 0xFF) as u8;
-            let ext_y = (extension >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::shift_op(
-                BitwiseOperationType::Hwsl,
-                ext_x,
-                ext_y,
                 aux.bit_shift,
             ));
         }
-
-        // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
-        let mask = if op.word_instr { 16 } else { 48 };
-        bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::ByteAluAnd,
-            op.shift,
-            mask,
+        // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
+        let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
+        let ext_x = (extension & 0xFF) as u8;
+        let ext_y = (extension >> 8) as u8;
+        emit(BitwiseOperation::shift_op(
+            BitwiseOperationType::Hwsl,
+            ext_x,
+            ext_y,
+            aux.bit_shift,
         ));
-
-        // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
-        // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
-        // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
-        // equality with the CPU's well-formed arg2 high word, so it needs no check.
-        // Padding rows' ARE_BYTES[0, 0] are counted by
-        // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
-        bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            op.shift,
-            ((op.shift_amount >> 8) & 0xFF) as u8,
-        ));
-        let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
-        bitwise_ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (half & 0xFF) as u8,
-            (half >> 8) as u8,
-        ));
-        // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
-        // active row — matches the four IS_HALF senders added in `bus_interactions`.
-        for i in 0..4 {
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (op.in_halves[i] & 0xFF) as u8,
-                (op.in_halves[i] >> 8) as u8,
-            ));
-        }
     }
 
-    bitwise_ops
+    // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
+    let mask = if op.word_instr { 16 } else { 48 };
+    emit(BitwiseOperation::byte_op(
+        BitwiseOperationType::ByteAluAnd,
+        op.shift,
+        mask,
+    ));
+
+    // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
+    // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
+    // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
+    // equality with the CPU's well-formed arg2 high word, so it needs no check.
+    // Padding rows' ARE_BYTES[0, 0] are counted by
+    // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
+    emit(BitwiseOperation::byte_op(
+        BitwiseOperationType::AreBytes,
+        op.shift,
+        ((op.shift_amount >> 8) & 0xFF) as u8,
+    ));
+    let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
+    emit(BitwiseOperation::halfword(
+        BitwiseOperationType::IsHalf,
+        (half & 0xFF) as u8,
+        (half >> 8) as u8,
+    ));
+    // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
+    // active row — matches the four IS_HALF senders added in `bus_interactions`.
+    for i in 0..4 {
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (op.in_halves[i] & 0xFF) as u8,
+            (op.in_halves[i] >> 8) as u8,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod count_direct_tests {
+    use super::*;
+
+    #[test]
+    fn count_direct_shift_lookups_match_the_listed_lookups_on_10000_rows() {
+        let mut seed = 0xb2f8_eae9_9838_ab2fu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut direct = BitwiseHistogram::new();
+        let mut listed = BitwiseHistogram::new();
+        for k in 0..10_000 {
+            let flags = next();
+            let right = flags & 1 != 0;
+            let op = ShiftOperation::new(
+                next(),
+                next(),
+                right,
+                right && flags & 2 != 0,
+                flags & 4 != 0,
+            );
+            let want = listed_before_direct(std::slice::from_ref(&op));
+            let mut got = Vec::new();
+            for_each_lookup(&op, |lookup| got.push(lookup));
+            assert_eq!(got, want, "shift row {k}");
+            assert_eq!(
+                collect_bitwise_from_shift(std::slice::from_ref(&op)),
+                want,
+                "listed shift row {k}"
+            );
+            count_bitwise_from_shift(std::slice::from_ref(&op), &mut direct);
+            listed.add_ops(&want);
+        }
+        assert_eq!(direct.digest(), listed.digest());
+    }
+
+    // Original listed implementation, independent of the shared emitter.
+    fn listed_before_direct(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
+        // No deduplication: each operation has μ=1, matching generate_shift_trace.
+        let mut bitwise_ops = Vec::new();
+
+        for op in operations {
+            let aux = op.compute_aux();
+            let left = !op.direction;
+            let right = op.direction;
+
+            // C14: MSB16[in[3]] | signed
+            if op.signed {
+                let x = (op.in_halves[3] & 0xFF) as u8;
+                let y = (op.in_halves[3] >> 8) as u8;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    x,
+                    y,
+                ));
+            }
+
+            // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
+            if left {
+                bitwise_ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::ByteAluAnd,
+                    op.shift,
+                    15,
+                ));
+            }
+
+            // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
+            if right {
+                let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
+                let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
+                bitwise_ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::ByteAluAnd,
+                    complement,
+                    15,
+                ));
+            }
+
+            // C3: ZERO[bit_shift] | μ (= 1)
+            bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
+
+            // C4.i + C7: HWSL paired lookups | 1-zbs
+            // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
+            // from the same input in a single bus interaction.
+            if !aux.zbs {
+                for i in 0..4 {
+                    let x = (op.in_halves[i] & 0xFF) as u8;
+                    let y = (op.in_halves[i] >> 8) as u8;
+                    bitwise_ops.push(BitwiseOperation::shift_op(
+                        BitwiseOperationType::Hwsl,
+                        x,
+                        y,
+                        aux.bit_shift,
+                    ));
+                }
+                // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
+                let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
+                let ext_x = (extension & 0xFF) as u8;
+                let ext_y = (extension >> 8) as u8;
+                bitwise_ops.push(BitwiseOperation::shift_op(
+                    BitwiseOperationType::Hwsl,
+                    ext_x,
+                    ext_y,
+                    aux.bit_shift,
+                ));
+            }
+
+            // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
+            let mask = if op.word_instr { 16 } else { 48 };
+            bitwise_ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluAnd,
+                op.shift,
+                mask,
+            ));
+
+            // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
+            // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
+            // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
+            // equality with the CPU's well-formed arg2 high word, so it needs no check.
+            // Padding rows' ARE_BYTES[0, 0] are counted by
+            // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
+            bitwise_ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                op.shift,
+                ((op.shift_amount >> 8) & 0xFF) as u8,
+            ));
+            let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+            // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
+            // active row — matches the four IS_HALF senders added in `bus_interactions`.
+            for i in 0..4 {
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (op.in_halves[i] & 0xFF) as u8,
+                    (op.in_halves[i] >> 8) as u8,
+                ));
+            }
+        }
+
+        bitwise_ops
+    }
 }

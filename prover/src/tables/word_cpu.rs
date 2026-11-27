@@ -353,6 +353,47 @@ pub(crate) fn stored_half<B: ConstraintBuilder<GoldilocksField, GoldilocksExtens
 // Rows
 // =========================================================================
 
+/// A row's lookups in insertion order, with room for at most `N`.
+pub(crate) struct Lookups<const N: usize> {
+    ops: [BitwiseOperation; N],
+    len: usize,
+}
+
+impl<const N: usize> Lookups<N> {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            ops: [BitwiseOperation::zero(0); N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, op: BitwiseOperation) {
+        self.ops[self.len] = op;
+        self.len += 1;
+    }
+}
+
+impl<const N: usize> Extend<BitwiseOperation> for Lookups<N> {
+    #[inline]
+    fn extend<T: IntoIterator<Item = BitwiseOperation>>(&mut self, ops: T) {
+        for op in ops {
+            self.push(op);
+        }
+    }
+}
+
+impl<const N: usize> IntoIterator for Lookups<N> {
+    type Item = BitwiseOperation;
+    type IntoIter = std::iter::Take<std::array::IntoIter<BitwiseOperation, N>>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.ops.into_iter().take(self.len)
+    }
+}
+
 /// A row's two step limbs' `IS_HALF` lookups.
 #[inline]
 pub(crate) fn limb_lookups(step: u32) -> [BitwiseOperation; 2] {
@@ -387,4 +428,57 @@ pub(crate) fn load_result(bytes: &[u8], offset: usize, width: u8, signed: bool) 
 pub(crate) fn store_into(old: &mut [u8], offset: usize, width: u8, value: u64) {
     let width = usize::from(width);
     old[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+}
+
+#[cfg(test)]
+mod count_direct_tests {
+    use crate::tables::{
+        mem_load2w::Load2WRow, mem_loadw::LoadWRow, mem_store2w::Store2WRow, mem_storew::StoreWRow,
+    };
+
+    #[test]
+    fn count_direct_word_lookups_match_the_listed_lookups_on_10000_rows_per_kind() {
+        let mut seed = 0xdefc_a673_b9fe_7527u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for k in 0..10_000 {
+            let width = [1, 2, 4][k % 3];
+            let crossing_width = [2, 4, 8][k % 3];
+            let address = (next() & 0xffff_fff8) + next() % (9 - u64::from(width));
+            let crossing = (next() & 0xffff_fff8)
+                + (9 - u64::from(crossing_width))
+                + next() % (u64::from(crossing_width) - 1);
+            let ts = 1u64 << 33;
+            let old_ts = [
+                ts - 1 - u64::from(next() as u32),
+                ts - 1 - u64::from(next() as u32),
+            ];
+            let signed = next() & 1 != 0;
+            let words = [next(), next()];
+            let load = LoadWRow::new(address, ts, old_ts[0], width, signed, words[0]).unwrap();
+            let store = StoreWRow::new(address, ts, old_ts[0], width, next(), words[0]).unwrap();
+            let load2 =
+                Load2WRow::new(crossing, ts, old_ts, crossing_width, signed, words).unwrap();
+            let store2 =
+                Store2WRow::new(crossing, ts, old_ts, crossing_width, next(), words).unwrap();
+            macro_rules! same_lookups {
+                ($row:ident) => {
+                    assert_eq!(
+                        $row.bitwise_ops_direct().into_iter().collect::<Vec<_>>(),
+                        $row.bitwise_ops().collect::<Vec<_>>(),
+                        "{} row {k}",
+                        stringify!($row)
+                    );
+                };
+            }
+            same_lookups!(load);
+            same_lookups!(store);
+            same_lookups!(load2);
+            same_lookups!(store2);
+        }
+    }
 }

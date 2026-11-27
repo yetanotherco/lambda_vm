@@ -6,7 +6,7 @@
 //! table; and a window absorbed without its walker's counts is refused.
 
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::Traces;
+use crate::tables::trace_builder::{Traces, WalkCuts};
 use crate::tests::windowed_builder_tests::{run, same_traces, whole};
 
 use super::WindowedTraceBuilder;
@@ -63,6 +63,11 @@ fn made_build(
 ) -> (Result<Traces, crate::Error>, usize) {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
         .expect("the builder")
+        .walk_cuts(WalkCuts {
+            count_direct: true,
+            ..WalkCuts::none()
+        })
+        .expect("the walk cuts")
         .count_handout_on_thread(count_thread)
         .drop_streamed_ops()
         .expect("before the first window")
@@ -220,6 +225,11 @@ fn merged_build(
         .expect("before the first window")
         .lt_merge()
         .defer_ecrec_witnesses(levers)
+        .walk_cuts(WalkCuts {
+            count_direct: true,
+            ..WalkCuts::none()
+        })
+        .expect("the walk cuts")
         .count_where_made(levers);
     assert_eq!(builder.counts_where_made(), levers);
     let body = logs.len() - 1;

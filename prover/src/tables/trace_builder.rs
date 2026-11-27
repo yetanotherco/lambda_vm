@@ -2433,6 +2433,7 @@ impl WalkOutputs {
         cpu_ops: usize,
         lookups: bool,
         sizes: &WalkSizes,
+        rows_sized: bool,
         order: MemwAlignedOrder,
     ) -> Self {
         let mut out = Self::for_walk(cpu_ops, lookups, order);
@@ -2452,6 +2453,11 @@ impl WalkOutputs {
         out.load_ops = for_the_card(size(sizes.load));
         out.lt_ops = Vec::with_capacity(size(sizes.lt));
         out.shift_ops = for_the_card(size(sizes.shift));
+        if rows_sized {
+            let mut capacity = sizes.word_rows.map(size);
+            capacity[word_walk::WORD_ROW_LISTS - 1] = 0; // COPY_W
+            out.word_rows = WordRows::with_capacities(capacity);
+        }
         // The fused rows, under the fused memory format (none else).
         if sizes.mem_load > 0 || sizes.mem_store > 0 {
             out.mem_load_rows = for_the_card(size(sizes.mem_load));
@@ -2521,6 +2527,7 @@ pub(crate) struct WalkSizes {
     shift: usize,
     mem_load: usize,
     mem_store: usize,
+    word_rows: [usize; word_walk::WORD_ROW_LISTS],
     /// The six segments the CPU ops route to (BRANCH, MUL, DVRM, EQ,
     /// BYTEWISE, STORE), where the walker routes its window.
     routed: [usize; 6],
@@ -2539,6 +2546,7 @@ impl WalkSizes {
             shift: walk.shift_ops.len(),
             mem_load: walk.mem_load_rows.len(),
             mem_store: walk.mem_store_rows.len(),
+            word_rows: walk.word_rows.lens(),
             routed: [0; 6],
         }
     }

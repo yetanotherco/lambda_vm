@@ -682,15 +682,17 @@ impl WindowWalker {
         job: &WindowJob,
         after: &Receiver<After>,
         image: &PagedMem<u8>,
-    ) -> Result<(WalkedWindow, f64, u64), Error> {
+    ) -> Result<(WalkedWindow, f64, f64, u64), Error> {
         let t = Instant::now();
         let (walked, boundary) = self.walk(job, image)?;
         let mut busy = t.elapsed().as_secs_f64();
         head_log::window_walked(job.window as usize, t, self.seeding);
+        let register_wait = Instant::now();
         let after = after
             .recv()
             .map_err(|_| Error::Prover(format!("window {}: {PASS_STOPPED}", job.window)))?;
         let t = Instant::now();
+        let register_wait = (t - register_wait).as_secs_f64();
         match after {
             After::Next {
                 registers,
@@ -704,7 +706,7 @@ impl WindowWalker {
             After::NextHistory { registers } => self.check_registers(job, &registers)?,
         }
         busy += t.elapsed().as_secs_f64();
-        Ok((walked, busy, boundary))
+        Ok((walked, busy, register_wait, boundary))
     }
 
     /// The bytes its window state takes on the heap.
@@ -717,6 +719,37 @@ impl WindowWalker {
 struct Ticket {
     job: WindowJob,
     after: Receiver<After>,
+}
+
+#[derive(Default)]
+struct HandoutWaits {
+    permit: f64,
+    job: f64,
+}
+
+impl HandoutWaits {
+    fn send(
+        &mut self,
+        permits: &SyncSender<()>,
+        jobs: &SyncSender<Ticket>,
+        ticket: Ticket,
+    ) -> Result<(), Error> {
+        let stopped = || Error::Prover(WALKERS_STOPPED.into());
+        let t = Instant::now();
+        permits.send(()).map_err(|_| stopped())?;
+        self.permit += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        jobs.send(ticket).map_err(|_| stopped())?;
+        self.job += t.elapsed().as_secs_f64();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct WalkerWaits {
+    job: f64,
+    registers: f64,
+    send: f64,
 }
 
 /// What the pass thread ends with.
@@ -737,6 +770,7 @@ struct PassEnd {
     /// The bytes the windows touched: their cells handed to the finish less
     /// their cells at the run's start, hashed and summed ([`cell_hash`]).
     boundaries: u64,
+    waits: HandoutWaits,
 }
 
 /// What a run walked on several threads reports (the `BLOCK WALKERS` line).
@@ -760,6 +794,10 @@ pub struct ParallelWalk {
     pub from_history: bool,
     /// The walkers' timed parts, summed, under `LAMBDA_VM_WALK_TIMES`.
     pub walk_times: Option<super::WalkTimes>,
+    waits: WalkerWaits,
+    handout_waits: HandoutWaits,
+    slowest: [(u32, f64); 3],
+    regrown_word_row_bytes: usize,
     /// The finish's state's parts, in record mode.
     pub state_split: Option<StateSplit>,
 }
@@ -777,6 +815,11 @@ pub struct StateSplit {
 }
 
 impl ParallelWalk {
+    /// Waits feeding the producer's receive and send totals.
+    pub(crate) fn producer_waits(&self) -> (f64, f64) {
+        (self.waits.job + self.waits.registers, self.waits.send)
+    }
+
     pub fn line(&self) -> String {
         format!(
             "BLOCK WALKERS: {} · pass busy {:.2}s · entries {} (most {} in one window) · walkers busy {:.2}s (summed) · reorder held at most {} · window states {:.2} GiB · {} windows walked from their entries · the finish's state built in {:.2}s",
@@ -806,6 +849,19 @@ impl ParallelWalk {
                 .walk_times
                 .map(|t| format!(" · {}", t.line()))
                 .unwrap_or_default()
+            + &format!(
+                " · walkers job wait {:.3}s register wait {:.3}s (summed) · hand-out permit send wait {:.3}s job send wait {:.3}s · slowest windows [{}] · regrown word-row bytes {}",
+                self.waits.job,
+                self.waits.registers,
+                self.handout_waits.permit,
+                self.handout_waits.job,
+                self.slowest[..self.windows.min(3)]
+                    .iter()
+                    .map(|(window, busy)| format!("{window}: {busy:.3}s"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.regrown_word_row_bytes,
+            )
     }
 }
 
@@ -923,16 +979,17 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;
-    let (end, walk_secs, walk_times, held_most, state_bytes, counts) = {
+    let (end, walk_secs, walk_times, held_most, state_bytes, counts, waits, slowest) = {
         let (mut accumulator, image) = builder.accumulator_and_image();
         let (job_tx, job_rx) = sync_channel::<Ticket>(walkers);
         let job_rx = Mutex::new(job_rx);
         std::thread::scope(|scope| -> Result<_, Error> {
             #[allow(clippy::type_complexity)]
-            let (done_tx, done_rx) =
-                sync_channel::<(u32, usize, Result<(WalkedWindow, f64, usize, u64), Error>)>(
-                    walkers + 2,
-                );
+            let (done_tx, done_rx) = sync_channel::<(
+                u32,
+                usize,
+                Result<(WalkedWindow, f64, f64, f64, usize, u64), Error>,
+            )>(walkers + 2);
             let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
             let decode = Arc::clone(&settings.decode);
             let words = settings.memory_format == crate::tables::fused_memory::MemoryFormat::Words;
@@ -980,7 +1037,9 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     // pass never waits on a full queue nobody reads; the
                     // closed permits stop the pass.
                     let mut stopped = false;
+                    let mut send_wait = 0.0;
                     loop {
+                        let t = Instant::now();
                         let ticket = match job_rx.lock() {
                             Ok(rx) => rx.recv(),
                             Err(_) => break,
@@ -991,6 +1050,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                         if stopped {
                             continue;
                         }
+                        let job_wait = t.elapsed().as_secs_f64();
                         let window = ticket.job.window;
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1001,11 +1061,23 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                                     "window {window}: its walker panicked"
                                 )))
                             })
-                            .map(|(walked, busy, boundary)| {
-                                (walked, busy, walker.state_bytes(), boundary)
-                            });
+                            .map(
+                                |(walked, busy, register_wait, boundary)| {
+                                    (
+                                        walked,
+                                        busy,
+                                        job_wait,
+                                        register_wait,
+                                        walker.state_bytes(),
+                                        boundary,
+                                    )
+                                },
+                            );
                         let failed = outcome.is_err();
-                        if done_tx.send((window, w, outcome)).is_err() || failed {
+                        let t = Instant::now();
+                        let sent = done_tx.send((window, w, outcome));
+                        send_wait += t.elapsed().as_secs_f64();
+                        if sent.is_err() || failed {
                             stopped = true;
                         }
                     }
@@ -1017,6 +1089,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                         .counts
                         .map(|mut counts| counts.settle(&decode).map(|()| counts))
                         .transpose()
+                        .map(|counts| (counts, send_wait))
                 }));
             }
             drop(done_tx);
@@ -1024,15 +1097,16 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             // Each walker's window state as of its last window, and the most
             // they took at once.
             let (mut walk_secs, mut states, mut state_bytes) = (0.0, vec![0usize; walkers], 0);
-            // The walkers' timed parts, summed (`LAMBDA_VM_WALK_TIMES`).
-            let mut walk_times: Option<super::WalkTimes> = None;
+            let mut walk_times = super::WalkTimes::default();
+            let mut waits = WalkerWaits::default();
+            let mut slowest = [(0, f64::NEG_INFINITY); 3];
             // The walked windows' boundary sums, added as they come.
             let mut boundaries = 0u64;
             // The first error from a walker or from absorbing; an absorbing
             // error is this thread's own and always wins.
             let (mut failure, mut absorbing) = (None, false);
             'windows: for (window, w, outcome) in &done_rx {
-                let (walked, busy, bytes, boundary) = match outcome {
+                let (walked, busy, job_wait, register_wait, bytes, boundary) = match outcome {
                     Ok(walked) => walked,
                     Err(e) => {
                         failure = Some(e);
@@ -1040,8 +1114,12 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     }
                 };
                 walk_secs += busy;
-                if let Some(times) = walked.times() {
-                    walk_times.get_or_insert_default().add(times);
+                walk_times.add(&walked.times);
+                waits.job += job_wait;
+                waits.registers += register_wait;
+                if let Some(index) = slowest.iter().position(|&(_, secs)| busy > secs) {
+                    slowest[index..].rotate_right(1);
+                    slowest[index] = (window, busy);
                 }
                 boundaries = boundaries.wrapping_add(boundary);
                 states[w] = bytes;
@@ -1076,7 +1154,10 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             let mut counts = Vec::with_capacity(walkers);
             for thread in threads {
                 match thread.join() {
-                    Ok(Ok(mine)) => counts.extend(mine),
+                    Ok(Ok((mine, send_wait))) => {
+                        counts.extend(mine);
+                        waits.send += send_wait;
+                    }
                     Ok(Err(e)) => {
                         failure.get_or_insert(e);
                     }
@@ -1134,7 +1215,16 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 }
                 (None, Ok(end)) => {
                     check_boundaries(boundaries, end.boundaries)?;
-                    Ok((end, walk_secs, walk_times, held_most, state_bytes, counts))
+                    Ok((
+                        end,
+                        walk_secs,
+                        walk_times,
+                        held_most,
+                        state_bytes,
+                        counts,
+                        waits,
+                        slowest,
+                    ))
                 }
             }
         })?
@@ -1151,6 +1241,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         entries,
         most_entries,
         boundaries: _,
+        waits: handout_waits,
     } = end;
     // The walkers' counts, for the finish to add.
     builder.made_counts.extend(counts);
@@ -1169,7 +1260,11 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         held_most,
         state_bytes,
         from_history: record.is_some(),
-        walk_times,
+        walk_times: (windows > 0 && super::walk_times_on()).then_some(walk_times),
+        waits,
+        handout_waits,
+        slowest,
+        regrown_word_row_bytes: walk_times.regrown_word_row_bytes,
         state_split,
     })
 }
@@ -1192,9 +1287,7 @@ fn pass_thread<W: Into<ExecWindow>>(
     jobs: SyncSender<Ticket>,
     permits: SyncSender<()>,
 ) -> Result<PassEnd, Error> {
-    fn stopped<T>(_: T) -> Error {
-        Error::Prover(WALKERS_STOPPED.into())
-    }
+    let mut waits = HandoutWaits::default();
     let mut pass = LeanPass::new(decode, start_registers)?.words(words);
     let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
     let mut waiting: Option<SyncSender<After>> = None;
@@ -1246,22 +1339,24 @@ fn pass_thread<W: Into<ExecWindow>>(
             });
         }
         let (after_tx, after_rx) = sync_channel(1);
-        permits.send(()).map_err(stopped)?;
         let (cycles, handed) = (logs.len(), window_entries.len());
-        jobs.send(Ticket {
-            job: WindowJob {
-                window: number(k),
-                first,
-                logs,
-                start,
-                registers,
-                entries: window_entries,
-                history: None,
-                recheck: false,
+        waits.send(
+            &permits,
+            &jobs,
+            Ticket {
+                job: WindowJob {
+                    window: number(k),
+                    first,
+                    logs,
+                    start,
+                    registers,
+                    entries: window_entries,
+                    history: None,
+                    recheck: false,
+                },
+                after: after_rx,
             },
-            after: after_rx,
-        })
-        .map_err(stopped)?;
+        )?;
         head_log::window_handed(k as usize, handed, t, passed);
         waiting = Some(after_tx);
         first += cycles;
@@ -1287,6 +1382,7 @@ fn pass_thread<W: Into<ExecWindow>>(
         entries,
         most_entries: most,
         boundaries,
+        waits,
     })
 }
 
@@ -1310,9 +1406,7 @@ fn record_thread<W: Into<ExecWindow>>(
     permits: SyncSender<()>,
     mut base: Option<MemoryState>,
 ) -> Result<PassEnd, Error> {
-    fn stopped<T>(_: T) -> Error {
-        Error::Prover(WALKERS_STOPPED.into())
-    }
+    let mut waits = HandoutWaits::default();
     let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
     // The previous job's follow-up.
     let mut waiting: Option<SyncSender<After>> = None;
@@ -1435,21 +1529,23 @@ fn record_thread<W: Into<ExecWindow>>(
         }
         busy += t.elapsed().as_secs_f64();
         let (after_tx, after_rx) = sync_channel(1);
-        permits.send(()).map_err(stopped)?;
-        jobs.send(Ticket {
-            job: WindowJob {
-                window: number(k),
-                first,
-                logs,
-                start: Arc::clone(&no_memory),
-                registers,
-                entries: Arc::new(Vec::new()),
-                history: Some(history),
-                recheck: rechecked,
+        waits.send(
+            &permits,
+            &jobs,
+            Ticket {
+                job: WindowJob {
+                    window: number(k),
+                    first,
+                    logs,
+                    start: Arc::clone(&no_memory),
+                    registers,
+                    entries: Arc::new(Vec::new()),
+                    history: Some(history),
+                    recheck: rechecked,
+                },
+                after: after_rx,
             },
-            after: after_rx,
-        })
-        .map_err(stopped)?;
+        )?;
         waiting = Some(after_tx);
         first += cycles;
         k += 1;
@@ -1474,6 +1570,7 @@ fn record_thread<W: Into<ExecWindow>>(
         entries: 0,
         most_entries: 0,
         boundaries: 0,
+        waits,
     })
 }
 
@@ -1847,6 +1944,17 @@ mod walkers_line_tests {
             state_bytes: 0,
             from_history: true,
             walk_times,
+            waits: super::WalkerWaits {
+                job: 1.0,
+                registers: 2.0,
+                send: 0.01,
+            },
+            handout_waits: super::HandoutWaits {
+                permit: 0.3,
+                job: 0.4,
+            },
+            slowest: [(7, 0.22), (2, 0.21), (5, 0.2)],
+            regrown_word_row_bytes: 8192,
             state_split,
         }
     }
@@ -1855,12 +1963,17 @@ mod walkers_line_tests {
     /// walk's timed parts follow it, in that order, each once.
     #[test]
     fn the_walkers_line_ends_as_today_and_takes_the_parts_after_it() {
-        let today = walk(None, None).line();
-        assert!(
-            today.ends_with(
-                "the finish's state built in 0.25s · record mode: from the executor's history"
-            ),
-            "{today}"
+        let walk_untimed = walk(None, None);
+        assert_eq!(walk_untimed.producer_waits(), (3.0, 0.01));
+        let line = walk_untimed.line();
+        let (today, stamps) = line.split_once(" · walkers job wait").unwrap();
+        assert_eq!(
+            today,
+            "BLOCK WALKERS: 4 · pass busy 0.24s · entries 0 (most 0 in one window) · walkers busy 17.10s (summed) · reorder held at most 6 · window states 0.00 GiB · 233 windows walked from their entries · the finish's state built in 0.25s · record mode: from the executor's history"
+        );
+        assert_eq!(
+            stamps,
+            " 1.000s register wait 2.000s (summed) · hand-out permit send wait 0.300s job send wait 0.400s · slowest windows [7: 0.220s, 2: 0.210s, 5: 0.200s] · regrown word-row bytes 8192"
         );
         let split = StateSplit {
             stamps: 0.04,
@@ -1879,11 +1992,16 @@ mod walkers_line_tests {
             count_rows: 0.7,
             count_shift: 0.2,
             count_listed: 0.25,
+            regrown_word_row_bytes: 8192,
         };
         let line = walk(Some(times), Some(split)).line();
-        assert!(line.starts_with(&today), "{line}");
+        assert!(line.starts_with(today), "{line}");
+        let (old, new_stamps) = line[today.len()..]
+            .split_once(" · walkers job wait")
+            .unwrap();
+        assert_eq!(stamps, new_stamps);
         assert_eq!(
-            &line[today.len()..],
+            old,
             " · the finish's state by part stamps 0.040s base 0.035s pages 0.100s fill 0.070s \
              · walk times (summed) prescan 0.80s lists 0.10s collect 2.00s walk 9.00s count 1.50s route 2.50s \
              · count by part loop 0.30s rows 0.70s shift 0.20s listed 0.25s"

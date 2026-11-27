@@ -627,10 +627,33 @@ pub(super) fn built(
     (level, cuts): (u8, crate::tables::trace_builder::WalkCuts),
     format: RegisterFormat,
 ) -> (Traces, Vec<(StreamTable, usize)>) {
-    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+    built_with_memory(
+        program,
+        &[],
+        max_rows,
+        window,
+        walkers,
+        (level, cuts),
+        (format, MemoryFormat::Split),
+    )
+}
+
+pub(super) fn built_with_memory(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    walkers: usize,
+    (level, cuts): (u8, crate::tables::trace_builder::WalkCuts),
+    (format, memory): (RegisterFormat, MemoryFormat),
+) -> (Traces, Vec<(StreamTable, usize)>) {
+    let words = memory == MemoryFormat::Words;
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
         .and_then(|b| b.register_format(format))
         .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
+        .and_then(|b| b.memory_format(memory))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| if words { b.stream_word_tables() } else { Ok(b) })
         .and_then(|b| b.card_fill_streamed(always(), true, format != RegisterFormat::InRow))
         .map(|b| b.count_where_made(true).drop_cpu_list(true))
         .and_then(|b| b.light_walk(level))
@@ -640,13 +663,29 @@ pub(super) fn built(
     let mut jobs: Vec<ChunkJob> = Vec::new();
     let report = std::thread::scope(|scope| {
         scope.spawn(move || {
-            let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
-            fast.enable_history().expect("history mode");
-            while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
+            let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
+            if words {
+                fast.enable_word_history().expect("word history mode");
+            } else {
+                fast.enable_history().expect("history mode");
+            }
+            loop {
+                let next = if words {
+                    fast.resume_word_history(window)
+                } else {
+                    fast.resume_history(window)
+                };
+                let Some((logs, history)) = next.expect("the run") else {
+                    break;
+                };
                 let last = (fast.pc() == 0)
                     .then(|| {
-                        fast.take_history_final()
-                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                        use super::parallel::RunEnd;
+                        if words {
+                            fast.take_word_history_final().map(RunEnd::boxed_words)
+                        } else {
+                            fast.take_history_final().map(RunEnd::boxed)
+                        }
                     })
                     .flatten();
                 let sent = tx.send(ExecWindow {
