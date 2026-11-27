@@ -314,7 +314,7 @@ pub struct DecodeRecords {
     /// The rows on each card (by backend slot): a card's fill reads only its
     /// own card's copy.
     #[cfg(feature = "cuda")]
-    card: std::sync::Mutex<[Option<Arc<math_cuda::fill::CardDecode>>; 2]>,
+    card: std::sync::Mutex<std::collections::BTreeMap<usize, Arc<math_cuda::fill::CardDecode>>>,
 }
 
 impl DecodeRecords {
@@ -340,7 +340,7 @@ impl DecodeRecords {
             entries,
             runs,
             #[cfg(feature = "cuda")]
-            card: std::sync::Mutex::new([None, None]),
+            card: std::sync::Mutex::default(),
         })
     }
 
@@ -380,10 +380,9 @@ impl DecodeRecords {
             assert!(align_of::<DecodeRun>() == align_of::<DecodeRunC>());
             assert!(std::mem::offset_of!(DecodeRun, len) == std::mem::offset_of!(DecodeRunC, len));
         };
-        let slot = math_cuda::device::current_slot();
+        let slot = math_cuda::device::CardId::of(math_cuda::device::backend().ok()?).index();
         let mut cards = self.card.lock().unwrap_or_else(|e| e.into_inner());
-        let held = cards.get_mut(slot)?;
-        if let Some(card) = held.as_ref() {
+        if let Some(card) = cards.get(&slot) {
             return Some(Arc::clone(card));
         }
         // SAFETY: each pair is `#[repr(C)]` with the same fields in the same
@@ -401,7 +400,7 @@ impl DecodeRecords {
             )
         };
         let card = Arc::new(CardDecode::resident(entries, runs).ok()?);
-        *held = Some(Arc::clone(&card));
+        cards.insert(slot, Arc::clone(&card));
         Some(card)
     }
 }
@@ -581,7 +580,8 @@ impl RecordsFill<'_> {
     /// (whatever pieces they lie in): what [`Records::digest`] reads. A CPU
     /// table's DECODE rows are the program's, the same for every table: left
     /// out.
-    fn words(&self, mut each: impl FnMut(u64)) {
+    /// Canonical words of the ordered fill inputs, without segment boundaries.
+    pub fn words(&self, mut each: impl FnMut(u64)) {
         match self {
             Self::KeccakRnd { ops, skip } => {
                 each(0);
@@ -908,36 +908,60 @@ impl Records {
 /// rebuilt a table's records digests them before it fills the table from
 /// them.
 pub fn digest_of(records: &dyn TableRecords) -> [u64; 2] {
-    const K: [u64; 4] = [
-        0x9e37_79b9_7f4a_7c15,
-        0xc2b2_ae3d_27d4_eb4f,
-        0x1656_67b1_9e37_79f9,
-        0x85eb_ca77_c2b2_ae63,
-    ];
-    let mut lanes = [
+    let mut digest = WordDigest::new([
         records.rows() as u64,
         records.cols() as u64,
         records.bytes() as u64,
         0x243f_6a88_85a3_08d3,
-    ];
-    let mut i = 0usize;
-    records.fill().words(|w| {
-        let l = i % 4;
-        lanes[l] = (lanes[l] ^ w).wrapping_mul(K[l]).rotate_left(31);
-        i += 1;
-    });
-    // MurmurHash3's finalizer, so every input bit reaches every output bit.
-    let fmix = |mut h: u64| {
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        h ^ (h >> 33)
-    };
-    [
-        fmix(lanes[0] ^ lanes[2].rotate_left(23)),
-        fmix(lanes[1] ^ lanes[3].rotate_left(41)),
-    ]
+    ]);
+    records.fill().words(|word| digest.push(word));
+    digest.finish()
+}
+
+/// An order-sensitive, non-cryptographic digest for witness parity.
+/// Every word is visited. Proof verification authenticates the actual witness.
+pub fn digest_words(feed: impl FnOnce(&mut dyn FnMut(u64))) -> [u64; 2] {
+    let mut digest = WordDigest::new([0, 0, 0, 0x243f_6a88_85a3_08d3]);
+    feed(&mut |word| digest.push(word));
+    digest.finish()
+}
+
+struct WordDigest {
+    lanes: [u64; 4],
+    i: usize,
+}
+
+impl WordDigest {
+    fn new(lanes: [u64; 4]) -> Self {
+        Self { lanes, i: 0 }
+    }
+
+    fn push(&mut self, word: u64) {
+        const K: [u64; 4] = [
+            0x9e37_79b9_7f4a_7c15,
+            0xc2b2_ae3d_27d4_eb4f,
+            0x1656_67b1_9e37_79f9,
+            0x85eb_ca77_c2b2_ae63,
+        ];
+        let lane = self.i % 4;
+        self.lanes[lane] = (self.lanes[lane] ^ word)
+            .wrapping_mul(K[lane])
+            .rotate_left(31);
+        self.i += 1;
+    }
+
+    fn finish(self) -> [u64; 2] {
+        // MurmurHash3's finalizer, so every input bit reaches every output bit.
+        let fmix = |mut h: u64| {
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            h ^ (h >> 33)
+        };
+        let [a, b, c, d] = self.lanes;
+        [fmix(a ^ c.rotate_left(23)), fmix(b ^ d.rotate_left(41))]
+    }
 }
 
 impl PartialEq for Records {
@@ -996,6 +1020,10 @@ mod tests {
         let base = records(ops(3), 8, 32);
         assert_eq!(base, records(ops(3), 8, 32));
         assert_eq!(base.digest(), records(ops(3), 8, 32).digest());
+        assert_eq!(
+            base.digest(),
+            [0xe85f_4153_0a24_9f5b, 0x98af_5e6a_0cb2_1b90]
+        );
         assert_eq!(base.bytes(), 3 * 208);
         let mut lane = ops(3);
         lane[2].input[24] ^= 1;
@@ -1042,6 +1070,32 @@ mod tests {
         let again = table.on_card().expect("card 0's copy again");
         assert!(Arc::ptr_eq(&main, &again), "card 0 keeps its own");
         set_two_card_openings_for_test(None);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "card: run alone with four aliases"]
+    fn indexed_aliases_cache_decode_uploads_by_owner() {
+        let cards = crate::gpu::indexed_cards()
+            .unwrap()
+            .expect("set LAMBDA_VM_CARDS");
+        assert_eq!(cards.len(), 4);
+        let table = decode();
+        let uploads: Vec<_> = cards
+            .iter()
+            .map(|&card| {
+                crate::gpu::in_indexed_card(card, || table.on_card().expect("decode upload"))
+            })
+            .collect();
+        for (&card, upload) in cards.iter().zip(&uploads) {
+            crate::gpu::in_indexed_card(card, || {
+                let again = table.on_card().expect("decode cache hit");
+                assert!(Arc::ptr_eq(upload, &again));
+            });
+        }
+        for (i, upload) in uploads.iter().enumerate() {
+            assert!(uploads[..i].iter().all(|peer| !Arc::ptr_eq(peer, upload)));
+        }
     }
 
     fn decode() -> DecodeRecords {

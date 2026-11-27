@@ -174,21 +174,20 @@ struct Place {
 /// Slots no session holds, from 64 KiB pages of pinned, card-mapped memory
 /// that are never given back (at most [`MAX_PAGES`] a card): one list a card,
 /// since a page's device address is its mapping card's.
-static FREE: [Mutex<Vec<Place>>; 2] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
-static PAGES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static FREE: crate::device::PerBackend<Mutex<Vec<Place>>> = crate::device::PerBackend::new();
+static PAGES: crate::device::PerBackend<AtomicU64> = crate::device::PerBackend::new();
 const PAGE_BYTES: usize = 64 * 1024;
 const MAX_PAGES: u64 = 16;
 
 /// A new page mapped by this thread's card (`card`, its backend slot).
-fn new_page(card: usize) -> Option<Vec<Place>> {
+fn new_page(card: usize, be: &crate::device::Backend) -> Option<Vec<Place>> {
     use cudarc::driver::sys;
-    let pages = &PAGES[card];
+    be.ctx.bind_to_thread().ok()?;
+    let pages = PAGES.cell(card).get_or_init(AtomicU64::default);
     if pages.fetch_add(1, Ordering::Relaxed) >= MAX_PAGES {
         pages.fetch_sub(1, Ordering::Relaxed);
         return None;
     }
-    let be = crate::device::backend().ok()?;
-    be.ctx.bind_to_thread().ok()?;
     // SAFETY: a fresh allocation of `PAGE_BYTES`, mapped into the card's
     // address space; never freed, so the addresses below stay valid.
     unsafe {
@@ -196,6 +195,9 @@ fn new_page(card: usize) -> Option<Vec<Place>> {
             PAGE_BYTES,
             sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE,
         )
+        .inspect_err(|_| {
+            pages.fetch_sub(1, Ordering::Relaxed);
+        })
         .ok()? as *mut u64;
         let mut dev: sys::CUdeviceptr = 0;
         if sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut _, 0)
@@ -236,13 +238,17 @@ impl MappedSlot {
     /// A slot for launches on `stream`, or `None` when the pool is spent or
     /// the card will not map host memory.
     pub fn take(stream: &Arc<CudaStream>) -> Option<Self> {
-        let card = crate::device::current_slot().min(FREE.len() - 1);
+        let be = crate::device::backend().ok()?;
+        if !Arc::ptr_eq(stream.context(), &be.ctx) {
+            return None;
+        }
+        let card = crate::device::CardId::of(be).index();
         let place = {
-            let mut free = FREE[card].lock().ok()?;
+            let mut free = FREE.cell(card).get_or_init(Mutex::default).lock().ok()?;
             match free.pop() {
                 Some(place) => place,
                 None => {
-                    let mut page = new_page(card)?;
+                    let mut page = new_page(card, be)?;
                     let place = page.pop()?;
                     free.extend(page);
                     place
@@ -296,7 +302,11 @@ impl Drop for MappedSlot {
     fn drop(&mut self) {
         // Every launch that writes this slot is on this stream.
         let _ = self.stream.synchronize();
-        if let Ok(mut free) = FREE[self.place.card].lock() {
+        if let Ok(mut free) = FREE
+            .cell(self.place.card)
+            .get_or_init(Mutex::default)
+            .lock()
+        {
             free.push(self.place);
         }
     }

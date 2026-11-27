@@ -745,6 +745,207 @@ pub struct WlfmArtifacts {
     pub program_id: Commitment,
 }
 
+/// Worker-produced inputs to the prover's join compiler. The public file
+/// verifier independently derives its own artifacts from the programs.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) struct LeafArtifacts {
+    program_id: Commitment,
+    hash_chunks: usize,
+    chips: [bool; 3],
+    lfm_chunks: Vec<Vec<usize>>,
+    b3l: B3lShape,
+    prepared: Vec<Vec<Commitment>>,
+}
+
+impl LeafArtifacts {
+    pub(crate) fn from_build(a: &WlfmArtifacts) -> Self {
+        Self {
+            program_id: a.program_id,
+            hash_chunks: a.hash_chunks,
+            chips: [a.chip_set.keccak, a.chip_set.blake3, a.chip_set.bitwise],
+            lfm_chunks: a.lfm_chunks.clone(),
+            b3l: a.b3l.clone(),
+            prepared: a.stacks.iter().map(|s| s.roots.clone()).collect(),
+        }
+    }
+
+    pub(crate) fn into_artifacts(mut self, rounds: Option<u8>) -> Result<WlfmArtifacts, String> {
+        let mut prepared = std::mem::take(&mut self.prepared).into_iter();
+        let artifacts = self.shaped(rounds, |count| {
+            let roots = prepared
+                .next()
+                .ok_or("worker leaf is missing a prepared stack")?;
+            if roots.len() != count {
+                return Err("worker leaf has the wrong prepared root count".into());
+            }
+            Ok(roots)
+        })?;
+        if prepared.next().is_some() {
+            return Err("worker leaf has an extra prepared stack".into());
+        }
+        if artifacts.program_id != wlfm_program_id(&artifacts) {
+            return Err("worker leaf artifacts disagree with its program id".into());
+        }
+        Ok(artifacts)
+    }
+
+    /// Worker artifacts that pass [`Self::into_artifacts`] for any shapes it
+    /// admits: `reshape` edits the hash chunks, the chips, the LFM chunks and
+    /// the lean tables; the prepared roots are placeholders of the derived
+    /// counts and the id is the one those artifacts hash to.
+    #[cfg(all(test, feature = "test-security"))]
+    pub(crate) fn self_consistent(
+        mut self,
+        rounds: Option<u8>,
+        reshape: impl FnOnce(&mut usize, &mut [bool; 3], &mut Vec<Vec<usize>>, &mut B3lShape),
+    ) -> Result<Self, String> {
+        reshape(
+            &mut self.hash_chunks,
+            &mut self.chips,
+            &mut self.lfm_chunks,
+            &mut self.b3l,
+        );
+        let mut prepared = Vec::new();
+        let artifacts = Self {
+            program_id: self.program_id,
+            hash_chunks: self.hash_chunks,
+            chips: self.chips,
+            lfm_chunks: self.lfm_chunks.clone(),
+            b3l: self.b3l.clone(),
+            prepared: Vec::new(),
+        }
+        .shaped(rounds, |count| {
+            let roots = (0..count).map(|i| [i as u8; 32]).collect::<Vec<_>>();
+            prepared.push(roots.clone());
+            Ok(roots)
+        })?;
+        self.prepared = prepared;
+        self.program_id = wlfm_program_id(&artifacts);
+        Ok(self)
+    }
+
+    /// The artifacts these shapes give, each prepared stack's roots taken
+    /// from `stack_roots` with the count the layout asks for. The id is
+    /// copied, not checked.
+    fn shaped(
+        self,
+        rounds: Option<u8>,
+        mut stack_roots: impl FnMut(usize) -> Result<Vec<Commitment>, String>,
+    ) -> Result<WlfmArtifacts, String> {
+        let [keccak, blake3, bitwise] = self.chips;
+        let chip_set = ChipSet {
+            keccak,
+            blake3,
+            bitwise,
+        };
+        check_chip_set(chip_set)?;
+        let hasher = <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET;
+        let lfm = whir_lfm_airs(
+            hasher,
+            chip_set,
+            self.hash_chunks.clamp(1, 2),
+            &air_options(),
+        );
+        let lean_rows = self
+            .b3l
+            .rounds
+            .iter()
+            .chain(&self.b3l.heads)
+            .chain(&self.b3l.muxes)
+            .chain(&self.b3l.caps)
+            .chain(&self.b3l.cap_reads);
+        let rows = self.lfm_chunks.iter().flatten().chain(lean_rows);
+        if !(1..=2).contains(&self.hash_chunks)
+            || self.lfm_chunks.len() != lfm.air_refs().len()
+            || self.lfm_chunks.iter().any(Vec::is_empty)
+            || self.b3l.is_empty()
+            || self.b3l.rounds.is_empty()
+            || rows.clone().count() > 4096
+            || rows.into_iter().any(|&n| {
+                !n.is_power_of_two()
+                    || n.ilog2() as u64 > crate::multilinear_prove::MAX_STATED_TABLE_VARS
+            })
+        {
+            return Err("invalid worker leaf table shapes".into());
+        }
+        let airs = WlfmAirs {
+            lfm,
+            lfm_chunks: self.lfm_chunks.clone(),
+            b3l: B3lAirs::new(&self.b3l, &air_options()),
+        };
+        let refs = airs.air_refs();
+        let table_num_vars: Vec<_> = self
+            .lfm_chunks
+            .iter()
+            .flatten()
+            .map(|n| n.trailing_zeros() as u8)
+            .chain(self.b3l.table_num_vars())
+            .collect();
+        if refs.len() != table_num_vars.len() {
+            return Err("worker leaf AIRs disagree with table shapes".into());
+        }
+        let counts: Vec<_> = refs.iter().map(|a| a.num_precomputed_columns()).collect();
+        let shapes = table_shapes(&refs, &table_num_vars);
+        let rate = super::levels::LEVEL_RATE;
+        let levers = super::levels::level_levers(WlfmFamily::B3);
+        let config = wlfm_config_levers(rate, &levers, rounds, &shapes)?;
+        let sizes =
+            multilinear_block::block_groups(&shapes, config.format.stack, wlfm_group_polys())
+                .map_err(|e| format!("worker leaf groups: {e:?}"))?;
+        let mut start = 0;
+        let mut stacks = Vec::new();
+        for (group, &size) in sizes.iter().enumerate() {
+            let tables: Vec<_> = (start..start + size)
+                .filter_map(|t| (counts[t] != 0).then_some((t, counts[t])))
+                .collect();
+            start += size;
+            if tables.is_empty() {
+                continue;
+            }
+            let shapes: Vec<_> = tables
+                .iter()
+                .map(|&(t, n)| (n, table_num_vars[t] as usize))
+                .collect();
+            let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
+                .map_err(|e| format!("worker leaf prepared layout: {e:?}"))?;
+            let domain = Domain::new(layout.n_stack() + config.log_blowup)
+                .map_err(|e| format!("worker leaf prepared domain: {e:?}"))?;
+            let roots = stack_roots(
+                multilinear::stacked_eval::round0_trees(layout.num_polys(), &config).len(),
+            )?;
+            stacks.push(WlfmStack {
+                group,
+                tables,
+                roots,
+                layout,
+                domain,
+            });
+        }
+        Ok(WlfmArtifacts {
+            rate,
+            hasher,
+            chip_set,
+            hash_chunks: self.hash_chunks,
+            table_num_vars,
+            counts,
+            sizes,
+            config,
+            prep: levers.prep,
+            final_poly: levers.final_poly,
+            fold: levers.fold,
+            first_fold: levers.first_fold,
+            grind: levers.grind,
+            family: levers.family,
+            rounds,
+            lfm_chunks: self.lfm_chunks,
+            b3l: self.b3l,
+            stacks,
+            evaluated: Vec::new(),
+            program_id: self.program_id,
+        })
+    }
+}
+
 impl WlfmArtifacts {
     /// The levers these artifacts were built under, as the verifier re-derives
     /// the config from them ([`wlfm_config_levers`]).
@@ -1096,6 +1297,8 @@ pub enum StackPlace {
 /// One group's prepared stack as the prover holds it: its columns, and its
 /// commitment held or retired ([`StackPlace`]).
 struct WlfmPrepared<H: WhirHash> {
+    /// The stack's backend, if assigned to a card.
+    card: Option<usize>,
     group: usize,
     tables: Vec<(usize, usize)>,
     columns: Vec<Mle<F>>,
@@ -1106,10 +1309,6 @@ struct WlfmPrepared<H: WhirHash> {
     /// kept for its opening's store.
     narrow: Option<NarrowCommitStamp>,
     packed: Option<multilinear::gpu::PackedStore>,
-    /// The card its commitment was made on (0 but for a stack committed on
-    /// the second card, [`WlfmPrebuild::commit_on`]): a held one is opened
-    /// there.
-    card: u8,
 }
 
 /// One prepared stack's narrow commit ([`NARROW_COMMIT_ENV`]): whether its
@@ -1150,6 +1349,16 @@ fn narrow_parts(
     }
 }
 
+fn prepared_device_failed(card: Option<usize>, error: &multilinear::Error) -> String {
+    if let Some(card) = card
+        && matches!(error, multilinear::Error::DeviceFailed { .. })
+    {
+        multilinear::gpu::mark_indexed_card_failed(card, "its prepared stack failed");
+        return format!("prepared stack on card {card}: ");
+    }
+    String::new()
+}
+
 enum PreparedHold<H: WhirHash> {
     Held(multilinear::stacked_eval::StackedCommitment<F, H>),
     Retired(multilinear::stacked_eval::RetiredStack<F>),
@@ -1165,7 +1374,7 @@ impl<H: WhirHash> WlfmPrepared<H> {
             hold: PreparedHold::Held(p.commitment),
             narrow: None,
             packed: None,
-            card: 0,
+            card: None,
         }
     }
 
@@ -1215,10 +1424,11 @@ impl WlfmStacks {
 /// either way.
 fn commit_under<H: WhirHash>(
     stacks: Vec<GroupStack>,
-    config: &ChainConfig,
+    artifacts: &WlfmArtifacts,
     place: StackPlace,
     cards: Option<&[u8]>,
 ) -> Result<Vec<WlfmPrepared<H>>, String> {
+    let config = &artifacts.config;
     let cards = cards.filter(|c| c.contains(&1));
     let card_of = |g: usize| cards.and_then(|c| c.get(g).copied()).unwrap_or(0).min(1);
     if place == StackPlace::Host {
@@ -1228,7 +1438,7 @@ fn commit_under<H: WhirHash>(
             .map_err(|e| format!("{e:?}"))?
             .into_iter()
             .map(|p| {
-                let card = card_of(p.group);
+                let card = cards.map(|_| usize::from(card_of(p.group)));
                 WlfmPrepared {
                     card,
                     ..WlfmPrepared::held(p)
@@ -1241,11 +1451,32 @@ fn commit_under<H: WhirHash>(
     // siblings serialize them. Inert unless a driver armed it. Taken once,
     // here, for both cards' commits.
     let _card = super::device_permit::hold_labeled("build_artifacts");
+    if let Some(cards) = multilinear::gpu::indexed_cards()? {
+        let _leases = multilinear::gpu::indexed_recursion_leases(&cards);
+        let prices = level_group_prices(artifacts);
+        let assignment =
+            stark::phase_b_split::assign_indexed(&prices, &vec![None; prices.len()], cards.len())
+                .ok_or_else(|| "cannot place prepared level stacks".to_string())?;
+        let stack_lanes: Vec<_> = stacks.iter().map(|stack| assignment[stack.group]).collect();
+        return stark::phase_b_split::commit_indexed(
+            stacks,
+            &cards,
+            &stack_lanes,
+            |card, _, mut stack| commit_one::<H>(&mut stack, config, place, Some(card)),
+            |card| {
+                multilinear::gpu::mark_indexed_card_failed(
+                    card,
+                    "its prepared stack committer panicked",
+                );
+                format!("prepared stack committer on card {card} panicked")
+            },
+        );
+    }
     match cards {
         // One stack at a time: committed, then held or let go before the next.
         None => stacks
             .into_iter()
-            .map(|mut stack| commit_one::<H>(&mut stack, config, place))
+            .map(|mut stack| commit_one::<H>(&mut stack, config, place, None))
             .collect(),
         Some(cards) => commit_by_card::<H>(stacks, config, place, cards),
     }
@@ -1257,17 +1488,23 @@ fn commit_one<H: WhirHash>(
     stack: &mut GroupStack,
     config: &ChainConfig,
     place: StackPlace,
+    card: Option<usize>,
 ) -> Result<WlfmPrepared<H>, String> {
     let group = stack.group;
     let (commitment, packed) = stack
         .commit::<H>(config, false, narrow_commit().then(narrow_commit_staged))
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| {
+            let backend = prepared_device_failed(card, &e.source);
+            let e = crate::Error::from(e);
+            format!("{backend}{e:?}")
+        })?;
     let roots = commitment.roots();
     let hold = if place == StackPlace::CardRetired {
         let drop = crate::block_whir::tree_drop_for_chain(config);
-        let retired = commitment
-            .retire(drop, config)
-            .map_err(|e| format!("group {group}: retiring its prepared stack: {e:?}"))?;
+        let retired = commitment.retire(drop, config).map_err(|e| {
+            let backend = prepared_device_failed(card, &e);
+            format!("{backend}group {group}: retiring its prepared stack: {e:?}")
+        })?;
         if retired.roots() != roots {
             return Err(format!(
                 "group {group}: a retired prepared stack's roots moved"
@@ -1286,7 +1523,7 @@ fn commit_one<H: WhirHash>(
         hold,
         narrow,
         packed: packed.filter(|_| place == StackPlace::CardRetired && narrow_store()),
-        card: 0,
+        card: Some(card.unwrap_or(0)),
     })
 }
 
@@ -1323,12 +1560,12 @@ fn commit_by_card<H: WhirHash>(
                 for (_, stack) in second {
                     #[cfg(test)]
                     let result = SecondStackFault::run_at(fault, done.len(), || {
-                        commit_one::<H>(stack, config, place)
+                        commit_one::<H>(stack, config, place, None)
                     });
                     #[cfg(not(test))]
-                    let result = commit_one::<H>(stack, config, place);
+                    let result = commit_one::<H>(stack, config, place, None);
                     match result {
-                        Ok(p) => done.push(WlfmPrepared { card: 1, ..p }),
+                        Ok(p) => done.push(WlfmPrepared { card: Some(1), ..p }),
                         Err(e) => return (done, Some(e)),
                     }
                 }
@@ -1337,7 +1574,7 @@ fn commit_by_card<H: WhirHash>(
         });
         let on0: Result<Vec<(usize, WlfmPrepared<H>)>, String> = first
             .into_iter()
-            .map(|(k, mut stack)| commit_one::<H>(&mut stack, config, place).map(|p| (k, p)))
+            .map(|(k, mut stack)| commit_one::<H>(&mut stack, config, place, None).map(|p| (k, p)))
             .collect();
         (on0, worker.join())
     });
@@ -1356,7 +1593,7 @@ fn commit_by_card<H: WhirHash>(
         }
         let again = second.len();
         for (k, mut stack) in second {
-            let p = commit_one::<H>(&mut stack, config, place).map_err(|retry| {
+            let p = commit_one::<H>(&mut stack, config, place, None).map_err(|retry| {
                 format!("second card failed ({e}); card 0 retry failed ({retry})")
             })?;
             out.push((k, p));
@@ -1404,6 +1641,24 @@ impl SecondStackFault {
 #[cfg(test)]
 pub(super) fn set_second_stack_fault_for_test(fault: Option<(usize, SecondStackFault)>) {
     SECOND_STACK_FAULT_FOR_TEST.with(|c| c.set(fault));
+}
+
+fn level_group_prices(artifacts: &WlfmArtifacts) -> Vec<u64> {
+    let shapes = artifacts.shapes(&artifacts.airs());
+    artifacts
+        .groups()
+        .iter()
+        .map(|group| {
+            let cells = group
+                .iter()
+                .map(|&table| {
+                    let (width, num_vars) = shapes[table];
+                    (width as u64) << num_vars
+                })
+                .sum();
+            stark::phase_b_split::split_price(cells, group.len())
+        })
+        .collect()
 }
 
 /// What a build keeps of each prepared commitment, under any hash.
@@ -1798,6 +2053,43 @@ impl WlfmPrebuild {
             .sum()
     }
 
+    /// Price a group's resident columns together with its largest working turn.
+    /// The GKR price covers one carried tree. Bin admission and opening overlap
+    /// price additional concurrent work at their own turns.
+    pub(super) fn group_card_room(&self) -> Result<u64, String> {
+        use multilinear::{gpu, stacked_eval::commit_card_bytes};
+        use stark::multilinear_table::global_layout;
+
+        let artifacts = &self.artifacts;
+        let airs = artifacts.airs();
+        let airs = airs.air_refs();
+        let shapes = table_shapes(&airs, &artifacts.table_num_vars);
+        let config = &artifacts.config;
+        let mut start = 0;
+        let mut peak = 0;
+        for &len in &artifacts.sizes {
+            let end = start + len;
+            let shapes = &shapes[start..end];
+            let layout =
+                global_layout(shapes, config.format.stack).map_err(|e| format!("{e:?}"))?;
+            let columns: u64 = shapes.iter().map(|&(w, n)| (8 * w as u64) << n).sum();
+            let tree = shapes
+                .iter()
+                .zip(&airs[start..end])
+                .filter(|(_, air)| !air.bus_interactions().is_empty())
+                .map(|(&(_, n), air)| {
+                    gpu::carry_bytes(air.bus_interactions().len().next_power_of_two() << n)
+                })
+                .max()
+                .unwrap_or(0);
+            let open = gpu::room_turns_for(&layout, config, true).open;
+            let commit = commit_card_bytes(&layout, config);
+            peak = peak.max(columns + commit.max(open).max(tree));
+            start = end;
+        }
+        Ok(peak)
+    }
+
     /// The seconds [`prepare_wlfm`] took.
     pub fn secs(&self) -> f64 {
         self.secs
@@ -1969,13 +2261,13 @@ impl WlfmPrebuild {
                 let committed = match family {
                     WlfmFamily::P1 => WlfmStacks::P1(commit_under::<WlfmHash>(
                         stacks,
-                        &artifacts.config,
+                        &artifacts,
                         place,
                         cards.as_deref(),
                     )?),
                     WlfmFamily::B3 => WlfmStacks::B3(commit_under::<WlfmB3Hash>(
                         stacks,
-                        &artifacts.config,
+                        &artifacts,
                         place,
                         cards.as_deref(),
                     )?),
@@ -2901,9 +3193,13 @@ fn prove_traces_under<H: WhirHash>(
         &artifacts.program_id,
         &public_words,
     );
-    let (lanes, shared_cards) = match proving {
-        WlfmProving::Held => (None, false),
-        WlfmProving::Streamed => {
+    let indexed = multilinear::gpu::indexed_cards()?;
+    let _leases = indexed
+        .as_deref()
+        .map(multilinear::gpu::indexed_recursion_leases);
+    let (lanes, shared_cards) = match (indexed.is_some(), proving) {
+        (true, _) | (_, WlfmProving::Held) => (None, false),
+        (false, WlfmProving::Streamed) => {
             use stark::multilinear_block::{LanePolicy, TwoCardKnob};
             let mut lanes = super::levels::phase_a_lanes()?;
             let cards = build.stack_cards.as_ref().filter(|_| {
@@ -2917,61 +3213,98 @@ fn prove_traces_under<H: WhirHash>(
             (Some(lanes), cards.is_some())
         }
     };
-    let block = match &lanes {
-        None => BlockCommitted::commit::<H, H::Sponge>(
-            tables,
-            &artifacts.sizes,
-            config,
+    let (tree_drop, commit_narrow, upload_ahead) = match proving {
+        WlfmProving::Held => (
             multilinear::whir_commit::TreeDrop::uniform(0),
             Narrowing::Wide,
             false,
         ),
-        Some(lanes) => {
+        WlfmProving::Streamed => {
             let options = crate::block_whir::BlockOptions::production();
-            // ★ THE LEVELS' COMMITS BY CARD (`LAMBDA_VM_LEVELS_COMMITS_BY_CARD`):
-            // phase A's groups on two commit lanes, one a card, put back by
-            // group index: the same block. A second lane needs the levels'
-            // split on and its second card ready.
-            BlockCommitted::commit_on_lanes::<H, H::Sponge>(
-                tables,
-                &artifacts.sizes,
-                config,
+            (
                 crate::block_whir::tree_drop_for_chain(config),
                 options.narrow,
                 options.upload_ahead && uploads_beside(stacks),
-                lanes,
             )
-            .map(|b| {
-                b.with_phase_b_commit_cards(shared_cards)
-                    .with_phase_b_overlap_planned(overlap_planned())
-                    .with_prepared_upload_once(upload_once())
-                    .with_overlap_priced_resident(overlap_resident())
-                    .with_prepared_store_narrow(narrow_store())
-                    .with_overlap_next_columns_priced(overlap_next_columns())
-                    .with_overlap_faults(overlap_faults_for_test())
-            })
-            .map(|b| {
-                // ★ THE LEVELS' TWO-CARD SPLIT (`LAMBDA_VM_TWO_CARD_LEVELS`): this
-                // level's phase B groups over two cards, each group on its own
-                // fork of the post-roots transcript, its share put back by group
-                // index: the same proof. A group with a held prepared stack
-                // stays on its card (`block_prove_in_order`). Off, nothing asked.
-                let groups = artifacts.sizes.len();
-                match levels_split_on_host_for_test() {
-                    true => {
-                        let mut b = b.with_two_card_levels(vec![false; groups]);
-                        b.set_two_card_split(Some(vec![false; groups]), true);
-                        b
-                    }
-                    false if multilinear::gpu::two_card_levels_on() => {
-                        b.with_two_card_levels(vec![false; groups])
-                    }
-                    false => b,
-                }
-            })
         }
+    };
+    let mut owners = None;
+    let block = if let Some(cards) = &indexed {
+        let prices = level_group_prices(artifacts);
+        let mut pins = vec![None; artifacts.sizes.len()];
+        for stack in stacks {
+            let Some(owner) = stack.card else { continue };
+            let lane = cards.iter().position(|&card| card == owner);
+            if lane.is_none() && matches!(&stack.hold, PreparedHold::Held(_)) {
+                return Err(format!("prepared stack owner {owner} unavailable"));
+            }
+            pins[stack.group] = lane;
+        }
+        let assignment = stark::phase_b_split::assign_indexed(&prices, &pins, cards.len())
+            .ok_or_else(|| "cannot place level commitments".to_string())?;
+        owners = Some(
+            assignment
+                .iter()
+                .map(|&lane| cards[lane])
+                .collect::<Vec<_>>(),
+        );
+        BlockCommitted::commit_level_indexed::<H, H::Sponge>(
+            tables,
+            &artifacts.sizes,
+            config,
+            tree_drop,
+            commit_narrow,
+            cards,
+            &assignment,
+        )
+    } else if let Some(lanes) = &lanes {
+        // Legacy levels use the same phase-A lanes as their prepared stacks
+        // when the levels split is on and the second card is ready.
+        BlockCommitted::commit_on_lanes::<H, H::Sponge>(
+            tables,
+            &artifacts.sizes,
+            config,
+            tree_drop,
+            commit_narrow,
+            upload_ahead,
+            lanes,
+        )
+        .map(|b| b.with_phase_b_commit_cards(shared_cards))
+    } else {
+        BlockCommitted::commit::<H, H::Sponge>(
+            tables,
+            &artifacts.sizes,
+            config,
+            tree_drop,
+            commit_narrow,
+            upload_ahead,
+        )
     }
     .map_err(|e| format!("{e:?}"))?;
+    let mut block = block;
+    if matches!(proving, WlfmProving::Streamed) {
+        if indexed.is_some() {
+            block = block
+                .with_phase_b_overlap(phase_b_overlap(stacks))
+                .with_phase_b_upload_beside(uploads_beside(stacks));
+        }
+        block = block
+            .with_phase_b_overlap_planned(overlap_planned())
+            .with_prepared_upload_once(upload_once())
+            .with_overlap_priced_resident(overlap_resident())
+            .with_prepared_store_narrow(narrow_store())
+            .with_overlap_next_columns_priced(overlap_next_columns())
+            .with_overlap_faults(overlap_faults_for_test());
+        if levels_split_on_host_for_test() && indexed.is_none() {
+            block = block.with_two_card_levels(vec![false; artifacts.sizes.len()]);
+            block.set_two_card_split(Some(vec![false; artifacts.sizes.len()]), true);
+        } else if indexed.is_none() && multilinear::gpu::two_card_levels_on() {
+            block = block.with_two_card_levels(vec![false; artifacts.sizes.len()]);
+        }
+    }
+    if indexed.is_some() {
+        block = block.with_two_card_levels(vec![false; artifacts.sizes.len()]);
+    }
     let phase_a = t_a.elapsed().as_secs_f64();
     let t_b = std::time::Instant::now();
     // Phase A may have replayed the second lane on card 0 and disabled its
@@ -2980,7 +3313,7 @@ fn prove_traces_under<H: WhirHash>(
     let recover = shared_cards
         && stacks
             .iter()
-            .any(|p| p.card == 1 && matches!(p.hold, PreparedHold::Held(_)))
+            .any(|p| p.card == Some(1) && matches!(p.hold, PreparedHold::Held(_)))
         && !multilinear::gpu::two_card_split_ready();
     let block = if lanes.is_some() && !recover {
         block
@@ -2999,7 +3332,7 @@ fn prove_traces_under<H: WhirHash>(
     if recover {
         let drop = crate::block_whir::tree_drop_for_chain(config);
         for (p, columns) in stacks.iter().zip(&borrowed) {
-            if p.card != 1 || !matches!(p.hold, PreparedHold::Held(_)) {
+            if p.card != Some(1) || !matches!(p.hold, PreparedHold::Held(_)) {
                 continue;
             }
             let retired = multilinear::stacked_eval::StackedCommitment::<F, H>::commit_to_retire(
@@ -3032,7 +3365,12 @@ fn prove_traces_under<H: WhirHash>(
         .map(|(p, columns)| {
             let (commitment, card) = match recovered.get(&p.group) {
                 Some(stack) => (PreparedCommitment::Retired(stack), 0),
-                None => (p.commitment(), p.card),
+                None => (
+                    p.commitment(),
+                    owners
+                        .as_ref()
+                        .map_or_else(|| p.card.unwrap_or(0), |cards| cards[p.group]),
+                ),
             };
             BlockPrepared {
                 group: p.group,
@@ -4111,6 +4449,8 @@ pub(crate) mod test_format {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(feature = "cuda")]
+    use multilinear::whir_chain::StackVars;
     use multilinear::whir_chain::{ChainConfig, GrindBits};
 
     // The ignored card identity runs alone. Its builders run on their own
@@ -4146,7 +4486,8 @@ pub(crate) mod test_format {
         static CHIP_RECORDS: Cell<Option<bool>> = const { Cell::new(None) };
         static LEAN_BESIDE: Cell<Option<bool>> = const { Cell::new(None) };
         static GROUP_POLYS: Cell<Option<usize>> = const { Cell::new(None) };
-        static STACK_LOG: Cell<Option<usize>> = const { Cell::new(None) };
+        #[cfg(feature = "cuda")]
+        static STACK: Cell<Option<StackVars>> = const { Cell::new(None) };
     }
 
     /// The levels driver builds on scoped threads. Tests that use these
@@ -4176,21 +4517,6 @@ pub(crate) mod test_format {
         config
     }
 
-    #[cfg(feature = "test-cuda-faults")]
-    pub(crate) struct StackLog(Option<usize>);
-
-    #[cfg(feature = "test-cuda-faults")]
-    impl Drop for StackLog {
-        fn drop(&mut self) {
-            STACK_LOG.with(|c| c.set(self.0));
-        }
-    }
-
-    #[cfg(feature = "test-cuda-faults")]
-    pub(crate) fn set_stack_log(log: usize) -> StackLog {
-        StackLog(STACK_LOG.with(|c| c.replace(Some(log))))
-    }
-
     /// Every W-LFM build and verify on this thread groups `polys` stacked
     /// polynomials a group until the guard drops.
     pub(crate) struct GroupPolysOverride(Option<usize>);
@@ -4207,6 +4533,23 @@ pub(crate) mod test_format {
 
     pub(super) fn group_polys() -> Option<usize> {
         GROUP_POLYS.with(Cell::get)
+    }
+
+    /// Restore the stack cap when the test finishes.
+    #[cfg(feature = "cuda")]
+    pub(crate) struct StackOverride(Option<StackVars>);
+
+    #[cfg(feature = "cuda")]
+    impl Drop for StackOverride {
+        fn drop(&mut self) {
+            STACK.with(|c| c.set(self.0));
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn set_stack_log(log: usize) -> StackOverride {
+        let stack = StackVars::new(log).expect("test stack cap");
+        StackOverride(STACK.with(|c| c.replace(Some(stack))))
     }
 
     /// Every W-LFM build on this thread cuts its chips at `2^log` rows until
@@ -4306,18 +4649,19 @@ pub(crate) mod test_format {
 
     pub(super) fn apply(config: ChainConfig) -> ChainConfig {
         let mut config = apply_driver_options(config);
-        let stack_log = STACK_LOG
-            .with(Cell::get)
-            .or_else(|| DRIVER_OPTIONS.load(Ordering::Relaxed).then_some(15));
-        if let Some(log) = stack_log {
+        if DRIVER_OPTIONS.load(Ordering::Relaxed) {
             config.format.stack =
-                multilinear::whir_chain::StackVars::new(log).expect("test stack cap");
+                multilinear::whir_chain::StackVars::new(15).expect("test stack cap");
         }
         if UNGROUND.with(Cell::get) {
             config.grind = GrindBits::uniform(0);
         }
         if let Some(q) = QUERIES.with(Cell::get) {
             config.num_queries = q;
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(stack) = STACK.with(Cell::get) {
+            config.format.stack = stack;
         }
         config
     }

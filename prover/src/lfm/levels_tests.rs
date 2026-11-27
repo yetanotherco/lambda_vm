@@ -211,8 +211,8 @@ fn the_closed_bus_assert_refuses_an_open_bus() {
     let plan = plan_of(&elf, &proof, &format, Some(1));
     let arenas = block_leaf_arena(&plan, &proof, 0).expect("the arena");
     let no_target = LeafChecks {
-        prepared: true,
         target: false,
+        ..LeafChecks::ALL
     };
     let hasher = super::hash::HasherKind::Poseidon1W16;
     let closed = plan
@@ -505,6 +505,14 @@ fn the_blake3_levels_driver_proves_a_small_block() {
     assert!(
         verify_levels(&flipped, WlfmFamily::B3, last).is_err(),
         "the flipped plan defines other programs"
+    );
+    write_identity_files(
+        &run,
+        &elf,
+        &opts,
+        &format,
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
     );
     let t = &run.times;
     println!(
@@ -3800,6 +3808,14 @@ fn rta_one_run(
         );
         assert!(refused, "a tampered last level is refused");
     }
+    write_identity_files(
+        &run,
+        &elf,
+        &opts,
+        &cfg.format,
+        family,
+        LevelStop::Levels(levels),
+    );
     // Off the clock, a box row (`RTA_IDENTITY=host`, with
     // `LAMBDA_VM_DETERMINISTIC_GRIND=1`): every level proved again over the
     // same base with its prepared stacks on the host must give the same bytes
@@ -3969,6 +3985,236 @@ fn the_rta_verify_word_verifies_by_default_and_refuses_other_words() {
     }
 }
 
+/// Archive gate for independently replayed test_commit_4. The proof uses the
+/// existing stage 1 BLAKE3 fixture settings. Run each worker count in a fresh
+/// process.
+#[cfg(all(feature = "cuda", feature = "test-security"))]
+#[test]
+#[ignore = "cluster archive gate: needs a real CUDA build"]
+fn cluster_stage2_test_commit_4() {
+    use super::levels::{prove_block_levels, verify_block_levels_under};
+    let ethrex = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF");
+    let (elf, input, format, options) = if let Some(path) = &ethrex {
+        let elf = std::fs::read(path).expect("read ethrex guest");
+        let input = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_INPUT").map_or_else(
+            || include_bytes!("../../../executor/tests/ethrex_empty_block.bin").to_vec(),
+            |path| std::fs::read(path).expect("read Ethereum input"),
+        );
+        let mut options = crate::block_whir::BlockOptions::production();
+        if let Ok(window) = std::env::var("LAMBDA_VM_TEST_CLUSTER_ETHREX_WINDOW_LOG2") {
+            let window: usize = window.parse().expect("Ethereum test window log2");
+            options.window_log2 = Some(window);
+            options.max_rows.cpu = 2 << window;
+        }
+        (elf, input, cluster_ethrex_format(), options)
+    } else {
+        let mut options = streamed_options();
+        if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_RANGE_FIXTURE").is_some() {
+            options.window_log2 = Some(2);
+            options.max_rows.cpu = 8;
+            options.drop_streamed_ops = true;
+        }
+        let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+        (elf, Vec::new(), cluster_archive_format(), options)
+    };
+    if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_BASE_ONLY").is_some()
+        || ethrex.is_some() && std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_LEVELS").is_none()
+    {
+        cluster_stage4_base(&elf, &input, &format, &options);
+        return;
+    }
+    let opts = ProofOptions::default_test_options();
+    let prove = || {
+        prove_block_levels(
+            &elf,
+            &input,
+            &opts,
+            &format,
+            &options,
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+    };
+    use crate::block_whir::cluster_tcp::{Topology, coordinate};
+    let start = std::time::Instant::now();
+    let result = if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY") {
+        let topology = Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
+        coordinate(&topology, prove)
+    } else {
+        prove()
+    };
+    println!("CLUSTER PROVE {:.6}s", start.elapsed().as_secs_f64());
+    let run = result.expect("the BLAKE3 fixture proves");
+    if ethrex.is_none() {
+        assert_eq!(run.base_proof.public_output, [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+    assert_eq!(run.proofs.len(), 2);
+    verify_block_levels_under(
+        &elf,
+        &opts,
+        &format,
+        run.base_proof.statement(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        run.proofs.last().expect("last level"),
+    )
+    .expect("the verifier derives its own plan and accepts the last level");
+    write_identity_files(
+        &run,
+        &elf,
+        &opts,
+        &format,
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+    );
+}
+
+#[cfg(all(feature = "cuda", feature = "test-security"))]
+fn cluster_ethrex_format() -> BlockFormat {
+    let mut format = BlockFormat::pinned();
+    format.zf = format.zf.with_base(BaseFormat::B3_WHIR);
+    if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_WORDS").is_some() {
+        format = format.with_memory(crate::tables::fused_memory::MemoryFormat::Words);
+    }
+    format
+}
+
+#[cfg(all(feature = "cuda", feature = "test-security"))]
+fn cluster_archive_format() -> BlockFormat {
+    let mut format = b3_format();
+    // The boundary tampers alter a window's word history, which the word
+    // memory format (and so the in-row register format) reads.
+    if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_BOUNDARY_WORDS").is_some() {
+        format.registers = crate::tables::register::RegisterFormat::InRow;
+        format = format.with_memory(crate::tables::fused_memory::MemoryFormat::Words);
+    }
+    format
+}
+
+/// Verify the base with test security settings. The runner covers the full
+/// recursion and shipment path in the focused review suite.
+#[cfg(all(feature = "cuda", feature = "test-security"))]
+fn cluster_stage4_base(
+    elf: &[u8],
+    input: &[u8],
+    format: &BlockFormat,
+    options: &crate::block_whir::BlockOptions,
+) {
+    use crate::block_whir::{
+        Deviations,
+        cluster_tcp::{Topology, coordinate},
+        prove_block_whir_with, verify_block_whir,
+    };
+    let opts = ProofOptions::default_test_options();
+    let prove =
+        || prove_block_whir_with(elf, input, &opts, format, options, &Deviations::default());
+    let start = std::time::Instant::now();
+    let result = crate::base_only::with_blake3_levels(|| {
+        if let Some(path) = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY") {
+            let topology =
+                Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
+            coordinate(&topology, prove)
+        } else {
+            prove()
+        }
+    });
+    println!("CLUSTER PROVE {:.6}s", start.elapsed().as_secs_f64());
+    let (proof, stamps) = result.expect("the base fixture proves");
+    println!(
+        "CLUSTER ARCHIVE LOCAL PHASE A: {:.6}s · {} cycles",
+        stamps.phase_a, stamps.executor.cycles,
+    );
+    assert!(
+        crate::base_only::with_blake3_levels(|| verify_block_whir(&proof, elf, &opts, format))
+            .unwrap()
+    );
+    if let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).unwrap();
+        std::fs::write(dir.join("base"), bytes.as_slice()).unwrap();
+    }
+}
+
+/// Worker entry point for the same fixture and binary as the coordinator.
+#[cfg(all(feature = "cuda", feature = "test-security"))]
+#[test]
+#[ignore = "cluster process worker"]
+fn cluster_stage4_worker() {
+    use crate::block_whir::cluster_tcp::{Topology, serve};
+    let path = std::env::var_os("LAMBDA_VM_TEST_CLUSTER_TOPOLOGY").expect("worker topology");
+    let topology = Topology::read(std::path::Path::new(&path)).expect("read cluster topology");
+    let id = std::env::var("LAMBDA_VM_TEST_CLUSTER_WORKER")
+        .expect("worker index")
+        .parse()
+        .expect("valid worker index");
+    let format = if std::env::var_os("LAMBDA_VM_TEST_CLUSTER_ETHREX_ELF").is_some() {
+        cluster_ethrex_format()
+    } else {
+        cluster_archive_format()
+    };
+    serve(
+        &topology,
+        id,
+        &ProofOptions::default_test_options(),
+        &format,
+    )
+    .expect("worker attempt");
+}
+
+/// Opt-in byte gate shared by the small fixture and the real-block harness.
+fn write_identity_files(
+    run: &super::levels::LevelsRun,
+    elf: &[u8],
+    opts: &ProofOptions,
+    format: &BlockFormat,
+    family: WlfmFamily,
+    stop: LevelStop,
+) {
+    let Some(dir) = std::env::var_os("LAMBDA_VM_TEST_PROOF_DIR") else {
+        return;
+    };
+    println!(
+        "CLUSTER ARCHIVE LOCAL PHASE A: {:.6}s · {} cycles",
+        run.base_stamps.phase_a, run.base_stamps.executor.cycles
+    );
+    let last = super::last_level::last_level(family).expect("last level format");
+    let shipped = super::last_level::last_level_file(
+        run.proofs.last().expect("last level proof"),
+        last,
+        super::last_level::last_wire().expect("last level encoding"),
+    )
+    .expect("encode shipped proof");
+    let start = std::time::Instant::now();
+    let decoded =
+        super::last_level::read_last_level_file(&shipped, last).expect("decode shipped proof");
+    super::levels::verify_block_levels_under(
+        elf,
+        opts,
+        format,
+        run.base_proof.statement(),
+        family,
+        stop,
+        &decoded,
+    )
+    .expect("the shipped proof verifies before publication");
+    println!(
+        "CLUSTER ARCHIVE FILE VERIFY {:.6}s",
+        start.elapsed().as_secs_f64()
+    );
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("proof output directory");
+    let base = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("archive base");
+    std::fs::write(dir.join("base"), &base[..]).expect("write base");
+    for (k, proof) in run.proofs.iter().enumerate() {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("archive level");
+        std::fs::write(dir.join(format!("level-{}", k + 1)), &bytes[..]).expect("write level");
+    }
+    std::fs::write(dir.join("shipped"), shipped).expect("write shipped proof");
+}
+
 /// One run of level 1 over a block's first `k` groups
 /// ([`WhirBlockPlan::first_groups_program_marked`]): its level, its proof, where
 /// its prepared stacks went, and its seconds by part.
@@ -4019,7 +4265,7 @@ fn prove_first_groups<L: crate::block_whir::LocalPart>(
     let t = Instant::now();
     let pre = prepare_level(&program, family, super::levels::level_rounds(plan))?;
     let cells = pre.prepared_cells();
-    let place = stack_place(cells, 1, stacks);
+    let place = stack_place(&pre, 1, stacks, multilinear::gpu::reserve_budget())?;
     let build = pre.commit(place)?;
     let level = super::levels::Level { program, build };
     let build = t.elapsed().as_secs_f64();
@@ -4523,8 +4769,8 @@ fn the_first_groups_level_proves_and_publishes_their_bus_sum() {
     let open = plan
         .closed_block_program_with(
             LeafChecks {
-                prepared: true,
                 target: false,
+                ..LeafChecks::ALL
             },
             false,
         )

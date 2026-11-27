@@ -51,6 +51,7 @@ use multilinear::whir_commit::Commitment;
 use stark::multilinear_logup::InteractionShape;
 use stark::multilinear_table::TableLayout;
 
+use crate::block_whir::cluster::stages::Clock;
 use crate::block_whir::{
     BlockFormat, BlockFrame, BlockStatement, BlockWhirProof, block_frame, block_statement_bytes,
     first_page_index, group_stacks, prepared_tables,
@@ -1625,6 +1626,10 @@ impl WhirBlockPlan {
     /// its words. Its arena is [`block_leaf_arena`]'s for leaf 0. Refused
     /// unless the plan is one leaf over every group.
     pub fn closed_block_program(&self) -> Result<LfmProgram, String> {
+        self.closed_block_program_staged(Clock::default())
+    }
+
+    pub(crate) fn closed_block_program_staged(&self, clock: Clock) -> Result<LfmProgram, String> {
         if self.partition.num_leaves() != 1 {
             return Err(format!(
                 "a closed block program covers every group in one leaf; the plan has {} leaves",
@@ -1641,7 +1646,9 @@ impl WhirBlockPlan {
             LeafChecks::ALL,
             None,
         )?;
-        finish(b)
+        let program = finish_leaf(b, clock)?;
+        clock.mark("leaf-validate-done");
+        Ok(program)
     }
 
     /// [`Self::closed_block_program`] with where its arena's parts end: the
@@ -1796,6 +1803,14 @@ impl WhirBlockPlan {
     /// streamed leaf can land each group's words as its own piece. The last end
     /// is the arena's length.
     pub fn leaf_program_marked(&self, k: usize) -> Result<(LfmProgram, Vec<u32>), String> {
+        self.leaf_program_marked_staged(k, Clock::default())
+    }
+
+    pub(crate) fn leaf_program_marked_staged(
+        &self,
+        k: usize,
+        clock: Clock,
+    ) -> Result<(LfmProgram, Vec<u32>), String> {
         if k >= self.partition.num_leaves() {
             return Err(format!("no leaf {k}"));
         }
@@ -1810,7 +1825,7 @@ impl WhirBlockPlan {
             LeafChecks::ALL,
             Some(&mut marks),
         )?;
-        let program = finish(b)?;
+        let program = finish_leaf(b, clock)?;
         if marks.arena_ends.len() != self.partition.leaf(k).len() + 1
             || marks.arena_ends.last().copied() != program.arena_schema.lens.first().copied()
         {
@@ -1832,6 +1847,7 @@ impl WhirBlockPlan {
                 ));
             }
         }
+        clock.mark("leaf-validate-done");
         Ok((program, marks.arena_ends))
     }
 
@@ -2033,6 +2049,16 @@ impl WhirBlockPlan {
         Err("no top".to_string())
     }
 
+    /// The range assignment is a statement input to the cluster levels.
+    pub(crate) fn with_cluster_leaf_map(
+        mut self,
+        map: &super::cluster_levels::LeafMap,
+    ) -> Result<Self, String> {
+        self.partition = map.partition(self.groups.len())?;
+        self.leaf_bound = None;
+        Ok(self)
+    }
+
     /// Replace the partition — another tree, test-only: what a prover may emit
     /// leaves over, refused at the final check. The derived partition's leaf
     /// bound goes with it: the replacement's leaves are held under none.
@@ -2051,7 +2077,7 @@ impl WhirBlockPlan {
 
     /// Where group `g`'s first root sits among the proof's roots: one a
     /// round-0 tree of every group before it.
-    fn root_start(&self, g: usize) -> usize {
+    pub(super) fn root_start(&self, g: usize) -> usize {
         self.frame.stack_layouts[..g]
             .iter()
             .map(|layout| self.trees(layout).len())
@@ -2186,7 +2212,14 @@ pub(crate) fn derived_of(
 }
 
 fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
-    let program = compile(b.finish());
+    finish_leaf(b, Clock::default())
+}
+
+fn finish_leaf(b: LfmBuilder, clock: Clock) -> Result<LfmProgram, String> {
+    let source = b.finish();
+    clock.mark("leaf-emit-done");
+    let program = compile(source);
+    clock.mark("leaf-compile-done");
     super::validator::validate(&program).map_err(|e| format!("not admissible: {e:?}"))?;
     Ok(program)
 }
@@ -3588,12 +3621,16 @@ pub struct LeafChecks {
     pub(crate) prepared: bool,
     /// Whether the carrier subtracts the COMMIT-bus target.
     pub(crate) target: bool,
+    #[cfg(test)]
+    pub(crate) opening: bool,
 }
 
 impl LeafChecks {
     pub const ALL: Self = Self {
         prepared: true,
         target: true,
+        #[cfg(test)]
+        opening: true,
     };
 }
 
@@ -3612,6 +3649,26 @@ pub(crate) fn leaf_program_with(
 ) -> Result<LfmProgram, String> {
     let mut b = plan.leaf_builder();
     emit_leaf(&mut b, plan, k, checks)?;
+    finish(b)
+}
+
+/// Mutant carrier assignment for the cluster join's binding tests.
+#[cfg(all(test, feature = "test-security"))]
+pub(crate) fn leaf_program_as_carrier(
+    plan: &WhirBlockPlan,
+    k: usize,
+    carrier: bool,
+) -> Result<LfmProgram, String> {
+    let mut b = plan.leaf_builder();
+    emit_leaf_over(
+        &mut b,
+        plan,
+        plan.partition.leaf(k),
+        carrier,
+        false,
+        LeafChecks::ALL,
+        None,
+    )?;
     finish(b)
 }
 
@@ -3925,22 +3982,28 @@ fn emit_leaf_over(
                 }
             })
             .collect();
-        emit_group_walk_chains(
-            b,
-            &mut fork,
-            &[GroupChainWires {
-                layout,
-                chains: &chains,
-                shape: &chain,
-                domain: &frame.domains[g],
-                ood: Some(OodWires {
-                    point: &point,
-                    answers: group_answers,
-                }),
-            }],
-            &[tables.len()],
-            &walk,
-        );
+        #[cfg(test)]
+        let verify_opening = checks.opening;
+        #[cfg(not(test))]
+        let verify_opening = true;
+        if verify_opening {
+            emit_group_walk_chains(
+                b,
+                &mut fork,
+                &[GroupChainWires {
+                    layout,
+                    chains: &chains,
+                    shape: &chain,
+                    domain: &frame.domains[g],
+                    ood: Some(OodWires {
+                        point: &point,
+                        answers: group_answers,
+                    }),
+                }],
+                &[tables.len()],
+                &walk,
+            );
+        }
 
         // Its prepared stack, against the derived roots: each table's block at
         // that table's point.

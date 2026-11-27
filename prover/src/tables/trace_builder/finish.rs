@@ -10,6 +10,7 @@
 //! oracle (`finish_oracle`, test-only) checks.
 
 use super::*;
+use crate::tables::trace_hash::with_seed;
 
 /// What a statement reads off a build before any of its tables exists.
 #[derive(Clone)]
@@ -1649,6 +1650,13 @@ impl<'a> FinishPlan<'a> {
     /// Phase 5: every table, as [`super::build_traces`] always built them, in
     /// one parallel scope; refused unless they are the ones the header counted.
     pub(super) fn emit_all(self) -> Result<Traces, Error> {
+        self.emit_all_with_bitwise(None)
+    }
+
+    pub(super) fn emit_all_with_bitwise(
+        self,
+        bitwise_slot: Option<&BitwiseSlot>,
+    ) -> Result<Traces, Error> {
         let Self {
             memory_state,
             register_init,
@@ -1743,6 +1751,7 @@ impl<'a> FinishPlan<'a> {
         // they all run in one rayon scope. Disk-spill stays sequential: its
         // generate→spill order keeps trace memory bounded.
         let cpu_ops_ref = &cpu_ops;
+        let seed = skip.trace_seed;
         let pack = skip.pack;
         // A packing build writes each table packed as it generates it where the
         // generator can (G-pack, `StreamSkip::gpack`); `packed_by` then finds it
@@ -1761,7 +1770,7 @@ impl<'a> FinishPlan<'a> {
                 skip.tails,
                 false,
                 packed_by(pack, |ops: &[CpuOperation]| {
-                    if cpu_side.is_empty() {
+                    if skip.register_format == register::RegisterFormat::Tokens32 {
                         return cpu::generate_cpu_trace_as(ops, decode_table, form);
                     }
                     // A chunk of `cpu_ops`: its side records at the same place.
@@ -1812,7 +1821,7 @@ impl<'a> FinishPlan<'a> {
                 skip.tails,
                 false,
                 packed_by(pack, |ops| {
-                    memw_register::generate_memw_register_trace_from_rows_as(ops, form)
+                    finished_register_rows(ops, skip.register_format, form)
                 }),
             )
         };
@@ -1837,7 +1846,7 @@ impl<'a> FinishPlan<'a> {
                 skip.tails,
                 true,
                 |start, end| {
-                    let rows = lt_chunk_rows(&lt_ops, &lt_merged, start, end);
+                    let rows = with_seed(seed, || lt_chunk_rows(&lt_ops, &lt_merged, start, end));
                     packed_if(pack, lt::lt_trace_of_rows(&rows, form))
                 },
             )
@@ -1859,7 +1868,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| mul::generate_mul_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || mul::generate_mul_trace_as(ops, form))
+                }),
             )
         };
         let gen_dvrms = || {
@@ -1869,7 +1880,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| dvrm::generate_dvrm_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || dvrm::generate_dvrm_trace_as(ops, form))
+                }),
             )
         };
         let gen_branches = || {
@@ -1879,7 +1892,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| branch::generate_branch_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || branch::generate_branch_trace_as(ops, form))
+                }),
             )
         };
         // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
@@ -1901,7 +1916,9 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 true,
-                packed_by(pack, |ops| bytewise::generate_bytewise_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    with_seed(seed, || bytewise::generate_bytewise_trace_as(ops, form))
+                }),
             )
         };
         let gen_stores = || {
@@ -1949,10 +1966,8 @@ impl<'a> FinishPlan<'a> {
             )
         };
         let gen_bitwise = || {
-            let mut bitwise = bitwise::generate_bitwise_trace();
-            // Fill the MU columns (11..=20) from the accumulated histogram.
-            bitwise_histogram.fill_multiplicities(&mut bitwise);
-            packed_if(pack, bitwise)
+            let witness = BitwiseWitness::new(bitwise_histogram, pack, form);
+            witness.hand_out(bitwise_slot)
         };
         // Each CPU operation looks up the DECODE table once; padding rows look up
         // pc=1 (the CPU padding entry). When CPU is split, each chunk pads
@@ -1964,7 +1979,7 @@ impl<'a> FinishPlan<'a> {
                 .map(|op| op.decode_row as usize);
             let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
             decode::count_rows(&mut decode, rows.chain(padding));
-            packed_if(pack, decode)
+            packed_if(pack && !skip.range_prefix, decode)
         };
         // Under the word memory format COPY's tables are COPY_W's, from the
         // word rows.
@@ -2110,18 +2125,8 @@ impl<'a> FinishPlan<'a> {
                 form,
             )
         };
-        let gen_register = || {
-            packed_if(
-                pack,
-                register_trace(skip.register_format, &register_final_state, register_init),
-            )
-        };
-        let gen_halt = || {
-            packed_if(
-                pack,
-                halt::generate_halt_trace(halt_timestamp, halt_next_pc),
-            )
-        };
+        let gen_register = || register_for_finish(skip, pack, &register_final_state, register_init);
+        let gen_halt = || halt_for_finish(skip, pack, halt_timestamp, halt_next_pc);
         // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
         // and no ECDAS table at all — not a padded one.
         let gen_ecsms = || {
@@ -2314,7 +2319,7 @@ impl<'a> FinishPlan<'a> {
         let stores = stores_slot.expect(PHASE5_RAN)?;
         let cpu32s = cpu32s_slot.expect(PHASE5_RAN)?;
         #[allow(unused_mut)]
-        let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
+        let mut bitwise = bitwise_slot.expect(PHASE5_RAN)?;
         #[allow(unused_mut)]
         let mut decode = decode_slot.expect(PHASE5_RAN);
         let copies = copies_slot.expect(PHASE5_RAN)?;
@@ -2429,6 +2434,131 @@ impl<'a> FinishPlan<'a> {
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
+/// The finish computes the full histogram while it still has the walk's
+/// lists. Its owner alone uses it to write the BITWISE trace.
+pub(crate) struct BitwiseWitness {
+    histogram: bitwise::BitwiseHistogram,
+    pack: bool,
+    form: TraceForm,
+    direct: bool,
+    tail: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct BitwiseSlot {
+    witness: std::sync::Mutex<Option<BitwiseWitness>>,
+    #[cfg(feature = "parallel")]
+    walk_end: std::sync::OnceLock<std::time::Instant>,
+}
+
+#[cfg(feature = "parallel")]
+impl BitwiseSlot {
+    pub(crate) fn note_walk_end(&self) {
+        let _ = self.walk_end.set(std::time::Instant::now());
+    }
+
+    pub(crate) fn walk_end(&self) -> Option<std::time::Instant> {
+        self.walk_end.get().copied()
+    }
+
+    pub(crate) fn take(&self) -> Result<BitwiseWitness, Error> {
+        self.witness
+            .lock()
+            .map_err(|_| Error::Prover("BITWISE handout lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| Error::Prover("replica did not hand out its BITWISE histogram".into()))
+    }
+}
+
+impl BitwiseWitness {
+    fn new(histogram: bitwise::BitwiseHistogram, pack: bool, form: TraceForm) -> Self {
+        Self {
+            histogram,
+            pack,
+            form,
+            direct: false,
+            tail: false,
+        }
+    }
+
+    fn hand_out(self, slot: Option<&BitwiseSlot>) -> Result<Table, Error> {
+        let Some(slot) = slot else {
+            return Ok(self.materialize());
+        };
+        let mut slot = slot
+            .witness
+            .lock()
+            .map_err(|_| Error::Prover("BITWISE handout lock poisoned".into()))?;
+        if slot.replace(self).is_some() {
+            return Err(Error::Prover("duplicate BITWISE handout".into()));
+        }
+        // A shape-only marker consumed by the cluster layouter. The actual
+        // data for this slot is the histogram above.
+        let mut marker = Table::new_main(Vec::new(), bitwise::cols::NUM_COLUMNS, 1);
+        marker.main_table.height = bitwise::NUM_ROWS;
+        Ok(marker)
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of_val(self.histogram.counts())
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn counts(&self) -> &[u64] {
+        self.histogram.counts()
+    }
+
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) fn change_count(&mut self) {
+        use bitwise::{BitwiseOperation, BitwiseOperationType};
+        self.histogram.bump(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            0,
+        ));
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn add_range_counts(&mut self, counts: &[u64]) -> Result<(), Error> {
+        self.histogram.add_range_counts(counts)
+    }
+
+    pub(crate) fn materialize(self) -> Table {
+        materialize_bitwise(
+            &self.histogram,
+            self.pack,
+            self.form,
+            self.direct,
+            self.tail,
+        )
+    }
+}
+
+fn materialize_bitwise(
+    histogram: &bitwise::BitwiseHistogram,
+    pack: bool,
+    form: TraceForm,
+    direct: bool,
+    tail: bool,
+) -> Table {
+    if tail {
+        let bounds = crate::tables::gpack::row_bounds_at(
+            bitwise::NUM_ROWS,
+            1 << 16,
+            crate::tables::gpack::SPLIT_MAX_PARTS,
+        );
+        let trace = histogram.trace_as_rows(form, &bounds);
+        build_stamps::mark(&format!("p5 bitwise by {} row ranges", bounds.len() - 1));
+        return trace;
+    }
+    if direct && form == TraceForm::Narrow {
+        return histogram.trace_as(form);
+    }
+    let mut table = bitwise::generate_bitwise_trace();
+    histogram.fill_multiplicities(&mut table);
+    packed_if(pack, table)
+}
+
 /// A table of the rest, not yet built: building it is calling this.
 type Job<'a> = Box<dyn FnOnce() -> Result<Table, Error> + Send + 'a>;
 
@@ -2527,11 +2657,15 @@ struct FinishDirect {
 
 fn finish_direct() -> FinishDirect {
     static DIRECT: std::sync::OnceLock<FinishDirect> = std::sync::OnceLock::new();
-    let word = |name: &str| std::env::var(name).ok();
-    *DIRECT.get_or_init(|| FinishDirect {
+    let read = |word: fn(&str) -> Option<String>| FinishDirect {
         page: page_direct_from(word("LAMBDA_VM_FINISH_PAGE_DIRECT").as_deref()),
         bitwise: word("LAMBDA_VM_FINISH_BITWISE_DIRECT").is_some_and(|v| v.trim() == "1"),
-    })
+    };
+    #[cfg(feature = "parallel")]
+    if crate::block_whir::cluster_tcp::witness_settings().is_some() {
+        return read(crate::block_whir::cluster_tcp::setting);
+    }
+    *DIRECT.get_or_init(|| read(|name| std::env::var(name).ok()))
 }
 
 /// [`finish_direct`]'s reading of `LAMBDA_VM_FINISH_PAGE_DIRECT`: unset or any
@@ -2554,6 +2688,12 @@ pub(crate) fn keccak_w_split() -> bool {
     #[cfg(test)]
     if let Some(on) = keccak_w_split_test::on() {
         return on;
+    }
+    #[cfg(feature = "parallel")]
+    if crate::block_whir::cluster_tcp::witness_settings().is_some() {
+        return keccak_w_split_from(
+            crate::block_whir::cluster_tcp::setting("LAMBDA_VM_FINISH_KECCAK_W_SPLIT").as_deref(),
+        );
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2831,7 +2971,7 @@ impl<'a> FinishPlan<'a> {
     /// the units are the tables the header counted.
     #[cfg(test)]
     pub(super) fn units(self) -> Result<Vec<Unit<'a>>, Error> {
-        self.units_keeping(false).map(|(units, _, _)| units)
+        self.units_keeping(false, None).map(|(units, _, _)| units)
     }
 
     /// [`Self::units`], and with `keep` the lists KECCAK_RND's and LT's units
@@ -2842,6 +2982,7 @@ impl<'a> FinishPlan<'a> {
     pub(super) fn units_keeping(
         self,
         keep: bool,
+        bitwise_slot: Option<&'a BitwiseSlot>,
     ) -> Result<(Vec<Unit<'a>>, Option<RestRegen>, Option<Side<'a>>), Error> {
         use std::sync::Arc;
         let Self {
@@ -2889,6 +3030,7 @@ impl<'a> FinishPlan<'a> {
             cut_line: _,
             cpu_decoded,
         } = self;
+        let seed = skip.trace_seed;
         let pack = skip.pack;
         let gpack = pack && skip.gpack;
         let form = if gpack {
@@ -3019,19 +3161,13 @@ impl<'a> FinishPlan<'a> {
                         histogram
                     }
                 };
-                if bitwise_tail {
-                    // Written packed by row ranges at once, its digest for the
-                    // log taken beside: the same table.
-                    let bounds = crate::tables::gpack::row_bounds_at(
-                        bitwise::NUM_ROWS,
-                        1 << 16,
-                        crate::tables::gpack::SPLIT_MAX_PARTS,
-                    );
+                // Under the local tail path, keep the existing timed
+                // log digest alongside the row-range writer.
+                if bitwise_tail && bitwise_slot.is_none() {
                     let trace = std::thread::scope(|scope| {
                         scope.spawn(|| note_bitwise(&histogram, from));
-                        histogram.trace_as_rows(form, &bounds)
+                        materialize_bitwise(&histogram, pack, form, direct_bitwise, true)
                     });
-                    build_stamps::mark(&format!("p5 bitwise by {} row ranges", bounds.len() - 1));
                     #[cfg(test)]
                     if skip.finish_early.counted {
                         super::finish_early::note_bitwise_tail();
@@ -3039,12 +3175,14 @@ impl<'a> FinishPlan<'a> {
                     return Ok(trace);
                 }
                 note_bitwise(&histogram, from);
-                if direct_bitwise && form == TraceForm::Narrow {
-                    return Ok(histogram.trace_as(form));
+                BitwiseWitness {
+                    histogram,
+                    pack,
+                    form,
+                    direct: direct_bitwise,
+                    tail: bitwise_tail,
                 }
-                let mut table = bitwise::generate_bitwise_trace();
-                histogram.fill_multiplicities(&mut table);
-                Ok(packed_if(pack, table))
+                .hand_out(bitwise_slot)
             }),
         });
         {
@@ -3059,7 +3197,7 @@ impl<'a> FinishPlan<'a> {
                         .map(|op| op.decode_row as usize);
                     let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
                     decode::count_rows(&mut decode, rows.chain(padding));
-                    Ok(packed_if(pack, decode))
+                    Ok(packed_if(pack && !skip.range_prefix, decode))
                 }),
             });
         }
@@ -3077,21 +3215,18 @@ impl<'a> FinishPlan<'a> {
             family: family("REGISTER"),
             rows: register_rows(register_format),
             job: Box::new(move || {
-                Ok(packed_if(
+                Ok(register_for_finish(
+                    skip,
                     pack,
-                    register_trace(register_format, &register_final_state, register_init),
+                    &register_final_state,
+                    register_init,
                 ))
             }),
         });
         units.push(Unit::Build {
             family: family("HALT"),
             rows: 1,
-            job: Box::new(move || {
-                Ok(packed_if(
-                    pack,
-                    halt::generate_halt_trace(halt_timestamp, halt_next_pc),
-                ))
-            }),
+            job: Box::new(move || Ok(halt_for_finish(skip, pack, halt_timestamp, halt_next_pc))),
         });
 
         // COPY, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, BLAKE3. Under the word
@@ -3258,7 +3393,7 @@ impl<'a> FinishPlan<'a> {
             Box::new(move || Ok(packed_if(pack, is_wh::generate_is_wh_trace(&is_wh_rows))))
         }));
 
-        // CPU … CPU32.
+        // An empty CPU table uses the same register format as the AIR.
         units.extend(chunked_units(
             family("CPU"),
             cpu_ops.len(),
@@ -3272,7 +3407,7 @@ impl<'a> FinishPlan<'a> {
                 Box::new(move || {
                     Ok(packed_if(
                         pack,
-                        if side.is_empty() {
+                        if skip.register_format == register::RegisterFormat::Tokens32 {
                             cpu::generate_cpu_trace_as(&ops[start..end], decode_table, form)
                         } else {
                             cpu::generate_cpu_trace_inrow_segments_as(
@@ -3352,7 +3487,10 @@ impl<'a> FinishPlan<'a> {
             0,
             false,
             move |ops: &[(MulOperation, bool)]| {
-                packed_if(pack, mul::generate_mul_trace_as(ops, form))
+                packed_if(
+                    pack,
+                    with_seed(seed, || mul::generate_mul_trace_as(ops, form)),
+                )
             },
         )?);
         units.extend(segmented_units(
@@ -3362,7 +3500,10 @@ impl<'a> FinishPlan<'a> {
             0,
             false,
             move |ops: &[(DvrmOperation, bool)]| {
-                packed_if(pack, dvrm::generate_dvrm_trace_as(ops, form))
+                packed_if(
+                    pack,
+                    with_seed(seed, || dvrm::generate_dvrm_trace_as(ops, form)),
+                )
             },
         )?);
         {
@@ -3374,7 +3515,7 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 move |ops: &[BranchOperation]| {
-                    let rows = dedup_rows(ops);
+                    let rows = with_seed(seed, || dedup_rows(ops));
                     if let Some(tables) = &tables {
                         let mut plane = bitwise::BitwisePlane::new();
                         count_branch_table_lookups(&rows, &mut plane);
@@ -3431,6 +3572,7 @@ impl<'a> FinishPlan<'a> {
                 }) as Job<'a>,
             }
         }));
+        let register_format = skip.register_format;
         units.extend(vec_units(
             family("MEMW_R"),
             Arc::clone(&shared.memw_register_rows),
@@ -3439,10 +3581,7 @@ impl<'a> FinishPlan<'a> {
             tails,
             false,
             move |ops: &[RegRow]| {
-                packed_if(
-                    pack,
-                    memw_register::generate_memw_register_trace_from_rows_as(ops, form),
-                )
+                packed_if(pack, finished_register_rows(ops, register_format, form))
             },
         )?);
         units.extend(segmented_units(
@@ -3462,7 +3601,7 @@ impl<'a> FinishPlan<'a> {
                 0,
                 false,
                 move |ops: &[bytewise::BytewiseOperation]| {
-                    let rows = dedup_rows(ops);
+                    let rows = with_seed(seed, || dedup_rows(ops));
                     if let Some(tables) = &tables {
                         let mut plane = bitwise::BitwisePlane::new();
                         count_bytewise_table_lookups(&rows, &mut plane);
@@ -3724,17 +3863,19 @@ fn lt_units<'a>(
         |start, end| {
             let lt = std::sync::Arc::clone(lt);
             let from_tables = from_tables.clone();
+            let seed = skip.trace_seed;
             let (merge, count_merge) = (skip.lt_merge, lt_count_merge(skip));
             Box::new(move || {
                 // The table and its lookups from one list of rows (a test's
                 // fault counts another).
-                let rows = lt.rows(start, end, merge);
+                let rows = with_seed(seed, || lt.rows(start, end, merge));
                 if count {
                     LT_ROWS_BUILT.add(rows.len(), end - start);
                 }
                 if let Some(tables) = &from_tables {
                     let mut plane = bitwise::BitwisePlane::new();
-                    let other = (count_merge != merge).then(|| lt.rows(start, end, count_merge));
+                    let other = (count_merge != merge)
+                        .then(|| with_seed(seed, || lt.rows(start, end, count_merge)));
                     count_lt_table_lookups(other.as_deref().unwrap_or(&rows), &mut plane);
                     tables.add(&plane)?;
                 }
@@ -4121,6 +4262,7 @@ impl<'a> FinishPlan<'a> {
         keep: bool,
         slide: bool,
         on_rows: Option<&mut dyn FnMut(RowsNote)>,
+        bitwise_slot: Option<&'a BitwiseSlot>,
     ) -> Result<Option<RestRegen>, Error> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
@@ -4128,7 +4270,7 @@ impl<'a> FinishPlan<'a> {
         let pages_first = slide && self.header.pages_first;
         let late_first = slide && self.skip.late_first;
         let ecdas_form = self.skip.ecdas_form;
-        let (units, regen, side) = match self.units_keeping(keep) {
+        let (units, regen, side) = match self.units_keeping(keep, bitwise_slot) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };
@@ -4806,6 +4948,52 @@ fn positions_of(units: &[Unit<'_>], family: usize) -> Vec<usize> {
 #[cfg(test)]
 #[path = "stream_tests.rs"]
 mod stream_tests;
+
+// The range layout still uses the ordinary table order. These slots carry
+// only their shapes until the coordinator's global finish supplies the rows.
+fn fixed_shape(width: usize, rows: usize) -> Table {
+    let mut table = Table::new_main(Vec::new(), width, 1);
+    table.main_table.height = rows;
+    table
+}
+
+fn finished_register_rows(
+    ops: &[RegRow],
+    registers: register::RegisterFormat,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    if registers == register::RegisterFormat::InRow {
+        super::super::register_residual::generate_residual_trace_segments_as(&[ops], form)
+    } else {
+        memw_register::generate_memw_register_trace_from_rows_as(ops, form)
+    }
+}
+
+fn register_for_finish(
+    skip: StreamSkip,
+    pack: bool,
+    state: &FinalRegisterStateMap,
+    init: &[u32],
+) -> Table {
+    let format = skip.register_format;
+    if skip.range_prefix {
+        let width = match format {
+            register::RegisterFormat::Tokens32 => register::cols::NUM_COLUMNS,
+            register::RegisterFormat::InRow => register::inrow::cols::NUM_COLUMNS,
+        };
+        fixed_shape(width, register_rows(format))
+    } else {
+        packed_if(pack, register_trace(format, state, init))
+    }
+}
+
+fn halt_for_finish(skip: StreamSkip, pack: bool, timestamp: u64, next_pc: u64) -> Table {
+    if skip.range_prefix {
+        fixed_shape(halt::cols::NUM_COLUMNS, 1)
+    } else {
+        packed_if(pack, halt::generate_halt_trace(timestamp, next_pc))
+    }
+}
 
 /// The rows [`register_trace`] builds REGISTER's table at under `format`.
 fn register_rows(format: super::super::register::RegisterFormat) -> usize {

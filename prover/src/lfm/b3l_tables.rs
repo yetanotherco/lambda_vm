@@ -74,7 +74,9 @@ pub const MUX_CHUNK_LOG: u32 = 22;
 /// The lean tables' shape: the padded rows of every round chunk and every
 /// head chunk, in table order. Empty for a program with no compression, which
 /// then has no lean table at all, not even the byte table.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct B3lShape {
     pub rounds: Vec<usize>,
     pub heads: Vec<usize>,

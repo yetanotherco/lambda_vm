@@ -1,10 +1,9 @@
 //! CUDA device context, stream pool, kernel handles, and twiddle cache.
 //!
-//! One process-wide backend — lazy-initialised on first use. All kernels live
-//! on a single CUDA context; a pool of streams lets rayon-parallel callers
-//! overlap H2D / compute / D2H.
+//! Backends are initialized on demand. Each owns its CUDA objects and
+//! stream pools. Backends on the same CUDA ordinal share a VRAM ceiling.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream};
@@ -169,7 +168,12 @@ const WHIR_FOLD_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/whir_fo
 /// other streams, defeating the point of the pool.
 const STREAM_POOL_SIZE: usize = 32;
 
+/// Logical IDs fit in the existing proof telemetry's card index.
+pub const MAX_LOGICAL_CARDS: usize = u8::MAX as usize + 1;
+
 pub struct Backend {
+    id: CardId,
+    physical: Arc<PhysicalLedger>,
     pub ctx: Arc<CudaContext>,
     /// The stream pool, and the background pool beside it unless
     /// `LAMBDA_VM_STREAM_CLASSES=off` ([`crate::stream_class`]).
@@ -590,14 +594,14 @@ fn retain_default_mempool(ctx: &CudaContext) {
 #[derive(Debug)]
 pub struct DeviceReservation {
     bytes: AtomicU64,
-    /// The backend whose ledger holds the bytes ([`BackendSlot`]): a
+    /// The backend whose ledger holds the bytes ([`CardId`]): a
     /// reservation grows, shrinks and is released there, whichever thread
     /// (in whichever role) does it.
-    slot: BackendSlot,
+    slot: CardId,
 }
 
 impl DeviceReservation {
-    /// The backend slot whose ledger holds these bytes ([`BackendSlot::index`]).
+    /// The backend slot whose ledger holds these bytes ([`CardId::index`]).
     pub fn slot_index(&self) -> usize {
         self.slot.index()
     }
@@ -616,37 +620,24 @@ impl DeviceReservation {
         let Ok(be) = self.slot.backend() else {
             return false;
         };
-        let mut held = be.reserved.load(Ordering::Relaxed);
-        loop {
-            if held.saturating_add(extra) > be.vram_budget_bytes() {
-                return false;
-            }
-            match be.reserved.compare_exchange_weak(
-                held,
-                held + extra,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.bytes.fetch_add(extra, Ordering::Relaxed);
-                    be.peaks.note(held + extra);
-                    return true;
-                }
-                Err(seen) => held = seen,
-            }
+        if be.take_room(extra).is_err() {
+            return false;
         }
+        self.bytes.fetch_add(extra, Ordering::Relaxed);
+        true
     }
 
     /// Give `given` of them back, when what they were promised for is dropped
     /// before the reservation is.
     pub fn shrink(&self, given: u64) {
-        let given = given.min(self.bytes.load(Ordering::Relaxed));
-        if given == 0 {
-            return;
-        }
-        self.bytes.fetch_sub(given, Ordering::Relaxed);
+        let held = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(given))
+            })
+            .expect("update always succeeds");
         if let Ok(be) = self.slot.backend() {
-            be.reserved.fetch_sub(given, Ordering::Relaxed);
+            be.give_room(given.min(held));
         }
     }
 }
@@ -654,8 +645,7 @@ impl DeviceReservation {
 impl Drop for DeviceReservation {
     fn drop(&mut self) {
         if let Ok(be) = self.slot.backend() {
-            be.reserved
-                .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            be.give_room(*self.bytes.get_mut());
         }
     }
 }
@@ -1003,22 +993,21 @@ pub fn window_high_water() -> u64 {
 /// it MUST NOT call `reserve` or `grow` — those would re-enter the allocator that
 /// called it and deadlock.
 ///
-/// It takes the asking backend's slot ([`BackendSlot::index`]) and frees only
-/// layers whose promise is that slot's: another card's layers give no room on
-/// this card.
-static EVICTOR: OnceLock<fn(u64, usize) -> u64> = OnceLock::new();
+/// The predicate selects which reservation owners can cover the deficit.
+type RetentionEvictor = fn(u64, &dyn Fn(usize) -> bool) -> u64;
+static EVICTOR: OnceLock<RetentionEvictor> = OnceLock::new();
 
 /// Install the retention evictor. Idempotent — only the first install sticks.
-pub fn set_retention_evictor(evictor: fn(u64, usize) -> u64) {
+pub fn set_retention_evictor(evictor: RetentionEvictor) {
     let _ = EVICTOR.set(evictor);
 }
 
-/// Ask the retention to give back at least `target` bytes of `slot`'s budget;
+/// Ask the retention to give back at least `target` bytes from eligible owners;
 /// returns how many it freed (0 if none is installed or nothing was
 /// reclaimable).
-fn try_evict_retained(target: u64, slot: usize) -> u64 {
+fn try_evict_retained(target: u64, eligible: impl Fn(usize) -> bool) -> u64 {
     match EVICTOR.get() {
-        Some(evict) => evict(target, slot),
+        Some(evict) => evict(target, &eligible),
         None => 0,
     }
 }
@@ -1112,11 +1101,31 @@ fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
     }
 }
 
+fn charge(held: &AtomicU64, limit: &AtomicU64, bytes: u64) -> std::result::Result<u64, u64> {
+    let mut current = held.load(Ordering::Relaxed);
+    loop {
+        let max = limit.load(Ordering::Relaxed);
+        let next = current.checked_add(bytes).ok_or(u64::MAX)?;
+        if next > max {
+            return Err(next - max);
+        }
+        match held.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(next),
+            Err(seen) => current = seen,
+        }
+    }
+}
+
+enum RoomDeficit {
+    Backend(u64),
+    Physical(u64),
+}
+
 impl Backend {
     /// The backend of the card at `ordinal`: its own context (the device's
     /// primary one), stream pools, staging, event pool, twiddle cache and
     /// ledger.
-    fn init_on(ordinal: usize) -> Result<Self> {
+    fn init_on(id: CardId, ordinal: usize, physical: Arc<PhysicalLedger>) -> Result<Self> {
         let ctx = CudaContext::new(ordinal)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
         // per alloc and serialises under the context lock. Cross-stream
@@ -1490,6 +1499,8 @@ impl Backend {
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
+            id,
+            physical,
             streams: crate::stream_class::StreamPools::new(streams, background),
             pinned_staging,
             pinned_hashes,
@@ -1527,6 +1538,13 @@ impl Backend {
     /// old budget back when it ends.
     pub fn set_vram_budget_bytes(&self, bytes: u64) -> u64 {
         self.vram_budget_bytes.swap(bytes, Ordering::Relaxed)
+    }
+
+    /// Temporarily move a shared physical ceiling. A unique backend is
+    /// governed by its own budget. Returns the previous shared ceiling.
+    pub fn set_alias_budget(&self, bytes: u64) -> Option<u64> {
+        let old = self.physical.limit.load(Ordering::Relaxed);
+        (old != u64::MAX).then(|| self.physical.limit.swap(bytes, Ordering::Relaxed))
     }
 
     /// Live `(free, total)` device memory in bytes, for diagnostics — the
@@ -1603,50 +1621,49 @@ impl Backend {
     /// [`Self::reserve`], asking the retention for spare bytes on a miss only
     /// when `evict`.
     fn reserve_with(&self, bytes: u64, evict: bool) -> Option<DeviceReservation> {
-        let mut evicted = !evict;
-        let mut held = self.reserved.load(Ordering::Relaxed);
-        loop {
-            if held.saturating_add(bytes) > self.vram_budget_bytes() {
-                // ★ Before giving up, ask the retention for spare bytes ONCE. The
-                // retention holds only genuinely-spare leaf layers and gives them
-                // back here, so a real caller (argue) is never displaced by a
-                // cache — the fix for wt16, where the retention won the shared
-                // budget and argue fell to the host. Bounded to one pass by
-                // `evicted`, so a persistent miss returns None (and the call
-                // site's `note_device_fallback` counts it) rather than spinning.
-                // A miss the layers cannot cover may keep them
-                // (`whir::keep_futile`): nothing is freed, and this returns None
-                // as it would after evicting them.
-                if !evicted {
-                    evicted = true;
-                    let deficit = held
-                        .saturating_add(bytes)
-                        .saturating_sub(self.vram_budget_bytes());
-                    if try_evict_retained(deficit, BackendSlot::of(self).index()) > 0 {
-                        held = self.reserved.load(Ordering::Relaxed);
-                        continue;
-                    }
-                }
-                return None;
-            }
-            match self.reserved.compare_exchange_weak(
-                held,
-                held + bytes,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Each card's ledger keeps its own peaks.
-                    let slot = BackendSlot::of(self);
-                    self.peaks.note(held + bytes);
-                    return Some(DeviceReservation {
-                        bytes: AtomicU64::new(bytes),
-                        slot,
-                    });
-                }
-                Err(seen) => held = seen,
-            }
+        let mut room = self.take_room(bytes);
+        if evict
+            && let Err(RoomDeficit::Backend(deficit)) = room
+            && try_evict_retained(deficit, |owner| owner == self.id.index()) != 0
+        {
+            room = self.take_room(bytes);
         }
+        if evict
+            && let Err(RoomDeficit::Physical(deficit)) = room
+            && try_evict_retained(deficit, |owner| {
+                card_set()
+                    .started(owner)
+                    .is_some_and(|backend| Arc::ptr_eq(&backend.physical, &self.physical))
+            }) != 0
+        {
+            room = self.take_room(bytes);
+        }
+        room.ok()?;
+        Some(DeviceReservation {
+            bytes: AtomicU64::new(bytes),
+            slot: self.id,
+        })
+    }
+
+    fn take_room(&self, bytes: u64) -> std::result::Result<(), RoomDeficit> {
+        // Check both the backend's share and the physical GPU's ceiling.
+        let total =
+            charge(&self.reserved, &self.vram_budget_bytes, bytes).map_err(RoomDeficit::Backend)?;
+        if self.physical.shared
+            && let Err(deficit) = charge(&self.physical.reserved, &self.physical.limit, bytes)
+        {
+            self.reserved.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(RoomDeficit::Physical(deficit));
+        }
+        self.peaks.note(total);
+        Ok(())
+    }
+
+    fn give_room(&self, bytes: u64) {
+        if self.physical.shared {
+            self.physical.reserved.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        self.reserved.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Bytes promised across every live reservation — what `reserve` checks
@@ -1760,6 +1777,7 @@ pub fn backend() -> Result<&'static Backend> {
         DeviceRole::Main => backend_once(),
         DeviceRole::Openings => openings_backend(),
         DeviceRole::Second => split_backend(),
+        DeviceRole::Card(id) => id.backend(),
     }
 }
 
@@ -1779,6 +1797,8 @@ pub enum DeviceRole {
     /// Phase B's second driver under the two-card split, every device call of
     /// its groups: card 1 ([`split_placement`]), card 0 otherwise.
     Second,
+    /// A worker bound to a specific initialized backend.
+    Card(CardId),
 }
 
 thread_local! {
@@ -1861,7 +1881,7 @@ pub const MAIN_PLACEMENT: RolePlacement = RolePlacement {
 pub fn placement_for(role: DeviceRole, setting: TwoCardOpenings, cards: usize) -> RolePlacement {
     match (role, setting, cards) {
         // The split's role is placed by its own knob ([`split_placement`]).
-        (DeviceRole::Main | DeviceRole::Second, _, _)
+        (DeviceRole::Main | DeviceRole::Second | DeviceRole::Card(_), _, _)
         | (_, TwoCardOpenings::Off, _)
         | (_, _, 0) => MAIN_PLACEMENT,
         (DeviceRole::Openings, TwoCardOpenings::Auto, 1) => MAIN_PLACEMENT,
@@ -1928,13 +1948,28 @@ pub fn card_count() -> usize {
     })
 }
 
+fn placement_card_count() -> usize {
+    match &card_set().configured {
+        Ok(Some(cards)) => cards.len(),
+        Ok(None) => card_count(),
+        Err(_) => 0,
+    }
+}
+
+fn configured_placement(mut placement: RolePlacement) -> RolePlacement {
+    if let Ok(Some(cards)) = &card_set().configured {
+        placement.ordinal = cards.get(placement.slot).copied().unwrap_or(cards[0]);
+    }
+    placement
+}
+
 /// Where the openings' device work runs in this process. Off, the driver is
 /// not asked for its cards.
 pub fn openings_placement() -> RolePlacement {
-    match two_card_openings_setting() {
+    configured_placement(match two_card_openings_setting() {
         TwoCardOpenings::Off => MAIN_PLACEMENT,
-        setting => placement_for(DeviceRole::Openings, setting, card_count()),
-    }
+        setting => placement_for(DeviceRole::Openings, setting, placement_card_count()),
+    })
 }
 
 /// Whether the openings run on a backend of their own (card 1, or forced).
@@ -1942,68 +1977,250 @@ pub fn two_card_openings() -> bool {
     openings_placement().slot != 0
 }
 
-static SECOND_BACKEND: OnceLock<Backend> = OnceLock::new();
-
-/// Which of the process's backends an object belongs to: card 0's
-/// ([`backend_once`]) or the second slot's ([`SECOND_BACKEND`]: the
-/// openings' own under the two-card openings, the second driver's under the
-/// split; one backend for both). What holds
-/// a backend's ledger bytes or pooled events keeps its slot, so it gives them
-/// back to that backend even when a thread in another role drops it.
+/// Stable process-local backend identity. Two IDs may refer to one CUDA ordinal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendSlot {
-    Main,
-    Second,
-}
+pub struct CardId(usize);
 
-impl BackendSlot {
-    /// The slot of `be`.
+impl CardId {
+    pub const MAIN: Self = Self(0);
+    pub const SECOND: Self = Self(1);
+
     pub fn of(be: &Backend) -> Self {
-        match SECOND_BACKEND.get() {
-            Some(o) if std::ptr::eq(o, be) => Self::Second,
-            _ => Self::Main,
-        }
+        be.id
     }
 
-    /// The backend of this slot.
-    pub fn backend(self) -> Result<&'static Backend> {
-        match self {
-            Self::Main => backend_once(),
-            Self::Second => SECOND_BACKEND.get().map_or_else(backend_once, Ok),
-        }
-    }
-}
-
-impl BackendSlot {
-    /// 0 for card 0's backend, 1 for the second.
     pub fn index(self) -> usize {
-        match self {
-            Self::Main => 0,
-            Self::Second => 1,
+        self.0
+    }
+
+    // Owners resolve through the registry even after the backend was quarantined.
+    fn backend(self) -> Result<&'static Backend> {
+        card_set()
+            .started(self.index())
+            .ok_or_else(crate::invalid_value)
+    }
+}
+
+struct PhysicalLedger {
+    shared: bool,
+    recursion: Mutex<()>,
+    limit: AtomicU64,
+    reserved: AtomicU64,
+}
+
+impl PhysicalLedger {
+    fn new(shared: bool) -> Self {
+        Self {
+            shared,
+            recursion: Mutex::new(()),
+            limit: AtomicU64::new(u64::MAX),
+            reserved: AtomicU64::new(0),
         }
     }
 }
 
-/// A value made once per backend (card 0's, the second's): kernels loaded in
-/// a backend's context and tables in its memory belong to that backend
-/// alone, so a cache of them is one per backend, never one per process.
-/// With one backend it is a single cell, as before.
-pub(crate) struct PerBackend<T>([OnceLock<T>; 2]);
+#[derive(Default)]
+struct CardEntry {
+    backend: OnceLock<Backend>,
+    failed: AtomicBool,
+    argue: OnceLock<Option<rayon::ThreadPool>>,
+    openings: OnceLock<Option<rayon::ThreadPool>>,
+}
+
+/// Ordered local topology. The index in `LAMBDA_VM_CARDS` is a logical card
+/// ID. Values are CUDA-visible ordinals. Repeated ordinals require
+/// `LAMBDA_VM_CARD_ALIASES=1` and share one physical ledger.
+pub struct CardSet {
+    configured: std::result::Result<Option<Vec<usize>>, String>,
+    entries: Box<[CardEntry]>,
+    physical: Mutex<std::collections::BTreeMap<usize, Arc<PhysicalLedger>>>,
+    init: Mutex<()>,
+}
+
+fn parse_cards(
+    word: Option<&str>,
+    aliases: bool,
+) -> std::result::Result<Option<Vec<usize>>, String> {
+    let Some(word) = word else { return Ok(None) };
+    let mut cards = Vec::new();
+    for entry in word.split(',') {
+        let ordinal = entry
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("LAMBDA_VM_CARDS: invalid CUDA ordinal {entry:?}"))?;
+        if cards.contains(&ordinal) && !aliases {
+            return Err(
+                "LAMBDA_VM_CARDS: repeated ordinals require LAMBDA_VM_CARD_ALIASES=1".into(),
+            );
+        }
+        cards.push(ordinal);
+    }
+    if cards.len() > MAX_LOGICAL_CARDS {
+        return Err("LAMBDA_VM_CARDS: at most 256 logical cards".into());
+    }
+    Ok(Some(cards))
+}
+
+pub fn card_set() -> &'static CardSet {
+    static CARDS: OnceLock<CardSet> = OnceLock::new();
+    CARDS.get_or_init(|| {
+        let configured = match std::env::var("LAMBDA_VM_CARDS") {
+            Ok(word) => parse_cards(
+                Some(&word),
+                std::env::var("LAMBDA_VM_CARD_ALIASES").as_deref() == Ok("1"),
+            ),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(format!("LAMBDA_VM_CARDS: {e}")),
+        };
+        if let Err(error) = &configured {
+            eprintln!("{error}");
+        }
+        let count = configured
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(2, |cards| cards.len().max(2));
+        CardSet {
+            configured,
+            entries: (0..count).map(|_| CardEntry::default()).collect(),
+            physical: Mutex::new(std::collections::BTreeMap::new()),
+            init: Mutex::new(()),
+        }
+    })
+}
+
+impl CardSet {
+    fn entry(&self, id: CardId) -> &CardEntry {
+        &self.entries[id.index()]
+    }
+
+    /// Whether a card list was supplied.
+    pub fn has_explicit_cards(&self) -> bool {
+        !matches!(self.configured, Ok(None))
+    }
+
+    /// Explicit topology for a new phase, excluding quarantined workers.
+    pub fn configured_indices(&self) -> std::result::Result<Option<Vec<usize>>, String> {
+        let cards = self.configured.as_ref().map_err(Clone::clone)?;
+        Ok(cards.as_ref().map(|cards| {
+            (0..cards.len())
+                .filter(|&i| !self.entry(CardId(i)).failed.load(Ordering::Relaxed))
+                .collect()
+        }))
+    }
+
+    /// Initialized backends, including quarantined owners with pending frees.
+    pub fn started_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| entry.backend.get().map(|_| i))
+            .collect()
+    }
+
+    pub fn started(&self, index: usize) -> Option<&Backend> {
+        self.entries.get(index)?.backend.get()
+    }
+
+    /// One lease per participating physical GPU, locked by CUDA ordinal.
+    pub fn recursion_leases(
+        &'static self,
+        indices: &[usize],
+    ) -> Vec<std::sync::MutexGuard<'static, ()>> {
+        let devices: std::collections::BTreeMap<_, _> = indices
+            .iter()
+            .map(|&index| {
+                let backend = self.started(index).expect("recursion backend is ready");
+                (backend.ordinal(), &backend.physical.recursion)
+            })
+            .collect();
+        devices
+            .into_values()
+            .map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect()
+    }
+
+    fn start(&'static self, id: CardId, legacy_ordinal: usize) -> Result<&'static Backend> {
+        let entry = self.entry(id);
+        if let Some(be) = entry.backend.get() {
+            return Ok(be);
+        }
+        let _init = self.init.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(be) = entry.backend.get() {
+            return Ok(be);
+        }
+        let configured = self
+            .configured
+            .as_ref()
+            .map_err(|_| crate::invalid_value())?;
+        let ordinal = configured
+            .as_ref()
+            .and_then(|cards| cards.get(id.index()).or_else(|| cards.first()))
+            .copied()
+            .unwrap_or(legacy_ordinal);
+        let aliases = configured
+            .as_ref()
+            .is_some_and(|cards| cards.iter().filter(|&&o| o == ordinal).count() > 1);
+        let physical = self
+            .physical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ordinal)
+            .or_insert_with(|| Arc::new(PhysicalLedger::new(aliases)))
+            .clone();
+        let be = Backend::init_on(id, ordinal, physical)?;
+        if aliases {
+            // Explicit aliases can use a peer's idle room, up to the same
+            // physical ceiling. The legacy forced slot keeps its fixed half.
+            be.physical
+                .limit
+                .fetch_min(be.vram_budget_bytes(), Ordering::Relaxed);
+        } else if id == CardId::SECOND
+            && let Some(main) = self.entry(CardId::MAIN).backend.get()
+            && main.ordinal() == ordinal
+        {
+            // The legacy forced second lane appears after the main backend.
+            let whole = main.vram_budget_bytes();
+            main.set_vram_budget_bytes(whole / 2);
+            be.set_vram_budget_bytes(be.vram_budget_bytes().min(whole / 2));
+            eprintln!(
+                "[gpu] two backends on card {ordinal}: each ledger's budget halved to {:.2} GiB",
+                (whole / 2) as f64 / (1u64 << 30) as f64
+            );
+        }
+        // The initialization lock serializes writers to this cell.
+        Ok(entry.backend.get_or_init(|| be))
+    }
+}
+
+/// One stable cell per backend, including aliases of the same physical card.
+pub(crate) struct PerBackend<T>(OnceLock<Box<[OnceLock<T>]>>);
 
 impl<T> PerBackend<T> {
     pub(crate) const fn new() -> Self {
-        Self([OnceLock::new(), OnceLock::new()])
+        Self(OnceLock::new())
     }
 
-    /// The cell of `be`.
+    pub(crate) fn cell(&self, index: usize) -> &OnceLock<T> {
+        &self.0.get_or_init(|| {
+            (0..card_set().entries.len())
+                .map(|_| OnceLock::new())
+                .collect()
+        })[index]
+    }
+
     pub(crate) fn of(&self, be: &Backend) -> &OnceLock<T> {
-        &self.0[BackendSlot::of(be).index()]
+        self.cell(be.id.index())
     }
 
-    /// The cell of this thread's backend ([`backend`]).
     pub(crate) fn current(&self) -> Result<&OnceLock<T>> {
         Ok(self.of(backend()?))
     }
+}
+
+/// Number of backend slots, including the legacy secondary slot.
+pub(crate) fn backend_slots() -> usize {
+    card_set().entries.len()
 }
 
 /// The openings' backend: card 0's under [`MAIN_PLACEMENT`], else the second
@@ -2027,10 +2244,6 @@ enum Asker {
     Levels,
 }
 
-/// Set once the second slot's backend failed to start, or a prove marked it
-/// failed ([`mark_second_failed`]): every later call is card 0's.
-static SECOND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// The second slot's backend, on `placement`'s card, made on first use: the
 /// one backend of that slot, whichever of the two-card openings or the split
 /// asks first (both place it on card 1 with two cards, on card 0 forced with
@@ -2041,18 +2254,23 @@ fn second_backend(placement: RolePlacement, asker: Asker) -> Result<&'static Bac
     // card 0's, as without a second backend.
     let main = backend_once()?;
     // Failed (at its start, or later: `mark_second_failed`): card 0's.
-    if SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+    let cards = card_set();
+    let entry = cards.entry(CardId::SECOND);
+    if entry.failed.load(Ordering::Relaxed) {
         return Ok(main);
     }
-    if let Some(b) = SECOND_BACKEND.get() {
+    if let Some(b) = entry.backend.get() {
         return Ok(b);
     }
-    static INIT: Mutex<()> = Mutex::new(());
-    let _init = INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(b) = SECOND_BACKEND.get() {
+    static LEGACY_SECOND_INIT: Mutex<()> = Mutex::new(());
+    let _init = LEGACY_SECOND_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if entry.failed.load(Ordering::Relaxed) {
+        return Ok(main);
+    }
+    if let Some(b) = entry.backend.get() {
         return Ok(b);
     }
-    match Backend::init_on(placement.ordinal) {
+    match cards.start(CardId::SECOND, placement.ordinal) {
         Ok(b) => {
             match asker {
                 Asker::Openings => eprintln!(
@@ -2074,26 +2292,10 @@ fn second_backend(placement: RolePlacement, asker: Asker) -> Result<&'static Bac
                     card_count()
                 ),
             }
-            // Two backends on one card (forced, one card): two full ledgers
-            // would promise the card twice, so each gets half.
-            if placement.ordinal == main.ordinal() {
-                let half = main.vram_budget_bytes() / 2;
-                main.set_vram_budget_bytes(half);
-                b.set_vram_budget_bytes(b.vram_budget_bytes().min(half));
-                eprintln!(
-                    "[gpu] two backends on card {}: each ledger's budget halved to {:.2} GiB",
-                    placement.ordinal,
-                    half as f64 / (1u64 << 30) as f64
-                );
-            }
-            let _ = SECOND_BACKEND.set(b);
-            match SECOND_BACKEND.get() {
-                Some(b) => Ok(b),
-                None => Ok(main),
-            }
+            Ok(b)
         }
         Err(e) => {
-            SECOND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            entry.failed.store(true, Ordering::Relaxed);
             match asker {
                 Asker::Openings => eprintln!(
                     "[gpu] two-card openings: card {}'s backend did not start ({e}); the openings stay on card 0",
@@ -2122,9 +2324,12 @@ static OPENINGS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 /// 0's) and their pool built. A counter of groups opened there reads it after
 /// the openings ran, so a fallback to card 0 is not counted.
 pub fn openings_on_own_backend() -> bool {
-    !SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+    !card_set()
+        .entry(CardId::SECOND)
+        .failed
+        .load(Ordering::Relaxed)
         && two_card_openings()
-        && SECOND_BACKEND.get().is_some()
+        && card_set().entry(CardId::SECOND).backend.get().is_some()
         && OPENINGS_POOL.get().is_some_and(Option::is_some)
 }
 
@@ -2323,10 +2528,12 @@ pub fn split_knob_places(setting: TwoCardSplit, cards: usize) -> bool {
 /// the levels' ([`second_driver_setting_for`]). Both off, the driver is not
 /// asked for its cards.
 pub fn split_placement() -> RolePlacement {
-    match second_driver_setting_for(two_card_split_setting(), two_card_levels_setting()) {
-        TwoCardSplit::Off => MAIN_PLACEMENT,
-        setting => split_placement_for(setting, card_count()),
-    }
+    configured_placement(
+        match second_driver_setting_for(two_card_split_setting(), two_card_levels_setting()) {
+            TwoCardSplit::Off => MAIN_PLACEMENT,
+            setting => split_placement_for(setting, placement_card_count()),
+        },
+    )
 }
 
 /// Whether the base's split is on in this process (its knob places a second
@@ -2334,7 +2541,7 @@ pub fn split_placement() -> RolePlacement {
 pub fn two_card_split() -> bool {
     match two_card_split_setting() {
         TwoCardSplit::Off => false,
-        setting => split_knob_places(setting, card_count()),
+        setting => split_knob_places(setting, placement_card_count()),
     }
 }
 
@@ -2343,7 +2550,7 @@ pub fn two_card_split() -> bool {
 pub fn two_card_levels() -> bool {
     match two_card_levels_setting() {
         TwoCardSplit::Off => false,
-        setting => split_knob_places(setting, card_count()),
+        setting => split_knob_places(setting, placement_card_count()),
     }
 }
 
@@ -2362,56 +2569,104 @@ fn split_backend() -> Result<&'static Backend> {
         _ => Asker::Split,
     };
     let be = second_backend(placement, asker)?;
-    if BackendSlot::of(be) == BackendSlot::Second {
+    if CardId::of(be) == CardId::SECOND {
         Ok(be)
     } else {
         Err(crate::invalid_value())
     }
 }
 
-/// The split's second driver's rayon pool (its argue), and its openings' own
-/// pool, once made; `None` inside when one could not be built.
-static SECOND_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-static SECOND_OPENINGS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-
-/// A pool whose workers are all [`DeviceRole::Second`] (background-class
-/// stream draws when `background`, as phase B's openings take them), as many
-/// as the global pool's and at least two.
-fn second_role_pool(
-    cell: &'static OnceLock<Option<rayon::ThreadPool>>,
-    name: &'static str,
-    background: bool,
-) -> Option<&'static rayon::ThreadPool> {
+fn lane_pool(id: CardId, opening: bool) -> Option<&'static rayon::ThreadPool> {
+    let cards = card_set();
+    let entry = cards.entry(id);
+    let cell = if opening {
+        &entry.openings
+    } else {
+        &entry.argue
+    };
     cell.get_or_init(|| {
+        let explicit = cards.configured.as_ref().ok().and_then(Option::as_ref);
+        let width = explicit.map_or_else(
+            || rayon::current_num_threads().max(2),
+            |cards| (rayon::current_num_threads() / cards.len()).max(1),
+        );
+        let role = if explicit.is_some() {
+            DeviceRole::Card(id)
+        } else {
+            DeviceRole::Second
+        };
         rayon::ThreadPoolBuilder::new()
-            .num_threads(rayon::current_num_threads().max(2))
-            .thread_name(move |i| format!("{name}-{i}"))
+            .num_threads(width)
+            .thread_name(move |i| {
+                format!(
+                    "card-{}-{}-{i}",
+                    id.index(),
+                    if opening { "open" } else { "argue" }
+                )
+            })
             .start_handler(move |_| {
-                set_thread_role(DeviceRole::Second);
-                if background {
+                set_thread_role(role);
+                if opening {
                     std::mem::forget(crate::stream_class::enter(
                         crate::stream_class::StreamClass::Background,
                     ));
                 }
             })
             .build()
-            .map_err(|e| eprintln!("[gpu] two-card split: no {name} pool ({e}); no split"))
+            .map_err(|e| eprintln!("[gpu] card {}: cannot build worker pool ({e})", id.index()))
             .ok()
     })
     .as_ref()
 }
 
-/// The second driver's pool: every parallel iterator of its argue draws the
-/// second backend.
-fn second_pool() -> Option<&'static rayon::ThreadPool> {
-    second_role_pool(&SECOND_POOL, "second-card", false)
+/// Initialize an explicit card and both pools before assigning work to it.
+pub fn indexed_card_ready(index: usize) -> bool {
+    let id = CardId(index);
+    let cards = card_set();
+    if cards
+        .configured
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .is_none_or(|ordinals| index >= ordinals.len())
+        || cards.entry(id).failed.load(Ordering::Relaxed)
+    {
+        return false;
+    }
+    cards.start(id, index).is_ok()
+        && lane_pool(id, false).is_some()
+        && lane_pool(id, true).is_some()
 }
 
-/// The second driver's openings' pool, apart from its argue's: an opening
-/// installed whole into the argue's pool could be run nested inside a worker
-/// waiting in the argue's join, and the argue would wait for all of it.
-fn second_openings_pool() -> Option<&'static rayon::ThreadPool> {
-    second_role_pool(&SECOND_OPENINGS_POOL, "second-open", true)
+/// Run bound to an already initialized card. Used by plain upload threads.
+pub fn in_indexed_card<R>(index: usize, f: impl FnOnce() -> R) -> R {
+    let _role = enter_role(DeviceRole::Card(CardId(index)));
+    f()
+}
+
+/// Run on the already prepared, card-bound argument or opening pool.
+pub fn on_indexed_card<R: Send>(index: usize, opening: bool, f: impl FnOnce() -> R + Send) -> R {
+    let entry = card_set().entry(CardId(index));
+    let cell = if opening {
+        &entry.openings
+    } else {
+        &entry.argue
+    };
+    cell.get()
+        .and_then(Option::as_ref)
+        .expect("indexed card pool initialized before dispatch")
+        .install(f)
+}
+
+/// Quarantine a failed worker for later placement. Its owners may still drop.
+pub fn mark_indexed_card_failed(index: usize, why: &str) {
+    if !card_set()
+        .entry(CardId(index))
+        .failed
+        .swap(true, Ordering::Relaxed)
+    {
+        eprintln!("[gpu] card {index}: marked failed ({why})");
+    }
 }
 
 /// The second card failed mid-prove (its phase-B driver returned a device
@@ -2419,7 +2674,11 @@ fn second_openings_pool() -> Option<&'static rayon::ThreadPool> {
 /// process (the second slot resolves to card 0's backend, or to none under
 /// [`DeviceRole::Second`]), so later proves use one card.
 pub fn mark_second_failed(why: &str) {
-    if !SECOND_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if !card_set()
+        .entry(CardId::SECOND)
+        .failed
+        .swap(true, Ordering::Relaxed)
+    {
         eprintln!(
             "[gpu] two-card: the second card is marked failed ({why}); every later prove uses card 0"
         );
@@ -2439,9 +2698,9 @@ pub fn two_card_split_ready() -> bool {
     let Ok(be) = split_backend() else {
         return false;
     };
-    BackendSlot::of(be) == BackendSlot::Second
-        && second_pool().is_some()
-        && second_openings_pool().is_some()
+    CardId::of(be) == CardId::SECOND
+        && lane_pool(CardId::SECOND, false).is_some()
+        && lane_pool(CardId::SECOND, true).is_some()
 }
 
 /// The second driver's backend when it was made and started on its own (not
@@ -2449,10 +2708,14 @@ pub fn two_card_split_ready() -> bool {
 /// budget of beside card 0's ([`Backend::set_vram_budget_bytes`]). Never
 /// makes it.
 pub fn second_backend_started() -> Option<&'static Backend> {
-    if SECOND_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+    if card_set()
+        .entry(CardId::SECOND)
+        .failed
+        .load(Ordering::Relaxed)
+    {
         return None;
     }
-    SECOND_BACKEND.get()
+    card_set().entry(CardId::SECOND).backend.get()
 }
 
 /// Whether the second driver's backend shares card 0 with the main one
@@ -2460,7 +2723,11 @@ pub fn second_backend_started() -> Option<&'static Backend> {
 pub fn second_backend_on_card_0() -> bool {
     match (
         second_backend_started(),
-        SECOND_BACKEND.get().and(backend_once().ok()),
+        card_set()
+            .entry(CardId::SECOND)
+            .backend
+            .get()
+            .and(backend_once().ok()),
     ) {
         (Some(second), Some(main)) => second.ordinal() == main.ordinal(),
         _ => false,
@@ -2472,7 +2739,12 @@ pub fn second_backend_on_card_0() -> bool {
 /// workers). Without the pool (the split not ready) it is `f()` here; callers
 /// check [`two_card_split_ready`] first.
 pub fn on_second_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    match SECOND_POOL.get().and_then(Option::as_ref) {
+    match card_set()
+        .entry(CardId::SECOND)
+        .argue
+        .get()
+        .and_then(Option::as_ref)
+    {
         Some(pool) => pool.install(f),
         None => f(),
     }
@@ -2481,7 +2753,12 @@ pub fn on_second_card<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// Runs `f` as the second driver's openings: inside their own pool, in
 /// [`DeviceRole::Second`]; `f()` here without it ([`on_second_card`]).
 pub fn on_second_card_openings<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    match SECOND_OPENINGS_POOL.get().and_then(Option::as_ref) {
+    match card_set()
+        .entry(CardId::SECOND)
+        .openings
+        .get()
+        .and_then(Option::as_ref)
+    {
         Some(pool) => pool.install(f),
         None => f(),
     }
@@ -2516,14 +2793,11 @@ pub fn set_up_backend() {
     }
 }
 
-/// The backend once [`backend_once`] has made it.
-static BACKEND: OnceLock<Backend> = OnceLock::new();
-
 /// The backend if it is already up, without making it or waiting for it: for
 /// a caller that must not hold up its thread on the initialisation (the pinned
 /// arena, which starts page-locking once the context exists).
 pub fn backend_if_ready() -> Option<&'static Backend> {
-    BACKEND.get()
+    card_set().entry(CardId::MAIN).backend.get()
 }
 
 /// Card 0's backend by name, whatever this thread's role: for what belongs to
@@ -2533,52 +2807,28 @@ pub fn main_backend() -> Result<&'static Backend> {
     backend_once()
 }
 
-/// The slot of this thread's backend: 0 under [`DeviceRole::Main`], without a
-/// second backend, or without a card; 1 when this thread works for the second.
+/// The slot of this thread's backend. The legacy main role and a fallback
+/// to the main backend use slot zero.
 pub fn current_slot() -> usize {
     match current_role() {
         DeviceRole::Main => 0,
-        // This thread's backend first: on a thread's first device call in the
-        // second role it is what makes the second backend.
-        _ => match backend() {
-            Ok(be) => usize::from(BackendSlot::of(be) == BackendSlot::Second),
-            Err(_) => 0,
-        },
+        DeviceRole::Card(id) => id.index(),
+        _ => backend().map_or(0, |be| be.id.index()),
     }
 }
 
 /// [`backend`] without the entry count.
 fn backend_once() -> Result<&'static Backend> {
-    static INIT: Mutex<()> = Mutex::new(());
-    if let Some(b) = BACKEND.get() {
-        return Ok(b);
-    }
-    let _init = INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(b) = BACKEND.get() {
-        return Ok(b);
-    }
-    let b = match Backend::init_on(0) {
-        Ok(b) => b,
-        Err(e) => {
-            // Backend init failing means every GPU entry point silently falls
-            // back to CPU. That is expected on a GPU-less host, but it also
-            // fires when the AOT cubins won't load — most often a build-host vs
-            // run-host GPU-arch mismatch (cubins are compiled for the detected
-            // `sm_XX`) or an empty nvcc-less stub. Warn once so the fallback is
-            // never silent: rebuild on the run host, or set `CUDARC_NVCC_ARCH`.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!(
-                    "math-cuda: GPU backend unavailable ({e}) — running on CPU. \
-                     If a GPU is present this is likely a kernel-cubin arch mismatch; \
-                     rebuild on the run host or set CUDARC_NVCC_ARCH to its sm_XX."
-                );
-            });
-            return Err(e);
-        }
-    };
-    let _ = BACKEND.set(b);
-    Ok(BACKEND.get().expect("backend just initialised"))
+    card_set().start(CardId::MAIN, 0).inspect_err(|e| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "math-cuda: GPU backend unavailable ({e}) — running on CPU. \
+                 If a GPU is present this is likely a kernel-cubin arch mismatch; \
+                 rebuild on the run host or set CUDARC_NVCC_ARCH to its sm_XX."
+            );
+        });
+    })
 }
 
 // ── Asynchronous D2H through the pinned staging slabs ────────────────────────
@@ -3589,7 +3839,7 @@ impl PendingD2H<'_> {
 pub struct PooledEvent {
     event: Option<cudarc::driver::CudaEvent>,
     /// The backend whose pool (and context) the event belongs to.
-    slot: BackendSlot,
+    slot: CardId,
 }
 
 impl PooledEvent {
@@ -3616,7 +3866,7 @@ impl Backend {
         };
         Ok(PooledEvent {
             event: Some(ev),
-            slot: BackendSlot::of(self),
+            slot: CardId::of(self),
         })
     }
 }
@@ -3905,7 +4155,7 @@ mod two_card_openings_tests {
     #[test]
     #[ignore = "card: run alone"]
     fn each_backend_keeps_its_own_kernels_tables_and_ledger() {
-        use super::{BackendSlot, backend, main_backend, reserve};
+        use super::{CardId, backend, main_backend, reserve};
         let setting = if super::card_count() >= 2 {
             TwoCardOpenings::Auto
         } else {
@@ -3918,7 +4168,7 @@ mod two_card_openings_tests {
             backend().expect("the second backend")
         };
         assert!(!std::ptr::eq(main, second), "two backends");
-        assert_eq!(BackendSlot::of(second), BackendSlot::Second);
+        assert_eq!(CardId::of(second), CardId::SECOND);
         let k0 = crate::blake3_whir::kernels().expect("card 0's kernels") as *const _;
         let k1 = {
             let _role = enter_role(DeviceRole::Openings);
@@ -4051,7 +4301,7 @@ mod device_state_scan_tests {
     }
 
     /// A process-wide static holding device objects keeps them per backend:
-    /// a `PerBackend` cell, an array of one per backend slot, or (listed here,
+    /// a `PerBackend` cell or (listed here,
     /// with why) a pool whose objects record their own context.
     #[test]
     fn no_device_object_in_a_process_wide_static() {
@@ -4064,9 +4314,8 @@ mod device_state_scan_tests {
                 if !DEVICE_TYPES.iter().any(|w| names_a_word(&ty, w)) {
                     continue;
                 }
-                let per_backend = ty.starts_with("crate::device::PerBackend<")
-                    || ty.starts_with("PerBackend<")
-                    || (ty.starts_with('[') && ty.ends_with("; 2]"));
+                let per_backend =
+                    ty.starts_with("crate::device::PerBackend<") || ty.starts_with("PerBackend<");
                 if per_backend || RECORD_THEIR_OWNER.contains(&(file.as_str(), name.as_str())) {
                     continue;
                 }
@@ -4114,23 +4363,22 @@ mod device_state_scan_tests {
     /// knob readings, the card count, the backends themselves, pools of host
     /// threads, host function pointers). A new one fails here until a person
     /// has read it and added it, per the rule.
-    const ONCE_CELLS: [(&str, &str); 39] = [
+    const ONCE_CELLS: &[(&str, &str)] = &[
         ("argue_fused.rs", "ON"),
         ("blake3_whir.rs", "KERNELS"),
         ("card_rows.rs", "BYTES"),
+        ("card_rows.rs", "CACHE"),
         ("card_rows.rs", "COUNTERS"),
         ("card_rows.rs", "FROM_ENV"),
         ("card_rows.rs", "MODULE"),
         ("columns.rs", "ON"),
-        ("device.rs", "BACKEND"),
         ("device.rs", "CACHED"),
+        ("device.rs", "CACHE"),
+        ("device.rs", "CARDS"),
         ("device.rs", "COUNT"),
         ("device.rs", "EVICTOR"),
         ("device.rs", "OPENINGS_POOL"),
-        ("device.rs", "SECOND_BACKEND"),
         // The split's two pools of host threads, and its knob's reading.
-        ("device.rs", "SECOND_OPENINGS_POOL"),
-        ("device.rs", "SECOND_POOL"),
         ("device.rs", "SETTING"),
         ("device.rs", "SETTING"),
         // The levels' split knob's reading: a process-wide setting like the
@@ -4153,6 +4401,8 @@ mod device_state_scan_tests {
         ("pinned.rs", "ARENAS_MADE"),
         ("pinned.rs", "ONCE"),
         ("pinned.rs", "POOL_GIB"),
+        ("round_slot.rs", "FREE"),
+        ("round_slot.rs", "PAGES"),
         ("stream_class.rs", "SETTING"),
         ("whir.rs", "ENABLED"),
         ("whir.rs", "INSTALLED"),
@@ -4411,7 +4661,7 @@ mod two_card_split_tests {
     #[test]
     #[ignore = "card: run alone"]
     fn a_reservation_in_the_second_role_is_the_second_backends() {
-        use super::{BackendSlot, SECOND_BACKEND, backend, backend_once, enter_role, reserve};
+        use super::{CardId, backend, backend_once, card_set, enter_role, reserve};
         let setting = if super::card_count() >= 2 {
             TwoCardSplit::Auto
         } else {
@@ -4420,17 +4670,18 @@ mod two_card_split_tests {
         set_two_card_split_for_test(Some(setting));
         assert!(two_card_split_ready(), "the split is ready on this box");
         let main = backend_once().expect("card 0");
-        let second = SECOND_BACKEND.get().expect("the second backend");
+        let second = card_set()
+            .entry(CardId::SECOND)
+            .backend
+            .get()
+            .expect("the second backend");
         assert!(!std::ptr::eq(main, second), "two backends");
         let held = |be: &super::Backend| be.reserved_bytes();
         let (m0, s0) = (held(main), held(second));
         const MIB: u64 = 1 << 20;
         let r = std::thread::spawn(|| {
             let _role = enter_role(DeviceRole::Second);
-            assert_eq!(
-                BackendSlot::of(backend().expect("backend")),
-                BackendSlot::Second
-            );
+            assert_eq!(CardId::of(backend().expect("backend")), CardId::SECOND);
             reserve(MIB)
         })
         .join()
@@ -4465,5 +4716,65 @@ mod two_card_split_tests {
         drop((r, o));
         assert_eq!((held(main), held(second)), (m0, s0));
         set_two_card_split_for_test(None);
+    }
+}
+
+#[cfg(test)]
+mod indexed_card_tests {
+    use super::*;
+
+    #[test]
+    fn card_list_preserves_order_and_requires_alias_opt_in() {
+        assert_eq!(parse_cards(None, false), Ok(None));
+        assert_eq!(parse_cards(Some("2, 0,1"), false), Ok(Some(vec![2, 0, 1])));
+        assert_eq!(parse_cards(Some("0,0,0,0"), true), Ok(Some(vec![0; 4])));
+        for invalid in ["", "0,", "0,0", "-1", "0,gpu"] {
+            assert!(parse_cards(Some(invalid), false).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    #[ignore = "card: four aliases of CUDA ordinal zero, physical budget 4 MiB"]
+    fn indexed_alias_owner_and_physical_admission() {
+        const MIB: u64 = 1 << 20;
+        static CACHE: PerBackend<usize> = PerBackend::new();
+        let registry = card_set();
+        let ids = registry.configured_indices().unwrap().unwrap();
+        assert_eq!(ids, [0, 1, 2, 3]);
+        for &id in &ids {
+            assert!(indexed_card_ready(id));
+        }
+        let backends: Vec<_> = ids
+            .iter()
+            .map(|&id| registry.started(id).unwrap())
+            .collect();
+        let physical = &backends[0].physical;
+        assert_eq!(physical.limit.load(Ordering::Relaxed), 4 * MIB);
+        assert_eq!(registry.recursion_leases(&ids).len(), 1);
+        for (id, be) in backends.iter().enumerate() {
+            assert_eq!(be.ordinal(), 0);
+            assert!(Arc::ptr_eq(physical, &be.physical));
+            assert_eq!(be.vram_budget_bytes(), 4 * MIB);
+            assert!(be.reserve(4 * MIB + 1).is_none());
+            on_indexed_card(id, id % 2 == 0, || {
+                assert_eq!(CardId::of(backend().unwrap()).index(), id);
+                assert_eq!(*CACHE.current().unwrap().get_or_init(|| id), id);
+            });
+        }
+        let owner = backends[3];
+        let events = owner.event_pool.lock().unwrap().len();
+        let event = owner.take_event().unwrap();
+        assert_eq!(owner.event_pool.lock().unwrap().len(), events - 1);
+        let promise = owner.reserve(3 * MIB).unwrap();
+        let peer = backends[0].reserve(MIB).unwrap();
+        assert!(backends[1].reserve(1).is_none());
+        assert!(!promise.grow(1));
+        on_indexed_card(2, true, move || drop((event, promise)));
+        assert_eq!(owner.reserved_bytes(), 0);
+        assert_eq!(owner.event_pool.lock().unwrap().len(), events);
+        assert_eq!(backends[0].reserved_bytes(), MIB);
+        assert!(backends[1].reserve(3 * MIB).is_some());
+        drop(peer);
+        assert_eq!(physical.reserved.load(Ordering::Relaxed), 0);
     }
 }

@@ -671,7 +671,10 @@ enum After {
         state: Arc<MemoryState>,
     },
     /// Record mode: the next window's starting registers.
-    NextHistory { registers: RegisterState },
+    NextHistory {
+        registers: RegisterState,
+    },
+    RangeEnd,
 }
 
 impl WindowWalker {
@@ -702,6 +705,7 @@ impl WindowWalker {
             }
             After::Finish { registers, .. } => self.check_registers(job, &registers)?,
             After::NextHistory { registers } => self.check_registers(job, &registers)?,
+            After::RangeEnd => {}
         }
         busy += t.elapsed().as_secs_f64();
         Ok((walked, busy, boundary))
@@ -826,7 +830,7 @@ pub fn walk_windows<W: Into<ExecWindow> + Send>(
     walkers: usize,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
-    walk_numbered(builder, windows, walkers, |k| k, None, absorb)
+    walk_numbered(builder, windows, walkers, |k| k, None, None, absorb)
 }
 
 /// [`walk_windows`] (`record` `None`) or [`walk_windows_from_history`]
@@ -836,9 +840,10 @@ pub fn walk_windows_with<W: Into<ExecWindow> + Send>(
     windows: Receiver<W>,
     walkers: usize,
     record: Option<usize>,
+    range: Option<bool>,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
-    walk_numbered(builder, windows, walkers, |k| k, record, absorb)
+    walk_numbered(builder, windows, walkers, |k| k, record, range, absorb)
 }
 
 /// [`walk_windows`] in record mode: each window comes with the executor's
@@ -859,7 +864,15 @@ pub fn walk_windows_from_history<W: Into<ExecWindow> + Send>(
     recheck: usize,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
-    walk_numbered(builder, windows, walkers, |k| k, Some(recheck), absorb)
+    walk_numbered(
+        builder,
+        windows,
+        walkers,
+        |k| k,
+        Some(recheck),
+        None,
+        absorb,
+    )
 }
 
 /// [`walk_windows`], each job numbered `number(k)` for the run's window `k`:
@@ -870,6 +883,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     walkers: usize,
     number: fn(u32) -> u32,
     record: Option<usize>,
+    range: Option<bool>,
     mut absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
     assert!(walkers >= 1, "walk_windows needs a walker");
@@ -956,6 +970,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     job_tx,
                     permit_tx,
                     base,
+                    range,
                 ),
                 None => pass_thread(
                     decode,
@@ -1309,6 +1324,7 @@ fn record_thread<W: Into<ExecWindow>>(
     jobs: SyncSender<Ticket>,
     permits: SyncSender<()>,
     mut base: Option<MemoryState>,
+    range: Option<bool>,
 ) -> Result<PassEnd, Error> {
     fn stopped<T>(_: T) -> Error {
         Error::Prover(WALKERS_STOPPED.into())
@@ -1344,6 +1360,9 @@ fn record_thread<W: Into<ExecWindow>>(
         } else {
             history.extras.len() == logs.len()
         };
+        if k == 0 && range.is_some() {
+            first = history.first as usize;
+        }
         if history.first != first as u64 || !paired {
             return Err(Error::Prover(format!(
                 "record mode: window {k}'s history covers {cycles} cycles from {} (lean: {}), its \
@@ -1359,6 +1378,7 @@ fn record_thread<W: Into<ExecWindow>>(
             ))
         })?);
         if k == 0
+            && first == 0
             && (registers.regs != start_registers.regs
                 || registers.index_register != start_registers.index_register
                 || registers.pc_register != start_registers.pc_register)
@@ -1455,6 +1475,18 @@ fn record_thread<W: Into<ExecWindow>>(
         k += 1;
     }
     drop(jobs);
+    let last = if range == Some(false) {
+        if let Some(after) = waiting {
+            let _ = after.send(After::RangeEnd);
+        }
+        Some((
+            Arc::new(Vec::new()),
+            Arc::new(MemoryState::new()),
+            start_registers.clone(),
+        ))
+    } else {
+        last
+    };
     let Some((last, state, registers)) = last else {
         return Err(if sent {
             Error::Prover("the executor stopped before the run halted".into())

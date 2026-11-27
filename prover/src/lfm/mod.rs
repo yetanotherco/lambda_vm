@@ -30,6 +30,9 @@ pub mod builder;
 pub(crate) mod chip_records;
 pub mod chips;
 pub mod chunking;
+/// Opt-in, range-owned block levels and their file verifier.
+#[cfg(feature = "parallel")]
+pub mod cluster_levels;
 pub mod commit;
 pub mod compiler;
 /// The block's compression step: one W-LFM proof of the top's verification.

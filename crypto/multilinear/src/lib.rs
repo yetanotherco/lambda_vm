@@ -105,6 +105,8 @@ pub fn challenge_powers<F: IsField>(gamma: &FieldElement<F>, count: usize) -> Ve
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
+    #[error("in-process cluster protocol: {0}")]
+    ClusterProtocol(&'static str),
     #[error("expected a power-of-two number of evaluations, got {0}")]
     NotPowerOfTwo(usize),
     #[error("expected {expected} variables, got {got}")]

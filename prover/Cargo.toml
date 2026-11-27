@@ -124,3 +124,7 @@ harness = false
 [[bench]]
 name = "bench_continuation"
 harness = false
+
+[[bin]]
+name = "cluster"
+required-features = ["parallel"]

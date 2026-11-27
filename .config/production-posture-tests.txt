@@ -40,3 +40,4 @@ zf_format::tests::the_blowup_knob_moves_the_rate_and_the_rule_s_queries_only
 zf_format::tests::the_whir_grind_lever_is_selectable_and_carried
 zf_format::tests::the_grind_bits_knob_trades_two_bits_for_two_queries
 zf_format::tests::production_sites_build_the_default_format_when_nothing_is_set
+lfm::cluster_levels::production_pin::two_leaf_program_ids_are_pinned_at_the_production_posture

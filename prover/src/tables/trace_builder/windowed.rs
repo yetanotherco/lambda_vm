@@ -195,7 +195,9 @@ impl StreamedCardFill {
 
 /// The tables a windowed build streams: those whose op lists grow in
 /// execution order from their first element.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum StreamTable {
     Cpu,
     MemwRegister,
@@ -292,6 +294,7 @@ pub struct WindowedTraceBuilder<'a> {
     register_init: Vec<u32>,
     max_rows: crate::tables::MaxRowsConfig,
     private_input: &'a [u8],
+    range_start: Option<usize>,
     memory_state: MemoryState,
     register_state: RegisterState,
     /// Cycles collected so far: the next window's first cycle.
@@ -430,7 +433,7 @@ struct DecodeTrace {
 }
 
 impl DecodeTrace {
-    fn spawn(instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
+    fn spawn(instructions: U64HashMap<Instruction>, prefix: bool) -> Result<Self, Error> {
         #[cfg(test)]
         let delay = DECODE_TRACE_DELAY.with(std::cell::Cell::get);
         let thread = std::thread::Builder::new()
@@ -440,7 +443,16 @@ impl DecodeTrace {
                 std::thread::sleep(delay);
                 // As `DecodeArtifacts::from_elf`: `generate_decode_trace` lays
                 // the rows out in the order the AIR's commitment holds.
-                decode::generate_decode_trace(&instructions).0
+                if prefix {
+                    let rows = (instructions.len() + 1).next_power_of_two().max(2);
+                    Table::new_main(
+                        super::super::types::zeroed_fe_vec(rows * decode::cols::NUM_COLUMNS),
+                        decode::cols::NUM_COLUMNS,
+                        1,
+                    )
+                } else {
+                    decode::generate_decode_trace(&instructions).0
+                }
             })
             .map_err(|e| Error::Prover(format!("DECODE's trace thread did not start: {e}")))?;
         Ok(Self {
@@ -585,6 +597,16 @@ impl<'a> WindowedTraceBuilder<'a> {
         max_rows: &crate::tables::MaxRowsConfig,
         hoist: super::HostHoist,
     ) -> Result<Self, Error> {
+        Self::new_for_range(elf, private_input, max_rows, hoist, false)
+    }
+
+    pub(crate) fn new_for_range(
+        elf: &Elf,
+        private_input: &'a [u8],
+        max_rows: &crate::tables::MaxRowsConfig,
+        hoist: super::HostHoist,
+        prefix: bool,
+    ) -> Result<Self, Error> {
         let t = std::time::Instant::now();
         // The initial image as pages, and the walk's memory state seeded from
         // them page by page: the state the image as a map of bytes, seeded byte
@@ -609,7 +631,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let decode = Arc::new(DecodeTable::from_instructions(&instructions));
         let decode_secs = t.elapsed().as_secs_f64();
-        let decode_trace = DecodeTrace::spawn(instructions)?;
+        let decode_trace = DecodeTrace::spawn(instructions, prefix)?;
         let lean = WalkLean::ALL;
         // The hand-out counts on a thread of its own with the `parallel`
         // feature, on the accumulator's thread without it.
@@ -626,6 +648,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             register_init,
             max_rows: max_rows.clone(),
             private_input,
+            range_start: None,
             memory_state,
             register_state,
             cycles: 0,
@@ -633,6 +656,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             segments: RoutedBlocks::new(max_rows),
             emitted: StreamSkip {
                 host_hoist: hoist,
+                range_prefix: prefix,
                 ..StreamSkip::default()
             },
             counted: PreCounted {
@@ -1542,6 +1566,12 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.stamps
     }
 
+    #[cfg(feature = "parallel")]
+    pub(crate) fn trace_seed(mut self, seed: super::super::trace_hash::Seed) -> Self {
+        self.emitted.trace_seed = seed;
+        self
+    }
+
     /// How many chunks of each streamed table have been handed out.
     pub fn streamed(&self) -> StreamSkip {
         self.emitted
@@ -1584,10 +1614,31 @@ impl<'a> WindowedTraceBuilder<'a> {
         parts
     }
 
+    pub(crate) fn range_start(&mut self, cycle: usize) {
+        self.range_start = Some(cycle);
+    }
+
     /// Collects the run's last window and builds every table the windows did
     /// not stream. The streamed chunks' slots hold empty placeholders;
     /// [`Traces::insert_streamed`] puts the chunks back.
     pub fn finish(self, logs: &[Log]) -> Result<Traces, Error> {
+        self.finish_with_bitwise(logs, None)
+    }
+
+    pub(crate) fn finish_with_bitwise(
+        self,
+        logs: &[Log],
+        bitwise_slot: Option<&super::BitwiseSlot>,
+    ) -> Result<Traces, Error> {
+        self.finish_range_with_bitwise(logs, bitwise_slot, true)
+    }
+
+    pub(crate) fn finish_range_with_bitwise(
+        self,
+        logs: &[Log],
+        bitwise_slot: Option<&super::BitwiseSlot>,
+        terminal: bool,
+    ) -> Result<Traces, Error> {
         let Finishing {
             ops,
             image,
@@ -1600,7 +1651,25 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             skip,
             pre,
-        } = self.finishing(logs)?;
+        } = self.finishing(logs, bitwise_slot)?;
+        if bitwise_slot.is_some() {
+            return super::finish::FinishPlan::new(
+                ops,
+                terminal.then_some(&image),
+                &memory_state,
+                &register_init,
+                decode_trace,
+                &decode,
+                register_state,
+                &max_rows,
+                private_input,
+                terminal,
+                false,
+                &skip,
+                Some(pre),
+            )?
+            .emit_all_with_bitwise(bitwise_slot);
+        }
         build_traces(
             ops,
             Some(&image),
@@ -1635,7 +1704,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             Error,
         >,
     ) -> Result<(), Error> {
-        self.finish_streamed_keeping(logs, gate, false, |header| {
+        self.finish_streamed_keeping(logs, gate, false, None, true, |header| {
             on_header(header).map(|send| (send, None))
         })
         .map(|_| ())
@@ -1651,6 +1720,8 @@ impl<'a> WindowedTraceBuilder<'a> {
         logs: &[Log],
         gate: &super::gate::ByteGate,
         keep: bool,
+        bitwise_slot: Option<&super::BitwiseSlot>,
+        terminal: bool,
         on_header: impl FnOnce(super::RestHeader) -> Result<(RestSink<'s>, Option<RowsSink<'s>>), Error>,
     ) -> Result<Option<super::RestRegen>, Error> {
         let slide = self.slide_rest;
@@ -1666,7 +1737,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             private_input,
             mut skip,
             pre,
-        } = self.finishing(logs)?;
+        } = self.finishing(logs, bitwise_slot)?;
         // BITWISE's lookups from the tables need BITWISE last (the slide, with
         // the `parallel` feature) and only the streamed chunks' tails kept:
         // their full chunks were counted as they were handed out. They count
@@ -1676,7 +1747,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         skip.p4_beside |= from_tables;
         let mut plan = super::finish::FinishPlan::new(
             ops,
-            Some(&image),
+            terminal.then_some(&image),
             &memory_state,
             &register_init,
             decode_trace,
@@ -1684,7 +1755,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             register_state,
             &max_rows,
             private_input,
-            true,
+            terminal,
             false,
             &skip,
             Some(pre),
@@ -1720,12 +1791,19 @@ impl<'a> WindowedTraceBuilder<'a> {
             slide,
             rows.as_mut()
                 .map(|r| &mut **r as &mut dyn FnMut(super::RowsNote)),
+            bitwise_slot,
         )
     }
 
     /// The run's last window collected and walked, and the run's lists
     /// assembled: what the table phase starts from.
-    fn finishing(mut self, logs: &[Log]) -> Result<Finishing<'a>, Error> {
+    fn finishing(
+        mut self,
+        logs: &[Log],
+        #[cfg_attr(not(feature = "parallel"), allow(unused_variables))] bitwise_slot: Option<
+            &super::BitwiseSlot,
+        >,
+    ) -> Result<Finishing<'a>, Error> {
         // Every handed-out chunk counted, wherever it was counted.
         self.join_handout_count()?;
         // The last window may halt: it is walked here, not by the `Walker`.
@@ -1768,6 +1846,10 @@ impl<'a> WindowedTraceBuilder<'a> {
             routed: None,
             times: None,
         };
+        #[cfg(feature = "parallel")]
+        if let Some(slot) = bitwise_slot {
+            slot.note_walk_end();
+        }
         super::build_stamps::mark("p0 last window");
         let Self {
             decode,
@@ -1832,7 +1914,14 @@ impl<'a> WindowedTraceBuilder<'a> {
                 );
                 super::build_stamps::mark("p0 concatenate");
                 let rest = KeptRest::from_walk(&mut walk);
-                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
+                let ops = assemble(
+                    cpu_ops,
+                    walk,
+                    rest,
+                    segments,
+                    &mut register_state,
+                    !emitted.range_prefix,
+                )?;
                 super::build_stamps::mark("p0 assemble");
                 let decode_trace = decode_trace
                     .ok_or_else(|| {
@@ -1919,7 +2008,11 @@ impl<'a> WindowedTraceBuilder<'a> {
                             tail.take_segments(n)
                         },
                     );
-                    let ops = ops_of_logs(&logs, emitted.cpu * max_rows.cpu, &decode)?;
+                    let ops = ops_of_logs(
+                        &logs,
+                        self.range_start.unwrap_or(0) + emitted.cpu * max_rows.cpu,
+                        &decode,
+                    )?;
                     eprintln!(
                         "BLOCK CPU LIST: none kept by the walkers · {} CPU chunks cut from their \
                          logs · the tail's {} ops rebuilt from its logs",
@@ -1937,7 +2030,14 @@ impl<'a> WindowedTraceBuilder<'a> {
                     emitted.memory_format,
                 )?;
                 super::build_stamps::mark("p0 concatenate");
-                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
+                let ops = assemble(
+                    cpu_ops,
+                    walk,
+                    rest,
+                    segments,
+                    &mut register_state,
+                    !emitted.range_prefix,
+                )?;
                 super::build_stamps::mark("p0 assemble");
                 // With the MEMW-derived LT ops streamed, `memw_lt_done` counts
                 // the dropped ops too; without, it is zero and the dropped
@@ -5681,6 +5781,19 @@ impl WordFamilyChunk {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    fn spans_parts(&self) -> bool {
+        match self {
+            WordFamilyChunk::Load8(r) => r.parts.len() > 1,
+            WordFamilyChunk::Store8(r) => r.parts.len() > 1,
+            WordFamilyChunk::LoadW(r) => r.parts.len() > 1,
+            WordFamilyChunk::StoreW(r) => r.parts.len() > 1,
+            WordFamilyChunk::Load2W(r) => r.parts.len() > 1,
+            WordFamilyChunk::Store2W(r) => r.parts.len() > 1,
+            WordFamilyChunk::MemwW(r) => r.parts.len() > 1,
+        }
+    }
+
     /// Its table in `form`: the finish's generator on its rows, so the chunk
     /// is the table the finish would build.
     fn generate_as(self, form: TraceForm) -> Table {
@@ -5733,7 +5846,194 @@ fn word_chunks(
     jobs
 }
 
+/// The ordered inputs of a streamed chunk, with deduplication already resolved
+/// where it changes the height or row order.
+#[cfg(feature = "parallel")]
+pub(crate) struct DeferredChunk {
+    data: DeferredChunkData,
+    pub(crate) rows: usize,
+    pub(crate) spans_parts: bool,
+}
+
+#[cfg(feature = "parallel")]
+enum DeferredChunkData {
+    Job(ChunkJob),
+    Lt(Vec<(super::LtOperation, u64)>),
+}
+
+#[cfg(feature = "parallel")]
+impl DeferredChunk {
+    pub(crate) fn materialize(self, form: TraceForm) -> Table {
+        match self.data {
+            DeferredChunkData::Job(job) => job.generate_as(form).trace,
+            DeferredChunkData::Lt(rows) => lt::lt_trace_of_rows(&rows, form),
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match &self.data {
+            DeferredChunkData::Job(job) => job.op_bytes(),
+            DeferredChunkData::Lt(rows) => super::vec_heap_bytes(rows),
+        }
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        use crypto::hash::blake3::chain::Blake3Std;
+        use digest::Digest;
+        use multilinear::records::TableRecords;
+        use std::fmt::Write;
+
+        // The walker already uses this field-by-field representation to check
+        // sampled re-walks. Feed one record at a time to ignore part boundaries.
+        struct Writer(Blake3Std);
+        impl Write for Writer {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.update(s.as_bytes());
+                Ok(())
+            }
+        }
+        impl Writer {
+            fn records<T: std::fmt::Debug>(&mut self, rows: impl IntoIterator<Item = T>) {
+                for row in rows {
+                    let _ = writeln!(self, "{row:?}");
+                }
+            }
+            fn fill(&mut self, fill: multilinear::records::RecordsFill<'_>) {
+                for word in multilinear::records::digest_words(|each| fill.words(each)) {
+                    self.0.update(word.to_le_bytes());
+                }
+            }
+        }
+        let mut digest = Writer(Blake3Std::new());
+        match &self.data {
+            DeferredChunkData::Lt(rows) => {
+                let parts = multilinear::records::digest_words(|each| {
+                    for (op, count) in rows {
+                        each(op.lhs);
+                        each(op.rhs);
+                        each(u64::from(op.signed) | (u64::from(op.invert) << 1));
+                        each(*count);
+                    }
+                });
+                for word in parts {
+                    digest.0.update(word.to_le_bytes());
+                }
+            }
+            DeferredChunkData::Job(job) => match &job.ops {
+                ChunkOps::Cpu(ops, _) => digest.records(ops.iter()),
+                ChunkOps::CpuInRow(ops, sides, _) => digest.records(ops.iter().zip(sides.iter())),
+                ChunkOps::CpuRecords { records, .. } => digest.fill(records.fill()),
+                ChunkOps::MemwRegister(rows) => digest.records(rows.iter()),
+                ChunkOps::MemwRegisterRecords(records) => digest.fill(records.fill()),
+                ChunkOps::MemwAligned(ops) => digest.records(ops.iter()),
+                ChunkOps::Memw(ops) => digest.records(ops.iter()),
+                ChunkOps::Load(ops) => digest.records(ops.iter()),
+                ChunkOps::Shift(ops) => digest.records(ops.iter()),
+                ChunkOps::Store(ops) => digest.records(ops),
+                ChunkOps::KeccakRnd {
+                    ops,
+                    skip,
+                    rows,
+                    records,
+                    fault,
+                } => {
+                    digest.records([(skip, rows, records, fault)]);
+                    digest.records(ops);
+                }
+                ChunkOps::MemLoad(rows) => digest.records(rows.iter()),
+                ChunkOps::MemStore(rows) => digest.records(rows.iter()),
+                ChunkOps::Word(rows) => match rows {
+                    WordFamilyChunk::Load8(r) => digest.records(r.iter()),
+                    WordFamilyChunk::Store8(r) => digest.records(r.iter()),
+                    WordFamilyChunk::LoadW(r) => digest.records(r.iter()),
+                    WordFamilyChunk::StoreW(r) => digest.records(r.iter()),
+                    WordFamilyChunk::Load2W(r) => digest.records(r.iter()),
+                    WordFamilyChunk::Store2W(r) => digest.records(r.iter()),
+                    WordFamilyChunk::MemwW(r) => digest.records(r.iter()),
+                },
+                ChunkOps::Rows(_) | ChunkOps::Lt(_) => unreachable!("already handled at handout"),
+            },
+        }
+        digest.0.finalize().into()
+    }
+}
+
 impl ChunkJob {
+    #[cfg(feature = "parallel")]
+    pub(crate) fn defer(self) -> DeferredChunk {
+        use multilinear::records::{RecordsFill, TableRecords};
+
+        let ops = self.op_count();
+        let spans_parts = match &self.ops {
+            ChunkOps::Cpu(ops, _) | ChunkOps::CpuInRow(ops, _, _) => ops.parts.len() > 1,
+            ChunkOps::CpuRecords { records, .. } => {
+                matches!(records.fill(), RecordsFill::Cpu { logs, .. } if logs.len() > 1)
+            }
+            ChunkOps::Lt(ops) => ops.parts.len() > 1,
+            ChunkOps::Word(rows) => rows.spans_parts(),
+            _ => false,
+        };
+        let (data, rows) = match self.ops {
+            ChunkOps::Lt(rows) => {
+                let rows = super::super::types::dedup_rows_of(rows.iter());
+                let height = rows.len().next_power_of_two().max(4);
+                (DeferredChunkData::Lt(rows), height)
+            }
+            ChunkOps::KeccakRnd { rows, .. } => (DeferredChunkData::Job(self), rows),
+            // A listless CPU chunk has no spent operations. Its logs still
+            // carry every row of the chunk.
+            ChunkOps::CpuRecords { ref records, .. } => {
+                let rows = records.rows();
+                (DeferredChunkData::Job(self), rows)
+            }
+            _ => (DeferredChunkData::Job(self), ops.next_power_of_two().max(4)),
+        };
+        DeferredChunk {
+            data,
+            rows,
+            spans_parts,
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn keccak_local_counts(
+        &self,
+        form: super::super::keccak_rnd::KeccakRndForm,
+    ) -> Result<Option<super::super::local_bytes::LocalCounts>, Error> {
+        use super::super::local_bytes::{LocalCounts, count_keccak_rnd_rows};
+        let ChunkOps::KeccakRnd {
+            ops,
+            skip,
+            rows,
+            records,
+            fault,
+        } = &self.ops
+        else {
+            return Ok(None);
+        };
+        if !form.byte_lookups_local() {
+            return Ok(None);
+        }
+        let mut counts = LocalCounts::default();
+        let skip = skip + if *records { *fault } else { 0 };
+        count_keccak_rnd_rows(
+            ops.iter().map(|op| &op.input),
+            skip,
+            *rows,
+            form,
+            &mut counts,
+        )
+        .map_err(Error::Prover)?;
+        Ok(Some(counts))
+    }
+
+    /// This variant is already an unfilled record holder, and can hand out
+    /// its TraceTable representation without producing any columns.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn is_row_records(&self) -> bool {
+        matches!(self.ops, ChunkOps::Rows(_))
+    }
+
     /// The bytes its ops take on the heap.
     pub fn op_bytes(&self) -> usize {
         use super::vec_heap_bytes as b;
@@ -5994,6 +6294,97 @@ impl ChunkJob {
     }
 }
 
+#[cfg(all(test, feature = "parallel"))]
+#[test]
+fn deferred_lt_chunk_preserves_rows_and_dedup_across_windows() {
+    let op = |v| super::LtOperation::new(v, v + 1, false);
+    let first = Arc::new(vec![op(1), op(2), op(3)]);
+    let second = Arc::new(vec![op(1), op(4), op(2)]);
+    let job = |parts| ChunkJob {
+        table: StreamTable::Lt,
+        index: 0,
+        ops: ChunkOps::Lt(Segments { parts }),
+    };
+    let parts = || vec![(Arc::clone(&first), 0..3), (Arc::clone(&second), 0..3)];
+    let local = job(parts()).generate();
+    let replica = job(parts()).defer();
+    let contiguous = job(vec![(
+        Arc::new(first.iter().chain(second.iter()).cloned().collect()),
+        0..6,
+    )])
+    .defer();
+    assert!(replica.spans_parts);
+    assert_eq!(replica.rows, 4);
+    assert_eq!(replica.digest(), contiguous.digest());
+    let trace = replica.materialize(TraceForm::Wide);
+    assert_eq!(
+        trace.main_data_row_major(),
+        local.trace.main_data_row_major()
+    );
+}
+
+#[cfg(all(test, feature = "parallel"))]
+#[test]
+fn deferred_word_chunk_hashes_rows_in_order_across_parts() {
+    let row = |word| mem_load8::Load8Row::new(8, 2, 1, word).unwrap();
+    let first = Arc::new(vec![row(10), row(20)]);
+    let second = Arc::new(vec![row(30)]);
+    let job = |parts| ChunkJob {
+        table: StreamTable::MemLoad8,
+        index: 0,
+        ops: ChunkOps::Word(WordFamilyChunk::Load8(parts)),
+    };
+    let parts = Segments {
+        parts: vec![(first, 0..2), (second, 0..1)],
+    };
+    let local = job(parts.clone()).generate();
+    let replica = job(parts).defer();
+    let copied = job(Segments::one(vec![row(10), row(20), row(30)])).defer();
+    let reordered = job(Segments::one(vec![row(20), row(10), row(30)])).defer();
+    assert!(replica.spans_parts);
+    assert_eq!(replica.rows, 4);
+    assert_eq!(replica.digest(), copied.digest());
+    assert_ne!(replica.digest(), reordered.digest());
+    assert_eq!(
+        replica.materialize(TraceForm::Wide).main_data_row_major(),
+        local.trace.main_data_row_major(),
+    );
+}
+
+#[cfg(all(test, feature = "parallel"))]
+#[test]
+fn deferred_listless_cpu_chunk_uses_the_log_height() {
+    let elf = Elf::load(&crate::test_utils::asm_elf_bytes("test_commit_4")).unwrap();
+    let result = executor::vm::execution::Executor::new(&elf, Vec::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    let builder =
+        WindowedTraceBuilder::new(&elf, &[], &super::super::MaxRowsConfig::small()).unwrap();
+    let decode = Arc::new(CardDecode::new(Arc::clone(&builder.decode)).unwrap());
+    let logs = Arc::new(result.logs);
+    let records = CpuLogRecords::new(
+        Segments {
+            parts: vec![(Arc::clone(&logs), 0..4), (logs, 4..8)],
+        },
+        0,
+        decode,
+    )
+    .unwrap();
+    let job = ChunkJob {
+        table: StreamTable::Cpu,
+        index: 0,
+        ops: ChunkOps::CpuRecords {
+            records,
+            spent: Segments { parts: Vec::new() },
+        },
+    };
+    let replica = job.defer();
+    assert!(replica.spans_parts);
+    assert_eq!(replica.rows, 8);
+    assert_eq!(replica.materialize(TraceForm::Narrow).main_table.height, 8);
+}
+
 #[cfg(all(test, feature = "cuda", feature = "parallel"))]
 impl ChunkJob {
     /// A CPU chunk's ops, window part by window part, and the decode they are
@@ -6023,6 +6414,7 @@ fn assemble(
     rest: KeptRest,
     segments: RoutedBlocks,
     register_state: &mut RegisterState,
+    terminal: bool,
 ) -> Result<CollectedOps, Error> {
     // The streamed tables' lists (their tails); `rest` holds the others.
     let WalkOutputs {
@@ -6061,13 +6453,15 @@ fn assemble(
     // HALT's register ops land at the end of their buckets, as in
     // `collect_all_ops`, routed and laid out in the run's MEMW_A form (the residual register table
     // rows under the in-row register format).
-    let mut halt = MemwBuckets::with_register_capacity(0, order);
-    halt.registers = registers;
-    halt.extend_ops(collect_halt_ops(register_state));
-    halt.refusal()?;
-    memw_register_rows.extend(halt.register_rows);
-    memw_aligned_ops.extend(halt.aligned);
-    memw_ops.extend(halt.general);
+    if terminal {
+        let mut halt = MemwBuckets::with_register_capacity(0, order);
+        halt.registers = registers;
+        halt.extend_ops(collect_halt_ops(register_state));
+        halt.refusal()?;
+        memw_register_rows.extend(halt.register_rows);
+        memw_aligned_ops.extend(halt.aligned);
+        memw_ops.extend(halt.general);
+    }
 
     let RoutedBlocks {
         branch_ops,

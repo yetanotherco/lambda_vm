@@ -39,6 +39,25 @@ pub mod whir_hash_knob;
 pub mod whir_identity;
 pub mod zf_format;
 
+// Exercise the real runner with the lib-test proof posture and allocator on
+// the host. The separately built runner always uses the production posture.
+#[cfg(all(
+    test,
+    feature = "parallel",
+    feature = "test-security",
+    not(feature = "cuda")
+))]
+extern crate self as lambda_vm_prover;
+#[cfg(all(
+    test,
+    feature = "parallel",
+    feature = "test-security",
+    not(feature = "cuda")
+))]
+#[path = "bin/cluster.rs"]
+#[allow(dead_code)]
+mod cluster_stage_runner;
+
 // The lib's test harness runs the allocator the shipped binary runs
 // (`bin/cli/src/main.rs` installs the same one), so every host-memory number a
 // `cargo test --lib` measurement produces is a production-allocator number.
@@ -922,6 +941,7 @@ impl RegisterFiles {
 /// anything; x254's final value is the committed byte count, a `u32`.
 pub(crate) struct BlockAirInputs {
     cpu_heights: Vec<usize>,
+    cpu_start: usize,
     register: RegisterFiles,
 }
 
@@ -938,6 +958,7 @@ impl BlockAirInputs {
         })?;
         Ok(Self {
             cpu_heights,
+            cpu_start: 0,
             register: RegisterFiles::halted(opts, program.entry_point, committed),
         })
     }
@@ -960,7 +981,7 @@ pub(crate) fn block_airs(
     registers: crate::tables::register::RegisterFormat,
     ecdas: crate::tables::ecdas::EcdasForm,
 ) -> VmAirs {
-    let mut airs = VmAirs::new(
+    let mut airs = VmAirs::new_at(
         program,
         opts,
         false,
@@ -971,6 +992,7 @@ pub(crate) fn block_airs(
         true,
         None,
         inputs.register.preprocessed(),
+        inputs.cpu_start,
     );
     if keccak_rnd != crate::tables::keccak_rnd::KeccakRndForm::Full {
         airs.keccak_rnds = (0..airs.keccak_rnds.len())
@@ -1018,13 +1040,16 @@ impl VmAirs {
             .enumerate()
             .map(|(i, (&height, ts_base))| {
                 Box::new(
-                    crate::test_utils::create_cpu_air_inrow(opts, ts_base)
-                        .with_name(&format!("CPU[{i}]"))
-                        .with_lazy_preprocessed_columns(
-                            cpu::lazy_timestamp_commitment(opts, height),
-                            cpu::NUM_PRECOMPUTED_COLS,
-                            Arc::new(move || vec![cpu::timestamp_column(height)]),
-                        ),
+                    crate::test_utils::create_cpu_air_inrow(
+                        opts,
+                        ts_base + cpu::TIMESTAMP_STRIDE * inputs.cpu_start as u64,
+                    )
+                    .with_name(&format!("CPU[{i}]"))
+                    .with_lazy_preprocessed_columns(
+                        cpu::lazy_timestamp_commitment(opts, height),
+                        cpu::NUM_PRECOMPUTED_COLS,
+                        Arc::new(move || vec![cpu::timestamp_column(height)]),
+                    ),
                 ) as VmAir
             })
             .collect();
@@ -1037,7 +1062,7 @@ impl VmAirs {
             })
             .collect();
         let rows: u64 = heights.iter().map(|&h| h as u64).sum();
-        let final_pc_ts = cpu::final_pc_timestamp(rows);
+        let final_pc_ts = cpu::final_pc_timestamp(rows + inputs.cpu_start as u64);
         let files = inputs.register.preprocessed();
         let (init, fini) = (files.init.to_vec(), files.fini.to_vec());
         self.register = Box::new(
@@ -1424,6 +1449,35 @@ impl VmAirs {
         page_commitments: Option<&[(u64, Commitment)]>,
         register_preprocessed: RegisterPreprocessed<'_>,
     ) -> Self {
+        Self::new_at(
+            elf,
+            proof_options,
+            minimal_bitwise,
+            page_configs,
+            table_counts,
+            cpu_heights,
+            decode_commitment,
+            include_halt,
+            page_commitments,
+            register_preprocessed,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_at(
+        elf: &Elf,
+        proof_options: &ProofOptions,
+        minimal_bitwise: bool,
+        page_configs: &[crate::tables::page::PageConfig],
+        table_counts: &TableCounts,
+        cpu_heights: &[usize],
+        decode_commitment: Option<Commitment>,
+        include_halt: bool,
+        page_commitments: Option<&[(u64, Commitment)]>,
+        register_preprocessed: RegisterPreprocessed<'_>,
+        cpu_start: usize,
+    ) -> Self {
         assert_eq!(
             cpu_heights.len(),
             table_counts.cpu,
@@ -1437,18 +1491,21 @@ impl VmAirs {
                 // TIMESTAMP's column too, for the multilinear verifier (see the
                 // REGISTER note below); its root only on the univariate path.
                 Box::new(
-                    create_cpu_air(proof_options, ts_base)
-                        .with_name(&format!("CPU[{}]", i))
-                        .with_lazy_preprocessed_columns(
-                            tables::cpu::lazy_timestamp_commitment(proof_options, height),
-                            tables::cpu::NUM_PRECOMPUTED_COLS,
-                            Arc::new(move || vec![tables::cpu::timestamp_column(height)]),
-                        ),
+                    create_cpu_air(
+                        proof_options,
+                        ts_base + tables::cpu::TIMESTAMP_STRIDE * cpu_start as u64,
+                    )
+                    .with_name(&format!("CPU[{}]", i))
+                    .with_lazy_preprocessed_columns(
+                        tables::cpu::lazy_timestamp_commitment(proof_options, height),
+                        tables::cpu::NUM_PRECOMPUTED_COLS,
+                        Arc::new(move || vec![tables::cpu::timestamp_column(height)]),
+                    ),
                 ) as VmAir
             })
             .collect();
         let total_cpu_rows: u64 = cpu_heights.iter().map(|&h| h as u64).sum();
-        let final_pc_ts = tables::cpu::final_pc_timestamp(total_cpu_rows);
+        let final_pc_ts = tables::cpu::final_pc_timestamp(total_cpu_rows + cpu_start as u64);
         let bitwise: VmAir = if minimal_bitwise {
             // TEST-ONLY BRANCH — must never be reached in production.
             //

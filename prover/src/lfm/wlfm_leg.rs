@@ -179,6 +179,24 @@ fn child_frame(
     let (layouts, domains) = stacks(shapes, &a.sizes, &a.config).map_err(|e| format!("{e:?}"))?;
     // No chain emitted under a round form the host refuses.
     super::wlfm::check_wlfm_round_form(a, &layouts)?;
+    // Nor a run whose index domain the field lacks: the host verifier refuses
+    // it before reading, and the emitter has no chain for it.
+    let two_adicity = <GoldilocksField as math::field::traits::IsFFTField>::TWO_ADICITY as usize;
+    for layout in &layouts {
+        for run in
+            multilinear::stacked_eval::index_chains(layout.num_polys(), a.config.format.group)
+        {
+            if run.len() >= 2 {
+                multilinear::whir_chain::check_index_domain(
+                    layout.n_stack(),
+                    multilinear::whir_chain::index_vars(run.len()),
+                    a.config.log_blowup,
+                    two_adicity,
+                )
+                .map_err(|e| format!("a W-leg's child: {e:?}"))?;
+            }
+        }
+    }
     Ok((layouts, domains))
 }
 

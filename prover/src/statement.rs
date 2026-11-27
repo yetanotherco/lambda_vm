@@ -337,7 +337,9 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         // IS_WH: 0 or 1, the range check for KECCAK's state addresses (main's
         // #1022); its bound is what bounds IS_WH's multiplicity sum.
         is_wh as u64,
-        // ECREC: 0 or 1, the ECDSA public-key recovery table.
+        // ECREC: the ECDSA public-key recovery table. 0 or 1, but a block
+        // statement takes one a range (`block_whir::BLOCK_MAX_ECREC`); the
+        // count is absorbed whole either way.
         ecrec as u64,
     ]
 }

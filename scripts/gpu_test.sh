@@ -11,6 +11,7 @@
 #   6. production-posture coverage       (make test-prover-comprehensive-cuda)
 #   7. cross-posture proof rejection     (make test-cross-posture-cuda)
 #   8. fixed-seed proof identities      (make test-prover-identities-cuda)
+#   9. cluster ranges over TCP          (make test-cluster-cuda)
 #
 # Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All groups
 # run even if one fails (so the log shows every failure); the script exits non-zero if ANY
@@ -75,6 +76,7 @@ CARGO_TARGET_DIR="$build_root/gpu-suite" run test-prover-cuda  # Group 5: multi-
 run test-prover-comprehensive-cuda  # Group 6: production proofs and parameter pins
 run test-cross-posture-cuda         # Group 7: production refusal of TEST proofs
 run test-prover-identities-cuda     # Group 8: deterministic proofs under the host and card levers
+run test-cluster-cuda               # Group 9: range ownership, faults, fallback, range levels
 
 if [ "$fail" -ne 0 ]; then
     log "FAILED — one or more GPU test groups failed"

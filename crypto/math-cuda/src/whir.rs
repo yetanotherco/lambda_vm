@@ -478,6 +478,35 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
     }
 }
 
+#[cfg(feature = "test-faults")]
+static FAIL_TOP_READBACK_CARD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Fail one device tree-top readback on this logical backend.
+#[cfg(feature = "test-faults")]
+pub fn fail_top_readback_for_test(card: usize) {
+    FAIL_TOP_READBACK_CARD.store(card, Ordering::Relaxed);
+}
+
+#[cfg(feature = "test-faults")]
+fn check_top_readback_fault() -> Result<()> {
+    if FAIL_TOP_READBACK_CARD.load(Ordering::Relaxed) != usize::MAX
+        && FAIL_TOP_READBACK_CARD
+            .compare_exchange(
+                crate::device::current_slot(),
+                usize::MAX,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+        ));
+    }
+    Ok(())
+}
+
 /// ⛔ THE EVICTOR — installed into `device::reserve`, called on its budget-miss
 /// path on the RESERVING thread. Frees at least `target` bytes of BUDGET by
 /// dropping retained leaf layers and whole trees, FIFO (oldest first), pruning
@@ -518,7 +547,7 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
 /// - `shrink` frees the BUDGET, not the bytes: never-purge keeps the raw device
 ///   allocation pooled for reuse, and the budget is exactly what argue's
 ///   `reserve` is gated on ([[gpu-two-vramgates-overlap]]).
-fn evict_retained_layers(target: u64, card: usize) -> u64 {
+fn evict_retained_layers(target: u64, eligible: &dyn Fn(usize) -> bool) -> u64 {
     let mut freed = 0u64;
     let mut reg = match RETENTION_REGISTRY.lock() {
         Ok(reg) => reg,
@@ -536,8 +565,7 @@ fn evict_retained_layers(target: u64, card: usize) -> u64 {
             Err(poisoned) => poisoned.into_inner(),
         };
         match slot.as_ref() {
-            // Another card's layer gives no room on this one.
-            Some(layer) if layer.card() != card => {}
+            Some(layer) if !eligible(layer.card()) => {}
             Some(layer) if layer.read_by_an_opening() => being_read += 1,
             Some(layer) => reclaimable += layer.bytes(),
             None => {}
@@ -584,7 +612,7 @@ fn evict_retained_layers(target: u64, card: usize) -> u64 {
             };
             if slot
                 .as_ref()
-                .is_some_and(|layer| layer.card() != card || layer.read_by_an_opening())
+                .is_some_and(|layer| !eligible(layer.card()) || layer.read_by_an_opening())
             {
                 passed += 1;
                 None
@@ -685,6 +713,57 @@ mod leaf_key_tests {
             !leaf_key_matches(kept, (2, DeviceHash::Keccak256, 512)),
             "and all three wrong is still not a match"
         );
+    }
+
+    #[test]
+    #[ignore = "card: two aliases, optionally a third slot on a different GPU"]
+    fn alias_admission_reclaims_only_idle_layers_on_its_physical_gpu() {
+        use super::commit_codeword;
+        use crate::device::{card_set, in_indexed_card, indexed_card_ready};
+
+        let cards = card_set().configured_indices().unwrap().unwrap();
+        assert!(matches!(cards.as_slice(), [0, 1] | [0, 1, 2]));
+        assert!(cards.iter().copied().all(indexed_card_ready));
+        let owner = card_set().started(0).unwrap();
+        let requester = card_set().started(1).unwrap();
+        assert_eq!(requester.ordinal(), owner.ordinal());
+        let commit = |card| {
+            in_indexed_card(card, || {
+                commit_codeword(&vec![1; 1 << 12], 2, 3, false, DeviceHash::Blake3)
+                    .unwrap()
+                    .0
+            })
+        };
+        let foreign = cards.get(2).map(|&card| {
+            assert_ne!(card_set().started(card).unwrap().ordinal(), owner.ordinal());
+            let codeword = commit(card);
+            assert_ne!(codeword.retained_leaf_bytes(), 0);
+            codeword
+        });
+        let codeword = commit(0);
+        let retained = codeword.retained_leaf_bytes();
+        assert_ne!(retained, 0);
+        let before = owner.reserved_bytes();
+        let ceiling = owner.set_alias_budget(before).unwrap();
+
+        let budget = requester.set_vram_budget_bytes(retained - 1);
+        assert!(requester.reserve(retained).is_none(), "backend-local miss");
+        assert_eq!(codeword.retained_leaf_bytes(), retained);
+        requester.set_vram_budget_bytes(budget);
+
+        let promise = requester
+            .reserve(retained)
+            .expect("peer layer covers the shared deficit");
+        assert_eq!(codeword.retained_leaf_bytes(), 0);
+        assert_eq!(owner.reserved_bytes(), before - retained);
+        assert!(requester.reserve(1).is_none(), "shared ceiling still binds");
+        if let Some(foreign) = foreign {
+            assert_ne!(foreign.retained_leaf_bytes(), 0);
+        }
+        drop((promise, codeword));
+        assert_eq!(requester.reserved_bytes(), 0);
+        assert_eq!(owner.reserved_bytes(), 0);
+        owner.set_alias_budget(ceiling);
     }
 }
 
@@ -1497,6 +1576,8 @@ impl DeviceCodeword {
                     "{nodes} nodes are not whole top levels of a tree of {num_leaves} leaves"
                 );
             }
+            #[cfg(feature = "test-faults")]
+            check_top_readback_fault()?;
             let out = crate::readback::clone_dtoh(&self.stream, &tree.slice(0..nodes * 32))?;
             self.stream.synchronize()?;
             Ok(out)
@@ -3308,6 +3389,8 @@ impl JointTree {
                 "not whole top levels of a binary tree"
             );
         }
+        #[cfg(feature = "test-faults")]
+        check_top_readback_fault()?;
         let out = crate::readback::clone_dtoh(&self.stream, &self.nodes.slice(0..nodes * 32))?;
         self.stream.synchronize()?;
         Ok(out)

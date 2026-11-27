@@ -4,7 +4,7 @@ clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-gkr2-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
-test-prover-cuda test-prover-comprehensive-cuda test-prover-identities-cuda test-cross-posture test-cross-posture-cuda \
+test-prover-cuda test-prover-comprehensive-cuda test-prover-identities-cuda test-cluster-cuda test-cross-posture test-cross-posture-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
@@ -878,12 +878,12 @@ test-prover-identities-cuda: compile-programs-asm
 	export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1; \
 	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
 	failed=0; \
-	while read -r features test; do \
+	while read -r features test settings; do \
 	    if ! ( \
 	        if [ "$$features" = test-cuda-faults ] && [ -n "$$GPU_CUDA_FAULT_TARGET_DIR" ]; then \
 	            export CARGO_TARGET_DIR="$$GPU_CUDA_FAULT_TARGET_DIR"; \
 	        fi; \
-	        $(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --lib \
+	        env $$settings $(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --lib \
 	            --features "test-security,$$features" -- --ignored --exact --test-threads=1 "$$test"; \
 	    ) > "$$output" 2>&1 || ! grep -Fq 'test result: ok. 1 passed;' "$$output"; then \
 	        echo "CUDA identity failed or missing: $$test" >&2; failed=1; \
@@ -891,6 +891,68 @@ test-prover-identities-cuda: compile-programs-asm
 	    cat "$$output"; \
 	done < .config/cuda-identity-tests.txt; \
 	exit "$$failed"
+
+# Cluster range ownership on one card: the stage-5A script (one process,
+# in-process and TCP workers, refusals, faults, a killed worker's fallback)
+# plus the range-levels, ECREC-in-two-ranges and repeated-process TCP tests.
+# Each list's run must report exactly its own count of passed tests.
+CLUSTER_TCP_TESTS := two_leaf_tcp_matches_one_process_reference \
+	four_leaf_tcp_matches_one_process_reference tcp_weakened_worker_returns_no_file \
+	a_failed_range_worker_falls_back_to_a_checked_reference \
+	the_range_reference_checks_its_file_before_returning_it \
+	ecrec_in_two_ranges_tcp_matches_one_process_reference
+# Two ECREC tables from two ranges: the honest base, and a dropped, a
+# duplicated and a re-keyed call row refused by the bus balance (split and
+# word memory formats).
+CLUSTER_ECREC_TESTS := two_ecrec_tables_from_two_ranges_verify \
+	an_ecrec_call_with_its_row_dropped_is_refused an_ecrec_row_in_both_tables_is_refused \
+	a_wrong_key_in_the_second_ecrec_table_is_refused an_ecrec_w_row_in_both_tables_is_refused
+CLUSTER_REPEAT_WORKER_TESTS := refused_first_attempt_stops_worker \
+	repeated_worker_discards_an_earlier_attempt_frame
+CLUSTER_REPEAT_RUNNER_TESTS := replica_runs_match_local_reference range_runs_match_local_reference \
+	a_refused_range_file_is_replaced_with_a_checked_local_proof \
+	a_refused_replica_file_is_replaced_with_a_checked_local_proof \
+	a_refused_replacement_ends_in_an_error_with_the_refused_file_in_place
+# The unchecked cluster file's two examples: the checked promotion compiles,
+# a conversion does not. CI's nextest shards run no doctests, so this tier does.
+CLUSTER_DOC_TESTS := lfm::cluster_levels::UncheckedClusterFile
+test-cluster-cuda: compile-programs-asm
+	@set -eu; \
+	unset LAMBDA_VM_CLUSTER LAMBDA_VM_CLUSTER_WINDOWS; \
+	export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1; \
+	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
+	cargo test --release -p lambda-vm-prover --lib --bin cluster --features cuda,test-security --no-run \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	binary=$$(sed -n 's|.*Executable unittests src/lib.rs (\(.*\))$$|\1|p' "$$output"); \
+	runner=$$(sed -n 's|.*Executable unittests src/bin/cluster.rs (\(.*\))$$|\1|p' "$$output"); \
+	test -x "$$binary" && test -x "$$runner" || { cat "$$output"; exit 1; }; \
+	cargo test --release -p lambda-vm-prover --doc --features cuda,test-security $(CLUSTER_DOC_TESTS) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	test "$$(grep -c '^test .* - $(CLUSTER_DOC_TESTS) (line [0-9]*) .*\.\.\. ok$$' "$$output")" = 2; \
+	grep -q '^test .* - $(CLUSTER_DOC_TESTS) (line [0-9]*) - compile fail \.\.\. ok$$' "$$output"; \
+	$(GPU_TEST_TIMEOUT) prover/tests/cluster_stage5a_ranges.sh "$$binary"; \
+	$(GPU_TEST_TIMEOUT) "$$binary" --ignored --exact --test-threads=1 \
+	    $(addprefix lfm::cluster_levels::tests::tcp::,$(CLUSTER_TCP_TESTS)) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	grep -Fq 'test result: ok. $(words $(CLUSTER_TCP_TESTS)) passed;' "$$output"; \
+	$(GPU_TEST_TIMEOUT) "$$binary" --ignored --exact --test-threads=1 \
+	    $(addprefix lfm::cluster_levels::tests::,$(CLUSTER_ECREC_TESTS)) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	grep -Fq 'test result: ok. $(words $(CLUSTER_ECREC_TESTS)) passed;' "$$output"; \
+	export LAMBDA_VM_CARDS=0; \
+	$(GPU_TEST_TIMEOUT) "$$binary" --ignored --exact --test-threads=1 \
+	    $(addprefix block_whir::cluster::tcp::repeat_tests::,$(CLUSTER_REPEAT_WORKER_TESTS)) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	grep -Fq 'test result: ok. $(words $(CLUSTER_REPEAT_WORKER_TESTS)) passed;' "$$output"; \
+	$(GPU_TEST_TIMEOUT) "$$runner" --ignored --exact --test-threads=1 \
+	    $(addprefix tests::tcp::,$(CLUSTER_REPEAT_RUNNER_TESTS)) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	grep -Fq 'test result: ok. $(words $(CLUSTER_REPEAT_RUNNER_TESTS)) passed;' "$$output"
 
 # Hand honest serialized proofs from the TEST binary to the production binary.
 test-cross-posture-cuda: CROSS_POSTURE_ARGS := --features cuda

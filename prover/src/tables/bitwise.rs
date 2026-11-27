@@ -838,6 +838,27 @@ impl PartialEq for BitwiseHistogram {
 }
 
 impl BitwiseHistogram {
+    /// Exact multiplicities in lookup-family and row order.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn counts(&self) -> &[u64] {
+        &self.counters
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn add_range_counts(&mut self, counts: &[u64]) -> Result<(), crate::Error> {
+        let invalid = || crate::Error::Prover("invalid range BITWISE counts".into());
+        if counts.len() != self.counters.len() {
+            return Err(invalid());
+        }
+        for (total, count) in self.counters.iter_mut().zip(counts) {
+            *total = total
+                .checked_add(*count)
+                .filter(|&value| value < math::field::goldilocks::GOLDILOCKS_PRIME)
+                .ok_or_else(invalid)?;
+        }
+        Ok(())
+    }
+
     /// Allocate a zeroed histogram (80 MiB).
     // No `Default` impl on purpose: `new()` allocates 80 MiB, so a stray
     // `..Default::default()` / `#[derive(Default)]` must not silently do that.

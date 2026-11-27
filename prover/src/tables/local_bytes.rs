@@ -338,6 +338,39 @@ pub fn local_counts_of(
     Ok(Some(counts))
 }
 
+/// Read a replica's local lookup sources in their builder representation.
+#[cfg(feature = "parallel")]
+pub(crate) fn local_counts_from_trace(
+    trace: &stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>,
+    interactions: &[BusInteraction],
+    form: KeccakRndForm,
+) -> Result<Option<LocalCounts>, String> {
+    let rows = trace.main_table.height;
+    let mut counts = LocalCounts::default();
+    if let Some(records) = trace.records_main() {
+        let multilinear::records::RecordsFill::KeccakRnd { ops, skip } = records.fill() else {
+            return Err("a local sender held as records other than KECCAK_RND's".to_string());
+        };
+        count_keccak_rnd_rows(
+            ops.iter().map(|op| &op.input),
+            skip,
+            rows,
+            form,
+            &mut counts,
+        )?;
+    } else if let Some(narrow) = trace.narrow_main() {
+        count_from_columns(interactions, rows, |r, c| narrow.get(r, c), &mut counts)?;
+    } else {
+        count_from_columns(
+            interactions,
+            rows,
+            |r, c| trace.main_table.get_row(r)[c].canonical_u64(),
+            &mut counts,
+        )?;
+    }
+    Ok(Some(counts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

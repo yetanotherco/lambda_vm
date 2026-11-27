@@ -1006,9 +1006,12 @@ use compact_branch::CompactBranch;
 use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 #[cfg(feature = "parallel")]
+pub(crate) use finish::BitwiseWitness;
+#[cfg(feature = "parallel")]
 pub(crate) use finish::hand_on_order_first;
 pub(crate) use finish::{
-    Emitted, RegenFamily, RegenJob, RestHeader, RestRegen, RowsNote, UnitRows, rows_misses,
+    BitwiseSlot, Emitted, RegenFamily, RegenJob, RestHeader, RestRegen, RowsNote, UnitRows,
+    rows_misses,
 };
 pub use finish_early::FinishEarly;
 pub use host_hoist::HostHoist;
@@ -1021,9 +1024,9 @@ pub use windowed::{
     WindowedTraceBuilder, exec_pad_probe, pad_write,
 };
 #[cfg(feature = "parallel")]
-pub(crate) use windowed::{RestSink, RowsSink};
+pub(crate) use windowed::{DeferredChunk, head_log, keccak_rnd_arrivals, parallel};
 #[cfg(feature = "parallel")]
-pub(crate) use windowed::{head_log, keccak_rnd_arrivals, parallel};
+pub(crate) use windowed::{RestSink, RowsSink};
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -8101,6 +8104,8 @@ struct CollectedOps {
 /// back). All zero — every build but the windowed one — changes nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamSkip {
+    pub(crate) range_prefix: bool,
+    pub(crate) trace_seed: super::trace_hash::Seed,
     pub cpu: usize,
     pub memw_register: usize,
     pub memw_aligned: usize,

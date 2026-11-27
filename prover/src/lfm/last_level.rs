@@ -45,8 +45,11 @@
 //! code of the format the proof was made in ([`LastLevel::code`]) and the
 //! encoding's code. A reader is given the one format it checks and refuses a
 //! file of another version or another format by name before decoding
-//! anything ([`read_last_level_file`]); the header never chooses what is
-//! checked, and the decoded proof is verified in full.
+//! anything ([`read_last_level_file`]). Version 2 carries a validated leaf map
+//! as a second statement input to the opt-in cluster verifier. After the
+//! common header come the map's little-endian u32 length, one byte per group,
+//! and a 32-byte checksum to detect corruption before decoding the proof.
+//! The join's program identity binds the validated map.
 
 use multilinear::whir_chain::FinalPoly;
 
@@ -365,6 +368,9 @@ pub const LAST_FILE_MAGIC: [u8; 4] = *b"LVLF";
 /// mean. A reader reads this version alone.
 pub const LAST_FILE_VERSION: u8 = 1;
 
+/// The opt-in file with the statement's cluster leaf map.
+pub const CLUSTER_LAST_FILE_VERSION: u8 = 2;
+
 /// The header's length: the magic, the version, the format's code and the
 /// encoding's code.
 pub const LAST_FILE_HEADER: usize = LAST_FILE_MAGIC.len() + 3;
@@ -387,6 +393,15 @@ pub fn last_level_file(
     format: LastLevel,
     wire: WireFormat,
 ) -> Result<Vec<u8>, String> {
+    encode_file(proof, format, wire, None)
+}
+
+pub(crate) fn encode_file(
+    proof: &super::wlfm::WlfmProof,
+    format: LastLevel,
+    wire: WireFormat,
+    map: Option<&super::cluster_levels::LeafMap>,
+) -> Result<Vec<u8>, String> {
     let code = format
         .code()
         .ok_or_else(|| format!("the last level's format ({format}) has no file code"))?;
@@ -398,7 +413,19 @@ pub fn last_level_file(
     };
     let mut file = Vec::with_capacity(LAST_FILE_HEADER + body.len());
     file.extend_from_slice(&LAST_FILE_MAGIC);
-    file.extend_from_slice(&[LAST_FILE_VERSION, code, wire_code(wire)]);
+    let version = if map.is_some() {
+        CLUSTER_LAST_FILE_VERSION
+    } else {
+        LAST_FILE_VERSION
+    };
+    file.extend_from_slice(&[version, code, wire_code(wire)]);
+    if let Some(map) = map {
+        let bytes = map.as_bytes();
+        let len = u32::try_from(bytes.len()).map_err(|_| "leaf map length overflows u32")?;
+        file.extend_from_slice(&len.to_le_bytes());
+        file.extend_from_slice(bytes);
+        file.extend_from_slice(&leaf_map_checksum(bytes));
+    }
     file.extend_from_slice(&body);
     Ok(file)
 }
@@ -415,6 +442,49 @@ pub fn read_last_level_file(
     bytes: &[u8],
     format: LastLevel,
 ) -> Result<super::wlfm::WlfmProof, String> {
+    let (_, wire, body) = file_header(bytes, format, false)?;
+    decode_body(wire, body)
+}
+
+/// V2 checks the map before handing any bytes to a proof decoder.
+pub(crate) fn cluster_file_parts(
+    bytes: &[u8],
+    format: LastLevel,
+    groups: usize,
+) -> Result<(Option<super::cluster_levels::LeafMap>, u8, &[u8]), String> {
+    let (version, wire, body) = file_header(bytes, format, true)?;
+    if version == LAST_FILE_VERSION {
+        return Ok((None, wire, body));
+    }
+    let (len, remaining) = body
+        .split_at_checked(4)
+        .ok_or("truncated leaf map length")?;
+    let len = u32::from_le_bytes(len.try_into().expect("four bytes")) as usize;
+    if len != groups {
+        return Err(format!("leaf map length {len}, expected {groups} groups"));
+    }
+    let (map, remaining) = remaining
+        .split_at_checked(len)
+        .ok_or("truncated leaf map")?;
+    let (checksum, proof) = remaining
+        .split_at_checked(32)
+        .ok_or("truncated leaf map checksum")?;
+    if checksum != leaf_map_checksum(map) {
+        return Err("altered leaf map: checksum mismatch".into());
+    }
+    Ok((
+        Some(super::cluster_levels::LeafMap::decode(map, groups)?),
+        wire,
+        proof,
+    ))
+}
+
+fn leaf_map_checksum(bytes: &[u8]) -> [u8; 32] {
+    use digest::Digest;
+    crypto::hash::blake3::chain::Blake3Std::digest(bytes).into()
+}
+
+fn file_header(bytes: &[u8], format: LastLevel, cluster: bool) -> Result<(u8, u8, &[u8]), String> {
     let want = format
         .code()
         .ok_or_else(|| format!("the verifier's last-level format ({format}) has no file code"))?;
@@ -425,7 +495,7 @@ pub fn read_last_level_file(
         return Err("not a last-level file: no LVLF header".into());
     }
     let (version, code, wire) = (header[4], header[5], header[6]);
-    if version != LAST_FILE_VERSION {
+    if version != LAST_FILE_VERSION && !(cluster && version == CLUSTER_LAST_FILE_VERSION) {
         return Err(format!(
             "last-level file version {version}, this verifier reads {LAST_FILE_VERSION}"
         ));
@@ -438,6 +508,10 @@ pub fn read_last_level_file(
              format {want} ({format})"
         ));
     }
+    Ok((version, wire, body))
+}
+
+pub(crate) fn decode_body(wire: u8, body: &[u8]) -> Result<super::wlfm::WlfmProof, String> {
     match wire {
         0 => {
             super::wire::check_wire_len(body)?;

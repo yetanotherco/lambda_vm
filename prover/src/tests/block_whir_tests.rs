@@ -4434,6 +4434,456 @@ fn keccak_and_ecsm_counts_are_bounded_by_the_block() {
     }
 }
 
+/// ★ A block statement takes one ECREC table a range: 2 and
+/// [`block_whir::BLOCK_MAX_ECREC`] (the most ranges, and leaves, a cluster
+/// cuts a run into) pass, one more is refused by name before the verifier
+/// builds an AIR off it. Every other verifier keeps ECREC to one table
+/// ([`crate::TableCounts::validate`]), and a block keeps HINT, BLAKE3 and
+/// IS_WH to one table each.
+///
+/// Mutations: the ECREC bound dropped and `MAX + 1` passes; ECREC left out of
+/// the block's clamp and `2` is refused; HINT, BLAKE3 or IS_WH clamped like
+/// ECREC and its `2` passes.
+#[test]
+fn a_block_takes_one_ecrec_table_a_range_and_one_hint_blake3_and_is_wh_table() {
+    assert_eq!(
+        block_whir::BLOCK_MAX_ECREC,
+        crate::lfm::cluster_levels::MAX_CLUSTER_LEAVES
+    );
+    assert_eq!(block_whir::BLOCK_MAX_ECREC, 8);
+    let mut single = chunked_counts();
+    (single.copy, single.keccak, single.keccak_rnd) = (1, 1, 1);
+    (single.ecsm, single.ecdas) = (1, 1);
+    single.ecrec = 1;
+    assert!(single.validate().is_ok());
+    single.ecrec = 2;
+    assert!(
+        single.validate().is_err(),
+        "every other verifier keeps ECREC to one table"
+    );
+    let max = block_whir::BLOCK_MAX_ECREC;
+    for (count, ok) in [
+        (0, true),
+        (1, true),
+        (2, true),
+        (max, true),
+        (max + 1, false),
+    ] {
+        let mut counts = chunked_counts();
+        counts.ecrec = count;
+        let checked = block_whir::validate_block_counts(&counts);
+        assert_eq!(
+            checked.is_ok(),
+            ok,
+            "ECREC count {count}: {checked:?} (the block takes at most {max})"
+        );
+    }
+    let mut counts = chunked_counts();
+    counts.ecrec = max + 1;
+    let refused = format!("{:?}", block_whir::validate_block_counts(&counts));
+    assert!(
+        refused.contains(&format!("ecrec count is {}", max + 1)),
+        "refused by name, got {refused}"
+    );
+    type Field = fn(&mut crate::TableCounts) -> &mut usize;
+    let one_table: [(&str, Field); 3] = [
+        ("hint", |c| &mut c.hint),
+        ("blake3", |c| &mut c.blake3),
+        ("is_wh", |c| &mut c.is_wh),
+    ];
+    for (name, field) in one_table {
+        let mut counts = chunked_counts();
+        counts.ecrec = 2;
+        *field(&mut counts) = 1;
+        assert!(
+            block_whir::validate_block_counts(&counts).is_ok(),
+            "{name}: one table"
+        );
+        *field(&mut counts) = 2;
+        let refused = format!("{:?}", block_whir::validate_block_counts(&counts));
+        assert!(
+            refused.contains(&format!("{name} count is 2")),
+            "{name}: a block keeps it to one table, got {refused}"
+        );
+    }
+}
+
+/// ★ With two ECREC tables the statement's order keeps its other tables in
+/// place: ECREC[0] and ECREC[1] after HINT, then BLAKE3, IS_WH, and the CPU
+/// tables where [`crate::cpu_proof_start`] (the verifier's reader of the CPU
+/// heights) puts them; the chunked tables' ranges are unchanged.
+#[test]
+fn the_tables_after_two_ecrec_tables_keep_their_places() {
+    use executor::elf::Elf;
+    let elf = asm_elf_bytes("poc_rodata_commit");
+    let program = Elf::load(&elf).expect("load the ELF");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf(&program);
+    let mut counts = chunked_counts();
+    (counts.ecrec, counts.blake3, counts.is_wh) = (2, 1, 1);
+    block_whir::validate_block_counts(&counts).expect("a block takes two ECREC tables");
+    let airs = crate::VmAirs::new(
+        &program,
+        &ProofOptions::default_test_options(),
+        false,
+        &page_configs,
+        &counts,
+        &vec![4; counts.cpu],
+        None,
+        true,
+        None,
+        crate::test_utils::halted_register_commitment(
+            &ProofOptions::default_test_options(),
+            &program,
+            &[],
+        )
+        .preprocessed(),
+    );
+    let names: Vec<String> = airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    let hint = names
+        .iter()
+        .position(|n| n.starts_with("HINT"))
+        .expect("a HINT table");
+    assert_eq!(names.iter().filter(|n| n.starts_with("HINT")).count(), 1);
+    assert_eq!(names[hint + 1], "ECREC[0]");
+    assert_eq!(names[hint + 2], "ECREC[1]");
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("ECREC")).count(),
+        2,
+        "{names:?}"
+    );
+    assert!(names[hint + 3].starts_with("BLAKE3"), "{names:?}");
+    assert!(names[hint + 4].starts_with("IS_WH"), "{names:?}");
+    let cpu = crate::cpu_proof_start(true, &counts);
+    assert_eq!(cpu, hint + 5);
+    for k in 0..counts.cpu {
+        assert_eq!(names[cpu + k], format!("CPU[{k}]"), "{names:?}");
+    }
+    assert!(!names[cpu + counts.cpu].starts_with("CPU"));
+    let ecdas = block_whir::chunked_table_ranges(&counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "ECDAS")
+        .expect("ECDAS's range")
+        .1;
+    assert_eq!(ecdas.end, hint, "ECDAS's range ends at HINT");
+}
+
+/// ★ End to end: a proof restated with one ECREC table past the block's
+/// bound is refused at the frame by that bound's error, before any AIR is
+/// built: the page AIRs the frame builds (counted where `VmAirs` builds
+/// them) do not move on the refusal, and do on the honest verification.
+///
+/// Mutation: the ECREC bound dropped and the error is no longer the bound's.
+#[test]
+fn an_ecrec_count_past_the_block_bound_is_refused_at_the_frame() {
+    let elf = asm_elf_bytes("sub");
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    let built = || crate::PAGE_AIRS_BUILT.with(std::cell::Cell::get);
+    let before = built();
+    assert!(verify(&proof, &elf, &format));
+    assert!(
+        built() > before,
+        "the honest verification builds its page AIRs"
+    );
+    proof.table_counts.ecrec = block_whir::BLOCK_MAX_ECREC + 1;
+    let before = built();
+    let refused =
+        block_whir::verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &format);
+    assert_eq!(built(), before, "an AIR was built before the refusal");
+    let msg = format!("{refused:?}");
+    assert!(
+        msg.contains(&format!(
+            "ecrec count is {} — a block takes at most {}",
+            block_whir::BLOCK_MAX_ECREC + 1,
+            block_whir::BLOCK_MAX_ECREC
+        )),
+        "the frame must refuse it with the bound's error, got {msg}"
+    );
+}
+
+/// What makes a block's ECREC tables, however many, prove what one table
+/// proves: the rows of several accepted ECREC (or ECREC_W) tables, put into
+/// one table and padded with zero rows, are an accepted one-table witness
+/// with the same bus terms. That holds while
+///
+/// 1. every constraint reads its own row only (each is evaluated here on a
+///    one-row frame, where a read of another row panics), and an all-zero
+///    row satisfies every one;
+/// 2. every bus message is weighted by one column, held to 0 or 1 on every
+///    row (so zero on a zero row): no constant, negated, summed or linear
+///    weight;
+/// 3. so a table split into two, each padded with zero rows, puts the same
+///    multiset of terms on the buses as the one table.
+///
+/// [`block_whir::BLOCK_MAX_ECREC`] rests on these; a change that breaks one
+/// fails here, beside the bound.
+mod ecrec_table_bound_premises {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::tables::ecrec::{self, EcrecConstraints, EcrecOperation, cols};
+    use crate::tables::ecrec_w::{self, EcrecWordConstraints};
+    use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+    use ecsm::compute_ecrec_witness;
+    use math::field::element::FieldElement;
+    use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
+    use stark::frame::Frame;
+    use stark::lookup::{BusInteraction, Multiplicity};
+    use stark::table::TableView;
+    use stark::traits::TransitionEvaluationContext;
+
+    /// Every constraint's value on `main` as the only row of the frame.
+    fn eval<C: ConstraintSet<GoldilocksField, GoldilocksExtension>>(
+        cs: &C,
+        main: Vec<FE>,
+    ) -> Vec<FE> {
+        let n = cs.meta().len();
+        let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![TableView::new(
+            vec![main],
+            vec![vec![]],
+        )]);
+        let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+        let offset_e = FieldElement::<GoldilocksExtension>::zero();
+        let ctx =
+            TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+        let mut base = vec![FE::zero(); n];
+        let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+        let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+        cs.eval(&mut folder);
+        assert!(ext.iter().all(|e| *e == FieldElement::zero()));
+        base
+    }
+
+    fn holds<C: ConstraintSet<GoldilocksField, GoldilocksExtension>>(
+        cs: &C,
+        main: Vec<FE>,
+    ) -> bool {
+        eval(cs, main).iter().all(|v| *v == FE::zero())
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    fn call(timestamp: u64, r: &str, s: &str, z: &str, parity: u8) -> EcrecOperation {
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&hex32(r));
+        sig[32..].copy_from_slice(&hex32(s));
+        EcrecOperation {
+            timestamp,
+            addr_out: 0x1000,
+            addr_sig: 0x2000,
+            addr_msg: 0x3000,
+            witness: compute_ecrec_witness(&sig, &hex32(z), parity),
+            pending: None,
+            words: false,
+        }
+    }
+
+    /// Three calls: two recover a key, the third bails (r = 0).
+    fn calls() -> Vec<EcrecOperation> {
+        vec![
+            call(
+                444,
+                "3284bae4a1b693dfbe8ac67400e4891f3b53681c5159a315561051f3d2c57139",
+                "97d4b2f2f728a54ed562a12237f6b11d32d626e7fcc24c3470b0729e095bd057",
+                "c0ffee0011223344556677889900aabbccddeeff00112233445566778899aabb",
+                0,
+            ),
+            call(
+                448,
+                "7962d45b38e8bcf82fa8efa8432a01f20c9a53e24c7d3f11df197cb8e70926da",
+                "ecec6811812f04794c1f92be72948f95a6cda7874445a39db40aab31c835f2cd",
+                "0000000000000000000000000000000000000000000000000000000000000042",
+                1,
+            ),
+            call(
+                452,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "ecec6811812f04794c1f92be72948f95a6cda7874445a39db40aab31c835f2cd",
+                "0000000000000000000000000000000000000000000000000000000000000042",
+                1,
+            ),
+        ]
+    }
+
+    fn rows_of(calls: &[EcrecOperation]) -> Vec<Vec<FE>> {
+        let trace = ecrec::generate_ecrec_trace(calls);
+        (0..trace.num_rows())
+            .map(|row| {
+                (0..cols::NUM_COLUMNS)
+                    .map(|c| *trace.main_table.get(row, c))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The multiset of a table's bus terms with a nonzero weight: (bus,
+    /// sender, values, weight) and how many times each occurs.
+    type Terms = BTreeMap<(u64, bool, Vec<u64>, u64), usize>;
+
+    fn terms(interactions: &[BusInteraction], rows: &[Vec<FE>]) -> Terms {
+        let mut out = Terms::new();
+        for row in rows {
+            let get = |c: usize| row[c];
+            for bi in interactions {
+                let Multiplicity::Column(mc) = bi.multiplicity else {
+                    panic!("not a column weight: {:?}", bi.multiplicity);
+                };
+                let m = row[mc].canonical();
+                if m == 0 {
+                    continue;
+                }
+                let values: Vec<u64> = bi
+                    .values
+                    .iter()
+                    .flat_map(|v| v.combine_from(get))
+                    .map(|f| f.canonical())
+                    .collect();
+                *out.entry((bi.bus_id, bi.is_sender, values, m)).or_default() += 1;
+            }
+        }
+        out
+    }
+
+    /// ★ An all-zero row satisfies all 981 ECREC and all 982 ECREC_W
+    /// constraints, each evaluated on a one-row frame.
+    ///
+    /// Mutation: a constraint with a constant term (or one reading the next
+    /// row) fails it.
+    #[test]
+    fn an_all_zero_row_satisfies_every_ecrec_and_ecrec_w_constraint() {
+        let zero = eval(&EcrecConstraints, vec![FE::zero(); cols::NUM_COLUMNS]);
+        assert_eq!(zero.len(), ecrec::NUM_CONSTRAINTS);
+        assert!(zero.iter().all(|v| *v == FE::zero()), "ECREC zero row");
+        let zero_w = eval(
+            &EcrecWordConstraints,
+            vec![FE::zero(); ecrec_w::cols::NUM_COLUMNS],
+        );
+        assert_eq!(zero_w.len(), ecrec_w::NUM_CONSTRAINTS);
+        assert!(zero_w.iter().all(|v| *v == FE::zero()), "ECREC_W zero row");
+        println!(
+            "ECREC ZERO ROW: ECREC {} constraints, ECREC_W {} constraints, all zero",
+            zero.len(),
+            zero_w.len()
+        );
+    }
+
+    /// ★ Every ECREC and ECREC_W bus message is weighted by one column, `MU`,
+    /// `OK` or a scalar bit, and each such column is held to a bit: 2 in it
+    /// alone, on an otherwise zero row, breaks a constraint of each table.
+    ///
+    /// Mutation: one message's weight made a constant (`Multiplicity::One`)
+    /// fails it.
+    #[test]
+    fn every_ecrec_bus_weight_is_one_column_held_to_a_bit() {
+        let allowed: BTreeSet<usize> = [cols::MU, cols::OK]
+            .into_iter()
+            .chain(cols::U1..cols::U1 + 256)
+            .chain(cols::U2..cols::U2 + 256)
+            .collect();
+        let mut used = BTreeSet::new();
+        for (name, list) in [
+            ("ECREC", ecrec::bus_interactions()),
+            ("ECREC_W", ecrec_w::bus_interactions()),
+        ] {
+            for bi in &list {
+                match bi.multiplicity {
+                    Multiplicity::Column(c) if allowed.contains(&c) => {
+                        used.insert(c);
+                    }
+                    ref other => panic!("{name}: weight {other:?} on bus {}", bi.bus_id),
+                }
+            }
+            println!(
+                "ECREC WEIGHTS: {name} {} messages, every weight a listed column",
+                list.len()
+            );
+        }
+        for &c in &used {
+            let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
+            row[c] = FE::from(2u64);
+            assert!(
+                !holds(&EcrecConstraints, row),
+                "ECREC column {c} not held to a bit"
+            );
+            let mut row = vec![FE::zero(); ecrec_w::cols::NUM_COLUMNS];
+            row[c] = FE::from(2u64);
+            assert!(
+                !holds(&EcrecWordConstraints, row),
+                "ECREC_W column {c} not held to a bit"
+            );
+        }
+        println!(
+            "ECREC WEIGHTS: {} weight columns, each held to a bit",
+            used.len()
+        );
+    }
+
+    /// ★ Three calls (two recovered, one bailed) as one table, and as two
+    /// tables (one call, then two) each padded with zero rows: every row of
+    /// both satisfies the constraints, and the two tables put on the buses
+    /// exactly the one table's terms, under ECREC and under ECREC_W.
+    ///
+    /// Mutation: a weight that is not zero on a zero row (a constant) gives
+    /// the padding rows terms of their own and fails it.
+    #[test]
+    fn ecrec_rows_split_into_two_padded_tables_carry_the_same_bus_terms() {
+        let one = rows_of(&calls());
+        assert!(one.len() >= 4, "three calls pad to four rows");
+        assert!(one.iter().all(|row| holds(&EcrecConstraints, row.clone())));
+        let zero = vec![FE::zero(); cols::NUM_COLUMNS];
+        // Call 0 alone in table A (padded to 2 rows); calls 1 and 2 in
+        // table B (padded to 4 rows).
+        let a = vec![one[0].clone(), zero.clone()];
+        let b = vec![one[1].clone(), one[2].clone(), zero.clone(), zero.clone()];
+        for row in a.iter().chain(&b) {
+            assert!(holds(&EcrecConstraints, row.clone()));
+        }
+        for (words, list) in [
+            (false, ecrec::bus_interactions()),
+            (true, ecrec_w::bus_interactions()),
+        ] {
+            let name = if words { "ECREC_W" } else { "ECREC" };
+            // ECREC_W's rows: ECREC's, then BAIL = MU − OK.
+            let widen = |rows: &[Vec<FE>]| -> Vec<Vec<FE>> {
+                rows.iter()
+                    .map(|row| {
+                        let mut wide = row.clone();
+                        if words {
+                            wide.push(row[cols::MU] - row[cols::OK]);
+                        }
+                        wide
+                    })
+                    .collect()
+            };
+            let (one, a, b) = (widen(&one), widen(&a), widen(&b));
+            if words {
+                for row in one.iter().chain(&a).chain(&b) {
+                    assert!(holds(&EcrecWordConstraints, row.clone()));
+                }
+            }
+            let whole = terms(&list, &one);
+            let mut split = terms(&list, &a);
+            for (key, n) in terms(&list, &b) {
+                *split.entry(key).or_default() += n;
+            }
+            assert_eq!(whole, split, "{name}: the split tables' bus terms");
+            let count: usize = whole.values().sum();
+            println!(
+                "ECREC SPLIT: {name} one table and two padded tables carry the same {count} bus terms"
+            );
+        }
+    }
+}
+
 /// ★ The statement's heights are capped for the chunked tables, and only
 /// theirs: a COPY table over [`block_whir::BLOCK_COPY_MAX_VARS`], a KECCAK
 /// table over [`block_whir::BLOCK_KECCAK_MAX_VARS`], a KECCAK_RND table over

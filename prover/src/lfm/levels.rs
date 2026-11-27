@@ -13,8 +13,8 @@
 //!   ships today); deeper chains stop at a group count instead, for the
 //!   compression modes. The level count follows from the shapes alone.
 //!
-//! There are no leaves and no nodes: the unit of proving (a group of the
-//! level's block) is apart from the unit of verifying (a program).
+//! The pinned chain uses one program per level. The opt-in range cluster
+//! uses several level-1 programs and a level-2 join ([`super::cluster_levels`]).
 //!
 //! # Never from a proof
 //!
@@ -41,13 +41,14 @@ use super::last_level::LastLevel;
 use super::merkle_cap::CapMux;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
-    StackPlace, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof, WlfmProving, WlfmRate,
-    prepare_wlfm_rounds, prove_wlfm_traces_as, verify_wlfm,
+    StackPlace, WlfmArtifacts, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof,
+    WlfmProving, WlfmRate, prepare_wlfm_rounds, prove_wlfm_traces_as, verify_wlfm,
 };
 use super::wlfm_leg::{
     WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_leg_program_marked, wlfm_wrap_hash,
 };
 use crate::block_whir::BlockWhirProof;
+use crate::block_whir::cluster::stages::Clock;
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use multilinear::whir_chain::GroupFold;
 use stark::proof::options::BaseFormat;
@@ -322,8 +323,8 @@ fn level_plan_with(
 /// probe: ≈ 250 M prepared cells, 4.98 GiB promised at its prove's start).
 const STACK_CARD_BYTES_PER_CELL: u64 = 20;
 
-/// The card room a group's commit needs above what the card already holds
-/// (the same probe: 8.05 → 23.45 GiB through its first group's commit).
+/// Minimum working room above the prepared stacks, from the levels probe
+/// (8.05 → 23.45 GiB through its first group's commit).
 const GROUP_COMMIT_ROOM: u64 = 19 << 30;
 
 /// `LAMBDA_VM_LEVELS_STACKS`: where the levels' prover commits each level's
@@ -435,16 +436,27 @@ pub fn parse_stacks(value: Option<&str>) -> Result<Option<StackPlace>, String> {
 
 /// Where level `level`'s `cells` prepared cells are committed: `forced` when
 /// given, else on the card, held when the card's ledger budget, read now,
-/// holds them beside a group's commit and retired when it does not; the host
+/// holds them beside the groups' working room and retired when it does not; the host
 /// only when there is no card. Printed.
-pub(crate) fn stack_place(cells: u64, level: usize, forced: Option<StackPlace>) -> StackPlace {
+pub(super) fn stack_place(
+    pre: &WlfmPrebuild,
+    level: usize,
+    forced: Option<StackPlace>,
+    budget: u64,
+) -> Result<StackPlace, String> {
+    let cells = pre.prepared_cells();
     let need = cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
-    let budget = multilinear::gpu::reserve_budget().saturating_sub(levels_pad_held());
+    let budget = budget.saturating_sub(levels_pad_held());
+    let room = if budget > 0 && forced.is_none() {
+        pre.group_card_room()?.max(GROUP_COMMIT_ROOM)
+    } else {
+        0
+    };
     let place = if budget == 0 {
         StackPlace::Host
     } else if let Some(place) = forced {
         place
-    } else if need > budget.saturating_sub(GROUP_COMMIT_ROOM) {
+    } else if need > budget.saturating_sub(room) {
         StackPlace::CardRetired
     } else {
         StackPlace::Card
@@ -452,16 +464,17 @@ pub(crate) fn stack_place(cells: u64, level: usize, forced: Option<StackPlace>) 
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     eprintln!(
         "LEVELS STACKS level {level}: {cells} prepared cells · ≈ {:.2} GiB on the card · budget \
-         {:.2} GiB · committed on the {}",
+         {:.2} GiB · group room {:.2} GiB · committed on the {}",
         gib(need),
         gib(budget),
+        gib(room),
         match place {
             StackPlace::Host => "host",
             StackPlace::Card => "card, held",
             StackPlace::CardRetired => "card, retired",
         }
     );
-    place
+    Ok(place)
 }
 
 /// The place [`STACKS_ENV`] forces, read once a process (a test's
@@ -1390,7 +1403,33 @@ fn narrow_pack_pool() -> Option<&'static rayon::ThreadPool> {
 /// card) each group's stack on the card its group is assigned to
 /// ([`stark::phase_b_split::assign_cards`] of [`WlfmPrebuild::group_prices`]).
 pub(crate) fn commit_level(pre: WlfmPrebuild, level: usize) -> Result<WlfmBuild, String> {
-    let place = stack_place(pre.prepared_cells(), level, stacks_forced()?);
+    commit_level_staged(pre, level, Clock::default())
+}
+
+pub(super) fn commit_level_staged(
+    pre: WlfmPrebuild,
+    level: usize,
+    clock: Clock,
+) -> Result<WlfmBuild, String> {
+    use multilinear::gpu;
+
+    let forced = stacks_forced()?;
+    let budget = match gpu::indexed_cards()? {
+        Some(cards) => {
+            // Apply the fit check conservatively across heterogeneous cards.
+            cards
+                .iter()
+                .map(|&card| gpu::in_indexed_card(card, gpu::reserve_budget))
+                .min()
+                .unwrap_or(0)
+        }
+        None => gpu::reserve_budget(),
+    };
+    let place = stack_place(&pre, level, forced, budget)?;
+    clock.mark("leaf-prepare-done");
+    if gpu::has_indexed_cards() {
+        return pre.commit(place);
+    }
     let cards = (place != StackPlace::Host && stacks_by_card_acts())
         .then(|| stark::phase_b_split::assign_cards(&pre.group_prices(), &[]))
         .filter(|cards| cards.contains(&1));
@@ -1398,7 +1437,7 @@ pub(crate) fn commit_level(pre: WlfmPrebuild, level: usize) -> Result<WlfmBuild,
         let cells = pre.prepared_cells_by_group();
         let mut by_card = [(0u64, 0usize); 2];
         for (g, &c) in cards.iter().enumerate() {
-            let at = &mut by_card[usize::from(c.min(1))];
+            let at = &mut by_card[usize::from(c)];
             let cells = cells.get(g).copied().unwrap_or(0);
             at.0 += cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
             at.1 += usize::from(cells > 0);
@@ -1460,10 +1499,10 @@ pub fn stacks_by_card() -> bool {
     })
 }
 
-/// Whether [`stacks_by_card`] acts: the knob on, the levels' split on and its
-/// second card ready.
+/// Whether [`stacks_by_card`] uses the legacy split's two backends.
 fn stacks_by_card_acts() -> bool {
     stacks_by_card()
+        && !multilinear::gpu::has_indexed_cards()
         && multilinear::gpu::two_card_levels_on()
         && multilinear::gpu::two_card_split_ready()
 }
@@ -1646,6 +1685,9 @@ static LEVELS_PAD: std::sync::Mutex<Option<(multilinear::gpu::DeviceRoom, u64)>>
 
 /// The bytes of the levels' pad held now (0 when none).
 fn levels_pad_held() -> u64 {
+    if multilinear::gpu::has_indexed_cards() {
+        return INDEXED_MAIN_PAD_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    }
     LEVELS_PAD
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1695,6 +1737,11 @@ impl Drop for PadRelease {
         release_levels_pad();
     }
 }
+
+// Indexed overrides span the base's end through the last level, including
+// scoped commit threads. Legacy callers retain their original ledger path.
+static LEVELS_LEDGER_EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static INDEXED_MAIN_PAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `LAMBDA_VM_LEVELS_CARD_BUDGET_PCT=<percent>`: from the base's end to the
 /// driver's return, the card ledger's budget is this share of the card's
@@ -1822,6 +1869,132 @@ impl Drop for BudgetRelease {
     }
 }
 
+#[derive(Default)]
+struct IndexedLevelsMemory {
+    pads: Vec<multilinear::gpu::DeviceRoom>,
+    budgets: Vec<multilinear::gpu::CardBudget>,
+}
+
+impl IndexedLevelsMemory {
+    fn activate(&mut self, leaf: Option<usize>) -> Result<(), String> {
+        use multilinear::gpu;
+
+        let pct = card_budget_pct()?;
+        let pad = card_pad_bytes()?;
+        let cards = gpu::indexed_cards()?.expect("explicit card list");
+        let mut physical = std::collections::BTreeSet::new();
+        for card in cards {
+            let available =
+                leaf.and_then(|leaf| gpu::in_indexed_card(card, || range_leaf_card(leaf, card)));
+            if let (Some(pct), Some((ordinal, total))) = (pct, gpu::card_memory(card))
+                && (leaf.is_none() || available.is_some())
+            {
+                let usable = available.unwrap_or(total).min(total);
+                let bytes = usable / 100 * pct;
+                if let Some(budget) = gpu::override_card_budget(
+                    card,
+                    bytes,
+                    physical.insert(ordinal).then_some(bytes),
+                ) {
+                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                    if card == 0 {
+                        eprintln!(
+                            "LEVELS CARD budget: {:.2} GiB ({pct} % of {:.2}) for the levels, the base's {:.2} GiB back at the driver's return",
+                            gib(bytes),
+                            gib(usable),
+                            gib(budget.previous),
+                        );
+                    } else {
+                        eprintln!(
+                            "LEVELS CARD budget on card {card}: {:.2} GiB, {:.2} GiB back at the driver's return",
+                            gib(bytes),
+                            gib(budget.previous),
+                        );
+                    }
+                    self.budgets.push(budget);
+                }
+            }
+            if pad != 0 {
+                let room = if card == 0 {
+                    gpu::reserve_room(pad)
+                } else {
+                    gpu::in_indexed_card(card, || gpu::reserve_room(pad))
+                };
+                if let Some(room) = room {
+                    if card == 0 {
+                        INDEXED_MAIN_PAD_BYTES.store(pad, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.pads.push(room);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IndexedLevelsMemory {
+    fn drop(&mut self) {
+        self.pads.clear();
+        INDEXED_MAIN_PAD_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        while let Some(budget) = self.budgets.pop() {
+            drop(budget);
+        }
+    }
+}
+
+fn activate_levels_memory(
+    memory: &mut Option<IndexedLevelsMemory>,
+    total: Option<u64>,
+) -> Result<(), String> {
+    if let Some(memory) = memory {
+        memory.activate(None)
+    } else {
+        take_levels_budget(total)?;
+        take_levels_pad()?;
+        Ok(())
+    }
+}
+
+/// Settle and measure the card after the range's base openings have released
+/// their stores. The scoped budget can promise a share of the memory available
+/// to this prover, including promises it already holds.
+fn range_leaf_card(leaf: usize, card: usize) -> Option<u64> {
+    use multilinear::gpu;
+
+    let (_, _, free, total) = gpu::settle_card()?;
+    let reserved = gpu::ledger_reserved();
+    let gib = |b| b as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "RANGE LEAF {leaf} card {card} entry: free {:.2} GiB · used {:.2} GiB · total {:.2} GiB · ledger {:.2} GiB promised",
+        gib(free),
+        gib(total.saturating_sub(free)),
+        gib(total),
+        gib(reserved),
+    );
+    Some(free.saturating_add(reserved).min(total))
+}
+
+/// Keep the local driver's levels budget and pad through the leaf's build and
+/// proof. Range TCP uses one indexed card per process. The reference may also
+/// use the legacy driver.
+pub(super) fn with_range_leaf_memory<T>(
+    leaf: usize,
+    prove: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _exclusive = LEVELS_LEDGER_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if multilinear::gpu::has_indexed_cards() {
+        let mut memory = IndexedLevelsMemory::default();
+        memory.activate(Some(leaf))?;
+        prove()
+    } else {
+        let (_pad, _budget) = (PadRelease, BudgetRelease);
+        activate_levels_memory(&mut None, range_leaf_card(leaf, 0))?;
+        prove()
+    }
+}
+
 /// `LAMBDA_VM_LEVELS_FREE_BESIDE=1`: level 1's filled program (its
 /// instructions and instruction columns) is let go on the thread that hands
 /// the execution's memory back beside the prove, where it is otherwise freed
@@ -1942,7 +2115,9 @@ pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
 /// A card reading inside the levels: trimmed as today, or under
 /// [`super::wlfm_knobs::levels_untrimmed`] untrimmed ([`card_settle_on`]).
 fn card_settle_levels(at: &str) -> Option<CardReading> {
-    card_settle_on(at, !super::wlfm_knobs::levels_untrimmed())
+    let trim = !super::wlfm_knobs::levels_untrimmed();
+    multilinear::gpu::settle_peer_cards(trim);
+    card_settle_on(at, trim)
 }
 
 /// Card readings this process took without a trim ([`card_settle_on`]).
@@ -2056,8 +2231,67 @@ pub fn settle_late() -> bool {
 /// whether it trimmed, for the times.
 fn settle_base_end(late: bool) -> (Option<CardReading>, f64, bool) {
     let t = std::time::Instant::now();
+    multilinear::gpu::settle_peer_cards(!late);
     let reading = card_settle_on("base end", !late);
     (reading, t.elapsed().as_secs_f64(), !late)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[test]
+#[ignore = "card: legacy split ready, run once per tail setting"]
+fn legacy_levels_preserve_primary_budget_and_settle_counts() {
+    use math_cuda::device;
+    use multilinear::gpu;
+
+    assert!(!gpu::has_indexed_cards());
+    assert!(gpu::two_card_levels_on() && gpu::two_card_split_ready());
+    assert_eq!(card_budget_pct(), Ok(Some(85)));
+    let original = || {
+        (
+            gpu::reserve_budget(),
+            gpu::in_second_role(gpu::reserve_budget),
+        )
+    };
+    let base_budgets = original();
+    // e2bb5f79f used the base-end reading from the primary for both
+    // budgets, regardless of the secondary's actual total VRAM.
+    let second_total =
+        gpu::in_second_role(|| device::backend().unwrap().device_mem_info().unwrap().1);
+    let primary_total = if second_total == 24 << 30 {
+        48 << 30
+    } else {
+        24 << 30
+    };
+    {
+        let _restore = BudgetRelease;
+        let _pad = PadRelease;
+        activate_levels_memory(&mut None, Some(primary_total)).unwrap();
+        let bytes = 85 * (primary_total / 100);
+        let expected = if gpu::second_shares_card_0() {
+            bytes / 2
+        } else {
+            bytes
+        };
+        assert_eq!(original(), (expected, expected));
+    }
+    assert_eq!(original(), base_budgets);
+
+    let untrimmed = super::wlfm_knobs::levels_untrimmed();
+    let drains_per_settle = if stacks_by_card() { 2 } else { 1 };
+    let drains = device::trims();
+    let readings = untrimmed_readings();
+    let (reading, _, trimmed) = settle_base_end(untrimmed);
+    assert!(reading.is_some());
+    assert_eq!(trimmed, !untrimmed);
+    assert_eq!(device::trims() - drains, drains_per_settle);
+    assert!(card_settle_levels("level 1 committed").is_some());
+    assert_eq!(device::trims() - drains, 2 * drains_per_settle);
+    assert!(card_settle_levels("level 1 proved").is_some());
+    assert_eq!(device::trims() - drains, 3 * drains_per_settle);
+    assert_eq!(
+        untrimmed_readings() - readings,
+        if untrimmed { 3 } else { 0 }
+    );
 }
 
 /// This process's resident set, in bytes (Linux; `None` elsewhere).
@@ -2095,17 +2329,26 @@ pub(crate) fn build_level(
     at: (LevelStop, usize),
     last: LastLevel,
 ) -> Result<Level, String> {
-    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let place = if on_host {
         StackPlace::Host
     } else {
         StackPlace::Card
     };
-    let build = prepare_as_level(at.0, at.1, last, family, |levers| {
-        prepare_wlfm_rounds(&program, hasher, LEVEL_RATE, levers, rounds)
-    })?
-    .commit(place)?;
+    let build = prepare_level_program(&program, family, rounds, at, last)?.commit(place)?;
     Ok(Level { program, build })
+}
+
+pub(super) fn prepare_level_program(
+    program: &LfmProgram,
+    family: WlfmFamily,
+    rounds: Option<u8>,
+    at: (LevelStop, usize),
+    last: LastLevel,
+) -> Result<WlfmPrebuild, String> {
+    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    prepare_as_level(at.0, at.1, last, family, |levers| {
+        prepare_wlfm_rounds(program, hasher, LEVEL_RATE, levers, rounds)
+    })
 }
 
 /// Level `k + 1`'s view of level `k`: its artifacts and the top's word count.
@@ -2574,7 +2817,7 @@ pub fn verify_block_levels_at(
 /// lookups argued per group, [`crate::block_whir::B3_BASE_KECCAK_RND`]) and
 /// the round form `rounds` — never their environment knobs. The leaf order and round-0 trees are
 /// re-checked against the new base.
-pub(crate) fn pin_family(
+pub fn pin_family(
     mut format: crate::block_whir::BlockFormat,
     family: WlfmFamily,
     rounds: crate::block_whir::B3Rounds,
@@ -2670,7 +2913,7 @@ fn verifier_level_plan_with(
 /// The verifier body under a pinned `format`: [`verifier_level_plan`], then
 /// [`verify_levels_to`] with the last level under the named `last_level`.
 #[allow(clippy::too_many_arguments)]
-fn verify_block_levels_pinned(
+pub(crate) fn verify_block_levels_pinned(
     elf: &[u8],
     format: &crate::block_whir::BlockFormat,
     statement: crate::block_whir::BlockStatement<'_>,
@@ -2711,7 +2954,10 @@ fn verify_block_levels_pinned(
 /// never the abort or panic of the process-wide reader. Only then are the
 /// process-wide cells read — the values the derivation will use — and only
 /// the family's own: a Poseidon1 verification reads no BLAKE3 cell.
-fn check_process_format(family: WlfmFamily, last_level: LastLevel) -> Result<(), String> {
+pub(crate) fn check_process_format(
+    family: WlfmFamily,
+    last_level: LastLevel,
+) -> Result<(), String> {
     check_last_level_knobs(super::last_level::last_level(family)?, last_level)?;
     let cap = knob_word(
         crate::block_whir::B3_BASE_CAP_ENV,
@@ -2907,7 +3153,16 @@ pub(crate) fn verify_levels_to(
 ) -> Result<(), String> {
     let levels = derive_levels_last(plan, family, stop, last_level, true)?;
     let top = levels.last().expect("a level");
-    verify_wlfm(&top.build.artifacts, last, &last.public_words).map_err(|e| {
+    verify_derived_level(plan, last_level, last, &top.build.artifacts)
+}
+
+pub(super) fn verify_derived_level(
+    plan: &WhirBlockPlan,
+    last_level: LastLevel,
+    last: &WlfmProof,
+    artifacts: &WlfmArtifacts,
+) -> Result<(), String> {
+    verify_wlfm(artifacts, last, &last.public_words).map_err(|e| {
         format!(
             "the last level does not verify (this verifier checks the last level's format: \
              {last_level}; a proof made in another is refused): {e}"
@@ -3143,6 +3398,10 @@ pub fn prove_block_levels(
     use super::executor::{ArenaPiece, StreamedExecution};
     use super::word::LfmWord;
 
+    #[cfg(not(test))]
+    if crate::block_whir::cluster_tcp::range_coordinator_selected() {
+        return Err("range topologies require prove_cluster_block_levels".into());
+    }
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
     // The last level's own format, read once (the process's knobs over the
@@ -3187,8 +3446,18 @@ pub fn prove_block_levels(
             (false, false) => "off",
         }
     );
-    let _pad = PadRelease;
-    let _budget = BudgetRelease;
+    let indexed = multilinear::gpu::has_indexed_cards();
+    let _memory_exclusive = indexed.then(|| {
+        LEVELS_LEDGER_EXCLUSIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    });
+    let (_pad, _budget) = if indexed {
+        (None, None)
+    } else {
+        (Some(PadRelease), Some(BudgetRelease))
+    };
+    let mut levels_memory = indexed.then(IndexedLevelsMemory::default);
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
     let at_start = if keep { None } else { card_settle("start") };
@@ -3759,8 +4028,7 @@ pub fn prove_block_levels(
                         return Err("the base did not prove".to_string());
                     }
                     let (settled, settle_secs, trimmed) = settle_base_end(late);
-                    take_levels_budget(settled.map(|c| c.total))?;
-                    take_levels_pad()?;
+                    activate_levels_memory(&mut levels_memory, settled.map(|c| c.total))?;
                     let build = commit_level(pre, 1)?;
                     let committed = card_settle_levels("level 1 committed");
                     Ok((
@@ -3873,8 +4141,7 @@ pub fn prove_block_levels(
             let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
             let (settled, settle_secs, trimmed) =
                 settle_base_end(settle_late() || super::wlfm_knobs::levels_untrimmed());
-            take_levels_budget(settled.map(|c| c.total))?;
-            take_levels_pad()?;
+            activate_levels_memory(&mut levels_memory, settled.map(|c| c.total))?;
             let build = commit_level(pre, 1)?;
             let committed = card_settle_levels("level 1 committed");
             (

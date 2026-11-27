@@ -1064,7 +1064,9 @@ fn numbered_on_a_thread(
                         }
                     }
                 });
-                walk_numbered(&mut builder, rx, walkers, number, None, |_, _, _| Ok(()))
+                walk_numbered(&mut builder, rx, walkers, number, None, None, |_, _, _| {
+                    Ok(())
+                })
             })
             .map(|_| ())
         });
