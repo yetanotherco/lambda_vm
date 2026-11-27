@@ -288,6 +288,70 @@ impl WlfmLevers {
 /// identity folds the cut, and no program today reaches it.
 pub const WLFM_CHUNK_LOG: u32 = 22;
 
+/// Whether each stated table height is within the cut the format builds that
+/// kind of table with: an LFM chip's tables at most 2^[`WLFM_CHUNK_LOG`] rows
+/// ([`chip_chunk_rows`]), the lean round and head chunks at most
+/// 2^[`super::b3l_tables::CHUNK_LOG`], the mux, cap and cap-read chunks at
+/// most 2^[`super::b3l_tables::MUX_CHUNK_LOG`] ([`B3lShape::of_program`]).
+/// A build can only cut smaller (a test's override), never taller.
+pub(crate) fn stated_heights_within_format(lfm_chunks: &[Vec<usize>], b3l: &B3lShape) -> bool {
+    let within = |rows: &[usize], log: u32| rows.iter().all(|&n| n <= 1 << log);
+    lfm_chunks
+        .iter()
+        .all(|chunks| within(chunks, WLFM_CHUNK_LOG))
+        && within(&b3l.rounds, super::b3l_tables::CHUNK_LOG)
+        && within(&b3l.heads, super::b3l_tables::CHUNK_LOG)
+        && within(&b3l.muxes, super::b3l_tables::MUX_CHUNK_LOG)
+        && within(&b3l.caps, super::b3l_tables::MUX_CHUNK_LOG)
+        && within(&b3l.cap_reads, super::b3l_tables::MUX_CHUNK_LOG)
+}
+
+#[cfg(test)]
+mod format_height_tests {
+    use super::*;
+
+    #[test]
+    fn stated_heights_stop_at_the_format_chunk_caps() {
+        use crate::lfm::b3l_tables::{CHUNK_LOG, MUX_CHUNK_LOG};
+        assert_eq!((WLFM_CHUNK_LOG, CHUNK_LOG, MUX_CHUNK_LOG), (22, 19, 22));
+        let base = || {
+            (
+                vec![vec![8], vec![16, 4]],
+                B3lShape {
+                    rounds: vec![8],
+                    heads: vec![8],
+                    muxes: vec![8],
+                    caps: vec![8],
+                    cap_reads: vec![8],
+                },
+            )
+        };
+        let (chunks, lean) = base();
+        assert!(stated_heights_within_format(&chunks, &lean));
+        // Each kind at its cap is admitted, one variable more is refused.
+        type Edit = fn(&mut Vec<Vec<usize>>, &mut B3lShape, usize);
+        let kinds: [(&str, u32, Edit); 6] = [
+            ("chip", WLFM_CHUNK_LOG, |c, _, n| c[1][0] = n),
+            ("round", CHUNK_LOG, |_, l, n| l.rounds[0] = n),
+            ("head", CHUNK_LOG, |_, l, n| l.heads[0] = n),
+            ("mux", MUX_CHUNK_LOG, |_, l, n| l.muxes[0] = n),
+            ("cap", MUX_CHUNK_LOG, |_, l, n| l.caps[0] = n),
+            ("cap read", MUX_CHUNK_LOG, |_, l, n| l.cap_reads[0] = n),
+        ];
+        for (name, log, edit) in kinds {
+            for (rows, admitted) in [(1usize << log, true), (1 << (log + 1), false)] {
+                let (mut chunks, mut lean) = base();
+                edit(&mut chunks, &mut lean, rows);
+                assert_eq!(
+                    stated_heights_within_format(&chunks, &lean),
+                    admitted,
+                    "{name} at {rows} rows"
+                );
+            }
+        }
+    }
+}
+
 /// The padded rows of each table an LFM chip of `real_rows` rows (padded to
 /// `padded_rows` as one table) takes under a `2^chunk_log` cap: the one table
 /// as it is when it fits, else full chunks and the remainder's own power of
@@ -767,6 +831,13 @@ impl LeafArtifacts {
             b3l: a.b3l.clone(),
             prepared: a.stacks.iter().map(|s| s.roots.clone()).collect(),
         }
+    }
+
+    /// Whether every stated table is within the format's own cut for its
+    /// kind ([`stated_heights_within_format`]): no honest leaf can state a
+    /// taller one.
+    pub(crate) fn within_format_heights(&self) -> bool {
+        stated_heights_within_format(&self.lfm_chunks, &self.b3l)
     }
 
     pub(crate) fn into_artifacts(mut self, rounds: Option<u8>) -> Result<WlfmArtifacts, String> {

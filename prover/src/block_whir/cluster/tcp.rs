@@ -1617,39 +1617,49 @@ enum JoinArtifact {
 const HONEST_LEAF_TABLES_FIXED: usize = 30;
 const HONEST_LEAF_TABLES_PER_GROUP: usize = 4;
 
+/// The most tables any worker leaf may state, whatever its group count: the
+/// cap for 10 groups, so every measured leaf keeps its margin (the large
+/// block's worker, 59 tables, at 2.4 times). The group count is not the
+/// coordinator's own: see [`max_worker_leaf_tables`].
+const MAX_WORKER_LEAF_TABLES: usize = 140;
+
 /// The most tables a worker's leaf of `groups` base groups may state: twice
-/// the honest bound above. The join program the coordinator builds from a
+/// the honest bound above, and never more than [`MAX_WORKER_LEAF_TABLES`].
+/// `groups` is read from the coordinator's plan, but the plan's group count
+/// for a worker's leaf is that worker's own range receipt (the groups it
+/// says its range holds), so a worker can raise it; the ceiling bounds the
+/// cap whatever the count. The join program the coordinator builds from a
 /// worker's stated shapes grows with them (on the test fixture, 2^24 rows on
 /// every table took 12 GiB to build and 2^29 rows over 32 GiB), so shapes
 /// above the cap are refused before any join is built.
 fn max_worker_leaf_tables(groups: usize) -> usize {
-    2 * (HONEST_LEAF_TABLES_FIXED + HONEST_LEAF_TABLES_PER_GROUP * groups)
+    let bound = HONEST_LEAF_TABLES_FIXED
+        .saturating_add(HONEST_LEAF_TABLES_PER_GROUP.saturating_mul(groups));
+    bound.saturating_mul(2).min(MAX_WORKER_LEAF_TABLES)
 }
 
-/// The tallest table a worker's leaf may state, in variables: every honest
-/// leaf in the same measurement had its tallest table at 2^22 rows. The cap
-/// is four times the rows.
-const MAX_WORKER_LEAF_TABLE_VARS: u8 = 22 + 2;
-
-/// A worker's leaf artifacts as the join's child, refused above the stated
-/// shape cap for a leaf of `groups` base groups ([`max_worker_leaf_tables`],
-/// [`MAX_WORKER_LEAF_TABLE_VARS`]). `groups` comes from the coordinator's
-/// plan, never from the worker. Every worker leaf reaches the join through
-/// here, early or with its proof.
+/// A worker's leaf artifacts as the join's child, refused above the shape
+/// cap: a stated table taller than the format cuts its kind
+/// ([`LeafArtifacts::within_format_heights`]), or more tables than
+/// [`max_worker_leaf_tables`] for the leaf's group count in the plan. Every
+/// worker leaf reaches the join through here, early or with its proof.
 fn worker_child(
     artifacts: LeafArtifacts,
     groups: usize,
     layout: &BlockLayout,
     rounds: Option<u8>,
 ) -> Result<WlfmChild, Error> {
+    if !artifacts.within_format_heights() {
+        return Err(fail(
+            "worker leaf shapes above the cap: a table taller than the format cuts its kind",
+        ));
+    }
     let artifacts = artifacts.into_artifacts(rounds).map_err(fail)?;
     let tables = artifacts.table_num_vars.len();
-    let tallest = artifacts.table_num_vars.iter().max().copied().unwrap_or(0);
-    if !within_worker_leaf_cap(tables, tallest, groups) {
+    if !within_worker_leaf_cap(tables, groups) {
         return Err(fail(format!(
-            "worker leaf shapes above the cap: {tables} tables, the tallest 2^{tallest} rows \
-             (at most {} tables for {groups} groups, of at most \
-             2^{MAX_WORKER_LEAF_TABLE_VARS} rows)",
+            "worker leaf shapes above the cap: {tables} tables \
+             (at most {} for {groups} groups)",
             max_worker_leaf_tables(groups)
         )));
     }
@@ -1660,8 +1670,8 @@ fn worker_child(
     })
 }
 
-fn within_worker_leaf_cap(tables: usize, tallest: u8, groups: usize) -> bool {
-    tables <= max_worker_leaf_tables(groups) && tallest <= MAX_WORKER_LEAF_TABLE_VARS
+fn within_worker_leaf_cap(tables: usize, groups: usize) -> bool {
+    tables <= max_worker_leaf_tables(groups)
 }
 
 /// Base groups in each leaf of `plan`, in leaf order.
@@ -2563,14 +2573,15 @@ impl Worker<'_> {
 #[cfg(all(test, feature = "test-security"))]
 fn faulted_shapes(artifacts: LeafArtifacts, rounds: Option<u8>) -> Result<LeafArtifacts, String> {
     if fault_is("oversized-leaf") {
+        // One chip table a variable above the format's chip cut.
         return artifacts.self_consistent(rounds, |_, _, chunks, _| {
-            chunks[0][0] = 1 << (MAX_WORKER_LEAF_TABLE_VARS + 1);
+            chunks[0][0] = 1 << (crate::lfm::wlfm::WLFM_CHUNK_LOG + 1);
         });
     }
     if fault_is("too-many-tables-leaf") {
-        // Above the cap for any leaf of up to 100 groups.
+        // Above the ceiling, whatever the leaf's group count.
         return artifacts.self_consistent(rounds, |_, _, chunks, _| {
-            chunks[0].extend(std::iter::repeat_n(2, max_worker_leaf_tables(100) + 1));
+            chunks[0].extend(std::iter::repeat_n(2, MAX_WORKER_LEAF_TABLES + 1));
         });
     }
     Ok(artifacts)
@@ -3681,26 +3692,24 @@ mod tests {
 
     #[test]
     fn the_worker_leaf_shape_cap_holds_at_its_bounds() {
-        assert_eq!(MAX_WORKER_LEAF_TABLE_VARS, 24);
-        // Twice the honest bound: 2 * (30 + 4 * groups) tables.
-        for (groups, cap) in [(1, 68), (5, 100), (8, 124), (10, 140)] {
+        // Twice the honest bound, 2 * (30 + 4 * groups) tables, up to 140.
+        for (groups, cap) in [(1, 68), (5, 100), (8, 124), (10, 140), (11, 140), (30, 140)] {
             assert_eq!(max_worker_leaf_tables(groups), cap, "{groups} groups");
-            assert!(within_worker_leaf_cap(cap, 24, groups), "{groups} groups");
-            assert!(
-                !within_worker_leaf_cap(cap + 1, 24, groups),
-                "{groups} groups"
-            );
-            assert!(!within_worker_leaf_cap(cap, 25, groups), "{groups} groups");
+            assert!(within_worker_leaf_cap(cap, groups), "{groups} groups");
+            assert!(!within_worker_leaf_cap(cap + 1, groups), "{groups} groups");
+        }
+        // The ceiling holds whatever group count a worker's receipt states.
+        for groups in [30, 1024, usize::MAX] {
+            assert!(within_worker_leaf_cap(140, groups), "{groups} groups");
+            assert!(!within_worker_leaf_cap(141, groups), "{groups} groups");
         }
         // Every measured honest leaf is within the cap, with twice its tables.
         for (tables, groups) in [(44, 5), (50, 5), (59, 10), (51, 8), (29, 1)] {
             assert!(
-                within_worker_leaf_cap(2 * tables, 22, groups),
+                within_worker_leaf_cap(2 * tables, groups),
                 "{tables}/{groups}"
             );
         }
-        assert!(within_worker_leaf_cap(1, 0, 1));
-        assert!(!within_worker_leaf_cap(4096, 31, 10));
     }
 
     /// The early leaf build's host lane is one pool for the process: one
