@@ -900,7 +900,22 @@ CLUSTER_TCP_TESTS := two_leaf_tcp_matches_one_process_reference \
 	four_leaf_tcp_matches_one_process_reference tcp_weakened_worker_returns_no_file \
 	a_failed_range_worker_falls_back_to_a_checked_reference \
 	the_range_reference_checks_its_file_before_returning_it \
-	ecrec_in_two_ranges_tcp_matches_one_process_reference
+	ecrec_in_two_ranges_tcp_matches_one_process_reference \
+	early_artifacts_are_refused_when_early_join_is_off
+# The four opt-in overhead cuts, all on: the two-leaf byte identity, a real
+# refusal through the early join, and the early leaf-artifacts frame's faults
+# (each refused, then the checked fallback equals the one-process reference).
+CLUSTER_CUT_KNOBS := LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE=1 LAMBDA_VM_CLUSTER_LEAF_AT_BIND=1 \
+	LAMBDA_VM_CLUSTER_EARLY_JOIN=1 LAMBDA_VM_CLUSTER_COMPACT_COUNTS=1
+CLUSTER_CUT_TESTS := two_leaf_tcp_matches_one_process_reference tcp_weakened_worker_returns_no_file \
+	early_join_refuses_duplicate_artifacts early_join_refuses_a_proof_before_its_artifacts \
+	early_join_refuses_artifacts_for_another_plan \
+	a_worker_that_sends_artifacts_and_no_proof_falls_back_to_a_checked_reference \
+	a_worker_that_exits_after_its_artifacts_falls_back_to_a_checked_reference \
+	early_artifacts_of_another_program_never_ship \
+	a_panicking_early_join_build_falls_back_to_a_checked_reference \
+	a_failing_early_join_build_falls_back_to_a_checked_reference \
+	a_panicking_join_build_beside_a_dead_worker_is_an_error_not_a_crash
 # Two ECREC tables from two ranges: the honest base, and a dropped, a
 # duplicated and a re-keyed call row refused by the bus balance (split and
 # word memory formats).
@@ -918,7 +933,9 @@ CLUSTER_REPEAT_RUNNER_TESTS := replica_runs_match_local_reference range_runs_mat
 CLUSTER_DOC_TESTS := lfm::cluster_levels::UncheckedClusterFile
 test-cluster-cuda: compile-programs-asm
 	@set -eu; \
-	unset LAMBDA_VM_CLUSTER LAMBDA_VM_CLUSTER_WINDOWS; \
+	unset LAMBDA_VM_CLUSTER LAMBDA_VM_CLUSTER_WINDOWS LAMBDA_VM_CLUSTER_EARLY_BIND \
+	    LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE LAMBDA_VM_CLUSTER_LEAF_AT_BIND \
+	    LAMBDA_VM_CLUSTER_EARLY_JOIN LAMBDA_VM_CLUSTER_COMPACT_COUNTS; \
 	export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1; \
 	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
 	cargo test --release -p lambda-vm-prover --lib --bin cluster --features cuda,test-security --no-run \
@@ -937,6 +954,11 @@ test-cluster-cuda: compile-programs-asm
 	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
 	cat "$$output"; \
 	grep -Fq 'test result: ok. $(words $(CLUSTER_TCP_TESTS)) passed;' "$$output"; \
+	env $(CLUSTER_CUT_KNOBS) $(GPU_TEST_TIMEOUT) "$$binary" --ignored --exact --test-threads=1 \
+	    $(addprefix lfm::cluster_levels::tests::tcp::,$(CLUSTER_CUT_TESTS)) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	grep -Fq 'test result: ok. $(words $(CLUSTER_CUT_TESTS)) passed;' "$$output"; \
 	$(GPU_TEST_TIMEOUT) "$$binary" --ignored --exact --test-threads=1 \
 	    $(addprefix lfm::cluster_levels::tests::,$(CLUSTER_ECREC_TESTS)) \
 	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \

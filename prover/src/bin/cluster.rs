@@ -874,10 +874,25 @@ mod tests {
             compare_runs(&[2], Refusal::None);
         }
 
+        /// The configuration that ships: early Bind on, the other cuts off.
         #[test]
         #[cfg(not(feature = "cuda"))]
         #[ignore = "runs the full TCP range proofs and reference on the host"]
         fn both_range_roles_log_their_stages_in_order() {
+            stage_order(false);
+        }
+
+        /// Every overhead cut on: prepared roots beside the last commits, the
+        /// leaf program at Bind, the early join and compact counts.
+        #[test]
+        #[cfg(not(feature = "cuda"))]
+        #[ignore = "runs the full TCP range proofs and reference on the host"]
+        fn both_range_roles_log_their_stages_in_order_with_every_cut() {
+            stage_order(true);
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        fn stage_order(cuts: bool) {
             use lambda_vm_prover::block_whir::cluster_tcp::EARLY_JOIN_ENV;
             use std::collections::BTreeMap;
 
@@ -885,7 +900,14 @@ mod tests {
                 std::hint::black_box(lambda_vm_prover::security_posture::TEST_POSTURE),
                 "run this test in the prover lib-test binary with test-security"
             );
-            let output = Command::new(std::env::current_exe().unwrap())
+            let knobs = [
+                "LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE",
+                "LAMBDA_VM_CLUSTER_LEAF_AT_BIND",
+                EARLY_JOIN_ENV,
+                "LAMBDA_VM_CLUSTER_COMPACT_COUNTS",
+            ];
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--ignored",
                     "--exact",
@@ -894,14 +916,16 @@ mod tests {
                 ])
                 .env("LAMBDA_VM_FIXED_TRACE_HASH", "1")
                 .env("LAMBDA_VM_DETERMINISTIC_GRIND", "1")
-                .env("LAMBDA_VM_CLUSTER_EARLY_BIND", "1")
-                .env("LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE", "1")
-                .env("LAMBDA_VM_CLUSTER_LEAF_AT_BIND", "1")
-                .env(EARLY_JOIN_ENV, "1")
-                .env("LAMBDA_VM_CLUSTER_COMPACT_COUNTS", "1")
-                .env("RAYON_NUM_THREADS", "4")
-                .output()
-                .unwrap();
+                .env_remove("LAMBDA_VM_CLUSTER_EARLY_BIND")
+                .env("RAYON_NUM_THREADS", "4");
+            for knob in knobs {
+                if cuts {
+                    command.env(knob, "1");
+                } else {
+                    command.env_remove(knob);
+                }
+            }
+            let output = command.output().unwrap();
             let stderr = String::from_utf8(output.stderr).unwrap();
             assert!(
                 output.status.success(),
@@ -1041,27 +1065,59 @@ mod tests {
                         "range-readers-done",
                     ],
                 );
-                order(
-                    c,
-                    &[
-                        "bind-sent-W0",
-                        "leaf-plan-done",
-                        "leaf-artifacts-local",
-                        "leaf-artifacts-ready",
-                    ],
-                );
+                order(c, &["bind-sent-W0", "leaf-plan-done"]);
                 order(
                     c,
                     &["assign-sent-W0", "final-commits-done", "wait-receipts"],
                 );
-                order(
-                    c,
-                    &[
-                        "leaf-artifacts-received-W0",
-                        "leaf-received-W0",
-                        "leaf-relay-done",
-                    ],
-                );
+                let early = [
+                    "leaf-artifacts-local",
+                    "leaf-artifacts-received-W0",
+                    "leaf-artifacts-sent",
+                ];
+                if cuts {
+                    order(
+                        c,
+                        &[
+                            "leaf-plan-done",
+                            "leaf-artifacts-local",
+                            "leaf-artifacts-ready",
+                        ],
+                    );
+                    order(
+                        c,
+                        &[
+                            "leaf-artifacts-received-W0",
+                            "leaf-received-W0",
+                            "leaf-relay-done",
+                        ],
+                    );
+                } else {
+                    // No early frame; each serial step after the one it waited on.
+                    for name in early {
+                        assert!(!c.contains_key(name) && !w.contains_key(name), "{name}");
+                    }
+                    order(
+                        c,
+                        &[
+                            "final-commits-done",
+                            "prepared-roots-done",
+                            "bind-sent-W0",
+                            "leaf-plan-done",
+                            "base-openings-start",
+                        ],
+                    );
+                    order(
+                        c,
+                        &[
+                            "leaf-received-W0",
+                            "leaf-relay-done",
+                            "finish-done",
+                            "leaf-artifacts-ready",
+                        ],
+                    );
+                    order(w, &["base-openings-end", "leaf-plan-done"]);
+                }
                 order(
                     c,
                     &[
@@ -1126,11 +1182,16 @@ mod tests {
                         "range-build-done",
                     ],
                 );
+                if cuts {
+                    order(
+                        w,
+                        &["leaf-build-done", "leaf-artifacts-sent", "leaf-prove-start"],
+                    );
+                }
                 order(
                     w,
                     &[
                         "leaf-build-done",
-                        "leaf-artifacts-sent",
                         "leaf-prove-start",
                         "leaf-prove-end",
                         "leaf-sent",
@@ -1164,7 +1225,9 @@ mod tests {
                     }
                 }
                 order(w, &["seal-checked", "leaf-plan-done"]);
-                order(c, &["leaf-artifacts-received-W0", "leaf-artifacts-ready"]);
+                if cuts {
+                    order(c, &["leaf-artifacts-received-W0", "leaf-artifacts-ready"]);
+                }
             }
         }
 
