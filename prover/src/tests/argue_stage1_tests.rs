@@ -1803,6 +1803,7 @@ fn dump_grid_root_degrees() {
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "one dedicated card, 2^21 rows"]
+// Build and time both grid programs directly, independent of the dispatch knob.
 fn bench_cpu_constraint_grid_split() {
     use math_cuda::argue_fused::{FusedBus, FusedZerocheck};
     use math_cuda::columns::DeviceColumns;
@@ -2063,13 +2064,29 @@ fn the_split_grid_matches_the_whole_grid_on_every_cubic_program() {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "run alone with LAMBDA_VM_ZC_GRID_SPLIT=1"]
+#[ignore = "one card, with the split grid enabled by default"]
 fn checking_grid_corners_uses_the_whole_grid_and_counts_the_check() {
+    check_grid_dispatch(true);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "one card, run alone with LAMBDA_VM_ZC_GRID_SPLIT=0"]
+fn disabling_grid_split_uses_the_whole_grid() {
+    check_grid_dispatch(false);
+}
+
+#[cfg(feature = "cuda")]
+fn check_grid_dispatch(expect_split: bool) {
     use multilinear::front_loaded::TableRounds;
     use multilinear::gpu_fused::{FusedInput, fused_corner_checks, zc_grid_split};
 
     let _permit = crate::lfm::device_permit::serial_for_test();
-    assert!(zc_grid_split(), "enable the split grid for this test");
+    assert_eq!(
+        zc_grid_split(),
+        expect_split,
+        "set LAMBDA_VM_ZC_GRID_SPLIT for this test"
+    );
     let (_, air) = grid_production_airs()
         .into_iter()
         .find(|(label, _)| *label == "CPU in-row")
@@ -2126,7 +2143,7 @@ fn checking_grid_corners_uses_the_whole_grid_and_counts_the_check() {
         )
         .unwrap();
         assert!(rounds.on_device());
-        assert_eq!(rounds.grid_was_split(), !check);
+        assert_eq!(rounds.grid_was_split(), expect_split && !check);
         assert_eq!(fused_corner_checks() - before, u64::from(check));
     }
 }

@@ -1116,6 +1116,12 @@ pub enum Where {
     Device,
 }
 
+/// Build eligible device tables' tail rule programs on scoped workers by
+/// default. A trimmed `LAMBDA_VM_ARGUE_SCOPED_RULES=0` keeps setup serial.
+fn scoped_rules_from_env(at: Where, value: Option<&str>) -> bool {
+    at == Where::Device && value.is_none_or(|v| v.trim() != "0")
+}
+
 /// [`multi_prove_batched`] as the host reference, with faults a negative test
 /// arms.
 #[doc(hidden)]
@@ -1503,8 +1509,12 @@ where
                 .zip(local_claims[t].as_ref().map(|c| c.point.as_slice())),
         })
         .collect();
-    let scoped_rules =
-        at == Where::Device && std::env::var("LAMBDA_VM_ARGUE_SCOPED_RULES").as_deref() == Ok("1");
+    let scoped_rules = scoped_rules_from_env(
+        at,
+        std::env::var("LAMBDA_VM_ARGUE_SCOPED_RULES")
+            .ok()
+            .as_deref(),
+    );
     let (
         constraint,
         point,

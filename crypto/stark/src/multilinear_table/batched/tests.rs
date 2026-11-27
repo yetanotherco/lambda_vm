@@ -209,6 +209,17 @@ fn commit<'a>(
 }
 
 #[test]
+fn scoped_rules_default_on_only_on_device() {
+    for value in [None, Some(""), Some("1"), Some("other")] {
+        assert!(scoped_rules_from_env(Where::Device, value));
+        assert!(!scoped_rules_from_env(Where::Host, value));
+    }
+    for value in ["0", " \t0\n"] {
+        assert!(!scoped_rules_from_env(Where::Device, Some(value)));
+    }
+}
+
+#[test]
 fn scoped_table_rules_join_every_program() {
     use front_loaded::{RoundStepper, ScopedBatch, TableRounds, TableRules};
     use std::{sync::mpsc, time::Duration};

@@ -377,10 +377,17 @@ fn env_is(name: &str) -> bool {
 }
 
 /// Walk degree-three constraint grids as separate quadratic and cubic parts.
-/// Opt in with `LAMBDA_VM_ZC_GRID_SPLIT=1`.
+/// On by default. A trimmed `LAMBDA_VM_ZC_GRID_SPLIT=0` disables the split.
+/// Corner checks and grids that retain the corners use the whole program.
 pub fn zc_grid_split() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_ZC_GRID_SPLIT").is_some_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        zc_grid_split_from_env(std::env::var("LAMBDA_VM_ZC_GRID_SPLIT").ok().as_deref())
+    })
+}
+
+fn zc_grid_split_from_env(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 static FUSED_FORCED: AtomicU8 = AtomicU8::new(0);
@@ -1553,6 +1560,16 @@ mod grid_split_tests {
     type Base = FieldElement<Gl>;
     type ExtValue = FieldElement<Ext>;
     type Grid = [[ExtValue; 4]; 4];
+
+    #[test]
+    fn the_grid_split_defaults_on_and_only_zero_disables_it() {
+        for value in [None, Some(""), Some("1"), Some("other")] {
+            assert!(zc_grid_split_from_env(value));
+        }
+        for value in ["0", " \t0\n"] {
+            assert!(!zc_grid_split_from_env(Some(value)));
+        }
+    }
 
     fn evaluate<F: IsField>(
         col: &[FieldElement<F>; 4],
