@@ -1629,9 +1629,12 @@ const MAX_WORKER_LEAF_TABLES: usize = 140;
 /// for a worker's leaf is that worker's own range receipt (the groups it
 /// says its range holds), so a worker can raise it; the ceiling bounds the
 /// cap whatever the count. The join program the coordinator builds from a
-/// worker's stated shapes grows with them (on the test fixture, 2^24 rows on
-/// every table took 12 GiB to build and 2^29 rows over 32 GiB), so shapes
-/// above the cap are refused before any join is built.
+/// worker's stated shapes grows with them, so shapes above the cap are
+/// refused before any join is built. At the cap the worst case measured is
+/// 140 tables at the format's cuts with the added tables on the bitdec chip:
+/// 40.8 s and +36.5 GiB to build the join (test fixture, host build on the
+/// CPU box). That bound is per worker leaf; the sum over a cluster's worker
+/// leaves is not yet bounded.
 fn max_worker_leaf_tables(groups: usize) -> usize {
     let bound = HONEST_LEAF_TABLES_FIXED
         .saturating_add(HONEST_LEAF_TABLES_PER_GROUP.saturating_mul(groups));
