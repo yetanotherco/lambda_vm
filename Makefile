@@ -874,7 +874,7 @@ test-prover-comprehensive-cuda: compile-recursion-elfs
 # Each identity gets its own process for the prover's format knobs and device
 # fault state. Forced split runs both backends on a single card.
 test-prover-identities-cuda: compile-programs-asm
-	@unset LAMBDA_VM_WORD_CHUNKS LAMBDA_VM_BLOCK_WALKERS; \
+	@unset LAMBDA_VM_WORD_CHUNKS LAMBDA_VM_BLOCK_WALKERS LAMBDA_VM_WALK_CUTS; \
 	unset LAMBDA_VM_WHIR_LEAN_ROUNDS LAMBDA_VM_GKR_TREE_SKIP_MIDDLE \
 	    LAMBDA_VM_ENCODE_MOBIUS_IN_NTT LAMBDA_VM_NTT_LAST_PASS_HASHES \
 	    LAMBDA_VM_LEVELS_FREE_BESIDE LAMBDA_VM_LEVELS_PREPARE_PARALLEL \

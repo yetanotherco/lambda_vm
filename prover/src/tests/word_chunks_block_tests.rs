@@ -149,7 +149,7 @@ fn assert_word_chunks_identity(name: &str, input: &[u8], regen: Option<RegenMode
     }
 }
 
-/// The production defaults preserve the bytes of both explicit opt-outs.
+/// The production defaults preserve the bytes of the explicit opt-outs.
 #[test]
 #[ignore = "box tier, run alone with deterministic grind and fixed trace hash"]
 fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
@@ -202,19 +202,13 @@ fn the_default_word_chunks_and_walkers_preserve_the_opt_out_proof_bytes() {
     let default = prove(None, None, None);
     assert_eq!(prove(Some(WordChunks::Copy), None, None), default, "copy");
     assert_eq!(prove(None, Some(4), None), default, "four walkers");
-    for (rows_sized, count_direct) in [(true, false), (false, true), (true, true)] {
-        let cuts = WalkCuts {
-            rows_sized,
-            count_direct,
-            ..WalkCuts::all()
-        };
-        assert_eq!(
-            prove(None, None, Some(cuts)),
-            default,
-            "{}",
-            cuts.describe()
-        );
-    }
+    let old_cuts = WalkCuts::parse(Some("prescan,const,one-loop,slots")).unwrap();
+    assert_eq!(
+        prove(None, None, Some(old_cuts)),
+        default,
+        "{}",
+        old_cuts.describe()
+    );
 }
 
 /// Explicit `part` requires streamed and dropped word rows. The default

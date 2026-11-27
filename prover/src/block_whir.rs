@@ -9885,8 +9885,8 @@ fn prove_streamed(
         "★ BLOCK HOST HOIST: {} (LAMBDA_VM_HOST_HOIST)",
         host_hoist.describe()
     );
-    // The walk's cuts: a word it does not take refuses the prove. The
-    // tables are the same with any part on.
+    // Stamp the active cuts. The environment defaults to all six parts,
+    // and an explicit list can select a subset with the same tables.
     let walk_cuts = match deviations.walk_cuts {
         Some(cuts) => cuts,
         None => WalkCuts::from_env()?,

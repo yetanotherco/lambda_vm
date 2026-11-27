@@ -27,6 +27,8 @@ use crate::tables::register::RegisterFormat;
 use crate::tables::trace_builder::walk_cuts::each_part_and_all;
 use crate::tests::windowed_builder_tests::{run, same_traces};
 
+const FOUR_PARTS: &str = "prescan,const,one-loop,slots";
+
 /// How a window is walked: its formats and batch.
 #[derive(Clone, Copy)]
 struct Shape {
@@ -120,7 +122,8 @@ fn windows(
 }
 
 /// Walks every window of `program`'s run but the last at the light walk's
-/// levels 2 and 0, without cuts and with each arm of [`each_part_and_all`]:
+/// levels 2 and 0, without cuts, with each cut alone, with the previous
+/// four-part default, and with the new default:
 /// each arm must emit the lists, the routing and the last ECALL the walk
 /// without cuts emits, refuse nothing, and over the run count the same
 /// lookups and DECODE rows. Returns the windows compared.
@@ -130,24 +133,7 @@ fn cuts_are_todays(name: &str, program: &Elf, input: &[u8], window: usize, shape
     let decode = Arc::clone(&builder.decode);
     drop(builder);
     let mut arms = each_part_and_all();
-    let default = WalkCuts::parse(None).unwrap();
-    arms.extend([
-        ("defaults", default),
-        (
-            "defaults,rows-sized",
-            WalkCuts {
-                rows_sized: true,
-                ..default
-            },
-        ),
-        (
-            "defaults,count-direct",
-            WalkCuts {
-                count_direct: true,
-                ..default
-            },
-        ),
-    ]);
+    arms.push((FOUR_PARTS, WalkCuts::parse(Some(FOUR_PARTS)).unwrap()));
     let levels = [(true, true), (false, false)];
     // By level: the walk without cuts, then each arm.
     let mut counts: Vec<Vec<WalkCounts>> = levels
@@ -361,21 +347,17 @@ fn assert_walk_cuts_build_the_same_tables_for_word_memory_and_ethrex_transfers()
     let (assembly, _) = run("fused_mem_cases");
     let ethrex = rust_elf("ethrex");
     let transfers = ethrex_transfers_input();
-    let default = WalkCuts::parse(None).unwrap();
+    let four_parts = WalkCuts::parse(Some(FOUR_PARTS)).unwrap();
     let cuts = [
         WalkCuts {
             rows_sized: true,
-            ..default
+            ..four_parts
         },
         WalkCuts {
             count_direct: true,
-            ..default
+            ..four_parts
         },
-        WalkCuts {
-            rows_sized: true,
-            count_direct: true,
-            ..default
-        },
+        WalkCuts::parse(None).unwrap(),
     ];
     for (name, program, input, window, max_rows) in [
         (
@@ -404,10 +386,10 @@ fn assert_walk_cuts_build_the_same_tables_for_word_memory_and_ethrex_transfers()
                 (RegisterFormat::InRow, MemoryFormat::Words),
             )
         };
-        let (want, want_order) = build(1, default);
+        let (want, want_order) = build(1, four_parts);
         assert!(!want_order.is_empty(), "{name}: streamed chunks");
         for walkers in [1, 3, 6] {
-            for cuts in std::iter::once(default).chain(cuts) {
+            for cuts in std::iter::once(four_parts).chain(cuts) {
                 let (got, order) = build(walkers, cuts);
                 assert_eq!(
                     order, want_order,
