@@ -1625,6 +1625,24 @@ mod tcp {
             .expect("the fallback file verifies");
     }
 
+    /// Sets the coordinator's early join build fault for one test.
+    struct JoinBuildFault;
+
+    impl JoinBuildFault {
+        fn set(fault: u8) -> Self {
+            use crate::block_whir::cluster_tcp::JOIN_BUILD_FAULT;
+            JOIN_BUILD_FAULT.store(fault, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for JoinBuildFault {
+        fn drop(&mut self) {
+            use crate::block_whir::cluster_tcp::JOIN_BUILD_FAULT;
+            JOIN_BUILD_FAULT.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
     #[ignore = "GPU tier (default knobs): early artifacts nobody asked for"]
     fn early_artifacts_are_refused_when_early_join_is_off() {
@@ -1685,5 +1703,39 @@ mod tcp {
     fn early_artifacts_of_another_program_never_ship() {
         assert_early_join();
         falls_back(Some("early-other-program"), "");
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): the early join build panics"]
+    fn a_panicking_early_join_build_falls_back_to_a_checked_reference() {
+        use crate::block_whir::cluster_tcp::JOIN_BUILD_PANICS;
+        assert_early_join();
+        let _fault = JoinBuildFault::set(JOIN_BUILD_PANICS);
+        falls_back(None, "join build thread panicked");
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): the early join build fails"]
+    fn a_failing_early_join_build_falls_back_to_a_checked_reference() {
+        use crate::block_whir::cluster_tcp::JOIN_BUILD_FAILS;
+        assert_early_join();
+        let _fault = JoinBuildFault::set(JOIN_BUILD_FAILS);
+        falls_back(None, "the early join build fails");
+    }
+
+    /// ★ The join build panics while the leaf phase has already failed (the
+    /// worker exited after its artifacts). Before the fix the leaf phase's
+    /// error returned past the join thread and the scope re-raised its panic:
+    /// the process died with no fallback.
+    ///
+    /// Mutation: drop both the catch in the join thread and the hand join on
+    /// the error path, and this test's process panics.
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): a join build panic beside a dead worker"]
+    fn a_panicking_join_build_beside_a_dead_worker_is_an_error_not_a_crash() {
+        use crate::block_whir::cluster_tcp::JOIN_BUILD_PANICS;
+        assert_early_join();
+        let _fault = JoinBuildFault::set(JOIN_BUILD_PANICS);
+        falls_back(Some("early-artifacts-exit"), "worker 0 leaf");
     }
 }

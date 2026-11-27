@@ -1643,12 +1643,28 @@ fn build_join_from_artifacts(
         worker_child(artifacts, &layout, rounds)
     })?;
     clock.mark("leaf-artifacts-ready");
+    #[cfg(test)]
+    match JOIN_BUILD_FAULT.load(Ordering::SeqCst) {
+        JOIN_BUILD_PANICS => panic!("test fault: the early join build panics"),
+        JOIN_BUILD_FAILS => return Err(fail("test fault: the early join build fails")),
+        _ => {}
+    }
     // The pinned level-2 program evaluates its instruction columns. This
     // build does not commit a prepared stack while the leaves use the card.
     let level =
         cluster_levels::build_join(&children, &layout, rounds, last, clock).map_err(fail)?;
     Ok((children, level))
 }
+
+/// Test hook: the early join build panics or returns an error once every leaf's
+/// artifacts are in, so the tests can show either one ends in the fallback.
+#[cfg(test)]
+pub(crate) static JOIN_BUILD_FAULT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+pub(crate) const JOIN_BUILD_PANICS: u8 = 1;
+#[cfg(test)]
+pub(crate) const JOIN_BUILD_FAILS: u8 = 2;
 
 fn open_levels(
     coordinator: &Coordinator<'_>,
@@ -1694,9 +1710,14 @@ fn open_levels(
         let (artifacts_tx, artifacts_rx) = mpsc::channel();
         let artifacts_tx = early_join.then_some(artifacts_tx);
         let local_artifacts = artifacts_tx.clone();
+        // A panic in the join build is an error of this attempt: the fallback
+        // runs, the process does not unwind.
         let join = early_join.then(|| {
             scope.spawn(move || {
-                build_join_from_artifacts(artifacts_rx, owners, local_leaf, local, last, clock)
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build_join_from_artifacts(artifacts_rx, owners, local_leaf, local, last, clock)
+                }))
+                .unwrap_or_else(|_| Err(fail("join build thread panicked")))
             })
         });
         let local_proof = scope.spawn(move || {
@@ -1824,10 +1845,22 @@ fn open_levels(
             )
             .map_err(fail);
         drop(artifacts_tx);
-        relayed?;
-        let (plan, local) = local_proof
+        // Join both threads by hand on every path: the scope panics on exit if
+        // a thread it joins for us panicked. Both end on their own: the join
+        // build's last artifact sender is the leaf thread's, dropped with it.
+        let local = local_proof
             .join()
-            .map_err(|_| fail("coordinator leaf thread panicked"))??;
+            .map_err(|_| fail("coordinator leaf thread panicked"))
+            .and_then(|local| local);
+        let (plan, local) = match relayed.and(local) {
+            Ok(local) => local,
+            Err(error) => {
+                if let Some(join) = join {
+                    let _ = join.join();
+                }
+                return Err(error);
+            }
+        };
         clock.mark("leaf-relay-done");
         // Acknowledge the completed leaves while the join build can still be
         // running, and before proving the join or checking the file.
