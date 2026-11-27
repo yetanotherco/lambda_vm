@@ -901,7 +901,8 @@ CLUSTER_TCP_TESTS := two_leaf_tcp_matches_one_process_reference \
 	a_failed_range_worker_falls_back_to_a_checked_reference \
 	the_range_reference_checks_its_file_before_returning_it \
 	ecrec_in_two_ranges_tcp_matches_one_process_reference \
-	early_artifacts_are_refused_when_early_join_is_off
+	early_artifacts_are_refused_when_early_join_is_off \
+	a_worker_leaf_above_the_shape_cap_never_reaches_the_join
 # The four opt-in overhead cuts, all on: the two-leaf byte identity, a real
 # refusal through the early join, and the early leaf-artifacts frame's faults
 # (each refused, then the checked fallback equals the one-process reference).
@@ -915,7 +916,8 @@ CLUSTER_CUT_TESTS := two_leaf_tcp_matches_one_process_reference tcp_weakened_wor
 	early_artifacts_of_another_program_never_ship \
 	a_panicking_early_join_build_falls_back_to_a_checked_reference \
 	a_failing_early_join_build_falls_back_to_a_checked_reference \
-	a_panicking_join_build_beside_a_dead_worker_is_an_error_not_a_crash
+	a_panicking_join_build_beside_a_dead_worker_is_an_error_not_a_crash \
+	early_artifacts_above_the_shape_cap_never_reach_the_join
 # Two ECREC tables from two ranges: the honest base, and a dropped, a
 # duplicated and a re-keyed call row refused by the bus balance (split and
 # word memory formats).

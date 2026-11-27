@@ -1605,17 +1605,51 @@ enum JoinArtifact {
     Worker(usize, LeafArtifacts),
 }
 
+/// The most tables a worker's leaf may state. The join program the
+/// coordinator builds from a worker's stated shapes grows with them (on the
+/// test fixture, 2^24 rows on every table took 12 GiB to build and 2^29 rows
+/// over 32 GiB), so shapes above this cap are refused before any join is
+/// built. Measured on one RTX 5090 (2026-11-27) with two machines: the
+/// largest honest leaf states 59 tables (mainnet block 25481021; 44 to 51 on
+/// 25475471 and 25481021 otherwise). The cap is twice that.
+const MAX_WORKER_LEAF_TABLES: usize = 2 * 59;
+
+/// The tallest table a worker's leaf may state, in variables: every honest
+/// leaf in the same measurement had its tallest table at 2^22 rows. The cap
+/// is four times the rows.
+const MAX_WORKER_LEAF_TABLE_VARS: u8 = 22 + 2;
+
+/// A worker's leaf artifacts as the join's child, refused above the stated
+/// shape cap ([`MAX_WORKER_LEAF_TABLES`], [`MAX_WORKER_LEAF_TABLE_VARS`]).
+/// Every worker leaf reaches the join through here, early or with its proof.
 fn worker_child(
     artifacts: LeafArtifacts,
     layout: &BlockLayout,
     rounds: Option<u8>,
 ) -> Result<WlfmChild, Error> {
+    let artifacts = artifacts.into_artifacts(rounds).map_err(fail)?;
+    let tables = artifacts.table_num_vars.len();
+    let tallest = artifacts.table_num_vars.iter().max().copied().unwrap_or(0);
+    if !within_worker_leaf_cap(tables, tallest) {
+        return Err(fail(format!(
+            "worker leaf shapes above the cap: {tables} tables, the tallest 2^{tallest} rows \
+             (at most {MAX_WORKER_LEAF_TABLES} tables of at most 2^{MAX_WORKER_LEAF_TABLE_VARS} rows)"
+        )));
+    }
     Ok(WlfmChild {
-        artifacts: artifacts.into_artifacts(rounds).map_err(fail)?,
+        artifacts,
         num_public_words: layout.total(),
         cap_mux: Some(CapMux::Packed),
     })
 }
+
+fn within_worker_leaf_cap(tables: usize, tallest: u8) -> bool {
+    tables <= MAX_WORKER_LEAF_TABLES && tallest <= MAX_WORKER_LEAF_TABLE_VARS
+}
+
+/// Joins this process built from worker leaves' stated shapes.
+#[cfg(test)]
+pub(crate) static WORKER_JOIN_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 /// Builds the join from each leaf's early artifacts. A worker's artifacts are
 /// authenticated only by the frame MAC and the plan digest they are bound to,
@@ -1651,6 +1685,8 @@ fn build_join_from_artifacts(
     }
     // The pinned level-2 program evaluates its instruction columns. This
     // build does not commit a prepared stack while the leaves use the card.
+    #[cfg(test)]
+    WORKER_JOIN_BUILDS.fetch_add(1, Ordering::SeqCst);
     let level =
         cluster_levels::build_join(&children, &layout, rounds, last, clock).map_err(fail)?;
     Ok((children, level))
@@ -1894,6 +1930,8 @@ fn open_levels(
         |artifacts| worker_child(artifacts, &layout, rounds),
     )?;
     clock.mark("leaf-artifacts-ready");
+    #[cfg(test)]
+    WORKER_JOIN_BUILDS.fetch_add(1, Ordering::SeqCst);
     let leaves = children.into_iter().zip(proofs).collect();
     cluster_levels::prove_join_staged(&layout, rounds, leaves, last, clock).map_err(fail)
 }
@@ -2394,7 +2432,10 @@ impl Worker<'_> {
                         if fault_is("early-other-plan") {
                             bound[0] ^= 1;
                         }
-                        let artifacts = LeafArtifacts::from_build(&child.artifacts);
+                        let artifacts = faulted_shapes(
+                            LeafArtifacts::from_build(&child.artifacts),
+                            level_rounds(&plan),
+                        )?;
                         #[cfg(all(test, feature = "test-security"))]
                         let artifacts = if fault_is("early-other-program") {
                             artifacts.self_consistent(level_rounds(&plan), |_, _, _, _| {})?
@@ -2440,7 +2481,11 @@ impl Worker<'_> {
                         Kind::Leaf,
                         &LeafReply {
                             plan: bind.digest,
-                            artifacts: LeafArtifacts::from_build(&child.artifacts),
+                            artifacts: faulted_shapes(
+                                LeafArtifacts::from_build(&child.artifacts),
+                                level_rounds(&plan),
+                            )
+                            .map_err(fail)?,
                             proof,
                         },
                     )
@@ -2478,6 +2523,29 @@ impl Worker<'_> {
         self.clock.mark("finish-sent");
         Ok(())
     }
+}
+
+/// Test faults on the shapes worker 0 states for its leaf, early or with its
+/// proof: one table a variable above the cap, or more tables than the cap.
+/// Both are self-consistent, so only the cap refuses them before the join.
+#[cfg(all(test, feature = "test-security"))]
+fn faulted_shapes(artifacts: LeafArtifacts, rounds: Option<u8>) -> Result<LeafArtifacts, String> {
+    if fault_is("oversized-leaf") {
+        return artifacts.self_consistent(rounds, |_, _, chunks, _| {
+            chunks[0][0] = 1 << (MAX_WORKER_LEAF_TABLE_VARS + 1);
+        });
+    }
+    if fault_is("too-many-tables-leaf") {
+        return artifacts.self_consistent(rounds, |_, _, chunks, _| {
+            chunks[0].extend(std::iter::repeat_n(2, MAX_WORKER_LEAF_TABLES + 1));
+        });
+    }
+    Ok(artifacts)
+}
+
+#[cfg(not(all(test, feature = "test-security")))]
+fn faulted_shapes(artifacts: LeafArtifacts, _: Option<u8>) -> Result<LeafArtifacts, String> {
+    Ok(artifacts)
 }
 
 #[cfg(test)]
@@ -3576,6 +3644,19 @@ mod tests {
         // A frame decoded as the other kind is refused.
         assert!(range_counts(Kind::RangeCounts, &compact, 8).is_err());
         assert!(range_counts(Kind::CompactRangeCounts, &empty, 0).is_err());
+    }
+
+    #[test]
+    fn the_worker_leaf_shape_cap_holds_at_its_bounds() {
+        assert_eq!(
+            (MAX_WORKER_LEAF_TABLES, MAX_WORKER_LEAF_TABLE_VARS),
+            (118, 24)
+        );
+        assert!(within_worker_leaf_cap(118, 24));
+        assert!(within_worker_leaf_cap(1, 0));
+        assert!(!within_worker_leaf_cap(119, 24));
+        assert!(!within_worker_leaf_cap(118, 25));
+        assert!(!within_worker_leaf_cap(4096, 31));
     }
 
     /// The early leaf build's host lane is one pool for the process: one

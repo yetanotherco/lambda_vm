@@ -1774,6 +1774,41 @@ mod tcp {
         falls_back(Some("early-unasked"), "unexpected early leaf artifacts");
     }
 
+    /// Worker 0 states one table above the shape cap, then more tables than
+    /// the cap (both self-consistent): each attempt is refused for the cap,
+    /// no join is built from the worker's shapes, and the fallback ships the
+    /// reference.
+    ///
+    /// Mutation: without the cap the join is built from those shapes.
+    fn refused_above_the_shape_cap() {
+        use crate::block_whir::cluster_tcp::WORKER_JOIN_BUILDS;
+        use std::sync::atomic::Ordering::SeqCst;
+        for fault in ["oversized-leaf", "too-many-tables-leaf"] {
+            let builds = WORKER_JOIN_BUILDS.load(SeqCst);
+            falls_back(Some(fault), "worker leaf shapes above the cap");
+            assert_eq!(
+                WORKER_JOIN_BUILDS.load(SeqCst),
+                builds,
+                "{fault}: a join was built from the worker's shapes"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU tier (default knobs): a worker leaf above the shape cap"]
+    fn a_worker_leaf_above_the_shape_cap_never_reaches_the_join() {
+        use crate::block_whir::cluster_tcp::EARLY_JOIN_ENV;
+        assert!(!knob(EARLY_JOIN_ENV), "run with {EARLY_JOIN_ENV} unset");
+        refused_above_the_shape_cap();
+    }
+
+    #[test]
+    #[ignore = "GPU tier (opt-in knobs): early artifacts above the shape cap"]
+    fn early_artifacts_above_the_shape_cap_never_reach_the_join() {
+        assert_early_join();
+        refused_above_the_shape_cap();
+    }
+
     #[test]
     #[ignore = "GPU tier (opt-in knobs): early artifacts sent twice"]
     fn early_join_refuses_duplicate_artifacts() {
