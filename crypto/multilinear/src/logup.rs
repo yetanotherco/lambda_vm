@@ -26,7 +26,7 @@ use rayon::prelude::*;
 use crate::{
     Error,
     batch::Rule,
-    eq::eq_evals,
+    eq::{eq_evals, eq_evals_serial},
     gkr::FractionLayer,
     mle::Mle,
     program::{Builder, Program},
@@ -634,6 +634,22 @@ pub fn claim_statements<'a, E: IsField + 'static>(
     num_row_vars: usize,
     weight: usize,
 ) -> Result<BusStatements<'a, E>, Error> {
+    let [numerator, denominator] =
+        claim_programs(interactions, claim_point, num_row_vars, weight, true)?;
+    let row_point = &claim_point[claim_point.len() - num_row_vars..];
+    Ok(BusStatements {
+        numerator: Rule::compiled(2, numerator),
+        denominator: Rule::compiled(2, denominator),
+        row_point: row_point.to_vec(),
+    })
+}
+
+/// The suffix of a bus claim used as its row weight.
+pub fn claim_row_point<'a, E: IsField>(
+    interactions: &[Interaction<E>],
+    claim_point: &'a [FieldElement<E>],
+    num_row_vars: usize,
+) -> Result<&'a [FieldElement<E>], Error> {
     let expected = input_layer_vars(interactions.len(), num_row_vars);
     if claim_point.len() != expected {
         return Err(Error::VariableCountMismatch {
@@ -641,11 +657,27 @@ pub fn claim_statements<'a, E: IsField + 'static>(
             got: claim_point.len(),
         });
     }
-    let (interaction_point, row_point) = claim_point.split_at(claim_point.len() - num_row_vars);
+    Ok(&claim_point[expected - num_row_vars..])
+}
 
+/// The two bus rule programs. Scoped workers keep the interaction weights on
+/// their own thread by passing `parallel_weights = false`.
+pub fn claim_programs<E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    claim_point: &[FieldElement<E>],
+    num_row_vars: usize,
+    weight: usize,
+    parallel_weights: bool,
+) -> Result<[Program<E>; 2], Error> {
+    claim_row_point(interactions, claim_point, num_row_vars)?;
+    let interaction_point = &claim_point[..claim_point.len() - num_row_vars];
     // Weight per interaction; the tail belongs to the 0/1 padding slots, whose
     // denominators are one and whose numerators vanish.
-    let weights = eq_evals(interaction_point);
+    let weights = if parallel_weights {
+        eq_evals(interaction_point)
+    } else {
+        eq_evals_serial(interaction_point)
+    };
     let padding = weights[interactions.len()..]
         .iter()
         .fold(FieldElement::<E>::zero(), |acc, w| acc + w);
@@ -676,14 +708,7 @@ pub fn claim_statements<'a, E: IsField + 'static>(
         interactions.iter().map(|i| &i.denominator).collect(),
         Some(padding),
     )?;
-    let numerator = Rule::compiled(2, numerator);
-    let denominator = Rule::compiled(2, denominator);
-
-    Ok(BusStatements {
-        numerator,
-        denominator,
-        row_point: row_point.to_vec(),
-    })
+    Ok([numerator, denominator])
 }
 
 #[cfg(test)]

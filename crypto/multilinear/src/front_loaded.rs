@@ -106,6 +106,33 @@ host_stepper!(
     crate::virtual_poly::VirtualPolynomial<F>
 );
 
+/// The combined host rule program being built by a table's scoped worker.
+pub struct ScopedBatch<'a, E: IsField> {
+    pub degree: usize,
+    pub program: std::thread::ScopedJoinHandle<'a, Result<crate::program::Program<E>, Error>>,
+}
+
+impl<'a, E: IsField + 'static> ScopedBatch<'a, E> {
+    fn finish(
+        self,
+        factors: Vec<crate::mle::Mle<E>>,
+    ) -> Result<crate::batch::Batched<'a, E>, Error> {
+        let program = match self.program.join() {
+            Ok(program) => program?,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let mut batched = crate::batch::Batched::from_program(self.degree, program);
+        batched.adopt(factors)?;
+        Ok(batched)
+    }
+}
+
+/// The table's rules supplied at setup or built during its device rounds.
+pub enum TableRules<'a, E: IsField> {
+    Immediate(Vec<crate::batch::Rule<'a, E>>),
+    Scoped(ScopedBatch<'a, E>),
+}
+
 /// One table's rule in the batched constraint sumcheck (D-BATCH phase C): its
 /// factors and weights on the host, or its fused rounds on a device down to
 /// today's crossover and the host's over what the card folded from there.
@@ -115,8 +142,11 @@ pub enum TableRounds<'a, E: IsField> {
     #[cfg(feature = "cuda")]
     Fused {
         stepper: Option<Box<crate::gpu_fused::FusedStepper<'a, E>>>,
-        /// The rules and weights, adopting the factors at the crossover.
-        batched: crate::batch::Batched<'a, E>,
+        /// The batch adopts the factors at the crossover.
+        batched: Option<crate::batch::Batched<'a, E>>,
+        /// A pending batch joins when the device hands back its factors.
+        scoped: Option<ScopedBatch<'a, E>>,
+        degree: usize,
         /// Variables left to bind.
         vars: usize,
         /// The program is a long one ([`crate::gpu_fused::TailTimes`]'s `[1]`).
@@ -135,13 +165,42 @@ where
     /// their points, one `eq` factor a point, in order.
     ///
     /// `claim` is the table's own `Σ λ^j·claim_j` — what the fused rounds
-    /// carry to reconstruct `A(1)`. Today's rules are `[zerocheck, numerator,
-    /// denominator]`, `lambdas` their `[1, λ, λ²]` and `weights` two points;
-    /// the fused rounds take exactly that shape (three rules, one bus) and
-    /// decline any other.
+    /// carry to reconstruct `A(1)`. The fused rounds take a zerocheck and
+    /// one or two buses, with two rules per bus.
     #[allow(clippy::too_many_arguments)]
     pub fn new<B, P>(
         rules: Vec<crate::batch::Rule<'a, E>>,
+        lambdas: Vec<FieldElement<E>>,
+        claim: &FieldElement<E>,
+        weights: &[&[FieldElement<E>]],
+        num_vars: usize,
+        device: Option<&'a crate::gpu::DeviceFactors>,
+        columns: Option<&'a crate::gpu::ColumnFactors>,
+        fused: Option<crate::gpu_fused::FusedInput<'_, B, E>>,
+        factors: P,
+    ) -> Result<Self, Error>
+    where
+        B: IsField + math::field::traits::IsSubFieldOf<E> + 'static,
+        P: FnOnce() -> Result<Vec<crate::mle::Mle<E>>, Error>,
+    {
+        Self::new_with_rules(
+            TableRules::Immediate(rules),
+            lambdas,
+            claim,
+            weights,
+            num_vars,
+            device,
+            columns,
+            fused,
+            factors,
+        )
+    }
+
+    /// Start the device rounds from the static rule degree. If setup declines,
+    /// join a pending batch immediately, before the host runs its first round.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_rules<B, P>(
+        rules: TableRules<'a, E>,
         lambdas: Vec<FieldElement<E>>,
         claim: &FieldElement<E>,
         weights: &[&[FieldElement<E>]],
@@ -167,22 +226,34 @@ where
         let decline = if let (Some(source), Some(input)) = (source, fused.as_ref())
             && crate::gpu_fused::argue_fused()
         {
-            let degree = rules
-                .iter()
-                .map(crate::batch::Rule::degree)
-                .max()
-                .unwrap_or(0)
-                .max(1);
+            let degree = match &rules {
+                TableRules::Immediate(rules) => crate::batch::degree_of(rules),
+                TableRules::Scoped(scoped) => scoped.degree,
+            };
             let check = crate::gpu_fused::argue_fused_xcheck();
-            match crate::gpu_fused::FusedStepper::new(source, input, &lambdas, claim, degree, check)
-            {
+            match crate::gpu_fused::FusedStepper::new(
+                source,
+                input,
+                &lambdas,
+                claim,
+                degree.max(1),
+                check,
+            ) {
                 Ok(Ok(stepper)) => {
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
-                    let batched = crate::batch::Batched::new(Vec::new(), rules, lambdas)?;
+                    let (batched, scoped) = match rules {
+                        TableRules::Immediate(rules) => (
+                            Some(crate::batch::Batched::new(Vec::new(), rules, lambdas)?),
+                            None,
+                        ),
+                        TableRules::Scoped(scoped) => (None, Some(scoped)),
+                    };
                     let long = stepper.long();
                     return Ok(Self::Fused {
                         stepper: Some(Box::new(stepper)),
                         batched,
+                        scoped,
+                        degree,
                         vars: num_vars,
                         long,
                     });
@@ -205,7 +276,10 @@ where
         for weight in weights {
             polys.push(crate::eq::eq_mle(weight)?);
         }
-        let batched = crate::batch::Batched::new(polys, rules, lambdas)?;
+        let batched = match rules {
+            TableRules::Immediate(rules) => crate::batch::Batched::new(polys, rules, lambdas)?,
+            TableRules::Scoped(scoped) => scoped.finish(polys)?,
+        };
         #[cfg(feature = "cuda")]
         if let Some(decline) = decline
             && crate::gpu_fused::worth_fused_rounds(num_vars)
@@ -220,7 +294,7 @@ where
         match self {
             Self::Host(batched) => batched.polys(),
             #[cfg(feature = "cuda")]
-            Self::Fused { batched, .. } => batched.polys(),
+            Self::Fused { batched, .. } => batched.as_ref().map_or(&[], |b| b.polys()),
         }
     }
 
@@ -262,7 +336,7 @@ where
         match self {
             Self::Host(batched) => SumcheckPolynomial::degree(batched),
             #[cfg(feature = "cuda")]
-            Self::Fused { batched, .. } => SumcheckPolynomial::degree(batched),
+            Self::Fused { degree, .. } => *degree,
         }
     }
 
@@ -278,6 +352,7 @@ where
             } => match stepper {
                 None => {
                     let tick = std::time::Instant::now();
+                    let batched = batched.as_ref().expect("host tail has a batch");
                     let out = round_evaluations(batched, degree, false);
                     let (long, spent) = (usize::from(*long), tick.elapsed().as_secs_f64());
                     crate::gpu_fused::note_tail(|tail| {
@@ -321,14 +396,19 @@ where
             Self::Fused {
                 stepper,
                 batched,
+                scoped,
                 vars,
                 long,
+                ..
             } => {
                 *vars -= 1;
                 match stepper.as_mut() {
                     None => {
                         let tick = std::time::Instant::now();
-                        let out = batched.fix_first_variable(r);
+                        let out = batched
+                            .as_mut()
+                            .expect("host tail has a batch")
+                            .fix_first_variable(r);
                         let (long, spent) = (usize::from(*long), tick.elapsed().as_secs_f64());
                         crate::gpu_fused::note_tail(|tail| tail.host[long] += spent);
                         out
@@ -340,7 +420,11 @@ where
                                 .take()
                                 .ok_or(Error::DeviceFailed { stage: "fused" })?
                                 .into_factors()?;
-                            batched.adopt(factors)?;
+                            if let Some(scoped) = scoped.take() {
+                                *batched = Some(scoped.finish(factors)?);
+                            } else {
+                                batched.as_mut().expect("immediate batch").adopt(factors)?;
+                            }
                         }
                         Ok(())
                     }
@@ -370,7 +454,7 @@ where
         let batched = match self {
             Self::Host(batched) => batched,
             #[cfg(feature = "cuda")]
-            Self::Fused { batched, .. } => batched,
+            Self::Fused { batched, .. } => batched.as_ref().expect("host tail has a batch"),
         };
         Ok(batched.eval_at_index(0))
     }
