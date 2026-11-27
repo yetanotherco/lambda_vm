@@ -3732,6 +3732,24 @@ fn rta_one_run(
     // that only move when host work runs (under
     // `LAMBDA_VM_DETERMINISTIC_GRIND=1`).
     let base_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes");
+    if std::env::var_os("RTA_COMMIT_IDENTITY").is_some() {
+        let roots = &run.base_proof.proof.roots;
+        let mut h = blake3::Hasher::new();
+        for root in roots {
+            h.update(root);
+        }
+        println!(
+            "RTA BASE COMMIT IDENTITY: {} roots · {} · deferred Möbius {} · last-pass hashes {}",
+            roots.len(),
+            h.finalize().to_hex(),
+            math_cuda::lde_cm::deferred_mobius_encodings(),
+            math_cuda::whir::ntt_last_pass_hashes_count(),
+        );
+        println!(
+            "RTA BASE FULL DIGEST: {}",
+            blake3::hash(&base_bytes).to_hex()
+        );
+    }
     println!(
         "RTA PROOF DIGEST: deterministic grind {} · base {} B {} · {}",
         std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
