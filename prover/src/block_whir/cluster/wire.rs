@@ -667,6 +667,22 @@ mod tests {
         assert_eq!(error.to_string(), "peer refused attempt: helloworld");
     }
 
+    /// With the compact-counts knob off the coordinator asks for the dense
+    /// kind only, and an authenticated compact frame is refused before its
+    /// payload is decoded.
+    #[test]
+    fn cluster_wire_refuses_a_compact_counts_frame_it_did_not_ask_for() {
+        let (sender, receiver) = authenticated_pair();
+        sender
+            .write_frame(deadline(), Kind::CompactRangeCounts, [7; 16], &[1, 2, 3])
+            .unwrap();
+        let error = receiver
+            .reader()
+            .receive(deadline(), Some([7; 16]), &[Kind::RangeCounts])
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected CompactRangeCounts frame");
+    }
+
     #[test]
     fn cluster_wire_deadline_covers_the_entire_frame() {
         let (sender, receiver) = authenticated_pair();

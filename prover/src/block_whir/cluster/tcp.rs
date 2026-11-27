@@ -1865,6 +1865,35 @@ fn open_levels(
     cluster_levels::prove_join_staged(&layout, rounds, leaves, last, clock).map_err(fail)
 }
 
+/// The frame kinds a worker's range counts may arrive in: the compact kind
+/// only when this coordinator's own knob is on.
+fn count_kinds(compact: bool) -> &'static [Kind] {
+    if compact {
+        &[Kind::RangeCounts, Kind::CompactRangeCounts]
+    } else {
+        &[Kind::RangeCounts]
+    }
+}
+
+/// A worker's range counts from a frame of `kind` (one [`count_kinds`]
+/// admitted), for a range that ends at `end`: an empty range sends no counts,
+/// any other range sends BITWISE counts.
+fn range_counts(kind: Kind, bytes: &AlignedVec, end: usize) -> Result<range::Counts, Error> {
+    let counts: range::Counts = if kind == Kind::CompactRangeCounts {
+        wire::decode::<range::CompactCounts>(bytes)
+            .map_err(fail)?
+            .expand()?
+    } else {
+        wire::decode(bytes).map_err(fail)?
+    };
+    if end == 0 && (!counts.bitwise.is_empty() || !counts.decode.is_empty() || counts.keccak != 0)
+        || end != 0 && counts.bitwise.is_empty()
+    {
+        return Err(fail("invalid range counts for assigned cycles"));
+    }
+    Ok(counts)
+}
+
 /// Takes a worker's leaf once, from a machine that owns a leaf, for the plan
 /// this attempt bound. Anything else is refused before it is kept.
 fn take_leaf_reply<R>(
@@ -2836,11 +2865,7 @@ fn prove_ranges_as(
         options,
     );
     let attempt = coordinator.attempt;
-    let count_kinds = if setting(COMPACT_COUNTS).as_deref() == Some("1") {
-        &[Kind::RangeCounts, Kind::CompactRangeCounts][..]
-    } else {
-        &[Kind::RangeCounts][..]
-    };
+    let count_kinds = count_kinds(setting(COMPACT_COUNTS).as_deref() == Some("1"));
     let (mut terminal, remote) = std::thread::scope(|scope| {
         let (stream_tx, stream_rx) = mpsc::channel();
         let readers: Vec<_> = coordinator
@@ -2870,21 +2895,7 @@ fn prove_ranges_as(
                             .receive(deadline, Some(attempt), count_kinds)
                             .map_err(fail)?;
                         clock.mark(format_args!("range-counts-received-W{id}"));
-                        let counts: range::Counts = if kind == Kind::CompactRangeCounts {
-                            wire::decode::<range::CompactCounts>(&bytes)
-                                .map_err(fail)?
-                                .expand()?
-                        } else {
-                            wire::decode(&bytes).map_err(fail)?
-                        };
-                        if metadata.end == 0
-                            && (!counts.bitwise.is_empty()
-                                || !counts.decode.is_empty()
-                                || counts.keccak != 0)
-                            || metadata.end != 0 && counts.bitwise.is_empty()
-                        {
-                            return Err(fail("invalid range counts for assigned cycles"));
-                        }
+                        let counts = range_counts(kind, &bytes, metadata.end)?;
                         Ok((metadata, counts))
                     };
                     read().inspect_err(cancel)
@@ -3436,6 +3447,60 @@ mod repeat_tests {
 #[cfg(all(test, not(feature = "cuda")))]
 mod tests {
     use super::*;
+
+    /// The coordinator's side of the compact counts: the compact kind is
+    /// admitted only with its own knob on; a compact frame decodes to the
+    /// dense counts it encodes; an empty range must send empty dense counts,
+    /// which no compact frame decodes to; any other range must send BITWISE
+    /// counts.
+    #[test]
+    fn cluster_compact_counts_on_the_coordinator() {
+        use crate::tables::bitwise::BitwiseHistogram;
+        assert_eq!(count_kinds(false), [Kind::RangeCounts]);
+        assert_eq!(
+            count_kinds(true),
+            [Kind::RangeCounts, Kind::CompactRangeCounts]
+        );
+        let refused = |kind, bytes: &AlignedVec, end| {
+            let error = range_counts(kind, bytes, end).err().expect("refused");
+            assert!(
+                error.to_string().contains("invalid range counts"),
+                "{error}"
+            );
+        };
+
+        let mut dense = range::Counts {
+            bitwise: vec![0; BitwiseHistogram::LEN],
+            decode: vec![(1, 2)],
+            keccak: 1,
+        };
+        dense.bitwise[5] = 9;
+        dense.bitwise[BitwiseHistogram::LEN - 1] = u64::MAX;
+        let bytes = |value: &range::Counts| rkyv::to_bytes::<rkyv::rancor::Error>(value).unwrap();
+        let compact = rkyv::to_bytes::<rkyv::rancor::Error>(&dense.compact().unwrap()).unwrap();
+        let got = range_counts(Kind::CompactRangeCounts, &compact, 8).unwrap();
+        assert_eq!(got.bitwise, dense.bitwise);
+        assert_eq!(got.decode, dense.decode);
+        assert_eq!(got.keccak, dense.keccak);
+        let got = range_counts(Kind::RangeCounts, &bytes(&dense), 8).unwrap();
+        assert_eq!(got.bitwise, dense.bitwise);
+
+        let empty = bytes(&range::Counts::default());
+        range_counts(Kind::RangeCounts, &empty, 0).unwrap();
+        refused(Kind::RangeCounts, &empty, 8);
+        let zeros = range::Counts {
+            bitwise: vec![0; BitwiseHistogram::LEN],
+            ..Default::default()
+        }
+        .compact()
+        .unwrap();
+        let zeros = rkyv::to_bytes::<rkyv::rancor::Error>(&zeros).unwrap();
+        refused(Kind::CompactRangeCounts, &zeros, 0);
+        assert!(range_counts(Kind::CompactRangeCounts, &zeros, 8).is_ok());
+        // A frame decoded as the other kind is refused.
+        assert!(range_counts(Kind::RangeCounts, &compact, 8).is_err());
+        assert!(range_counts(Kind::CompactRangeCounts, &empty, 0).is_err());
+    }
 
     /// The early leaf build's host lane is one pool for the process: one
     /// thread started over many leaves, from callers on several threads,

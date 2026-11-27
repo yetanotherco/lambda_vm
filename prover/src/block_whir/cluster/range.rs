@@ -1746,8 +1746,160 @@ mod tests {
         assert!(compact_merge == dense_merge);
     }
 
+    /// The encoder with no size limit: the bitmap, then one LEB128 count
+    /// per set bit.
+    fn unbounded_compact(dense: &[u64]) -> Vec<u8> {
+        let mut bitwise = vec![0; BITWISE_BITMAP];
+        for (index, &count) in dense.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            bitwise[index / 8] |= 1 << (index % 8);
+            let mut value = count;
+            while value >= 128 {
+                bitwise.push(value as u8 | 128);
+                value >>= 7;
+            }
+            bitwise.push(value as u8);
+        }
+        bitwise
+    }
+
+    fn compact_of(bitwise: Vec<u8>) -> CompactCounts {
+        CompactCounts {
+            bitwise,
+            decode: Vec::new(),
+            keccak: 0,
+        }
+    }
+
+    /// Every accepted frame is the encoder's frame of what it decodes to.
+    fn round_trip(dense: &Counts) {
+        let compact = dense.compact().expect("compact frame");
+        assert_eq!(compact.bitwise, unbounded_compact(&dense.bitwise));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&compact).unwrap();
+        let expanded = super::super::wire::decode::<CompactCounts>(&bytes)
+            .unwrap()
+            .expand()
+            .unwrap();
+        assert!(expanded.bitwise == dense.bitwise);
+        assert_eq!(expanded.decode, dense.decode);
+        assert_eq!(expanded.keccak, dense.keccak);
+        assert_eq!(expanded.compact().unwrap().bitwise, compact.bitwise);
+    }
+
+    #[test]
+    fn cluster_compact_counts_refuse_bad_lengths() {
+        for len in [0, 1, BITWISE_BITMAP - 1, BITWISE_BYTES, BITWISE_BYTES + 1] {
+            assert!(compact_of(vec![0; len]).expand().is_err(), "{len} bytes");
+        }
+        // The shortest accepted frame: an empty bitmap, every count zero.
+        let zeros = compact_of(vec![0; BITWISE_BITMAP]).expand().unwrap();
+        assert!(zeros.bitwise.len() == BITWISE_LEN && zeros.bitwise.iter().all(|&c| c == 0));
+        // A bitmap with no counts behind it, or a count with no bit.
+        let mut bitwise = vec![0; BITWISE_BITMAP];
+        bitwise[BITWISE_BITMAP - 1] = 0x80;
+        assert!(compact_of(bitwise.clone()).expand().is_err());
+        bitwise[BITWISE_BITMAP - 1] = 0;
+        bitwise.push(1);
+        assert!(compact_of(bitwise).expand().is_err());
+    }
+
+    /// The longest frame below the dense size decodes and round trips; one
+    /// byte more and the encoder sends the dense frame, and a hand-built
+    /// compact frame of that length is refused.
+    #[test]
+    fn cluster_compact_counts_at_the_dense_size() {
+        // 8 a + 7 b bytes of counts, a + b = LEN, fill the frame to one byte
+        // below the dense size.
+        let values = BITWISE_BYTES - 1 - BITWISE_BITMAP;
+        let eight = values - 7 * BITWISE_LEN;
+        let mut dense = Counts {
+            bitwise: vec![1 << 42; BITWISE_LEN],
+            decode: vec![(3, 4)],
+            keccak: 5,
+        };
+        dense.bitwise[..eight].fill((1 << 56) - 1);
+        assert_eq!(unbounded_compact(&dense.bitwise).len(), BITWISE_BYTES - 1);
+        round_trip(&dense);
+        dense.bitwise[eight] = 1 << 49;
+        let longest = unbounded_compact(&dense.bitwise);
+        assert_eq!(longest.len(), BITWISE_BYTES);
+        assert!(dense.compact().is_none());
+        assert!(compact_of(longest).expand().is_err());
+    }
+
+    #[test]
+    fn cluster_compact_counts_round_trip_the_largest_counts() {
+        for (count, len) in [
+            (1, 1),
+            (127, 1),
+            (128, 2),
+            ((1 << 56) - 1, 8),
+            (1 << 56, 9),
+            ((1 << 63) - 1, 9),
+            (1 << 63, 10),
+            (u64::MAX, 10),
+        ] {
+            let mut dense = Counts {
+                bitwise: vec![0; BITWISE_LEN],
+                ..Default::default()
+            };
+            dense.bitwise[BITWISE_LEN - 1] = count;
+            assert_eq!(
+                unbounded_compact(&dense.bitwise).len(),
+                BITWISE_BITMAP + len,
+                "{count}"
+            );
+            round_trip(&dense);
+        }
+    }
+
+    /// Dense arrays of every count length, sparse and full, decode to
+    /// themselves.
+    #[test]
+    fn cluster_compact_counts_decode_equals_the_dense_encoding() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for density in [1, 64, 1024] {
+            let mut dense = Counts {
+                bitwise: vec![0; BITWISE_LEN],
+                decode: vec![(1, 2), (7, 9)],
+                keccak: 11,
+            };
+            for count in &mut dense.bitwise {
+                let roll = next();
+                if roll % 1024 < density {
+                    // A count of 1 to 64 significant bits.
+                    *count = (next() >> ((roll >> 10) % 64)).max(1);
+                }
+            }
+            round_trip(&dense);
+        }
+    }
+
     #[test]
     fn cluster_compact_counts_refuse_noncanonical_values() {
+        let nine = |last| [&[0xff; 9][..], &[last]].concat();
+        let nine_zero = |last| [&[0x80; 9][..], &[last]].concat();
+        for values in [nine(2), nine(0), nine(0x81), nine_zero(0), nine_zero(2)] {
+            let mut bitwise = vec![0; BITWISE_BITMAP];
+            bitwise[0] = 1;
+            bitwise.extend_from_slice(&values);
+            assert!(compact_of(bitwise).expand().is_err(), "{values:?}");
+        }
+        // Nine continuation bytes and a final 1 is 2^63 and up, accepted.
+        for values in [nine(1), nine_zero(1)] {
+            let mut bitwise = vec![0; BITWISE_BITMAP];
+            bitwise[0] = 1;
+            bitwise.extend_from_slice(&values);
+            assert!(compact_of(bitwise).expand().is_ok(), "{values:?}");
+        }
         for values in [&[][..], &[0], &[0x80, 0], &[1, 1], &[0xff; 10]] {
             let mut bitwise = vec![0; BITWISE_BITMAP];
             bitwise[0] = 1;
