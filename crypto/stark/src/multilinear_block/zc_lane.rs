@@ -34,6 +34,31 @@ use std::time::Duration;
 use multilinear::whir_chain::GkrPack;
 
 use super::*;
+use crate::multilinear_table::LaneColumns;
+
+/// Small non-record tables may be copied into an owned retry job.
+const LANE_COPY_MAX_CELLS: usize = 1 << 20;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryEvent {
+    WorkerStarted,
+    Arrived,
+    BinStarted(usize, usize),
+    AttemptEnded(usize, LaneState),
+    InputEnded,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RetryTest(pub Arc<dyn Fn(RetryEvent) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for RetryTest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RetryTest")
+    }
+}
 
 /// A local argue the lane hands on ([`super::LocalStarted`], type-erased:
 /// the lane is not generic over the transcript).
@@ -178,6 +203,11 @@ pub struct ZcLaneStamp {
     pub ladders: f64,
     /// What this group's commit waited for the lane's unit under way.
     pub commit_wait: f64,
+    pub retries: usize,
+    pub retry_upload: f64,
+    pub retries_cut_short: usize,
+    /// On the last group only: include the retry readout for this block.
+    pub retry_enabled: bool,
     /// A local job (local lookups): `bins`, `bins_ran` and `ladders` are its
     /// local argue's.
     pub local: bool,
@@ -219,6 +249,20 @@ where
     local: Option<Box<dyn Any + Send>>,
 }
 
+struct RetryJob<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    group: usize,
+    source: Vec<LaneColumns<F>>,
+    shells: Vec<CommittedTable<'a, F, E>>,
+    stamp: ZcLaneStamp,
+    local: LocalHandOff,
+}
+
 struct LaneQueue<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -227,6 +271,11 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     jobs: VecDeque<LaneJob<'a, F, E>>,
+    retry: VecDeque<RetryJob<'a, F, E>>,
+    retrying: bool,
+    retry_closed: bool,
+    /// The commit window's peak before the first retry used it.
+    commit_peak: Option<u64>,
     /// The store bytes of the job under way.
     running: Option<u64>,
     /// A unit of the job under way (a bin's ladder, or the constraint
@@ -271,6 +320,11 @@ where
     committing: AtomicBool,
     /// The most a commit has grown the ledger so far (bytes).
     max_growth: AtomicU64,
+    arrived: AtomicUsize,
+    max_store: AtomicU64,
+    retry_on: bool,
+    #[cfg(test)]
+    retry_test: Option<RetryTest>,
     queue: Mutex<LaneQueue<'a, F, E>>,
     wake: Condvar,
 }
@@ -282,13 +336,13 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    /// The lane for `probe` under `config`, running local jobs over
-    /// `local_buses` when they are given; `None` unless the argue is batched
+    /// The lane for `probe` under `config`, running local jobs when given
+    /// `local`; `None` unless the argue is batched
     /// and the lane has work (a lane probe or local jobs).
     pub(super) fn new(
         probe: &CsProbe,
         config: &ChainConfig,
-        local_buses: Option<Vec<u64>>,
+        local: Option<&LocalPhaseA>,
     ) -> Option<Self> {
         let ArgueFormat::Batched {
             bin_log_cells,
@@ -302,7 +356,7 @@ where
             CsProbeMode::Lane(work) => Some(work),
             _ => None,
         };
-        if work.is_none() && local_buses.is_none() {
+        if work.is_none() && local.is_none() {
             return None;
         }
         Some(Self {
@@ -314,11 +368,20 @@ where
             pack,
             ladder,
             work,
-            local_buses,
+            local_buses: local.map(|local| local.buses.clone()),
             committing: AtomicBool::new(false),
             max_growth: AtomicU64::new(0),
+            arrived: AtomicUsize::new(0),
+            max_store: AtomicU64::new(0),
+            retry_on: local.is_some_and(|local| local.retry),
+            #[cfg(test)]
+            retry_test: local.and_then(|local| local.retry_test.clone()),
             queue: Mutex::new(LaneQueue {
                 jobs: VecDeque::new(),
+                retry: VecDeque::new(),
+                retrying: false,
+                retry_closed: false,
+                commit_peak: None,
                 running: None,
                 unit: false,
                 shed: false,
@@ -361,13 +424,17 @@ where
     /// first, while its predicted peak would pass `budget − unledgered`; if
     /// that is not enough, the job under way lets its store go at its unit
     /// boundary, and the commit waits for that too.
-    pub(super) fn commit_begins(&self, group: usize) {
+    pub(super) fn commit_begins(&self, group: usize, retry_wait: f64) {
         let waited = Instant::now();
         let mut queue = self.lock();
         Self::end_idle(&mut queue);
         self.committing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        while queue.unit {
+        if self.retry_on {
+            self.arrived.fetch_sub(1, Relaxed);
+            queue.commit_peak = None;
+        }
+        while queue.unit || queue.retrying {
             queue = self
                 .wake
                 .wait_timeout(queue, Duration::from_millis(1))
@@ -402,7 +469,61 @@ where
         queue.shed = false;
         queue
             .commit_waits
-            .push((group, waited.elapsed().as_secs_f64()));
+            .push((group, retry_wait + waited.elapsed().as_secs_f64()));
+    }
+
+    /// Record an arriving group before it uploads, so a retry stops at its
+    /// next boundary even if the group has yet to reach its commit.
+    pub(super) fn group_arrived(&self, group: &[CommittedTable<'a, F, E>]) {
+        if self.retry_on {
+            let mut queue = self.lock();
+            Self::end_idle(&mut queue);
+            self.max_store
+                .fetch_max(group.iter().map(|t| wide_bytes(t) as u64).sum(), Relaxed);
+            self.arrived.fetch_add(1, Relaxed);
+            drop(queue);
+            self.wake.notify_all();
+            #[cfg(test)]
+            self.retry_event(RetryEvent::Arrived);
+        }
+    }
+
+    /// Uploads can overlap the end of a retry's last unit. The next commit's
+    /// ledger window starts only after the retry has released its store.
+    pub(super) fn wait_for_retry(&self) -> f64 {
+        if !self.retry_on {
+            return 0.0;
+        }
+        let mut queue = self.lock();
+        if !queue.retrying {
+            return 0.0;
+        }
+        let waited = Instant::now();
+        while queue.retrying {
+            queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+        waited.elapsed().as_secs_f64()
+    }
+
+    /// The producer has no more groups. Let an active retry stop while the
+    /// committer finishes the last group and closes the lane.
+    pub(super) fn input_ended(&self) {
+        if self.retry_on {
+            self.lock().retry_closed = true;
+            self.wake.notify_all();
+            #[cfg(test)]
+            self.retry_event(RetryEvent::InputEnded);
+        }
+    }
+
+    pub(super) fn commit_peak(&self) -> u64 {
+        if self.retry_on {
+            return self
+                .lock()
+                .commit_peak
+                .unwrap_or_else(multilinear::gpu::reserved_window_peak);
+        }
+        multilinear::gpu::reserved_window_peak()
     }
 
     /// Whether the lane runs local jobs.
@@ -476,9 +597,27 @@ where
         };
         if let Some(why) = defer {
             stamp.state = LaneState::Deferred(why);
-            queue.stamps.push((group, stamp));
             if let Some(local) = local {
-                queue.local.push((group, local));
+                if self.retry_on
+                    && matches!(why, LaneDefer::Memory | LaneDefer::Hold)
+                    && let Some(source) = tables
+                        .iter()
+                        .map(|t| t.lane_columns(LANE_COPY_MAX_CELLS))
+                        .collect::<Option<Vec<_>>>()
+                {
+                    queue.retry.push_back(RetryJob {
+                        group,
+                        source,
+                        shells: tables.iter().map(|t| t.lane_shell(false)).collect(),
+                        stamp,
+                        local,
+                    });
+                } else {
+                    queue.stamps.push((group, stamp));
+                    queue.local.push((group, local));
+                }
+            } else {
+                queue.stamps.push((group, stamp));
             }
             drop(queue);
             self.decide();
@@ -516,6 +655,24 @@ where
         }
     }
 
+    #[cfg(test)]
+    fn retry_event(&self, event: RetryEvent) {
+        if let Some(test) = &self.retry_test {
+            (test.0)(event);
+        }
+    }
+
+    fn retry_fits(&self, store_bytes: u64) -> bool {
+        let budget = multilinear::gpu::reserve_budget();
+        self.limits.hold_bytes.is_none_or(|cap| store_bytes <= cap)
+            && (budget == 0
+                || multilinear::gpu::ledger_reserved()
+                    + store_bytes
+                    + self.limits.margin
+                    + self.max_store.load(Relaxed)
+                    <= budget.saturating_sub(self.limits.unledgered))
+    }
+
     /// The lane's thread: runs the jobs until [`Self::close`].
     pub(super) fn run<T>(&self)
     where
@@ -523,7 +680,9 @@ where
     {
         // Behind the commits: every stream this thread draws is a background one.
         let _background = multilinear::gpu::background_streams();
-        loop {
+        #[cfg(test)]
+        self.retry_event(RetryEvent::WorkerStarted);
+        'jobs: loop {
             let job = {
                 let mut queue = self.lock();
                 loop {
@@ -535,7 +694,25 @@ where
                             queue.running = Some(job.stamp.store_bytes);
                             break Some(job);
                         }
-                        if !queue.commit_waits.is_empty() {
+                        if !queue.retry_closed
+                            && self.arrived.load(Relaxed) == 0
+                            && let Some(job) = queue.retry.front()
+                            && self.retry_fits(job.stamp.store_bytes)
+                        {
+                            let job = queue.retry.pop_front().expect("retry job at the front");
+                            queue.retrying = true;
+                            queue
+                                .commit_peak
+                                .get_or_insert_with(multilinear::gpu::reserved_window_peak);
+                            Self::end_idle(&mut queue);
+                            drop(queue);
+                            self.run_retry::<T>(job);
+                            continue 'jobs;
+                        }
+                        if queue.retry.is_empty()
+                            && self.arrived.load(Relaxed) == 0
+                            && !queue.commit_waits.is_empty()
+                        {
                             queue.idle_since.get_or_insert_with(Instant::now);
                         }
                     }
@@ -572,22 +749,28 @@ where
             drop(job.tables);
             self.decide();
         }
+        let mut queue = self.lock();
+        while let Some(job) = queue.retry.pop_front() {
+            queue.stamps.push((job.group, job.stamp));
+            queue.local.push((job.group, job.local));
+        }
     }
 
     /// Starts a unit of the job under way once no commit is in flight:
     /// `Ok(())`, or why the job stops here — phase A's loop ended
     /// ([`LaneDefer::Tail`]), or a commit asked for the job's store
     /// ([`LaneDefer::Shed`]).
-    fn begin_unit(&self) -> Result<(), LaneDefer> {
+    fn begin_unit(&self, retry: bool) -> Result<(), LaneDefer> {
         let mut queue = self.lock();
         loop {
-            if queue.closing {
+            if queue.closing || (retry && queue.retry_closed) {
                 return Err(LaneDefer::Tail);
             }
-            if queue.shed {
+            let committing = self.committing.load(Relaxed);
+            if queue.shed || (retry && (committing || self.arrived.load(Relaxed) > 0)) {
                 return Err(LaneDefer::Shed);
             }
-            if !self.committing.load(std::sync::atomic::Ordering::SeqCst) {
+            if !committing {
                 queue.unit = true;
                 return Ok(());
             }
@@ -603,6 +786,94 @@ where
     fn end_unit(&self) {
         self.lock().unit = false;
         self.wake.notify_all();
+    }
+
+    fn run_retry<T>(&self, job: RetryJob<'a, F, E>)
+    where
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        let RetryJob {
+            group,
+            source,
+            mut shells,
+            mut stamp,
+            local,
+        } = job;
+        let tick = Instant::now();
+        if stamp.retries == 0 {
+            stamp.started_at = self.secs(tick);
+        }
+        stamp.retries += 1;
+        let views: Vec<_> = source.iter().map(LaneColumns::upload_view).collect();
+        let store = multilinear::gpu::upload_tables(&views).map(Arc::new);
+        stamp.retry_upload += tick.elapsed().as_secs_f64();
+        let local = if store.is_none() && !self.host {
+            stamp.state = LaneState::Deferred(LaneDefer::NoStore);
+            Some(local)
+        } else {
+            let mut first = 0;
+            for (shell, columns) in shells.iter_mut().zip(&source) {
+                shell.attach_lane_columns(columns, store.as_ref(), first);
+                first += shell.num_committed_columns();
+            }
+            let mut first = 0;
+            let bound = shells.iter().all(|shell| {
+                let has_columns = match &store {
+                    Some(store) => shell.trace().resident().is_some_and(|(held, offset)| {
+                        std::ptr::eq(held, &**store) && offset == first
+                    }),
+                    None => shell.columns().len() == shell.num_committed_columns(),
+                };
+                first += shell.num_committed_columns();
+                has_columns
+            });
+            if bound {
+                let at = if store.is_some() {
+                    Where::Device
+                } else {
+                    Where::Host
+                };
+                self.run_local::<T>(group, &shells, local, at, &mut stamp, true)
+            } else {
+                stamp.state = LaneState::Declined;
+                Some(local)
+            }
+        };
+        let cut = matches!(
+            stamp.state,
+            LaneState::Deferred(LaneDefer::Shed | LaneDefer::Tail)
+        );
+        stamp.retries_cut_short += usize::from(cut);
+        let requeue = stamp.state == LaneState::Deferred(LaneDefer::Shed);
+        // Keep only shells with no column store or cached device factors.
+        let next_shells =
+            requeue.then(|| shells.iter().map(|shell| shell.lane_shell(false)).collect());
+        // The old shells and their references to the store must go before
+        // waking the committer. The next attempt uses only the owned source.
+        drop(shells);
+        drop(store);
+        stamp.ended_at = self.secs(Instant::now());
+        let mut queue = self.lock();
+        queue.retrying = false;
+        match local {
+            Some(local) if requeue && !queue.closing => queue.retry.push_front(RetryJob {
+                group,
+                source,
+                shells: next_shells.expect("shed retry has empty shells"),
+                stamp,
+                local,
+            }),
+            local => {
+                queue.stamps.push((group, stamp));
+                if let Some(local) = local {
+                    queue.local.push((group, local));
+                }
+            }
+        }
+        drop(queue);
+        self.wake.notify_all();
+        #[cfg(test)]
+        self.retry_event(RetryEvent::AttemptEnded(group, stamp.state));
     }
 
     /// A throwaway transcript for group `group`'s part `part` of a job.
@@ -641,7 +912,7 @@ where
         stamp.started_at = self.secs(Instant::now());
         let at = if on_card { Where::Device } else { Where::Host };
         if let Some(local) = local {
-            let local = self.run_local::<T>(group, &tables, local, at, &mut stamp);
+            let local = self.run_local::<T>(group, &tables, local, at, &mut stamp, false);
             drop(tables);
             stamp.ended_at = self.secs(Instant::now());
             return (group, stamp, local);
@@ -656,7 +927,7 @@ where
             // no bin starts while a commit is in flight, none after phase A.
             stamp.bins = batched::argue_bins(&tables, self.bin_log_cells, self.pack);
             for bin in 0..stamp.bins {
-                if let Err(why) = self.begin_unit() {
+                if let Err(why) = self.begin_unit(false) {
                     state = LaneState::Deferred(why);
                     break;
                 }
@@ -713,7 +984,7 @@ where
             }
         }
         if work.zc() && state == LaneState::Ran {
-            if let Err(why) = self.begin_unit() {
+            if let Err(why) = self.begin_unit(false) {
                 state = LaneState::Deferred(why);
             } else {
                 let mut transcript = Self::transcript::<T>(group, 0, &roots);
@@ -766,6 +1037,7 @@ where
         mut local: Box<dyn Any + Send>,
         at: Where,
         stamp: &mut ZcLaneStamp,
+        retry: bool,
     ) -> Option<Box<dyn Any + Send>>
     where
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
@@ -813,12 +1085,16 @@ where
                 state = LaneState::Deferred(LaneDefer::Stopped);
                 break;
             }
-            if let Err(why) = self.begin_unit() {
+            if let Err(why) = self.begin_unit(retry) {
                 state = LaneState::Deferred(why);
                 break;
             }
             let tick = Instant::now();
             let bin = prover.bins_run();
+            #[cfg(test)]
+            if retry {
+                self.retry_event(RetryEvent::BinStarted(group, bin));
+            }
             let ran = prover.step(tables, transcript, at).and_then(|()| {
                 if self.limits.fail_bin == Some(bin) {
                     transcript.append_bytes(b"a test's failed unit");
@@ -1069,13 +1345,14 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
         return String::new();
     }
     let secs = |v: &[f64]| v.iter().fold(0.0, |a, b| a + b);
+    let retry_enabled = stamps.last().is_some_and(|s| s.zc_lane.retry_enabled);
     let mut out = String::new();
     for (g, s) in &local {
         let l = &s.zc_lane;
         let bins = local_bins(s);
         out.push_str(&format!(
             "BLOCK LOCAL LANE: group {g} · {} · bins {} of {bins} in phase A · lane {:.3}s · \
-             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}] · job start {:.3}s · end {:.3}s\n",
+             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}] · job start {:.3}s · end {:.3}s",
             l.state.word(),
             l.bins_ran,
             l.ladders,
@@ -1090,6 +1367,13 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
             l.started_at,
             l.ended_at,
         ));
+        if retry_enabled {
+            out.push_str(&format!(
+                " · retries {} · retry upload {:.3}s",
+                l.retries, l.retry_upload
+            ));
+        }
+        out.push('\n');
     }
     let count = |state: LaneState| {
         local
@@ -1109,7 +1393,7 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
          deferred hold {} · memory {} · tail {} · shed {} · no store {} · stopped {} · declined {} · \
          failed {} · lane {:.3}s · phase B {:.3}s · commits waited {:.3}s (most {:.3}s) · last job \
          ended at {:.3}s · phase A's end waited {:.3}s · idle with nothing queued {idle:.3}s in \
-         {gaps} gaps (most {longest:.3}s) · deferred jobs left {deferred_left}\n",
+         {gaps} gaps (most {longest:.3}s) · deferred jobs left {deferred_left}",
         local.len(),
         local.iter().filter(|(_, s)| s.zc_lane.local).count(),
         local.iter().map(|(_, s)| s.zc_lane.bins_ran).sum::<usize>(),
@@ -1137,6 +1421,21 @@ pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
             .fold(0.0, f64::max),
         stamps.iter().map(|s| s.zc_lane.close_wait).fold(0.0, f64::max),
     ));
+    if retry_enabled {
+        let retried = local
+            .iter()
+            .map(|(_, s)| &s.zc_lane)
+            .filter(|l| l.retries > 0);
+        let groups = retried.clone().count();
+        let bins = retried.map(|l| l.bins_ran).sum::<usize>();
+        let cut = local
+            .iter()
+            .map(|(_, s)| s.zc_lane.retries_cut_short)
+            .sum::<usize>();
+        let uploads = total(&|s| s.zc_lane.retry_upload);
+        out.push_str(&format!(" · retried {groups} groups · bins {bins} in gaps · retry uploads {uploads:.3}s · retries cut short {cut}"));
+    }
+    out.push('\n');
     out
 }
 

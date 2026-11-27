@@ -534,6 +534,31 @@ where
         shell
     }
 
+    /// Bind an empty lane shell to the retry's uploaded store. A host lane
+    /// binds the owned columns directly, using the same shell setup.
+    pub(crate) fn attach_lane_columns(
+        &mut self,
+        source: &LaneColumns<F>,
+        store: Option<&Arc<multilinear::gpu::ResidentColumns>>,
+        first: usize,
+    ) {
+        if let Some(store) = store {
+            self.set_resident(store.clone(), first);
+        } else if let Ok(public) = self.layout.shape().public_tables() {
+            let kinds = self.layout.kinds().to_vec();
+            let trace = match source {
+                LaneColumns::Wide(columns) => TraceData::new(columns.clone(), kinds, public),
+                LaneColumns::Narrow(packed) => TraceData::new_narrow(packed.clone(), kinds, public),
+                LaneColumns::Records(records) => {
+                    TraceData::new_records(records.clone(), kinds, public)
+                }
+            };
+            if let Ok(trace) = trace {
+                self.trace = trace;
+            }
+        }
+    }
+
     /// The columns as they go to the card: their field elements, or packed.
     pub(crate) fn upload_view(&self) -> multilinear::gpu::TableColumns<'_, F> {
         match (self.trace.narrow(), self.trace.records()) {
