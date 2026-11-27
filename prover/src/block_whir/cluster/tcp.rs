@@ -1570,19 +1570,35 @@ fn build_beside_openings<T: Send>(
 ) -> Result<T, Error> {
     let build = || with_settings(settings, || crate::base_only::with_blake3_levels(build));
     // Reserve a single host lane for the early chain, including its Rayon work.
-    // The base openings continue to use the prover's pool.
+    // The base openings continue to use the prover's pool. The lane is one
+    // pool for the whole process: a pool built per call with
+    // `use_current_thread` leaks its registry (rayon-core 1.13), once per leaf
+    // per attempt. Two callers at once take turns on the lane.
     #[cfg(feature = "parallel")]
     {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .use_current_thread()
-            .build()
-            .map_err(fail)?
+        static HOST_LANE: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+        HOST_LANE
+            .get_or_init(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .thread_name(|_| "cluster-host-lane".into())
+                    .start_handler(|_| {
+                        HOST_LANE_THREADS.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .build()
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| fail(format!("host lane pool: {e}")))?
             .install(build)
     }
     #[cfg(not(feature = "parallel"))]
     build()
 }
+
+/// Threads the host lane's pool has started in this process.
+#[cfg(feature = "parallel")]
+static HOST_LANE_THREADS: AtomicU64 = AtomicU64::new(0);
 
 enum JoinArtifact {
     Local(WlfmChild, BlockLayout, Option<u8>),
@@ -3420,6 +3436,39 @@ mod repeat_tests {
 #[cfg(all(test, not(feature = "cuda")))]
 mod tests {
     use super::*;
+
+    /// The early leaf build's host lane is one pool for the process: one
+    /// thread started over many leaves, from callers on several threads,
+    /// also after a build panicked; each build sees one Rayon thread.
+    ///
+    /// Mutation: a pool built per call (as before, without
+    /// `use_current_thread`) starts a thread per call and the count grows.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn the_early_leaf_host_lane_is_one_pool_for_the_process() {
+        let lane = || {
+            build_beside_openings(None, || Ok(rayon::current_num_threads()))
+                .expect("the lane runs the build")
+        };
+        assert_eq!(lane(), 1);
+        let started = HOST_LANE_THREADS.load(Ordering::Relaxed);
+        assert_eq!(started, 1);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..64 {
+                        assert_eq!(lane(), 1);
+                    }
+                });
+            }
+        });
+        let panicked = std::panic::catch_unwind(|| {
+            build_beside_openings(None, || -> Result<(), Error> { panic!("a build panics") })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(lane(), 1);
+        assert_eq!(HOST_LANE_THREADS.load(Ordering::Relaxed), started);
+    }
 
     #[test]
     fn a_worker_leaf_is_refused_unless_once_from_an_owner_for_the_bound_plan() {
