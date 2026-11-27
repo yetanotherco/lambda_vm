@@ -611,6 +611,7 @@ test-prover-debug: compile-recursion-elfs
 # 45 min is generous against their normal runtime; the SIGKILL follows 30s later, and
 # timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
 GPU_TEST_TIMEOUT := timeout -k 30 2700
+GPU_FAULT_CARGO = $(if $(GPU_CUDA_FAULT_TARGET_DIR),env CARGO_TARGET_DIR="$(GPU_CUDA_FAULT_TARGET_DIR)") cargo
 
 # math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
 # so a hang here also costs Groups 2-6: they run after it, sequentially.
@@ -849,20 +850,20 @@ test-cuda-d1:
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
 test-cuda-fallback:
-	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	$(GPU_TEST_TIMEOUT) $(GPU_FAULT_CARGO) test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
 	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
-# The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
-# GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
-# GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
-# to stark; crypto/ecsm build without it (they have no GPU path).
+# The GPU counterpart of CPU CI's prover suite (requires NVIDIA GPU, nvcc and nextest).
+# The cuda profile schedules fresh processes so dispatch counters and cached settings are
+# private to each test. It bounds the number of tests sharing the card.
 # compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
 # smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
 test-prover-cuda: compile-recursion-elfs
-	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
-	    --features lambda-vm-prover/cuda,lambda-vm-prover/test-security -- --test-threads=1
+	$(GPU_TEST_TIMEOUT) python3 scripts/test_prover_cuda.py --release \
+	    -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	    --features lambda-vm-prover/cuda,lambda-vm-prover/test-security
 
 # These exact tests pin production parameters or smoke-test proof paths at
 # production settings. Build the unit binary without test-security.
@@ -878,9 +879,13 @@ test-prover-identities-cuda: compile-programs-asm
 	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
 	failed=0; \
 	while read -r features test; do \
-	    if ! $(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --lib \
-	        --features "test-security,$$features" -- --ignored --exact --test-threads=1 "$$test" \
-	        > "$$output" 2>&1 || ! grep -Fq 'test result: ok. 1 passed;' "$$output"; then \
+	    if ! ( \
+	        if [ "$$features" = test-cuda-faults ] && [ -n "$$GPU_CUDA_FAULT_TARGET_DIR" ]; then \
+	            export CARGO_TARGET_DIR="$$GPU_CUDA_FAULT_TARGET_DIR"; \
+	        fi; \
+	        $(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --lib \
+	            --features "test-security,$$features" -- --ignored --exact --test-threads=1 "$$test"; \
+	    ) > "$$output" 2>&1 || ! grep -Fq 'test result: ok. 1 passed;' "$$output"; then \
 	        echo "CUDA identity failed or missing: $$test" >&2; failed=1; \
 	    fi; \
 	    cat "$$output"; \

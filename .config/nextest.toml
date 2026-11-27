@@ -1,0 +1,43 @@
+[test-groups.cuda]
+max-threads = 8
+
+[profile.cuda]
+test-threads = 8
+
+[profile.cuda.junit]
+path = "junit.xml"
+
+# A heavy test claims every runner slot. The first four cases proved whole
+# blocks or levels and reached 3.6–4.8 GiB on a single RTX 5090. Earlier GPU gates also marked
+# the remaining cases as large. The production-posture target runs serially.
+# Run the exclusive cases first so they can claim all slots without draining
+# the worker pool in the middle of the suite.
+[[profile.cuda.overrides]]
+filter = '''
+package(=lambda-vm-prover) & (
+    test(=tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier)
+    | test(=tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block)
+    | test(=tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block)
+    | test(=lfm::levels_tests::the_pinned_blake3_base_and_both_levels_verify_at_test_security)
+    | test(/::(card_built_words_on_a_real_block_write_todays_words|card_rows_on_a_real_block_write_todays_words|the_real_blocks_words_decode_to_the_walks_rows)$/)
+    | test(/::(a_batched_block_leaf_refuses_a_tampered_witness|a_p1_block_leaf_refuses_a_tampered_witness|a_small_blocks_leaves_stream_in_pieces_to_their_execute)$/)
+    | test(/::(the_(evaluated_|final_polynomial_|folds_|twice_)?compressed_block(_at_grind_26)?_verifies_and_refuses_tampering)$/)
+    | test(/::(the_leaf_(scale|query)_is_the_verifiers_both_ways|the_packed_block_proves_to_the_derived_top_and_only_there|the_lean_derive_still_refuses_a_tampered_leaf_and_node)$/)
+    | test(/::(the_whir_block_tree_proves_to_the_derived_top|the_whir_block_tree_verifies_split_keccak_and_ecsm|a_block_one_table_short_of_the_real_rows_is_refused_on_the_bus)$/)
+    | test(/::(block_whir_on_a_real_block|a_block_at_the_pinned_format_short_of_real_tables_is_refused_on_the_bus)$/)
+)
+'''
+threads-required = "num-test-threads"
+priority = 100
+
+# Start the longest host cases while there are still other tests ready to run.
+[[profile.cuda.overrides]]
+filter = '''
+    test(=tests::constraint_set_tests_a::ecrec::ecrec_constraint_set_folder_capture_agree)
+    | test(=tests::windowed_builder_tests::dropping_the_streamed_ops_builds_the_same_tables)
+'''
+priority = 50
+
+[[profile.cuda.overrides]]
+filter = "all()"
+test-group = "cuda"

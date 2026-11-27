@@ -49,23 +49,29 @@ log "compiling guest programs (asm + rust)"
 make compile-programs-asm
 make compile-programs-rust
 
+# STARK builds a cdylib alongside its Rust library. Switching feature graphs
+# in one Cargo target directory invalidates its fingerprint and its dependents.
+build_root=${CARGO_TARGET_DIR:-"$PWD/target"}
+export GPU_CUDA_FAULT_TARGET_DIR="$build_root/gpu-faults"
+
 # --- Run the CUDA test groups via the Makefile targets --------------------------
 fail=0
 run() {  # $1 = make target
     log "make $1"
-    local output
+    local output start=$SECONDS
     output=$(mktemp)
     if ! make "$1" 2>&1 | tee "$output" || grep -qi 'empty cubin stubs' "$output"; then
         echo "::error::GPU test group failed: $1"
         fail=1
     fi
+    printf 'GPU test group %s took %ss\n' "$1" "$((SECONDS - start))"
     rm -f "$output"
 }
-run test-math-cuda                  # Group 1: kernel parity
+CARGO_TARGET_DIR="$build_root/gpu-parity" run test-math-cuda  # Group 1: kernel parity
 run test-cuda-integration           # Group 2: end-to-end GPU dispatch + proof verifies
 run test-cuda-d1                    # Group 3: num_parts==1 (DECODE) device DEEP/FRI + verify
 run test-cuda-fallback              # Group 4: GPU error -> CPU fallback still verifies
-run test-prover-cuda                # Group 5: prover/stark/crypto/ecsm suite on the GPU path
+CARGO_TARGET_DIR="$build_root/gpu-suite" run test-prover-cuda  # Group 5: multi-package CUDA suite
 run test-prover-comprehensive-cuda  # Group 6: production proofs and parameter pins
 run test-cross-posture-cuda         # Group 7: production refusal of TEST proofs
 run test-prover-identities-cuda     # Group 8: deterministic proofs under the host and card levers
