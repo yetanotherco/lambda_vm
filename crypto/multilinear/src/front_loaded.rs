@@ -232,6 +232,17 @@ where
             Self::Fused { .. } => true,
         }
     }
+
+    /// Whether this table's fused grid pass walked the root subsets.
+    pub fn grid_was_split(&self) -> bool {
+        match self {
+            Self::Host(_) => false,
+            #[cfg(feature = "cuda")]
+            Self::Fused { stepper, .. } => stepper
+                .as_deref()
+                .is_some_and(crate::gpu_fused::FusedStepper::grid_was_split),
+        }
+    }
 }
 
 impl<E> RoundStepper<E> for TableRounds<'_, E>

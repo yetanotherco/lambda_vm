@@ -95,6 +95,48 @@ pub struct LoweredFused {
     pub num_slots: usize,
 }
 
+#[cfg(feature = "cuda")]
+impl LoweredFused {
+    #[doc(hidden)]
+    pub fn device_program<'a>(
+        &'a self,
+        betas: &'a [u64],
+    ) -> math_cuda::argue_fused::FusedProgram<'a> {
+        math_cuda::argue_fused::FusedProgram {
+            nodes: &self.nodes,
+            base_consts: &self.base_consts,
+            ext_consts: &self.ext_consts,
+            betas,
+            num_slots: self.num_slots,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub const LOW_GRID_POINTS: [(u32, u32); 5] = [(2, 0), (2, 1), (0, 2), (1, 2), (2, 2)];
+
+/// Adds the quadratic part to the cubic grid. Its four corners are zero on
+/// trace rows. Extrapolating from 0, 1 and 2 to 3 uses weights 1, -3 and 3.
+pub fn add_low_grid<E: IsField>(t: &mut [[FieldElement<E>; 4]; 4], low: &[FieldElement<E>; 5]) {
+    let thrice = |x: &FieldElement<E>| x + x + x;
+    let at_three =
+        |x0: &FieldElement<E>, x1: &FieldElement<E>, x2: &FieldElement<E>| x0 + thrice(&(x2 - x1));
+    let [t20, t21, t02, t12, t22] = low;
+    for (&(a, b), value) in LOW_GRID_POINTS.iter().zip(low) {
+        t[a as usize][b as usize] += value.clone();
+    }
+    let t03 = thrice(t02);
+    let t13 = thrice(t12);
+    let t23 = at_three(t20, t21, t22);
+    t[3][3] += at_three(&t03, &t13, &t23);
+    t[0][3] += t03;
+    t[1][3] += t13;
+    t[2][3] += t23;
+    t[3][0] += thrice(t20);
+    t[3][1] += thrice(t21);
+    t[3][2] += at_three(t02, t12, t22);
+}
+
 /// A base-field element's canonical u64, or `None` off Goldilocks.
 fn base_raw<B: IsField + 'static>(value: &FieldElement<B>) -> Option<u64> {
     use math::field::goldilocks::GoldilocksField as Gl;
@@ -110,6 +152,44 @@ fn base_raw<B: IsField + 'static>(value: &FieldElement<B>) -> Option<u64> {
 /// Lowers `constraints` with its `ACC` steps. `None` off Goldilocks or past
 /// [`crate::gpu::MAX_SLOTS`].
 pub fn lower_fused<B: IsField + 'static>(constraints: &Constraints<B>) -> Option<LoweredFused> {
+    lower_fused_part(constraints, None)
+}
+
+/// Lower the quadratic-or-lower and cubic roots of a degree-three program.
+/// An ACC keeps its original beta index; each part only walks live steps.
+pub fn lower_fused_grid_split<B: IsField + 'static>(
+    constraints: &Constraints<B>,
+) -> Option<[LoweredFused; 2]> {
+    if constraints.degree() != 3 {
+        return None;
+    }
+    let mut degrees: Vec<usize> = Vec::with_capacity(constraints.steps().len());
+    for step in constraints.steps() {
+        degrees.push(match *step {
+            Op::Fixed(_) => 0,
+            Op::Var(_) => 1,
+            Op::Neg(a) => degrees[a as usize],
+            Op::Add(a, b) | Op::Sub(a, b) => degrees[a as usize].max(degrees[b as usize]),
+            Op::Mul(a, b) => degrees[a as usize].saturating_add(degrees[b as usize]),
+        });
+    }
+    let (low, high): (Vec<_>, Vec<_>) = (0..constraints.roots().len()).partition(|&i| {
+        let degree = degrees[constraints.roots()[i] as usize];
+        degree <= 2 - usize::from(constraints.selectors()[i].is_some())
+    });
+    if low.is_empty() || high.is_empty() {
+        return None;
+    }
+    Some([
+        lower_fused_part(constraints, Some(&low))?,
+        lower_fused_part(constraints, Some(&high))?,
+    ])
+}
+
+fn lower_fused_part<B: IsField + 'static>(
+    constraints: &Constraints<B>,
+    selected: Option<&[usize]>,
+) -> Option<LoweredFused> {
     enum Item {
         Step(usize),
         Acc(usize),
@@ -119,11 +199,34 @@ pub fn lower_fused<B: IsField + 'static>(constraints: &Constraints<B>) -> Option
     let selectors = constraints.selectors();
     // Each root's ACC right after the step that makes it.
     let mut after: Vec<Vec<usize>> = vec![Vec::new(); steps.len()];
-    for (i, &root) in roots.iter().enumerate() {
-        after.get_mut(root as usize)?.push(i);
+    let mut live = selected.map(|_| vec![false; steps.len()]);
+    for i in 0..selected.map_or(roots.len(), <[usize]>::len) {
+        let i = selected.map_or(i, |indices| indices[i]);
+        let root = roots[i] as usize;
+        after.get_mut(root)?.push(i);
+        if let Some(live) = &mut live {
+            live[root] = true;
+        }
+    }
+    if let Some(live) = &mut live {
+        for (s, step) in steps.iter().enumerate().rev() {
+            if live[s] {
+                match *step {
+                    Op::Fixed(_) | Op::Var(_) => {}
+                    Op::Neg(a) => live[a as usize] = true,
+                    Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => {
+                        live[a as usize] = true;
+                        live[b as usize] = true;
+                    }
+                }
+            }
+        }
     }
     let mut items = Vec::with_capacity(steps.len() + roots.len());
     for (s, accs) in after.iter().enumerate() {
+        if live.as_ref().is_some_and(|live| !live[s]) {
+            continue;
+        }
         items.push(Item::Step(s));
         items.extend(accs.iter().map(|&i| Item::Acc(i)));
     }
@@ -271,6 +374,13 @@ where
 
 fn env_is(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1" || v == "true")
+}
+
+/// Walk degree-three constraint grids as separate quadratic and cubic parts.
+/// Opt in with `LAMBDA_VM_ZC_GRID_SPLIT=1`.
+pub fn zc_grid_split() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_ZC_GRID_SPLIT").is_some_and(|v| v == "1"))
 }
 
 static FUSED_FORCED: AtomicU8 = AtomicU8::new(0);
@@ -566,6 +676,7 @@ pub fn reset_fused_counters() {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FusedTimes {
     pub grid: f64,
+    pub grid_split: bool,
     pub fold2: f64,
     pub rounds: f64,
     pub total: f64,
@@ -866,13 +977,7 @@ where
         .ok_or_else(unsupported)?;
         let r_tail = flat(&input.r[2..]).ok_or_else(unsupported)?;
         let rho_tail = flat(&rho[2..]).ok_or_else(unsupported)?;
-        let program = math_cuda::argue_fused::FusedProgram {
-            nodes: &lowered.nodes,
-            base_consts: &lowered.base_consts,
-            ext_consts: &lowered.ext_consts,
-            betas: &betas,
-            num_slots: lowered.num_slots,
-        };
+        let program = lowered.device_program(&betas);
         let fused_bus = math_cuda::argue_fused::FusedBus {
             slots: &slots,
             coeffs: &coeffs,
@@ -961,11 +1066,20 @@ where
 
         let from = |limbs: &[u64]| ext3_from_raw::<E>(limbs);
         let side = d + 1;
+        let grid_split = d == 3
+            && !check_corners
+            && !keep
+            && zc_grid_split()
+            && lower_fused_grid_split(constraints).is_some_and(|parts| {
+                session
+                    .prepare_grid_split(parts.each_ref().map(|p| p.device_program(&betas)))
+                    .unwrap_or(false)
+            });
 
         // ── rounds 0 and 1: one base-field pass ──
         let tick = Instant::now();
         let (t_sums, u_sums, violation) = session
-            .grid(&points, keep)
+            .grid(&points, keep, grid_split.then_some(&LOW_GRID_POINTS))
             .map_err(|error| ZerocheckDecline::new(format!("fused grid: {error:?}"), asked))?;
         if check_corners {
             if let Some(row) = violation
@@ -978,13 +1092,26 @@ where
             }
             CORNER_CHECKS.fetch_add(1, Ordering::Relaxed);
         }
-        let mut t = vec![vec![FieldElement::<E>::zero(); side]; side];
-        for (k, &(a, b)) in points.iter().enumerate() {
-            if a < 2 && b < 2 && !keep {
-                continue;
+        let t = if grid_split {
+            let mut grid = std::array::from_fn(|_| std::array::from_fn(|_| FieldElement::zero()));
+            for (&(a, b), limbs) in points.iter().zip(t_sums.chunks_exact(3)) {
+                grid[a as usize][b as usize] = from(limbs);
             }
-            t[a as usize][b as usize] = from(&t_sums[k * 3..k * 3 + 3]);
-        }
+            let low = std::array::from_fn(|i| {
+                let at = (points.len() + i) * 3;
+                from(&t_sums[at..at + 3])
+            });
+            add_low_grid(&mut grid, &low);
+            grid.into_iter().map(Vec::from).collect()
+        } else {
+            let mut grid = vec![vec![FieldElement::<E>::zero(); side]; side];
+            for (&(a, b), limbs) in points.iter().zip(t_sums.chunks_exact(3)) {
+                if a >= 2 || b >= 2 || keep {
+                    grid[a as usize][b as usize] = from(limbs);
+                }
+            }
+            grid
+        };
         let u: [[FieldElement<E>; 2]; 2] = core::array::from_fn(|b| {
             core::array::from_fn(|c| from(&u_sums[(2 * b + c) * 3..(2 * b + c) * 3 + 3]))
         });
@@ -1008,6 +1135,7 @@ where
         };
         let times = FusedTimes {
             grid: tick.elapsed().as_secs_f64(),
+            grid_split,
             roots: constraints.roots().len(),
             terms: slots.len(),
             slots: lowered.num_slots,
@@ -1040,6 +1168,10 @@ where
     /// Rounds the card runs before the host takes the cube.
     pub(crate) fn device_rounds(&self) -> usize {
         self.there
+    }
+
+    pub(crate) fn grid_was_split(&self) -> bool {
+        self.times.grid_split
     }
 
     /// Variables this table has left to bind on the card.
@@ -1405,5 +1537,144 @@ mod tests {
     fn a_slot_is_reused_once_its_last_reader_passed() {
         let lowered = lower_fused(&two_roots()).unwrap();
         assert!(lowered.num_slots <= 4, "{} slots", lowered.num_slots);
+    }
+}
+
+#[cfg(test)]
+mod grid_split_tests {
+    use super::*;
+    use crate::{batch, sumcheck};
+    use crypto::fiat_shamir::{default_transcript::DefaultTranscript, is_transcript::IsTranscript};
+    use math::field::{
+        extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+        goldilocks::GoldilocksField as Gl,
+    };
+
+    type Base = FieldElement<Gl>;
+    type ExtValue = FieldElement<Ext>;
+    type Grid = [[ExtValue; 4]; 4];
+
+    fn evaluate<F: IsField>(
+        col: &[FieldElement<F>; 4],
+        a: &FieldElement<F>,
+        b: &FieldElement<F>,
+    ) -> FieldElement<F> {
+        let lo = &col[0] + b * (&col[1] - &col[0]);
+        let hi = &col[2] + b * (&col[3] - &col[2]);
+        &lo + a * (&hi - &lo)
+    }
+
+    #[test]
+    fn split_grid_preserves_the_sumcheck_and_the_verifier_refuses_bad_grids() {
+        // The same quadratic root is cubic once multiplied by its selector.
+        let constraints = Constraints::<Gl>::from_extension(
+            &[
+                Op::Var(0),
+                Op::Fixed(ExtValue::one()),
+                Op::Sub(0, 1),
+                Op::Mul(0, 2),
+                Op::Fixed(ExtValue::from(2)),
+                Op::Sub(0, 4),
+                Op::Mul(3, 5),
+                Op::Var(1),
+                Op::Var(2),
+                Op::Sub(7, 8),
+            ],
+            &[3, 6, 9, 3],
+            &[None, None, Some(3), Some(3)],
+            3,
+        )
+        .unwrap();
+        let whole = lower_fused(&constraints).unwrap();
+        let [low, high] = lower_fused_grid_split(&constraints).unwrap();
+        // Mutant: move x(x-1)(x-2) into the quadratic program.
+        let misplaced_low = lower_fused_part(&constraints, Some(&[0, 1, 2])).unwrap();
+        let misplaced_high = lower_fused_part(&constraints, Some(&[3])).unwrap();
+        let betas = [2, 3, 5, 7].map(ExtValue::from);
+        let rules = [batch::Rule::new(3, |values| {
+            let [x, y, z, sel] = values else {
+                unreachable!()
+            };
+            let quadratic = x * (x - ExtValue::one());
+            &quadratic * (&betas[0] + (x - ExtValue::from(2)) * &betas[1] + sel * &betas[3])
+                + &betas[2] * sel * (y - z)
+        })];
+        for k in 0u64..8 {
+            let parity = k & 1;
+            let cols = [
+                [parity, 1 - parity, 1 - parity, parity],
+                [3 + k, 7 + 2 * k, 11 + 3 * k, 13 + 5 * k],
+                [4 + k, 7 + 2 * k, 6 + 3 * k, 13 + 5 * k],
+                [0, 1, 0, 1],
+            ]
+            .map(|col| col.map(Base::from));
+            let eval = |program, a, b| {
+                let values = cols
+                    .each_ref()
+                    .map(|col| evaluate(col, &Base::from(u64::from(a)), &Base::from(u64::from(b))));
+                run_lowered_host(program, &betas, &values)
+            };
+            let grid = |program| -> Grid {
+                std::array::from_fn(|a| std::array::from_fn(|b| eval(program, a as u32, b as u32)))
+            };
+            let low_at_five = |program| LOW_GRID_POINTS.map(|(a, b)| eval(program, a, b));
+            let whole_grid = grid(&whole);
+            assert!(
+                whole_grid[..2]
+                    .iter()
+                    .all(|row| row[..2].iter().all(|x| x == &ExtValue::zero()))
+            );
+            let low_sums = low_at_five(&low);
+            let mut split_grid = grid(&high);
+            add_low_grid(&mut split_grid, &low_sums);
+            assert_eq!(split_grid, whole_grid);
+            let verify = |t: &Grid| {
+                let mut transcript = DefaultTranscript::<Ext>::new(b"constraint grid");
+                transcript.append_field_element(&ExtValue::zero());
+                let _: ExtValue = transcript.sample_field_element();
+                let first = (1..4).map(|a| &t[a][0] + &t[a][1]).collect::<Vec<_>>();
+                for v in &first {
+                    transcript.append_field_element(v);
+                }
+                let a: ExtValue = transcript.sample_field_element();
+                let second = (1..4)
+                    .map(|b| sumcheck::interpolate(&t.each_ref().map(|row| row[b]), &a))
+                    .collect();
+                let proof = sumcheck::SumcheckProof {
+                    rounds: vec![
+                        sumcheck::RoundProof { evaluations: first },
+                        sumcheck::RoundProof {
+                            evaluations: second,
+                        },
+                    ],
+                };
+                batch::verify(
+                    &proof,
+                    &rules,
+                    &[ExtValue::zero()],
+                    |point| {
+                        Ok(cols
+                            .each_ref()
+                            .map(|col| {
+                                let lifted = col.map(|x| x.to_extension::<Ext>());
+                                evaluate(&lifted, &point[0], &point[1])
+                            })
+                            .to_vec())
+                    },
+                    2,
+                    &mut DefaultTranscript::<Ext>::new(b"constraint grid"),
+                )
+            };
+            assert!(verify(&split_grid).is_ok());
+
+            // Mutant: weight the low (2, 0) evaluation by 2 instead of 3 at (3, 0).
+            let mut bad_weight = split_grid;
+            bad_weight[3][0] = &bad_weight[3][0] - &low_sums[0];
+            assert_eq!(verify(&bad_weight), Err(crate::Error::BatchMismatch));
+
+            let mut bad_degree = grid(&misplaced_high);
+            add_low_grid(&mut bad_degree, &low_at_five(&misplaced_low));
+            assert_eq!(verify(&bad_degree), Err(crate::Error::BatchMismatch));
+        }
     }
 }

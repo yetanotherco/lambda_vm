@@ -1670,3 +1670,463 @@ fn a_second_bus_on_the_card_sends_the_hosts_messages() {
     }
     eprintln!("argue second bus: {checked} card runs sent the host's messages");
 }
+
+fn grid_production_airs() -> Vec<crate::test_utils::LabeledAir> {
+    use crate::tables::{
+        ecdas::EcdasForm, keccak_rnd::KeccakRndForm, memw_aligned::MemwAlignedOrder,
+    };
+    use crate::test_utils::*;
+
+    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 valid");
+    let mut airs = production_airs(&opts);
+    assert_eq!(airs.len(), NUM_PRODUCTION_AIRS);
+    let variants: Vec<LabeledAir> = vec![
+        ("CPU in-row", Box::new(create_cpu_air_inrow(&opts, 0))),
+        (
+            "REGISTER in-row",
+            Box::new(create_register_air_inrow(&opts, 0)),
+        ),
+        ("HALT in-row", Box::new(create_halt_air_inrow(&opts))),
+        (
+            "MEMW_R residual",
+            Box::new(create_register_residual_air(&opts)),
+        ),
+        (
+            "MEMW_A limbs",
+            Box::new(create_memw_aligned_air_for(&opts, MemwAlignedOrder::Limbs)),
+        ),
+        (
+            "ECDAS halves",
+            create_ecdas_air_for(&opts, EcdasForm::Halves, "ECDAS halves"),
+        ),
+        (
+            "KECCAK_RND lean",
+            Box::new(create_keccak_rnd_air_for(&opts, KeccakRndForm::Lean)),
+        ),
+        (
+            "KECCAK_RND lean local",
+            Box::new(create_keccak_rnd_air_for(&opts, KeccakRndForm::LeanLocal)),
+        ),
+        ("MEM_LOAD", Box::new(create_mem_load_air(&opts))),
+        ("MEM_STORE", Box::new(create_mem_store_air(&opts))),
+        ("MEM_LOAD8", Box::new(create_mem_load8_air(&opts))),
+        ("MEM_STORE8", Box::new(create_mem_store8_air(&opts))),
+        ("MEM_LOADW", Box::new(create_mem_loadw_air(&opts))),
+        ("MEM_STOREW", Box::new(create_mem_storew_air(&opts))),
+        ("MEM_LOAD2W", Box::new(create_mem_load2w_air(&opts))),
+        ("MEM_STORE2W", Box::new(create_mem_store2w_air(&opts))),
+        ("MEMW_W", Box::new(create_memw_w_air(&opts))),
+        ("LOCAL_BYTES", Box::new(create_local_bytes_air(&opts))),
+        ("KECCAK_W", Box::new(create_keccak_w_air(&opts))),
+        ("ECREC_W", Box::new(create_ecrec_w_air(&opts))),
+        ("COPY_W", Box::new(create_copy_w_air(&opts))),
+    ];
+    airs.extend(variants);
+    airs
+}
+
+#[test]
+fn dump_grid_root_degrees() {
+    use multilinear::gpu::op;
+    use multilinear::gpu_fused::{
+        lower_fused,
+        op::{ACC, NO_SELECTOR},
+    };
+    use std::collections::BTreeMap;
+
+    for (label, air) in grid_production_airs() {
+        let table = Table::from_air(&*air, label, 10, &mut Rng::new(1));
+        if table.constraints.degree() != 3 {
+            continue;
+        }
+        let program = lower_fused(&table.constraints).expect(label);
+        let mut slots = vec![0; program.num_slots];
+        let mut degree = Vec::new();
+        let mut deps = Vec::<[Option<usize>; 2]>::new();
+        let mut roots = BTreeMap::new();
+        let mut live = [
+            vec![false; program.nodes.len() / 2],
+            vec![false; program.nodes.len() / 2],
+        ];
+        println!("GRID DUMP {label} begin");
+        for (index, node) in program.nodes.chunks_exact(2).enumerate() {
+            let (tag, a) = (node[0] as u32, (node[0] >> 32) as usize);
+            let (b, dest) = (node[1] as u32, (node[1] >> 32) as usize);
+            let (d, operands) = match tag {
+                op::FIXED => (0, [None, None]),
+                op::VAR => (1, [None, None]),
+                op::NEG => (degree[slots[a]], [Some(slots[a]), None]),
+                op::ADD | op::SUB | op::MUL => {
+                    let (left, right) = (slots[a], slots[b as usize]);
+                    let d = if tag == op::MUL {
+                        degree[left] + degree[right]
+                    } else {
+                        usize::max(degree[left], degree[right])
+                    };
+                    (d, [Some(left), Some(right)])
+                }
+                ACC => (
+                    degree[slots[a]] + usize::from(b != NO_SELECTOR),
+                    [Some(slots[a]), None],
+                ),
+                _ => panic!("unknown opcode {tag}"),
+            };
+            println!("{index} op={tag} a={a} b={b} dest={dest} degree={d}");
+            if tag == ACC {
+                *roots.entry(d).or_insert(0) += 1;
+                live[usize::from(d > 2)][index] = true;
+            } else {
+                slots[dest] = index;
+            }
+            degree.push(d);
+            deps.push(operands);
+        }
+        for part in &mut live {
+            for (i, operands) in deps.iter().enumerate().rev() {
+                if part[i] {
+                    for dep in operands.iter().flatten() {
+                        part[*dep] = true;
+                    }
+                }
+            }
+        }
+        let [low, high] = live.map(|part| part.into_iter().filter(|x| *x).count());
+        println!(
+            "GRID CENSUS {label}: roots {roots:?}; steps whole={} low={low} high={high}",
+            deps.len()
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "one dedicated card, 2^21 rows"]
+fn bench_cpu_constraint_grid_split() {
+    use math_cuda::argue_fused::{FusedBus, FusedZerocheck};
+    use math_cuda::columns::DeviceColumns;
+    use math_cuda::sumcheck::{ColumnFactors, ColumnSlot};
+    use multilinear::gpu::{ext3_from_raw, ext3_raw};
+    use multilinear::gpu_fused::{
+        LOW_GRID_POINTS, add_low_grid, lower_fused, lower_fused_grid_split,
+    };
+    use std::time::Instant;
+
+    let _permit = crate::lfm::device_permit::serial_for_test();
+    let (_, air) = grid_production_airs()
+        .into_iter()
+        .find(|(label, _)| *label == "CPU in-row")
+        .unwrap();
+    let n = 21;
+    let rows = 1 << n;
+    let mut rng = Rng::new(0x519);
+    let table = Table::from_air(&*air, "CPU in-row", n, &mut rng);
+    let whole = lower_fused(&table.constraints).unwrap();
+    let [low, high] = lower_fused_grid_split(&table.constraints).unwrap();
+    let betas: Vec<u64> = table
+        .betas
+        .iter()
+        .flat_map(|b| ext3_raw(b).unwrap())
+        .collect();
+    let factors: Vec<Vec<u64>> = (0..table.width())
+        .map(|_| (0..rows).map(|_| rng.base().canonical_u64()).collect())
+        .collect();
+    let columns = DeviceColumns::upload(&factors.iter().map(Vec::as_slice).collect::<Vec<_>>())
+        .expect("CPU-sized resident columns");
+    drop(factors);
+    let slots = (0..table.width())
+        .map(ColumnSlot::Column)
+        .collect::<Vec<_>>();
+    let factors = ColumnFactors::new(&columns.view(0, table.width()), rows, &slots).unwrap();
+    let weights: Vec<_> = rng
+        .exts(n - 2)
+        .iter()
+        .flat_map(|r| ext3_raw(r).unwrap())
+        .collect();
+    let points: Vec<_> = (0..4)
+        .flat_map(|a| (0..4).map(move |b| (a, b)))
+        .filter(|&(a, b)| a >= 2 || b >= 2)
+        .collect();
+    let bus = FusedBus {
+        slots: &[],
+        coeffs: &[],
+        constant: [0; 3],
+    };
+    let mut session = FusedZerocheck::new(
+        factors.view(),
+        whole.device_program(&betas),
+        bus,
+        &weights,
+        &weights,
+        points.len(),
+        5,
+        None,
+        |be, bytes| be.try_reserve(bytes).ok(),
+    )
+    .unwrap()
+    .expect("reserve a CPU grid session");
+    assert!(
+        session
+            .prepare_grid_split([low.device_program(&betas), high.device_program(&betas)])
+            .unwrap()
+    );
+
+    let mut run = |split: bool| {
+        let tick = Instant::now();
+        let (t, violation) = session
+            .grid_constraints(&points, false, split.then_some(&LOW_GRID_POINTS[..]))
+            .unwrap();
+        assert!(violation.is_none());
+        let mut grid = std::array::from_fn(|_| std::array::from_fn(|_| EE::zero()));
+        for (&(a, b), limbs) in points.iter().zip(t.chunks_exact(3)) {
+            grid[a as usize][b as usize] = ext3_from_raw(limbs);
+        }
+        if split {
+            let low = std::array::from_fn(|i| {
+                let at = (points.len() + i) * 3;
+                ext3_from_raw(&t[at..at + 3])
+            });
+            add_low_grid(&mut grid, &low);
+        }
+        std::hint::black_box(grid);
+        tick.elapsed().as_secs_f64() * 1000.0
+    };
+    for _ in 0..3 {
+        run(false);
+        run(true);
+    }
+    let mut whole_ms = Vec::new();
+    let mut split_ms = Vec::new();
+    for rep in 0..10 {
+        let (whole, split) = if rep % 2 == 0 {
+            (run(false), run(true))
+        } else {
+            let split = run(true);
+            (run(false), split)
+        };
+        println!(
+            "GRID BENCH rep={} whole_ms={whole:.6} split_ms={split:.6}",
+            rep + 1
+        );
+        whole_ms.push(whole);
+        split_ms.push(split);
+    }
+    whole_ms.sort_by(f64::total_cmp);
+    split_ms.sort_by(f64::total_cmp);
+    let whole_ms = (whole_ms[4] + whole_ms[5]) / 2.0;
+    let split_ms = (split_ms[4] + split_ms[5]) / 2.0;
+    println!(
+        "GRID BENCH median whole_ms={whole_ms:.6} split_ms={split_ms:.6} ratio={:.6}",
+        split_ms / whole_ms
+    );
+}
+
+#[test]
+fn the_lowered_grid_parts_sum_to_the_whole_on_random_rows() {
+    use multilinear::gpu_fused::{lower_fused, lower_fused_grid_split, run_lowered_host};
+
+    let mut rng = Rng::new(0x3533);
+    for (label, air) in grid_production_airs() {
+        let table = Table::from_air(&*air, label, 10, &mut rng);
+        if table.constraints.degree() != 3 {
+            continue;
+        }
+        let whole = lower_fused(&table.constraints).expect(label);
+        let [low, high] = lower_fused_grid_split(&table.constraints).expect(label);
+        for _ in 0..16 {
+            let values: Vec<_> = (0..table.width()).map(|_| rng.base()).collect();
+            let eval = |p| run_lowered_host(p, &table.betas, &values);
+            assert_eq!(eval(&low) + eval(&high), eval(&whole), "{label}");
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "one card"]
+fn the_split_grid_matches_the_whole_grid_on_every_cubic_program() {
+    use math_cuda::argue_fused::{FusedBus, FusedZerocheck};
+    use math_cuda::columns::DeviceColumns;
+    use math_cuda::sumcheck::{ColumnFactors, ColumnSlot};
+    use multilinear::gpu::{ext3_from_raw, ext3_raw};
+    use multilinear::gpu_fused::{
+        LOW_GRID_POINTS, add_low_grid, lower_fused, lower_fused_grid_split, run_lowered_host,
+    };
+
+    let _permit = crate::lfm::device_permit::serial_for_test();
+    let n = 6;
+    let rows = 1 << n;
+    let quarter = rows / 4;
+    let mut rng = Rng::new(0xc203);
+    let points: Vec<_> = (0..4)
+        .flat_map(|a| (0..4).map(move |b| (a, b)))
+        .filter(|&(a, b)| a >= 2 || b >= 2)
+        .collect();
+    let mut tested = 0;
+    for (label, air) in grid_production_airs() {
+        let table = Table::from_air(&*air, label, n, &mut rng);
+        if table.constraints.degree() != 3 {
+            continue;
+        }
+        let whole = lower_fused(&table.constraints).expect(label);
+        let [low, high] = lower_fused_grid_split(&table.constraints).expect(label);
+        let betas: Vec<_> = table
+            .betas
+            .iter()
+            .flat_map(|b| ext3_raw(b).unwrap())
+            .collect();
+        // Each corner varies in a distinct suffix bit. Choose its weight so
+        // its weighted quadratic sum is zero while its rows can vary freely.
+        // This exercises all the production root walks on nontrivial grids.
+        let mut corner_rows = Vec::with_capacity(4);
+        let mut weights = Vec::with_capacity(12);
+        for _ in 0..4 {
+            let pair =
+                std::array::from_fn(|_| (0..table.width()).map(|_| rng.base()).collect::<Vec<_>>());
+            let [l0, l1] = pair
+                .each_ref()
+                .map(|row| run_lowered_host(&low, &table.betas, row));
+            let r = l0
+                * (l0 - l1)
+                    .inv()
+                    .unwrap_or_else(|_| panic!("{label}: constant corner"));
+            assert_eq!(l0 + r * (l1 - l0), EE::zero());
+            corner_rows.push(pair);
+            weights.extend(ext3_raw(&r).unwrap());
+        }
+        let factors: Vec<Vec<u64>> = (0..table.width())
+            .map(|slot| {
+                (0..rows)
+                    .map(|row| {
+                        let corner = row / quarter;
+                        let variant = (row >> (3 - corner)) & 1;
+                        corner_rows[corner][variant][slot].canonical_u64()
+                    })
+                    .collect()
+            })
+            .collect();
+        let columns = DeviceColumns::upload(&factors.iter().map(Vec::as_slice).collect::<Vec<_>>())
+            .expect(label);
+        let slots = (0..table.width())
+            .map(ColumnSlot::Column)
+            .collect::<Vec<_>>();
+        let factors = ColumnFactors::new(&columns.view(0, table.width()), rows, &slots).unwrap();
+        let mut session = FusedZerocheck::new(
+            factors.view(),
+            whole.device_program(&betas),
+            FusedBus {
+                slots: &[],
+                coeffs: &[],
+                constant: [0; 3],
+            },
+            &weights,
+            &weights,
+            points.len(),
+            5,
+            None,
+            |be, bytes| be.try_reserve(bytes).ok(),
+        )
+        .unwrap()
+        .expect(label);
+        assert!(
+            session
+                .prepare_grid_split([low.device_program(&betas), high.device_program(&betas)])
+                .unwrap()
+        );
+        let (whole, _) = session.grid_constraints(&points, false, None).unwrap();
+        let (split, _) = session
+            .grid_constraints(&points, false, Some(&LOW_GRID_POINTS))
+            .unwrap();
+        let mut grid = [[EE::zero(); 4]; 4];
+        for (&(a, b), limbs) in points.iter().zip(split.chunks_exact(3)) {
+            grid[a as usize][b as usize] = ext3_from_raw(limbs);
+        }
+        let low_at_five = std::array::from_fn(|i| {
+            let at = (points.len() + i) * 3;
+            ext3_from_raw(&split[at..at + 3])
+        });
+        assert!(low_at_five.iter().any(|x| *x != EE::zero()), "{label}");
+        add_low_grid(&mut grid, &low_at_five);
+        for (&(a, b), limbs) in points.iter().zip(whole.chunks_exact(3)) {
+            assert_eq!(
+                grid[a as usize][b as usize],
+                ext3_from_raw(limbs),
+                "{label} ({a},{b})"
+            );
+        }
+        eprintln!("{label}: split grid matches");
+        tested += 1;
+    }
+    assert_eq!(tested, 21);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "run alone with LAMBDA_VM_ZC_GRID_SPLIT=1"]
+fn checking_grid_corners_uses_the_whole_grid_and_counts_the_check() {
+    use multilinear::front_loaded::TableRounds;
+    use multilinear::gpu_fused::{FusedInput, fused_corner_checks, zc_grid_split};
+
+    let _permit = crate::lfm::device_permit::serial_for_test();
+    assert!(zc_grid_split(), "enable the split grid for this test");
+    let (_, air) = grid_production_airs()
+        .into_iter()
+        .find(|(label, _)| *label == "CPU in-row")
+        .unwrap();
+    let n = 10;
+    let mut rng = Rng::new(0xa215);
+    let table = Table::from_air(&*air, "CPU in-row", n, &mut rng);
+    let zero = Mle::new(vec![FB::zero(); 1 << n]).unwrap();
+    let session = table.session(vec![zero; table.num_columns], &mut rng);
+    let claims = session.true_claims();
+    assert_eq!(claims[0], EE::zero());
+    let public: Vec<Mle<Ext3>> = table
+        .shape
+        .public_selectors()
+        .iter()
+        .map(|selector| selector.table::<Ext3>(n).unwrap())
+        .collect();
+    let device = multilinear::gpu::upload_factors_from_columns(
+        &session.columns,
+        &table.kinds,
+        &public,
+        None,
+    )
+    .expect("CPU factors on the card");
+    let rho = &session.claim_point[session.claim_point.len() - n..];
+    let lambdas = multilinear::challenge_powers(&rng.ext(), 3);
+    let claim = claims
+        .iter()
+        .zip(&lambdas)
+        .map(|(c, l)| c * l)
+        .fold(EE::zero(), |a, b| a + b);
+    for check in [false, true] {
+        let _switches = CardSwitches::set(Default::default(), check);
+        let before = fused_corner_checks();
+        let (_, rules) = session.todays();
+        let rounds = TableRounds::new(
+            rules,
+            lambdas.clone(),
+            &claim,
+            &[&session.r, rho],
+            n,
+            Some(&device),
+            None,
+            Some(FusedInput {
+                constraints: &table.constraints,
+                betas: &table.betas,
+                interactions: &table.interactions,
+                claim_point: &session.claim_point,
+                r: &session.r,
+                columns: None,
+                second: None,
+            }),
+            || panic!("the grid must stay on the card"),
+        )
+        .unwrap();
+        assert!(rounds.on_device());
+        assert_eq!(rounds.grid_was_split(), !check);
+        assert_eq!(fused_corner_checks() - before, u64::from(check));
+    }
+}

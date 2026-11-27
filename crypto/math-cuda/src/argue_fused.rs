@@ -117,6 +117,13 @@ struct Second {
     eq_rho: CudaSlice<u64>,
 }
 
+struct GridProgram {
+    nodes: CudaSlice<u64>,
+    num_nodes: u64,
+    base_consts: CudaSlice<u64>,
+    num_slots: usize,
+}
+
 /// One table's fused zerocheck on the card.
 pub struct FusedZerocheck<'f> {
     stream: Arc<CudaStream>,
@@ -130,6 +137,7 @@ pub struct FusedZerocheck<'f> {
     num_nodes: u64,
     base_consts: CudaSlice<u64>,
     ext_consts: CudaSlice<u64>,
+    grid_split: Option<([GridProgram; 2], DeviceReservation)>,
     betas: CudaSlice<u64>,
     num_slots: usize,
     term_slots: CudaSlice<u32>,
@@ -389,6 +397,7 @@ impl<'f> FusedZerocheck<'f> {
             nodes,
             num_nodes: (program.nodes.len() / 2) as u64,
             base_consts,
+            grid_split: None,
             ext_consts,
             betas,
             num_slots: program.num_slots.max(1),
@@ -473,12 +482,13 @@ impl<'f> FusedZerocheck<'f> {
         &mut self,
         points: &[(u32, u32)],
         keep_corners: bool,
+        low_points: Option<&[(u32, u32)]>,
     ) -> Result<(Vec<u64>, Vec<u64>, Option<u64>)> {
         assert!(points.len() <= MAX_ROWS, "grid points per launch");
         let (t, violation) = if points.is_empty() {
             (Vec::new(), None)
         } else {
-            self.grid_pass(points, keep_corners)?
+            self.grid_constraints(points, keep_corners, low_points)?
         };
         let be = backend()?;
         let q = (self.rows / 4) as u64;
@@ -563,13 +573,71 @@ impl<'f> FusedZerocheck<'f> {
         self.reduce(4, grid).map(Some)
     }
 
-    /// `zc_grid01` over a non-empty `points`: `T` at each, three u64 a point,
-    /// and the first row whose corner is not zero.
-    fn grid_pass(
+    /// Uploads the two root subsets for the grid, sharing the full program's
+    /// batching powers. Returns false if their device room is unavailable.
+    pub fn prepare_grid_split(&mut self, parts: [FusedProgram<'_>; 2]) -> Result<bool> {
+        let bytes = parts
+            .iter()
+            .map(|p| (p.nodes.len().max(1) + p.base_consts.len().max(1)) as u64 * 8)
+            .sum();
+        let Ok(room) = backend()?.try_reserve(bytes) else {
+            return Ok(false);
+        };
+        let upload = |p: FusedProgram<'_>| -> Result<GridProgram> {
+            Ok(GridProgram {
+                nodes: htod_or_trim(&self.stream, p.nodes)?,
+                num_nodes: (p.nodes.len() / 2) as u64,
+                base_consts: htod_or_trim(
+                    &self.stream,
+                    if p.base_consts.is_empty() {
+                        &[0]
+                    } else {
+                        p.base_consts
+                    },
+                )?,
+                num_slots: p.num_slots,
+            })
+        };
+        self.grid_split = Some(([upload(parts[0])?, upload(parts[1])?], room));
+        Ok(true)
+    }
+
+    /// `T` at each point, three u64 a point. When split, the high sums
+    /// occupy the first rows and the low sums follow them in one read-back.
+    #[doc(hidden)]
+    pub fn grid_constraints(
         &mut self,
         points: &[(u32, u32)],
         keep_corners: bool,
+        low_points: Option<&[(u32, u32)]>,
     ) -> Result<(Vec<u64>, Option<u64>)> {
+        if let Some(low_points) = low_points {
+            assert!(!keep_corners && points.len() + low_points.len() <= MAX_ROWS);
+            assert!(
+                points
+                    .iter()
+                    .chain(low_points)
+                    .all(|&(a, b)| a >= 2 || b >= 2)
+            );
+            self.enqueue_grid_constraints(points, false, Some(1), 0)?;
+            self.enqueue_grid_constraints(low_points, false, Some(0), points.len())?;
+            return Ok((self.collect(points.len() + low_points.len())?, None));
+        }
+        self.stream.memcpy_htod(&[u64::MAX], &mut self.violation)?;
+        self.enqueue_grid_constraints(points, keep_corners, None, 0)?;
+        let t = self.collect(points.len())?;
+        let violation = crate::readback::clone_dtoh(&self.stream, &self.violation)?;
+        self.stream.synchronize()?;
+        Ok((t, (violation[0] != u64::MAX).then_some(violation[0])))
+    }
+
+    fn enqueue_grid_constraints(
+        &mut self,
+        points: &[(u32, u32)],
+        keep_corners: bool,
+        part: Option<usize>,
+        output_at: usize,
+    ) -> Result<()> {
         let be = backend()?;
         let q = (self.rows / 4) as u64;
         let packed: Vec<u64> = points
@@ -580,17 +648,28 @@ impl<'f> FusedZerocheck<'f> {
             let mut head = self.points.slice_mut(0..packed.len());
             self.stream.memcpy_htod(&packed, &mut head)?;
         }
-        self.stream.memcpy_htod(&[u64::MAX], &mut self.violation)?;
-        let (grid, block) = self.shape(q, points.len(), self.num_slots as u64)?;
+        let (nodes, num_nodes, base_consts, num_slots) = match part {
+            Some(i) => {
+                let p = &self.grid_split.as_ref().expect("split programs uploaded").0[i];
+                (&p.nodes, p.num_nodes, &p.base_consts, p.num_slots)
+            }
+            None => (
+                &self.nodes,
+                self.num_nodes,
+                &self.base_consts,
+                self.num_slots,
+            ),
+        };
+        let (grid, block) = self.shape(q, points.len(), num_slots as u64)?;
         let factors = self.source.ptrs;
         unsafe {
             self.stream
                 .launch_builder(&be.zc_grid01)
                 .arg(factors)
                 .arg(&q)
-                .arg(&self.nodes)
-                .arg(&self.num_nodes)
-                .arg(&self.base_consts)
+                .arg(nodes)
+                .arg(&num_nodes)
+                .arg(base_consts)
                 .arg(&self.betas)
                 .arg(&self.points)
                 .arg(&self.eq_r)
@@ -605,10 +684,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: block * 3 * 8,
                 })?;
         }
-        let t = self.reduce(points.len(), grid)?;
-        let violation = crate::readback::clone_dtoh(&self.stream, &self.violation)?;
-        self.stream.synchronize()?;
-        Ok((t, (violation[0] != u64::MAX).then_some(violation[0])))
+        self.reduce_enqueue_at(points.len(), grid, output_at)
     }
 
     /// Both folds at once (`w[2a + b] = eq₁(s₀, a)·eq₁(s₁, b)`, twelve u64), into

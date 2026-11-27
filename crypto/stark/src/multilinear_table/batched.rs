@@ -1494,6 +1494,19 @@ where
         )?);
     }
     split.zc_setup += started.elapsed().as_secs_f64();
+    let mut grid_splits = 0;
+    let mut cubic_full_height = 0;
+    let mut cubic_full_height_split = 0;
+    if multilinear::whir_split::enabled() {
+        for (table, poly) in tables.iter().zip(&polys) {
+            let split = poly.grid_was_split();
+            grid_splits += usize::from(split);
+            if table.num_vars() == 21 && table.shape().degree() == 3 {
+                cubic_full_height += 1;
+                cubic_full_height_split += usize::from(split);
+            }
+        }
+    }
     split.ledger_zc = multilinear::gpu::ledger_reserved();
     // What an earlier argue on this thread left, so the line below is this one's.
     multilinear::gpu_fused::take_tail();
@@ -1576,7 +1589,8 @@ where
         eprintln!(
             "BATCHED ARGUE SPLIT: tables {} · bins {} · trees {:.3}s · ladders {:.3}s · zc setup \
              {:.3}s · zc rounds {:.3}s · reduce {:.3}s · Gruen layers (process) +{} · two-layer \
-             Gruen layers (process) +{} · Gruen card rounds (process) +{}",
+             Gruen layers (process) +{} · Gruen card rounds (process) +{} · max rows 2^{} · \
+             grid splits {} · 2^21 cubic grids split {}/{}",
             tables.len(),
             plan.bins.len(),
             split.trees,
@@ -1586,7 +1600,11 @@ where
             split.reduce,
             multilinear::gkr_gruen::gruen_layers() - gruen_layers,
             multilinear::gkr_gruen::gruen2_layers() - gruen2_layers,
-            multilinear::gkr_gruen::gruen_rounds() - gruen_rounds
+            multilinear::gkr_gruen::gruen_rounds() - gruen_rounds,
+            num_vars_max,
+            grid_splits,
+            cubic_full_height_split,
+            cubic_full_height,
         );
         // The fused tables' later rounds by program length: the card's, and the
         // host's over what the card folded.
