@@ -1346,6 +1346,43 @@ fn stated_at<const TABLES: usize, const VARS: u32>(
     chunks[0] = vec![1 << VARS; TABLES.saturating_sub(others).max(1)];
 }
 
+/// Every stated table at the format's cut for its kind (chips, mux and cap
+/// chunks at 2^22 rows, lean round and head chunks at 2^19), then tables
+/// added to chip `CHIP` (`CHIP` past the chips: to lean list `CHIP - 100`, in
+/// `B3lShape` order) at that kind's cut, up to `TABLES` stated tables.
+#[allow(clippy::ptr_arg)] // a `Reshape`
+fn at_format_cuts_on<const CHIP: usize, const TABLES: usize>(
+    _: &mut usize,
+    _: &mut [bool; 3],
+    chunks: &mut Vec<Vec<usize>>,
+    lean: &mut B3lShape,
+) {
+    const CHIP_ROWS: usize = 1 << crate::lfm::wlfm::WLFM_CHUNK_LOG;
+    const LEAN_ROWS: usize = 1 << crate::lfm::b3l_tables::CHUNK_LOG;
+    const MUX_ROWS: usize = 1 << crate::lfm::b3l_tables::MUX_CHUNK_LOG;
+    chunks.iter_mut().flatten().for_each(|n| *n = CHIP_ROWS);
+    lean.rounds
+        .iter_mut()
+        .chain(&mut lean.heads)
+        .for_each(|n| *n = LEAN_ROWS);
+    lean.muxes
+        .iter_mut()
+        .chain(&mut lean.caps)
+        .chain(&mut lean.cap_reads)
+        .for_each(|n| *n = MUX_ROWS);
+    let more = TABLES.saturating_sub(rows_mut(chunks, lean).count());
+    let (list, rows) = match CHIP {
+        chip if chip < chunks.len() => (&mut chunks[chip], CHIP_ROWS),
+        100 => (&mut lean.rounds, LEAN_ROWS),
+        101 => (&mut lean.heads, LEAN_ROWS),
+        102 => (&mut lean.muxes, MUX_ROWS),
+        103 => (&mut lean.caps, MUX_ROWS),
+        104 => (&mut lean.cap_reads, MUX_ROWS),
+        _ => return,
+    };
+    list.extend(std::iter::repeat_n(rows, more));
+}
+
 /// 4096 stated tables, each at `2^VARS` rows.
 fn most_chunks_at<const VARS: u32>(
     hash: &mut usize,
@@ -1368,7 +1405,21 @@ fn the_join_build_cost_of_every_admitted_worker_shape() {
     let layout = f.plan.child_layout();
     let rounds = level_rounds(&f.plan);
     let [a, b] = leaves();
-    let sized: [(&str, Reshape); 16] = [
+    let sized: [(&str, Reshape); 30] = [
+        ("139 at the cuts, chip 0", at_format_cuts_on::<0, 139>),
+        ("139 at the cuts, chip 1", at_format_cuts_on::<1, 139>),
+        ("139 at the cuts, chip 2", at_format_cuts_on::<2, 139>),
+        ("139 at the cuts, chip 3", at_format_cuts_on::<3, 139>),
+        ("139 at the cuts, chip 4", at_format_cuts_on::<4, 139>),
+        ("139 at the cuts, chip 5", at_format_cuts_on::<5, 139>),
+        ("139 at the cuts, chip 6", at_format_cuts_on::<6, 139>),
+        ("139 at the cuts, chip 7", at_format_cuts_on::<7, 139>),
+        ("139 at the cuts, chip 8", at_format_cuts_on::<8, 139>),
+        ("139 at the cuts, chip 9", at_format_cuts_on::<9, 139>),
+        ("139 at the cuts, rounds", at_format_cuts_on::<100, 139>),
+        ("139 at the cuts, heads", at_format_cuts_on::<101, 139>),
+        ("139 at the cuts, muxes", at_format_cuts_on::<102, 139>),
+        ("139 at the cuts, caps", at_format_cuts_on::<103, 139>),
         ("59 stated tables at 2^22 rows", stated_at::<59, 22>),
         ("118 stated tables at 2^22 rows", stated_at::<118, 22>),
         ("110 stated tables at 2^24 rows", stated_at::<110, 24>),
