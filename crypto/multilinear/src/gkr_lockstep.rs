@@ -2144,6 +2144,120 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn additive_host_nodes_match_multiplication_for_ladder_relations() {
+        let mut random = DefaultTranscript::<Ext3>::new(b"ladder round nodes");
+        for n in [1, 4, 7] {
+            let mut polynomials = |width| {
+                (0..width)
+                    .map(|_| {
+                        Mle::new((0..1 << n).map(|_| random.sample_field_element()).collect())
+                            .unwrap()
+                    })
+                    .collect()
+            };
+            let weights = vec![FieldElement::<Ext3>::from(2), FieldElement::from(3)];
+            let single = LockstepRelation {
+                polys: polynomials(5),
+                weights: weights.clone(),
+            };
+            sumcheck::assert_host_node_steps(&single, single.degree());
+            let double = DoubleRelation {
+                polys: polynomials(9),
+                weights,
+            };
+            sumcheck::assert_host_node_steps(&double, double.degree());
+        }
+    }
+
+    fn node_step_fixture() -> Vec<Vec<FractionLayer<Ext3>>> {
+        let mut random = DefaultTranscript::<Ext3>::new(b"ladder node step test data");
+        [4, 3]
+            .into_iter()
+            .map(|n| {
+                let mut poly = || {
+                    Mle::new((0..1 << n).map(|_| random.sample_field_element()).collect()).unwrap()
+                };
+                let mut layers = vec![FractionLayer::new(poly(), poly()).unwrap()];
+                while layers.last().unwrap().num_vars() > 0 {
+                    layers.push(layers.last().unwrap().fold().unwrap());
+                }
+                layers.reverse();
+                layers
+            })
+            .collect()
+    }
+
+    #[test]
+    fn additive_host_nodes_produce_the_same_canonical_lockstep_proof() {
+        use sumcheck::{HostNodeStep, with_host_node_step};
+
+        let trees = node_step_fixture();
+        let refs: Vec<_> = trees.iter().map(Vec::as_slice).collect();
+        let outputs: Vec<_> = refs.iter().map(|tree| HostLayers(tree).output()).collect();
+        let seed = b"ladder node step proof";
+        let claim_values = |claims: Vec<GkrClaim<Ext3>>| {
+            claims
+                .into_iter()
+                .map(|c| (c.point, c.p, c.q))
+                .collect::<Vec<_>>()
+        };
+        for form in [GkrLadder::Single, GkrLadder::Double] {
+            let run = |step| {
+                let mut transcript = DefaultTranscript::<Ext3>::new(seed);
+                let (proof, claims) =
+                    with_host_node_step(step, || prove(&refs, form, &mut transcript)).unwrap();
+                let mut verifier = DefaultTranscript::<Ext3>::new(seed);
+                let claims = claim_values(claims);
+                assert_eq!(
+                    claim_values(verify(&proof, &outputs, &[4, 3], form, &mut verifier).unwrap()),
+                    claims
+                );
+                assert_eq!(transcript.state(), verifier.state());
+                let layers = proof
+                    .layers
+                    .into_iter()
+                    .map(|layer| {
+                        let rounds = layer
+                            .sumcheck
+                            .rounds
+                            .into_iter()
+                            .map(|r| r.evaluations)
+                            .collect::<Vec<_>>();
+                        let halves = layer
+                            .halves
+                            .into_iter()
+                            .map(|h| [h.p_lo, h.p_hi, h.q_lo, h.q_hi])
+                            .collect::<Vec<_>>();
+                        (rounds, halves)
+                    })
+                    .collect::<Vec<_>>();
+                (layers, claims, transcript.state())
+            };
+            // Compare every field value and the proof's shape.
+            assert_eq!(run(HostNodeStep::Multiply), run(HostNodeStep::Add));
+        }
+    }
+
+    #[test]
+    fn additive_host_nodes_starting_from_lo_are_refused() {
+        use sumcheck::{HostNodeStep, with_host_node_step};
+
+        let trees = node_step_fixture();
+        let refs: Vec<_> = trees.iter().map(Vec::as_slice).collect();
+        let outputs: Vec<_> = refs.iter().map(|tree| HostLayers(tree).output()).collect();
+        let transcript = || DefaultTranscript::<Ext3>::new(b"ladder bad node");
+        let form = GkrLadder::Double;
+        let (proof, _) = with_host_node_step(HostNodeStep::AddFromLo, || {
+            prove(&refs, form, &mut transcript())
+        })
+        .unwrap();
+        assert!(matches!(
+            verify(&proof, &outputs, &[4, 3], form, &mut transcript()),
+            Err(Error::LayerRelationMismatch { .. })
+        ));
+    }
+
     /// Whether every claim is its tree's input layer at its point.
     fn claims_are_the_inputs(trees: &[Vec<FractionLayer<F>>], claims: &[GkrClaim<F>]) -> Vec<bool> {
         trees

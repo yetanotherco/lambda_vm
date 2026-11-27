@@ -94,7 +94,31 @@ pub(crate) fn interpolate<F: IsField>(
         })
 }
 
-/// Sums `f(r_0..r_{j-1}, t, rest)` over the remaining cube.
+#[derive(Clone, Copy)]
+pub(crate) enum HostNodeStep {
+    Multiply,
+    Add,
+    #[cfg(test)]
+    AddFromLo,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NODE_STEP: std::cell::Cell<Option<HostNodeStep>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_host_node_step<R>(step: HostNodeStep, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<HostNodeStep>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_NODE_STEP.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_NODE_STEP.replace(Some(step)));
+    run()
+}
+
 /// Sums `f(r_0..r_{j-1}, t, rest)` over the remaining cube.
 ///
 /// `t` runs over `1..=degree`, or `0..=degree` when `with_zero` — which only
@@ -117,11 +141,26 @@ where
     P: SumcheckPolynomial<F> + Sync,
     FieldElement<F>: Send + Sync,
 {
+    static STEP: std::sync::OnceLock<HostNodeStep> = std::sync::OnceLock::new();
+    let step = *STEP.get_or_init(|| {
+        if std::env::var("LAMBDA_VM_ARGUE_HOST_NODE_ADD").as_deref() == Ok("1") {
+            HostNodeStep::Add
+        } else {
+            HostNodeStep::Multiply
+        }
+    });
+    #[cfg(test)]
+    let step = TEST_NODE_STEP.get().unwrap_or(step);
     let half = 1usize << (poly.num_vars() - 1);
     let first = usize::from(!with_zero);
-    let steps: Vec<FieldElement<F>> = (first..=degree)
-        .map(|t| FieldElement::<F>::from(t as u64))
-        .collect();
+    let num_nodes = degree + usize::from(with_zero);
+    let steps: Vec<FieldElement<F>> = if matches!(step, HostNodeStep::Multiply) {
+        (first..=degree)
+            .map(|t| FieldElement::<F>::from(t as u64))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // A slice of the cube, summed independently. The rounds are the whole cost
     // of the prover, and every index is independent, so this is where the cores
@@ -131,7 +170,7 @@ where
         // Buffers for the whole slice. Collecting a fresh `Vec` per cube index
         // would be one heap allocation per index, which on a real trace is
         // millions of them per round and dwarfs the arithmetic.
-        let mut totals = vec![FieldElement::<F>::zero(); steps.len()];
+        let mut totals = vec![FieldElement::<F>::zero(); num_nodes];
         let mut lo = vec![FieldElement::<F>::zero(); width];
         let mut hi = vec![FieldElement::<F>::zero(); width];
         let mut delta = vec![FieldElement::<F>::zero(); width];
@@ -144,6 +183,29 @@ where
                 lo[k] = p.evals()[j].clone();
                 hi[k] = p.evals()[j + half].clone();
                 delta[k] = &hi[k] - &lo[k];
+            }
+            if !matches!(step, HostNodeStep::Multiply) {
+                let mut nodes = totals.iter_mut();
+                if with_zero {
+                    *nodes.next().expect("requested node zero") +=
+                        poly.combine_in(&lo, &mut scratch);
+                }
+                if let Some(at_one) = nodes.next() {
+                    let start = match step {
+                        HostNodeStep::Add | HostNodeStep::Multiply => &hi,
+                        #[cfg(test)]
+                        HostNodeStep::AddFromLo => &lo,
+                    };
+                    values.clone_from(start);
+                    *at_one += poly.combine_in(&values, &mut scratch);
+                    for total in nodes {
+                        for (value, d) in values.iter_mut().zip(&delta) {
+                            *value = &*value + d;
+                        }
+                        *total += poly.combine_in(&values, &mut scratch);
+                    }
+                }
+                continue;
             }
             for (total, t) in totals.iter_mut().zip(&steps) {
                 // `t = 0` and `t = 1` are the halves as they are, so they skip
@@ -180,12 +242,29 @@ where
             .into_par_iter()
             .step_by(chunk)
             .map(|start| slice(start..(start + chunk).min(half)))
-            .reduce(|| vec![FieldElement::<F>::zero(); steps.len()], add)
+            .reduce(|| vec![FieldElement::<F>::zero(); num_nodes], add)
     }
     #[cfg(not(feature = "parallel"))]
     {
         let _ = add;
         slice(0..half)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_host_node_steps<F, P>(poly: &P, degree: usize)
+where
+    F: IsField + 'static,
+    P: SumcheckPolynomial<F> + Sync,
+    FieldElement<F>: Send + Sync,
+{
+    for with_zero in [false, true] {
+        let nodes = |step| with_host_node_step(step, || round_evaluations(poly, degree, with_zero));
+        assert_eq!(
+            nodes(HostNodeStep::Multiply),
+            nodes(HostNodeStep::Add),
+            "degree {degree}, with_zero {with_zero}"
+        );
     }
 }
 
@@ -426,6 +505,41 @@ mod tests {
             .map(|i| (i.wrapping_mul(6364136223846793005).wrapping_add(seed)) >> 11)
             .collect();
         mle(&vals)
+    }
+
+    #[test]
+    fn additive_host_nodes_match_multiplication_for_batched_rules() {
+        use crate::{batch, program::Builder};
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+
+        let mut random = DefaultTranscript::<Ext>::new(b"batched round nodes");
+        for degree in 2..=5 {
+            for n in [1, 4, 7] {
+                let polys = (0..degree)
+                    .map(|_| {
+                        Mle::new((0..1 << n).map(|_| random.sample_field_element()).collect())
+                            .unwrap()
+                    })
+                    .collect();
+                let mut builder = Builder::<Ext>::new();
+                let mut product = builder.var(0);
+                for i in 1..degree {
+                    let factor = builder.var(i);
+                    product = builder.mul(product, factor);
+                }
+                let product = batch::Rule::compiled(degree, builder.finish(product).unwrap());
+                let mut builder = Builder::<Ext>::new();
+                let linear = builder.var(0);
+                let linear = batch::Rule::compiled(1, builder.finish(linear).unwrap());
+                let batched = batch::Batched::new(
+                    polys,
+                    vec![product, linear],
+                    vec![random.sample_field_element(), random.sample_field_element()],
+                )
+                .unwrap();
+                assert_host_node_steps(&batched, degree);
+            }
+        }
     }
 
     #[test]
