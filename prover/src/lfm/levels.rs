@@ -1858,6 +1858,16 @@ pub fn free_beside() -> bool {
     })
 }
 
+/// Drop level 2's filled program on a scoped thread beside the prove.
+pub const FREE_L2_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_FREE_L2_BESIDE";
+
+fn free_l2_beside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(super::wlfm_knobs::env_word(FREE_L2_BESIDE_ENV).as_deref())
+    })
+}
+
 /// What [`take_program`] took out of a program: dropped wherever it goes.
 pub(crate) struct TakenProgram {
     _instrs: Vec<super::instr::Instr>,
@@ -2951,6 +2961,8 @@ pub struct LevelsTimes {
     /// seconds there, and whether it went to the purge's thread instead
     /// ([`FREE_BESIDE_ENV`]).
     pub release: (f64, bool),
+    /// Level 2's release time on the driver and, when offloaded, on the worker.
+    pub release_l2: Option<(f64, Option<f64>)>,
     /// The base proof's end, the plan's derivation, level 1's program emitted
     /// and every level built.
     pub base: f64,
@@ -4200,7 +4212,19 @@ pub fn prove_block_levels(
                 }
             };
             let mut program = program;
-            release_program(&mut program, &mut times.sizes);
+            let t_release = std::time::Instant::now();
+            let release_worker = if k == 1 && free_l2_beside() {
+                let taken = take_program(&mut program, &mut times.sizes);
+                Some(scope.spawn(move || {
+                    let t = std::time::Instant::now();
+                    drop(taken);
+                    t.elapsed().as_secs_f64()
+                }))
+            } else {
+                release_program(&mut program, &mut times.sizes);
+                None
+            };
+            let release_driver = t_release.elapsed().as_secs_f64();
             let (build, committed, card) = committer
                 .join()
                 .map_err(|_| format!("level {}'s commit panicked", k + 1))??;
@@ -4236,6 +4260,12 @@ pub fn prove_block_levels(
                 prove: t.elapsed().as_secs_f64(),
                 end: now(),
             });
+            if k == 1 {
+                let worker = release_worker
+                    .map(|worker| worker.join().map_err(|_| "level 2's program drop panicked"))
+                    .transpose()?;
+                times.release_l2 = Some((release_driver, worker));
+            }
             times
                 .stamps
                 .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());

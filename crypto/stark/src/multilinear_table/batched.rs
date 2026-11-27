@@ -2245,7 +2245,7 @@ where
         .iter()
         .map(|table| {
             multilinear_logup::interactions(
-                table.layout.interactions,
+                table.layout.interactions(),
                 table.slot_of().len(),
                 &z,
                 &alpha,
@@ -2504,7 +2504,7 @@ where
         .iter()
         .map(|table| {
             multilinear_logup::interactions(
-                table.layout.interactions,
+                table.layout.interactions(),
                 table.slot_of().len(),
                 z,
                 alpha,

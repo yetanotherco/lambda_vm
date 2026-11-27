@@ -4105,15 +4105,50 @@ impl WordTails {
     }
 
     /// The rows not handed out, one list a family: the finish's.
-    fn into_rows(self) -> super::WordRows {
+    fn into_rows(self, parallel: bool) -> super::WordRows {
+        let (((load8, store8), (loadw, storew)), ((load2w, store2w), memw)) = join_if(
+            parallel,
+            || {
+                join_if(
+                    parallel,
+                    || {
+                        join_if(
+                            parallel,
+                            || self.load8.into_vec(),
+                            || self.store8.into_vec(),
+                        )
+                    },
+                    || {
+                        join_if(
+                            parallel,
+                            || self.loadw.into_vec(),
+                            || self.storew.into_vec(),
+                        )
+                    },
+                )
+            },
+            || {
+                join_if(
+                    parallel,
+                    || {
+                        join_if(
+                            parallel,
+                            || self.load2w.into_vec(),
+                            || self.store2w.into_vec(),
+                        )
+                    },
+                    || self.memw.into_vec(),
+                )
+            },
+        );
         super::WordRows {
-            load8: self.load8.into_vec(),
-            store8: self.store8.into_vec(),
-            loadw: self.loadw.into_vec(),
-            storew: self.storew.into_vec(),
-            load2w: self.load2w.into_vec(),
-            store2w: self.store2w.into_vec(),
-            memw: self.memw.into_vec(),
+            load8,
+            store8,
+            loadw,
+            storew,
+            load2w,
+            store2w,
+            memw,
             copy: self.copy,
         }
     }
@@ -4639,6 +4674,7 @@ impl Kept {
             listless_broken: _,
         } = self;
         let mut walk = WalkOutputs::with_capacity(0, order);
+        let parallel = finish_head_parallel();
         // Words mode: the run's last register rows, decoded from the logs. A
         // run whose words could not all be decoded (a window without its
         // logs) is refused here: its prove fails, nothing panics.
@@ -4653,33 +4689,58 @@ impl Kept {
             }
             None => register_rows.into_vec(),
         };
+        let join_word_rows = || {
+            // Under the in-place hand-out `word_rows` holds nothing: the tails'
+            // rows follow whatever it holds, so a row kept in both shows twice.
+            match word_tails {
+                Some(tails) => {
+                    let mut rows = word_rows;
+                    rows.append(tails.into_rows(parallel));
+                    rows
+                }
+                None => word_rows,
+            }
+        };
+        let ((aligned, general), ((cpu_side, (mem_load, mem_store)), word_rows)) = join_if(
+            parallel,
+            || join_if(parallel, || aligned.into_vec(), || general.into_vec()),
+            || {
+                join_if(
+                    parallel,
+                    || {
+                        join_if(
+                            parallel,
+                            || cpu_side.into_vec(),
+                            || join_if(parallel, || mem_load.into_vec(), || mem_store.into_vec()),
+                        )
+                    },
+                    join_word_rows,
+                )
+            },
+        );
         walk.memw = MemwBuckets {
             register_rows,
-            aligned: aligned.into_vec(),
-            general: general.into_vec(),
+            aligned,
+            general,
             words: None,
             order,
             registers,
             memory,
             refused: None,
         };
-        walk.cpu_side = cpu_side.into_vec();
-        walk.mem_load_rows = mem_load.into_vec();
-        walk.mem_store_rows = mem_store.into_vec();
-        // Under the in-place hand-out `word_rows` holds nothing: the tails'
-        // rows follow whatever it holds, so a row kept in both shows twice.
-        walk.word_rows = match word_tails {
-            Some(tails) => {
-                let mut rows = word_rows;
-                rows.append(tails.into_rows());
-                rows
-            }
-            None => word_rows,
-        };
-        walk.load_ops = load.into_vec();
-        walk.lt_ops = lt.into_vec();
-        walk.shift_ops = shift.into_vec();
-        Ok((cpu.into_vec(), walk, rest, decode.into_table()))
+        walk.cpu_side = cpu_side;
+        walk.mem_load_rows = mem_load;
+        walk.mem_store_rows = mem_store;
+        walk.word_rows = word_rows;
+        let ((load, lt), (shift, cpu)) = join_if(
+            parallel,
+            || join_if(parallel, || load.into_vec(), || lt.into_vec()),
+            || join_if(parallel, || shift.into_vec(), || cpu.into_vec()),
+        );
+        walk.load_ops = load;
+        walk.lt_ops = lt;
+        walk.shift_ops = shift;
+        Ok((cpu, walk, rest, decode.into_table()))
     }
 }
 
@@ -5449,6 +5510,22 @@ fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + 
     {
         (a(), b())
     }
+}
+
+fn finish_head_parallel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "parallel")
+            && std::env::var("LAMBDA_VM_FINISH_HEAD_PARALLEL").as_deref() == Ok("1")
+    })
+}
+
+fn join_if<A: Send, B: Send>(
+    parallel: bool,
+    a: impl FnOnce() -> A + Send,
+    b: impl FnOnce() -> B + Send,
+) -> (A, B) {
+    if parallel { join(a, b) } else { (a(), b()) }
 }
 
 /// The windows' lists concatenated into the run's, once: list by list in

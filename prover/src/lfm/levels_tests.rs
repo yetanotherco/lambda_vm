@@ -3463,6 +3463,13 @@ fn rta_one_run(
         "RTA LEVEL1 RELEASE: {:.3}s on the driver's thread · beside {}",
         t.release.0, t.release.1
     );
+    if let Some((driver, worker)) = t.release_l2 {
+        println!(
+            "RTA LEVEL2 RELEASE: {driver:.3}s on the driver's thread · beside {} · worker {}",
+            worker.is_some(),
+            worker.map_or_else(|| "none".to_string(), |secs| format!("{secs:.3}s"))
+        );
+    }
     match t.validated_after_fill {
         Some(wait) => println!("RTA LEVEL1 VALIDATE AFTER FILL: on · the join waited {wait:.3}s"),
         None => println!("RTA LEVEL1 VALIDATE AFTER FILL: off"),
@@ -4094,7 +4101,7 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
         "{tag} PROVE: prep {:.3}s · phase A {:.3}s · phase B {:.3}s · group cells {cells} · card \
          budget {:.2} GiB · reserved at start {:.2} GiB · ledger peak {:.2} GiB · narrow {} tables \
          · records {} tables · prep parts: merge {:.3}s airs {:.3}s pairs {:.3}s check {:.3}s \
-         layouts {:.3}s tables {:.3}s",
+         layouts {:.3}s tables {:.3}s · prepare parallel {}",
         st.prep,
         st.phase_a,
         st.phase_b,
@@ -4109,6 +4116,7 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
         st.prep_parts[3],
         st.prep_parts[4],
         st.prep_parts[5],
+        st.prep_parallel,
     );
     for (g, s) in st.groups.iter().enumerate() {
         println!(

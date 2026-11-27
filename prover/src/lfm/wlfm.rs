@@ -58,7 +58,9 @@ use stark::multilinear_block::{
     self, BlockCommitted, BlockPrepared, BlockPreparedCheck, Narrowing, PreparedCommitment,
 };
 use stark::multilinear_table::batched::VerifierChecks;
-use stark::multilinear_table::{BatchedArgue, CommittedTable, MultiProof, TableStatement};
+use stark::multilinear_table::{
+    BatchedArgue, CommittedTable, MultiProof, TableLayout, TableStatement,
+};
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use crate::block_whir::{
@@ -1048,6 +1050,7 @@ pub enum WlfmProving {
 /// A program's artifacts and the prover's half of its prepared stacks.
 pub struct WlfmBuild {
     pub artifacts: WlfmArtifacts,
+    prove_layouts: Option<Vec<TableLayout<'static, F, E>>>,
     stacks: WlfmStacks,
     /// The planned stack placement by group, also used by the level's phase-A lanes.
     stack_cards: Option<Vec<u8>>,
@@ -1532,11 +1535,12 @@ impl WlfmBuild {
     }
 
     /// The prover's half let go: the prepared stacks (their columns and
-    /// commitments) and the held chip prefixes. The artifacts stay, for the
-    /// level above and the verifier. A released build proves no more.
+    /// commitments), the held chip prefixes and the proof's table layouts.
+    /// The artifacts stay, for the level above and the verifier.
     pub fn release_prover_half(&mut self) {
         self.stacks = WlfmStacks::empty(self.artifacts.family);
         self.chip_prefixes = Vec::new();
+        self.prove_layouts = None;
         self.released = true;
     }
 
@@ -1730,6 +1734,8 @@ pub struct WlfmPrebuild {
     /// [`WlfmPrep::Evaluated`] the identity is settled here (no prepared root
     /// moves it).
     artifacts: WlfmArtifacts,
+    /// The proof's table layouts, in table order, when parallel preparation is on.
+    prove_layouts: Option<Vec<TableLayout<'static, F, E>>>,
     /// Under [`WlfmPrep::Stacked`], the stacks to commit; `None` otherwise.
     stacks: Option<Vec<GroupStack>>,
     secs: f64,
@@ -1956,6 +1962,7 @@ impl WlfmPrebuild {
         let t = std::time::Instant::now();
         let WlfmPrebuild {
             mut artifacts,
+            prove_layouts,
             stacks,
             secs,
             split: _,
@@ -2005,6 +2012,7 @@ impl WlfmPrebuild {
         };
         Ok(WlfmBuild {
             artifacts,
+            prove_layouts,
             stacks: committed,
             stack_cards: cards.filter(|cards| cards.contains(&1)),
             place,
@@ -2166,6 +2174,19 @@ pub(crate) fn prepare_wlfm_tiled(
             })
             .collect()
     };
+    let prove_layouts = if prepare_parallel() {
+        Some(
+            refs.iter()
+                .zip(&shapes)
+                .map(|(&air, &(width, num_vars))| {
+                    layout_of(air, width, num_vars).map(TableLayout::into_owned)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("{e:?}"))?,
+        )
+    } else {
+        None
+    };
     let columns_from = std::time::Instant::now();
     let columns: Vec<PreparedColumns> = if prepare_par() && !tiled {
         use rayon::prelude::*;
@@ -2263,6 +2284,7 @@ pub(crate) fn prepare_wlfm_tiled(
         let identity_secs = identity_from.elapsed().as_secs_f64();
         return Ok(WlfmPrebuild {
             artifacts,
+            prove_layouts,
             stacks: None,
             secs: t.elapsed().as_secs_f64(),
             split: [groups_secs, columns_secs, identity_secs],
@@ -2297,6 +2319,7 @@ pub(crate) fn prepare_wlfm_tiled(
     };
     Ok(WlfmPrebuild {
         artifacts,
+        prove_layouts,
         stacks: Some(stacks),
         secs: t.elapsed().as_secs_f64(),
         split: [groups_secs, columns_secs, stacks_secs],
@@ -2666,11 +2689,14 @@ fn any_retired<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct WlfmStamps {
     pub prep: f64,
+    pub prep_parallel: bool,
     /// `prep` by part: the merge split back, the AIR set and its shapes, the
     /// trace pairs, the prefix check, the layouts, the committed tables.
+    /// The last three are summed across tables when prepared in parallel.
     pub prep_parts: [f64; 6],
     /// Under [`narrow_chips`], the chips packed narrow before the prove takes
-    /// them (left out of `prep`): seconds, tables, cells, packed bytes.
+    /// them: seconds, tables, cells, packed bytes. Left out of serial `prep`
+    /// and included in parallel `prep` wall time, where packs can overlap.
     pub narrow_pack: f64,
     pub narrow_tables: usize,
     pub narrow_cells: usize,
@@ -2771,18 +2797,14 @@ fn prove_traces_under<H: WhirHash>(
             at += n;
         }
     }
-    let mut tables: Vec<CommittedTable<'_, F, E>> = Vec::with_capacity(pairs.len());
-    // The chips packed narrow: seconds, tables, cells, packed bytes.
-    let mut narrow = (0f64, 0usize, 0usize, 0usize);
-    // The chips held as records: tables, cells, records bytes.
-    let mut records_held = (0usize, 0usize, 0usize);
-    for (t, ((air, table), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
-        let (cols, rows) = table.shape();
+    let prepare_table = |(t, ((air, table), &(width, num_vars)))| {
+        let t: usize = t;
+        let name = stark::traits::AIR::name(air);
+        let (cols, rows) = TableIn::shape(&table);
         if cols != width || rows != 1usize << num_vars {
             return Err(format!(
-                "{}: the trace is {cols} columns of {rows} rows, the program's {width} of \
-                 2^{num_vars}",
-                air.name()
+                "{name}: the trace is {cols} columns of {rows} rows, the program's {width} of \
+                 2^{num_vars}"
             ));
         }
         // A table held as its records writes its prefix from them (a lean
@@ -2801,8 +2823,7 @@ fn prove_traces_under<H: WhirHash>(
                 .collect();
             if !table.prefix_is(&pinned) {
                 return Err(format!(
-                    "{}: a preprocessed column is not the program's",
-                    air.name()
+                    "{name}: a preprocessed column is not the program's"
                 ));
             }
         }
@@ -2813,18 +2834,22 @@ fn prove_traces_under<H: WhirHash>(
                 .collect();
             if !table.prefix_is(&pinned) {
                 return Err(format!(
-                    "{}: a preprocessed column is not the program's",
-                    air.name()
+                    "{name}: a preprocessed column is not the program's"
                 ));
             }
         }
-        parts[3] += t_check.elapsed().as_secs_f64();
+        let check_secs = t_check.elapsed().as_secs_f64();
         let t_layout = std::time::Instant::now();
-        let layout = layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?;
-        parts[4] += t_layout.elapsed().as_secs_f64();
+        let layout = match &build.prove_layouts {
+            Some(layouts) => layouts[t].clone(),
+            None => layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?,
+        };
+        let layout_secs = t_layout.elapsed().as_secs_f64();
         let t_table = std::time::Instant::now();
-        // Under `narrow_chips`, the chips packed narrow: stamped apart from
-        // the preparation, as the fill's own work.
+        // The chips packed narrow: seconds, tables, cells, packed bytes.
+        let mut narrow = (0f64, 0usize, 0usize, 0usize);
+        // The chips held as records: tables, cells, records bytes.
+        let mut records_held = (0usize, 0usize, 0usize);
         let mut pack_narrow = |cells: &[FieldElement<F>], width: usize, rows: usize| {
             let t = std::time::Instant::now();
             let packed = pack_rows_narrow(cells, width, rows);
@@ -2834,7 +2859,7 @@ fn prove_traces_under<H: WhirHash>(
                 narrow.2 += p.rows() * p.cols();
                 narrow.3 += p.data().len();
             }
-            packed.map_err(|e| format!("{}: {e}", air.name()))
+            packed.map_err(|e| format!("{name}: {e}"))
         };
         let committed = match table {
             TableIn::Wide(trace) if narrow_chips() => CommittedTable::from_narrow(
@@ -2880,11 +2905,52 @@ fn prove_traces_under<H: WhirHash>(
                 }
             },
         };
-        tables.push(committed.map_err(|e| format!("{}: {e:?}", air.name()))?);
-        parts[5] += t_table.elapsed().as_secs_f64();
+        let committed = committed.map_err(|e| format!("{name}: {e:?}"))?;
+        Ok((
+            committed,
+            [check_secs, layout_secs, t_table.elapsed().as_secs_f64()],
+            narrow,
+            records_held,
+        ))
+    };
+    let prep_parallel = build.prove_layouts.is_some();
+    let prepared = if prep_parallel {
+        use rayon::prelude::*;
+        pairs
+            .into_par_iter()
+            .zip(&shapes)
+            .enumerate()
+            .map(prepare_table)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        pairs
+            .into_iter()
+            .zip(&shapes)
+            .enumerate()
+            .map(prepare_table)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut tables = Vec::with_capacity(prepared.len());
+    let mut narrow = (0f64, 0usize, 0usize, 0usize);
+    let mut records_held = (0usize, 0usize, 0usize);
+    for (table, table_parts, packed, held) in prepared {
+        tables.push(table);
+        for (part, secs) in parts[3..].iter_mut().zip(table_parts) {
+            *part += secs;
+        }
+        narrow.0 += packed.0;
+        narrow.1 += packed.1;
+        narrow.2 += packed.2;
+        narrow.3 += packed.3;
+        records_held.0 += held.0;
+        records_held.1 += held.1;
+        records_held.2 += held.2;
     }
     parts[5] -= narrow.0;
-    let prep_secs = t_prep.elapsed().as_secs_f64() - narrow.0 - prefix_pack;
+    let prep_secs =
+        t_prep.elapsed().as_secs_f64() - prefix_pack - if prep_parallel { 0.0 } else { narrow.0 };
     let waited_before = super::device_permit::waited_secs();
     let t_held = std::time::Instant::now();
     // ⛔ THE CARD, for the prove's device phases: the permit the STARK prover
@@ -3076,6 +3142,7 @@ fn prove_traces_under<H: WhirHash>(
     LAST_WLFM_STAMPS.with(|c| {
         *c.borrow_mut() = Some(WlfmStamps {
             prep: prep_secs,
+            prep_parallel,
             prep_parts: parts,
             narrow_pack: narrow.0,
             narrow_tables: narrow.1,
@@ -3756,6 +3823,18 @@ pub fn prepare_par() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         super::wlfm_knobs::knob_word_on(super::wlfm_knobs::env_word(PREPARE_PAR_ENV).as_deref())
+    })
+}
+
+/// Prepare a filled level's proof tables in parallel, using layouts made at build time.
+pub const PREPARE_PARALLEL_ENV: &str = "LAMBDA_VM_LEVELS_PREPARE_PARALLEL";
+
+fn prepare_parallel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(
+            super::wlfm_knobs::env_word(PREPARE_PARALLEL_ENV).as_deref(),
+        )
     })
 }
 

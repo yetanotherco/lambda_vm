@@ -19,7 +19,7 @@ use math::{
     },
     traits::AsBytes,
 };
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use multilinear::{
     Error as MlError,
@@ -72,7 +72,7 @@ where
     E: IsField,
 {
     shape: IrShape<F, E>,
-    interactions: &'a [BusInteraction],
+    interactions: Cow<'a, [BusInteraction]>,
     leaves: LeafLayout,
     /// Main column -> the factor that reads it unshifted.
     slot_of: Vec<usize>,
@@ -136,13 +136,26 @@ where
 
         Ok(Self {
             shape,
-            interactions,
+            interactions: Cow::Borrowed(interactions),
             leaves,
             slot_of,
             kinds,
             num_vars,
             preprocessed_count: 0,
         })
+    }
+
+    /// Keep a layout after its AIR goes away.
+    pub fn into_owned(self) -> TableLayout<'static, F, E> {
+        TableLayout {
+            shape: self.shape,
+            interactions: Cow::Owned(self.interactions.into_owned()),
+            leaves: self.leaves,
+            slot_of: self.slot_of,
+            kinds: self.kinds,
+            num_vars: self.num_vars,
+            preprocessed_count: self.preprocessed_count,
+        }
     }
 
     /// The layout with its AIR's preprocessed count `count` (its leading
@@ -160,8 +173,8 @@ where
     }
 
     /// The table's bus interactions.
-    pub fn interactions(&self) -> &'a [BusInteraction] {
-        self.interactions
+    pub fn interactions(&self) -> &[BusInteraction] {
+        &self.interactions
     }
 
     /// The statement this layout describes, with no preprocessed columns to
@@ -182,7 +195,7 @@ where
     ) -> TableStatement<'s, F, E> {
         TableStatement {
             shape: &self.shape,
-            interactions: self.interactions,
+            interactions: self.interactions(),
             slot_of: &self.slot_of,
             preprocessed,
             num_preprocessed: preprocessed.len(),
@@ -205,7 +218,7 @@ where
     pub fn statement_with_prepared_prefix(&self, count: usize) -> TableStatement<'_, F, E> {
         TableStatement {
             shape: &self.shape,
-            interactions: self.interactions,
+            interactions: self.interactions(),
             slot_of: &self.slot_of,
             preprocessed: &[],
             num_preprocessed: count,
@@ -1261,7 +1274,7 @@ where
 
     let t = tick();
     let interactions = multilinear_logup::interactions(
-        table.layout.interactions,
+        table.layout.interactions(),
         table.slot_of().len(),
         z,
         alpha,
@@ -3940,7 +3953,7 @@ mod tests {
     /// program a device's rounds walk.
     fn tall_batch(table: &CommittedTable<'_, Fp, Ext>) -> multilinear::program::Program<Ext> {
         let interactions = multilinear_logup::interactions(
-            table.layout.interactions,
+            table.layout.interactions(),
             table.slot_of().len(),
             &ExtE::from(0x2a_u64),
             &ExtE::from(0x3b_u64),
@@ -4436,7 +4449,7 @@ mod tests {
         ];
         let t = table(air, &columns).expect("the ADD table builds");
         let interactions = multilinear_logup::interactions(
-            t.layout.interactions,
+            t.layout.interactions(),
             t.slot_of().len(),
             &ExtE::from(7u64),
             &ExtE::from(11u64),
