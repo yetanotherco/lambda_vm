@@ -1,7 +1,7 @@
 //! Process runner for the block levels over a configured TCP topology.
 //!
 //! `cluster prove` publishes each run's proof file at OUTPUT first and checks
-//! it right after, so OUTPUT can hold a file nobody has checked yet. Neither
+//! it right after, including when a range join uses early leaf artifacts. Neither
 //! OUTPUT nor its marker carries trust. A consumer reads the
 //! `(OwnedBlockStatement, file)` pair, compares the statement with the one it
 //! expects (program, input, outputs), and verifies the file itself:
@@ -214,9 +214,11 @@ fn prove_runs(
         );
         clock.mark("PUBLISHED");
 
+        clock.mark("file-check-start");
         let check_start = Instant::now();
         let checked = check_published(number, output, shipment);
         let check_wall = check_start.elapsed().as_secs_f64();
+        clock.mark("file-check-end");
         match checked {
             Ok(_) => {
                 eprintln!("CLUSTER FILE CHECK {number} ACCEPTED {check_wall:.6}");
@@ -876,6 +878,7 @@ mod tests {
         #[cfg(not(feature = "cuda"))]
         #[ignore = "runs the full TCP range proofs and reference on the host"]
         fn both_range_roles_log_their_stages_in_order() {
+            use lambda_vm_prover::block_whir::cluster_tcp::EARLY_JOIN_ENV;
             use std::collections::BTreeMap;
 
             assert!(
@@ -886,11 +889,16 @@ mod tests {
                 .args([
                     "--ignored",
                     "--exact",
-                    &test_name("range_runs_match_local_reference"),
+                    &test_name("a_refused_range_file_is_replaced_with_a_checked_local_proof"),
                     "--nocapture",
                 ])
                 .env("LAMBDA_VM_FIXED_TRACE_HASH", "1")
                 .env("LAMBDA_VM_DETERMINISTIC_GRIND", "1")
+                .env("LAMBDA_VM_CLUSTER_EARLY_BIND", "1")
+                .env("LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE", "1")
+                .env("LAMBDA_VM_CLUSTER_LEAF_AT_BIND", "1")
+                .env(EARLY_JOIN_ENV, "1")
+                .env("LAMBDA_VM_CLUSTER_COMPACT_COUNTS", "1")
                 .env("RAYON_NUM_THREADS", "4")
                 .output()
                 .unwrap();
@@ -901,6 +909,20 @@ mod tests {
                 output.status,
                 String::from_utf8_lossy(&output.stdout)
             );
+
+            let mut lines = stderr.lines();
+            for prefix in [
+                "CLUSTER PROVE RUN 1 PUBLISHED WALL ",
+                "CLUSTER FILE CHECK 1 ACCEPTED ",
+                "CLUSTER PROVE RUN 2 PUBLISHED WALL ",
+                "CLUSTER FILE CHECK 2 REFUSED ",
+                "CLUSTER PROVE RUN 2 REPUBLISHED LOCAL WALL ",
+            ] {
+                assert!(
+                    lines.any(|line| line.starts_with(prefix)),
+                    "missing or out of order: {prefix}\n{stderr}"
+                );
+            }
 
             let mut attempts = BTreeMap::<_, BTreeMap<_, BTreeMap<_, _>>>::new();
             for line in stderr.lines() {
@@ -966,7 +988,7 @@ mod tests {
                 }
             };
             let leaf = [
-                "leaf-arena-done",
+                "leaf-plan-done",
                 "leaf-emit-done",
                 "leaf-compile-done",
                 "leaf-validate-done",
@@ -997,14 +1019,13 @@ mod tests {
                         "range-readers-done",
                         "assign-encode-done",
                         "assign-sent-W0",
-                        "final-commits-done",
                         "prepared-roots-done",
                         "wait-receipts",
                         "receipts-received",
                         "receipts-gathered",
                         "seal-done",
                         "bind-encode-done",
-                        "leaf-plan-done",
+                        "bind-sent-W0",
                         "base-openings-start",
                         "base-openings-end",
                         "leaf-arena-done",
@@ -1023,8 +1044,20 @@ mod tests {
                 order(
                     c,
                     &[
-                        "leaf-plan-done",
                         "bind-sent-W0",
+                        "leaf-plan-done",
+                        "leaf-artifacts-local",
+                        "leaf-artifacts-ready",
+                    ],
+                );
+                order(
+                    c,
+                    &["assign-sent-W0", "final-commits-done", "wait-receipts"],
+                );
+                order(
+                    c,
+                    &[
+                        "leaf-artifacts-received-W0",
                         "leaf-received-W0",
                         "leaf-relay-done",
                     ],
@@ -1039,6 +1072,12 @@ mod tests {
                         "wait-finish-W0",
                         "finish-received-W0",
                         "finish-done",
+                        "join-fill-done",
+                    ],
+                );
+                order(
+                    c,
+                    &[
                         "leaf-artifacts-ready",
                         "join-compile-start",
                         "join-compile-end",
@@ -1050,6 +1089,8 @@ mod tests {
                         "inner-encode-done",
                         "outer-encode-done",
                         "PUBLISHED",
+                        "file-check-start",
+                        "file-check-end",
                     ],
                 );
                 order(
@@ -1074,7 +1115,6 @@ mod tests {
                         "seal-checked",
                         "base-openings-start",
                         "base-openings-end",
-                        "leaf-plan-done",
                         "leaf-arena-done",
                     ],
                 );
@@ -1089,6 +1129,9 @@ mod tests {
                 order(
                     w,
                     &[
+                        "leaf-build-done",
+                        "leaf-artifacts-sent",
+                        "leaf-prove-start",
                         "leaf-prove-end",
                         "leaf-sent",
                         "opened-all-sent",
@@ -1099,6 +1142,8 @@ mod tests {
                 );
                 for stages in [c, w] {
                     order(stages, &leaf);
+                    order(stages, &["leaf-arena-done", "leaf-prepare-done"]);
+                    order(stages, &["base-openings-end", "leaf-prepare-done"]);
                     order(
                         stages,
                         &[
@@ -1118,6 +1163,8 @@ mod tests {
                         order(stages, &["base-openings-start", group, "base-openings-end"]);
                     }
                 }
+                order(w, &["seal-checked", "leaf-plan-done"]);
+                order(c, &["leaf-artifacts-received-W0", "leaf-artifacts-ready"]);
             }
         }
 

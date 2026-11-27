@@ -21,7 +21,7 @@ use rkyv::{
 pub(super) const MAX_WORKERS: usize = 8;
 pub(super) const INPUT_CHUNK: usize = 1 << 20;
 const HEADER: usize = 24;
-const VERSION: u16 = 4;
+const VERSION: u16 = 6;
 pub(super) type Attempt = [u8; 16];
 pub(super) type Digest32 = [u8; 32];
 
@@ -47,6 +47,8 @@ pub(super) enum Kind {
     StreamClosed,
     IndexBase,
     Leaf,
+    LeafArtifacts,
+    CompactRangeCounts,
 }
 
 impl Kind {
@@ -72,21 +74,23 @@ impl Kind {
             StreamClosed,
             IndexBase,
             Leaf,
+            LeafArtifacts,
+            CompactRangeCounts,
         ]
         .into_iter()
         .find(|&kind| kind as u16 == value)
         .ok_or_else(|| invalid("unknown frame kind"))
     }
 
-    fn limit(self) -> usize {
+    pub(super) fn limit(self) -> usize {
         match self {
             Self::Challenge | Self::Authenticate | Self::Welcome => 64,
             Self::Start | Self::Error => 4096,
             Self::Witness => 32,
             Self::Committed => 256 << 10,
             Self::Input => INPUT_CHUNK + 32,
-            Self::Assign | Self::Bind | Self::RangeReady => 8 << 20,
-            Self::RangeCounts => 96 << 20,
+            Self::Assign | Self::Bind | Self::RangeReady | Self::LeafArtifacts => 8 << 20,
+            Self::RangeCounts | Self::CompactRangeCounts => 96 << 20,
             Self::StreamClosed | Self::IndexBase => 8,
             Self::Result => 16 << 20,
             Self::Leaf => 64 << 20,

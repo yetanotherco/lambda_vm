@@ -838,6 +838,8 @@ impl PartialEq for BitwiseHistogram {
 }
 
 impl BitwiseHistogram {
+    pub(crate) const LEN: usize = NUM_ROWS * NUM_LOOKUP_TYPES;
+
     /// Exact multiplicities in lookup-family and row order.
     #[cfg(feature = "parallel")]
     pub(crate) fn counts(&self) -> &[u64] {
@@ -865,7 +867,7 @@ impl BitwiseHistogram {
     #[allow(clippy::new_without_default)]
     pub(crate) fn new() -> Self {
         Self {
-            counters: vec![0u64; NUM_ROWS * NUM_LOOKUP_TYPES].into_boxed_slice(),
+            counters: vec![0u64; Self::LEN].into_boxed_slice(),
         }
     }
 

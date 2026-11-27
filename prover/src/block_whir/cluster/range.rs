@@ -292,6 +292,93 @@ pub(super) struct Counts {
     pub keccak: usize,
 }
 
+const BITWISE_LEN: usize = crate::tables::bitwise::BitwiseHistogram::LEN;
+const BITWISE_BITMAP: usize = BITWISE_LEN.div_ceil(8);
+const BITWISE_BYTES: usize = BITWISE_LEN * size_of::<u64>();
+
+/// A fixed bitmap in dense BITWISE order, then one unsigned LEB128 count for
+/// each set bit in ascending order. Empty ranges use the original frame.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(super) struct CompactCounts {
+    bitwise: Vec<u8>,
+    decode: Vec<(usize, u64)>,
+    keccak: usize,
+}
+
+impl Counts {
+    pub(super) fn compact(&self) -> Option<CompactCounts> {
+        if self.bitwise.len() != BITWISE_LEN {
+            return None;
+        }
+        let mut bitwise = vec![0; BITWISE_BITMAP];
+        for (byte, chunk) in self.bitwise.chunks(8).enumerate() {
+            let mut mask = 0;
+            for (bit, &count) in chunk.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                mask |= 1 << bit;
+                let mut value = count;
+                while value >= 128 {
+                    bitwise.push(value as u8 | 128);
+                    value >>= 7;
+                }
+                bitwise.push(value as u8);
+                if bitwise.len() >= BITWISE_BYTES {
+                    return None;
+                }
+            }
+            bitwise[byte] = mask;
+        }
+        Some(CompactCounts {
+            bitwise,
+            decode: self.decode.clone(),
+            keccak: self.keccak,
+        })
+    }
+}
+
+impl CompactCounts {
+    pub(super) fn expand(self) -> Result<Counts, Error> {
+        let bad = || invalid("invalid compact range BITWISE counts");
+        if !(BITWISE_BITMAP..BITWISE_BYTES).contains(&self.bitwise.len()) {
+            return Err(bad());
+        }
+        let (bitmap, values) = self.bitwise.split_at(BITWISE_BITMAP);
+        let mut values = values.iter().copied();
+        let mut bitwise = vec![0; BITWISE_LEN];
+        for (byte, &mask) in bitmap.iter().enumerate() {
+            let mut mask = mask;
+            while mask != 0 {
+                let index = byte * 8 + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let count = bitwise.get_mut(index).ok_or_else(bad)?;
+                for shift in (0..=63).step_by(7) {
+                    let value = values.next().ok_or_else(bad)?;
+                    if shift == 63 && value > 1 {
+                        return Err(bad());
+                    }
+                    *count |= u64::from(value & 127) << shift;
+                    if value < 128 {
+                        if value == 0 {
+                            return Err(bad());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if values.next().is_some() {
+            return Err(bad());
+        }
+        Ok(Counts {
+            bitwise,
+            decode: self.decode,
+            keccak: self.keccak,
+        })
+    }
+}
+
 fn multiplicity(trace: &TraceTable<F, E>, row: usize, col: usize) -> u64 {
     trace.narrow_main().map_or_else(
         || trace.get_main(row, col).to_raw(),
@@ -1626,6 +1713,51 @@ mod tests {
                 }),
                 "missing BITWISE, DECODE or KECCAK_RC count table",
             );
+        }
+    }
+
+    #[test]
+    fn cluster_compact_counts_preserve_dense_merge() {
+        use crate::tables::bitwise::BitwiseHistogram;
+
+        let mut dense_merge = BitwiseHistogram::new();
+        let mut compact_merge = BitwiseHistogram::new();
+        for n in [127, 16_384] {
+            let mut dense = Counts {
+                bitwise: vec![0; BITWISE_LEN],
+                decode: vec![(2, 11), (9, 20)],
+                keccak: 3,
+            };
+            for (index, count) in [(0, 1), (7, n), (8, n), (BITWISE_LEN - 1, 1 << 40)] {
+                dense.bitwise[index] = count;
+            }
+            dense_merge.add_range_counts(&dense.bitwise).unwrap();
+            let compact = dense.compact().unwrap();
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&compact).unwrap();
+            let expanded = super::super::wire::decode::<CompactCounts>(&bytes)
+                .unwrap()
+                .expand()
+                .unwrap();
+            assert_eq!(expanded.bitwise, dense.bitwise);
+            assert_eq!(expanded.decode, dense.decode);
+            assert_eq!(expanded.keccak, dense.keccak);
+            compact_merge.add_range_counts(&expanded.bitwise).unwrap();
+        }
+        assert!(compact_merge == dense_merge);
+    }
+
+    #[test]
+    fn cluster_compact_counts_refuse_noncanonical_values() {
+        for values in [&[][..], &[0], &[0x80, 0], &[1, 1], &[0xff; 10]] {
+            let mut bitwise = vec![0; BITWISE_BITMAP];
+            bitwise[0] = 1;
+            bitwise.extend_from_slice(values);
+            let compact = CompactCounts {
+                bitwise,
+                decode: Vec::new(),
+                keccak: 0,
+            };
+            assert!(compact.expand().is_err(), "{values:?}");
         }
     }
 }

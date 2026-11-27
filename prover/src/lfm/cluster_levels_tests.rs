@@ -37,16 +37,18 @@ fn range_leaf_uses_the_local_levels_stack_placement() {
     let local = levels::prepare_level(&program, FAMILY, None).unwrap();
     assert!(local.prepared_cells() > 0);
     let base_budget = gpu::reserve_budget();
-    with_proving_leaf(0, program, None, LAST, Clock::default(), |leaf| {
-        let local = levels::commit_level(local, 1)?;
-        assert_eq!(leaf.build.place(), local.place());
-        assert_eq!(
-            leaf.build.artifacts.derived_roots(),
-            local.artifacts.derived_roots()
-        );
-        Ok(())
-    })
-    .unwrap();
+    LeafPrebuild::new(program, None, LAST, Clock::default())
+        .unwrap()
+        .prove(0, Clock::default(), |leaf| {
+            let local = levels::commit_level(local, 1)?;
+            assert_eq!(leaf.build.place(), local.place());
+            assert_eq!(
+                leaf.build.artifacts.derived_roots(),
+                local.artifacts.derived_roots()
+            );
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(gpu::reserve_budget(), base_budget);
 }
 
@@ -706,7 +708,8 @@ fn two_leaf_card_artifacts_match_host() {
 fn a_weakened_leaf_program_from_a_worker_is_refused_before_publication() {
     let f = fixture();
     let arena = block_leaf_arena(&f.plan, &f.base, 1).unwrap();
-    let weak = prove_weakened_leaf(&f.plan, 1, &arena, Clock::default()).unwrap();
+    let weak = prebuild_weakened_leaf(&f.plan, 1, Clock::default()).unwrap();
+    let weak = prove_prebuilt_leaf(&f.plan, 1, weak, &arena, Clock::default()).unwrap();
     assert_ne!(
         weak.0.artifacts.program_id,
         leaves()[1].0.artifacts.program_id

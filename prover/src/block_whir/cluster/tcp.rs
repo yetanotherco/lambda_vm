@@ -7,9 +7,10 @@ use super::stages::Clock;
 use super::wire::{self, Attempt, Connection, Digest32, Kind, Reader};
 use super::{super::*, HostAirs, Owned, Pass, Plan, range};
 use crate::lfm::{
+    block_node::BlockLayout,
     cluster_levels::{self, LeafMap},
     last_level::LastLevel,
-    levels::level_rounds,
+    levels::{Level, level_rounds},
     merkle_cap::CapMux,
     whir_block::{group_arena_words, leaf_arena_under},
     wlfm::{LeafArtifacts, WlfmFamily, WlfmProof},
@@ -43,6 +44,9 @@ const INPUT_LIMIT: usize = 128 << 20;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(1);
 const WATCHDOG_GRACE: Duration = Duration::from_secs(1);
+const LEAF_AT_BIND: &str = "LAMBDA_VM_CLUSTER_LEAF_AT_BIND";
+pub const EARLY_JOIN_ENV: &str = "LAMBDA_VM_CLUSTER_EARLY_JOIN";
+const COMPACT_COUNTS: &str = "LAMBDA_VM_CLUSTER_COMPACT_COUNTS";
 /// How long a repeated worker waits for the coordinator's next attempt unless
 /// the topology says otherwise (`next-attempt-ms`). Between two attempts the
 /// `cluster prove` runner proves the join, publishes the file and checks it;
@@ -343,6 +347,9 @@ pub(super) const BUILD_SETTINGS: &[&str] = &[
     "LAMBDA_VM_FINISH_PAGE_DIRECT",
     "LAMBDA_VM_FINISH_BITWISE_DIRECT",
     "LAMBDA_VM_FINISH_KECCAK_W_SPLIT",
+    LEAF_AT_BIND,
+    EARLY_JOIN_ENV,
+    COMPACT_COUNTS,
 ];
 
 thread_local! {
@@ -589,6 +596,18 @@ struct GroupReply {
 struct LeafReply {
     plan: Digest32,
     artifacts: LeafArtifacts,
+    proof: WlfmProof,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LeafArtifactsReply {
+    plan: Digest32,
+    artifacts: LeafArtifacts,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LeafProofReply {
+    plan: Digest32,
     proof: WlfmProof,
 }
 
@@ -856,6 +875,15 @@ impl Phase<'_> {
     fn run(
         &self,
         request: impl Fn(usize, &Connection, Instant) -> WireResult<()> + Sync,
+        admit: impl FnMut(usize, Kind, &AlignedVec) -> WireResult<()>,
+    ) -> WireResult<()> {
+        self.run_until(Instant::now() + self.duration, request, admit)
+    }
+
+    fn run_until(
+        &self,
+        deadline: Instant,
+        request: impl Fn(usize, &Connection, Instant) -> WireResult<()> + Sync,
         mut admit: impl FnMut(usize, Kind, &AlignedVec) -> WireResult<()>,
     ) -> WireResult<()> {
         enum Event {
@@ -863,7 +891,6 @@ impl Phase<'_> {
             Done,
             Failed(io::Error),
         }
-        let deadline = Instant::now() + self.duration;
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(0);
             let mut close = CloseOnDrop(self.peers);
@@ -875,11 +902,11 @@ impl Phase<'_> {
                         request(id, peer, deadline)?;
                         let mut read = peer.reader();
                         loop {
-                            let kinds = [self.reply, self.end, Kind::Witness];
-                            let kinds = if self.reply == Kind::Committed {
-                                &kinds[..]
-                            } else {
-                                &kinds[..2]
+                            let kinds = [self.reply, self.end];
+                            let kinds: &[_] = match self.reply {
+                                Kind::Committed => &[self.reply, self.end, Kind::Witness],
+                                Kind::Leaf => &[self.reply, self.end, Kind::LeafArtifacts],
+                                _ => &kinds,
                             };
                             let (_, kind, bytes) =
                                 read.receive(deadline, Some(self.attempt), kinds)?;
@@ -976,9 +1003,43 @@ pub(in crate::block_whir) fn prove<H: multilinear::whir_hash::WhirHash>(
         on_group,
         stamps,
         local_owned,
+        None,
     )
     .and_then(Proved::base)
     .inspect_err(|_| mark_failed())
+}
+
+struct PreparedFrame<H: multilinear::whir_hash::WhirHash> {
+    frame: BlockFrame,
+    groups: Vec<GroupPrepared<H>>,
+    roots: Vec<PreparedRoots>,
+}
+
+impl<H: multilinear::whir_hash::WhirHash> PreparedFrame<H> {
+    fn derive(
+        laid: &Laid,
+        statement: BlockStatement<'_>,
+        elf: &[u8],
+        opts: &ProofOptions,
+        format: &BlockFormat,
+        clock: Clock,
+    ) -> Result<Self, Error> {
+        let frame = block_frame(statement, elf, opts, format)?;
+        let groups = commit_groups_on_host::<H>(
+            group_stacks(
+                prepared_tables(&frame.airs, &frame.page_configs, format)?,
+                &laid.groups,
+            )?,
+            &frame.config,
+        )?;
+        let roots = prepared_roots(&groups);
+        clock.mark("prepared-roots-done");
+        Ok(Self {
+            frame,
+            groups,
+            roots,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -993,6 +1054,7 @@ fn prove_as<H: multilinear::whir_hash::WhirHash>(
     on_group: GroupObserver<'_>,
     stamps: &mut BlockStamps,
     local_owned: Option<Owned<'_>>,
+    prepared_frame: Option<PreparedFrame<H>>,
 ) -> Result<Proved, Error> {
     let begin = Instant::now();
     let clock = coordinator.clock;
@@ -1006,17 +1068,15 @@ fn prove_as<H: multilinear::whir_hash::WhirHash>(
     let attempt = *attempt;
     let table_num_vars: Vec<_> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
     let statement = laid.statement(&table_num_vars);
-    let frame = block_frame(statement, elf, opts, format)?;
+    let PreparedFrame {
+        frame,
+        groups: prepared,
+        roots: prepared_roots,
+    } = match prepared_frame {
+        Some(frame) => frame,
+        None => PreparedFrame::derive(&laid, statement, elf, opts, format, clock)?,
+    };
     let airs = frame.airs.air_refs();
-    let prepared = commit_groups_on_host::<H>(
-        group_stacks(
-            prepared_tables(&frame.airs, &frame.page_configs, format)?,
-            &laid.groups,
-        )?,
-        &frame.config,
-    )?;
-    let prepared_roots = prepared_roots(&prepared);
-    clock.mark("prepared-roots-done");
     let mut settled = Vec::with_capacity(prepared.len());
     for p in &prepared {
         settled.push(multilinear_block::BlockPreparedCheck {
@@ -1263,19 +1323,53 @@ fn prove_as<H: multilinear::whir_hash::WhirHash>(
     };
     if coordinator.start.range_levels {
         let (map, owners) = LeafMap::from_owners(&plan.owners, peers.len() + 1).map_err(fail)?;
-        let leaf_plan = cluster_levels::cluster_plan(
-            elf,
-            opts,
-            format,
-            statement,
-            Some(&prepared_roots),
-            map.as_ref(),
-        )
-        .map_err(fail)?;
-        clock.mark("leaf-plan-done");
-        let proof = open_levels(coordinator, &leaf_plan, &owners, &bind, &sealed, || {
-            open_local(local_post)
-        })?;
+        let early_deadline = if setting("LAMBDA_VM_CLUSTER_EARLY_BIND").as_deref() != Some("0") {
+            let deadline = Instant::now() + topology.open;
+            std::thread::scope(|scope| {
+                let sealed = &sealed;
+                let writers: Vec<_> = peers
+                    .iter()
+                    .enumerate()
+                    .map(|(id, peer)| {
+                        scope.spawn(move || {
+                            peer.write_frame(deadline, Kind::Bind, attempt, sealed)
+                                .map_err(fail)?;
+                            clock.mark(format_args!("bind-sent-W{id}"));
+                            Ok::<_, Error>(())
+                        })
+                    })
+                    .collect();
+                for writer in writers {
+                    writer.join().map_err(|_| fail("Bind writer panicked"))??;
+                }
+                Ok::<_, Error>(())
+            })?;
+            Some(deadline)
+        } else {
+            None
+        };
+        let derive_plan = || {
+            let plan = cluster_levels::cluster_plan(
+                elf,
+                opts,
+                format,
+                statement,
+                Some(&prepared_roots),
+                map.as_ref(),
+            )
+            .map_err(fail)?;
+            clock.mark("leaf-plan-done");
+            Ok(plan)
+        };
+        let proof = open_levels(
+            coordinator,
+            derive_plan,
+            &owners,
+            &bind,
+            &sealed,
+            early_deadline,
+            || open_local(local_post),
+        )?;
         return Ok(Proved::Levels((statement.to_owned(), map, proof)));
     }
     let open = Phase {
@@ -1470,12 +1564,78 @@ fn range_leaf_arena(
     Ok(leaf_arena_under(&roots, &answers, words, plan.wrap_hash()))
 }
 
+fn build_beside_openings<T: Send>(
+    settings: Option<Arc<[Option<String>]>>,
+    build: impl FnOnce() -> Result<T, Error> + Send,
+) -> Result<T, Error> {
+    let build = || with_settings(settings, || crate::base_only::with_blake3_levels(build));
+    // Reserve a single host lane for the early chain, including its Rayon work.
+    // The base openings continue to use the prover's pool.
+    #[cfg(feature = "parallel")]
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .use_current_thread()
+            .build()
+            .map_err(fail)?
+            .install(build)
+    }
+    #[cfg(not(feature = "parallel"))]
+    build()
+}
+
+enum JoinArtifact {
+    Local(WlfmChild, BlockLayout, Option<u8>),
+    Worker(usize, LeafArtifacts),
+}
+
+fn worker_child(
+    artifacts: LeafArtifacts,
+    layout: &BlockLayout,
+    rounds: Option<u8>,
+) -> Result<WlfmChild, Error> {
+    Ok(WlfmChild {
+        artifacts: artifacts.into_artifacts(rounds).map_err(fail)?,
+        num_public_words: layout.total(),
+        cap_mux: Some(CapMux::Packed),
+    })
+}
+
+fn build_join_from_artifacts(
+    artifacts: mpsc::Receiver<JoinArtifact>,
+    owners: &[usize],
+    local_leaf: usize,
+    workers: usize,
+    last: LastLevel,
+    clock: Clock,
+) -> Result<(Vec<WlfmChild>, Level), Error> {
+    let mut local = None;
+    let mut remote: Vec<_> = (0..workers).map(|_| None).collect();
+    for artifact in artifacts.iter().take(owners.len()) {
+        match artifact {
+            JoinArtifact::Local(child, layout, rounds) => local = Some((child, layout, rounds)),
+            JoinArtifact::Worker(id, artifacts) => remote[id] = Some(artifacts),
+        }
+    }
+    let (local, layout, rounds) = local.ok_or_else(|| fail("missing local leaf artifacts"))?;
+    let children = leaves_in_order(owners, local_leaf, local, &mut remote, |artifacts| {
+        worker_child(artifacts, &layout, rounds)
+    })?;
+    clock.mark("leaf-artifacts-ready");
+    // The pinned level-2 program evaluates its instruction columns. This
+    // build does not commit a prepared stack while the leaves use the card.
+    let level =
+        cluster_levels::build_join(&children, &layout, rounds, last, clock).map_err(fail)?;
+    Ok((children, level))
+}
+
 fn open_levels(
     coordinator: &Coordinator<'_>,
-    plan: &crate::lfm::whir_block::WhirBlockPlan,
+    derive_plan: impl FnOnce() -> Result<crate::lfm::whir_block::WhirBlockPlan, Error> + Send,
     owners: &[usize],
     bind: &Bind,
     sealed: &[u8],
+    early_deadline: Option<Instant>,
     open_local: impl FnOnce() -> Result<Vec<GroupReply>, Error> + Send,
 ) -> Result<WlfmProof, Error> {
     let clock = coordinator.clock;
@@ -1484,8 +1644,10 @@ fn open_levels(
         .iter()
         .position(|&id| id == local)
         .ok_or_else(|| fail("the terminal machine has no leaf"))?;
-    let mut replies: Vec<Option<LeafReply>> = coordinator.peers.iter().map(|_| None).collect();
-    let rounds = level_rounds(plan);
+    let mut proofs: Vec<Option<WlfmProof>> = coordinator.peers.iter().map(|_| None).collect();
+    let mut legacy_artifacts: Vec<Option<LeafArtifacts>> =
+        coordinator.peers.iter().map(|_| None).collect();
+    let mut received_artifacts = vec![None; coordinator.peers.len()];
     let last = LastLevel::pinned(WlfmFamily::B3);
     enum Local {
         Closed(WlfmProof),
@@ -1499,69 +1661,187 @@ fn open_levels(
         peers: &coordinator.peers,
         attempt: coordinator.attempt,
     };
-    let local = std::thread::scope(|scope| {
-        let local_proof = scope.spawn(|| {
-            let groups = open_local()?
+    let at_bind = early_deadline.is_some() && setting(LEAF_AT_BIND).as_deref() == Some("1");
+    let (early_plan, serial_plan) = if at_bind {
+        (Some(derive_plan), None)
+    } else {
+        (None, Some(derive_plan()?))
+    };
+    let closed = owners.len() == 1;
+    let early_join = !closed && setting(EARLY_JOIN_ENV).as_deref() == Some("1");
+    let (plan, local, built_join) = std::thread::scope(|scope| {
+        let (artifacts_tx, artifacts_rx) = mpsc::channel();
+        let artifacts_tx = early_join.then_some(artifacts_tx);
+        let local_artifacts = artifacts_tx.clone();
+        let join = early_join.then(|| {
+            scope.spawn(move || {
+                build_join_from_artifacts(artifacts_rx, owners, local_leaf, local, last, clock)
+            })
+        });
+        let local_proof = scope.spawn(move || {
+            let (plan, pre, groups) = match early_plan {
+                Some(derive) => std::thread::scope(|scope| {
+                    let host = scope.spawn(|| {
+                        build_beside_openings(Some(coordinator.settings()), || {
+                            let plan = derive()?;
+                            let pre =
+                                cluster_levels::prebuild_leaf(&plan, local_leaf, closed, clock)
+                                    .map_err(fail)?;
+                            Ok((plan, pre))
+                        })
+                    });
+                    let groups = open_local();
+                    let (plan, pre) = host
+                        .join()
+                        .map_err(|_| fail("coordinator leaf prebuild panicked"))??;
+                    Ok::<_, Error>((plan, Some(pre), groups?))
+                })?,
+                None => (serial_plan.expect("serial leaf plan"), None, open_local()?),
+            };
+            let groups = groups
                 .into_iter()
                 .map(|reply| (reply.group, reply.parts))
                 .collect();
-            let arena = range_leaf_arena(plan, local_leaf, bind, groups)?;
+            let arena = range_leaf_arena(&plan, local_leaf, bind, groups)?;
             clock.mark("leaf-arena-done");
-            let proof = if owners.len() == 1 {
-                cluster_levels::prove_single_staged(plan, &arena, last, clock)
+            let pre = match pre {
+                Some(pre) => pre,
+                None => {
+                    cluster_levels::prebuild_leaf(&plan, local_leaf, closed, clock).map_err(fail)?
+                }
+            };
+            let proof = if closed {
+                cluster_levels::prove_prebuilt_single(&plan, pre, &arena, last, clock)
                     .map(Local::Closed)
                     .map_err(fail)
             } else {
-                cluster_levels::prove_leaf_staged(plan, local_leaf, &arena, clock)
-                    .map(|leaf| Local::Leaf(Box::new(leaf)))
-                    .map_err(fail)
+                cluster_levels::prove_leaf_with_artifacts(
+                    &plan,
+                    local_leaf,
+                    pre,
+                    &arena,
+                    clock,
+                    |child| {
+                        if let Some(tx) = local_artifacts.as_ref() {
+                            clock.mark("leaf-artifacts-local");
+                            tx.send(JoinArtifact::Local(
+                                child.clone(),
+                                plan.child_layout(),
+                                level_rounds(&plan),
+                            ))
+                            .map_err(|_| "join artifact receiver stopped")?;
+                        }
+                        Ok(())
+                    },
+                )
+                .map(|leaf| Local::Leaf(Box::new(leaf)))
+                .map_err(fail)
             }?;
             clock.mark("wait-leaf-relay");
-            Ok::<_, Error>(proof)
+            Ok::<_, Error>((plan, proof))
         });
-        phase
-            .run(
+        let relayed = phase
+            .run_until(
+                early_deadline.unwrap_or_else(|| Instant::now() + phase.duration),
                 |id, socket, deadline| {
-                    socket.write_frame(deadline, Kind::Bind, coordinator.attempt, sealed)?;
-                    clock.mark(format_args!("bind-sent-W{id}"));
+                    if early_deadline.is_none() {
+                        socket.write_frame(deadline, Kind::Bind, coordinator.attempt, sealed)?;
+                        clock.mark(format_args!("bind-sent-W{id}"));
+                    }
                     Ok(())
                 },
-                |id, _, bytes| {
-                    let reply: LeafReply = wire::decode(bytes)?;
-                    let plan = reply.plan;
-                    take_leaf_reply(&mut replies, owners, &bind.digest, id, plan, reply)?;
+                |id, kind, bytes| {
+                    if kind == Kind::LeafArtifacts {
+                        let tx = artifacts_tx
+                            .as_ref()
+                            .ok_or_else(|| wire::invalid("unexpected early leaf artifacts"))?;
+                        let reply: LeafArtifactsReply = wire::decode(bytes)?;
+                        take_leaf_reply(
+                            &mut received_artifacts,
+                            owners,
+                            &bind.digest,
+                            id,
+                            reply.plan,
+                            bytes.len(),
+                        )?;
+                        clock.mark(format_args!("leaf-artifacts-received-W{id}"));
+                        tx.send(JoinArtifact::Worker(id, reply.artifacts))
+                            .map_err(|_| wire::invalid("join artifact receiver stopped"))?;
+                        return Ok(());
+                    }
+                    if early_join {
+                        let Some(artifact_bytes) = received_artifacts[id] else {
+                            return Err(wire::invalid("leaf proof arrived before its artifacts"));
+                        };
+                        if artifact_bytes + bytes.len() > Kind::Leaf.limit() {
+                            return Err(wire::invalid("leaf exceeds its combined byte limit"));
+                        }
+                        let reply: LeafProofReply = wire::decode(bytes)?;
+                        take_leaf_reply(
+                            &mut proofs,
+                            owners,
+                            &bind.digest,
+                            id,
+                            reply.plan,
+                            reply.proof,
+                        )?;
+                    } else {
+                        let reply: LeafReply = wire::decode(bytes)?;
+                        take_leaf_reply(
+                            &mut proofs,
+                            owners,
+                            &bind.digest,
+                            id,
+                            reply.plan,
+                            reply.proof,
+                        )?;
+                        legacy_artifacts[id] = Some(reply.artifacts);
+                    }
                     clock.mark(format_args!("leaf-received-W{id}"));
                     Ok(())
                 },
             )
-            .map_err(fail)?;
-        local_proof
+            .map_err(fail);
+        drop(artifacts_tx);
+        relayed?;
+        let (plan, local) = local_proof
             .join()
-            .map_err(|_| fail("coordinator leaf thread panicked"))?
+            .map_err(|_| fail("coordinator leaf thread panicked"))??;
+        clock.mark("leaf-relay-done");
+        // Acknowledge the completed leaves while the join build can still be
+        // running, and before proving the join or checking the file.
+        finish_peers(coordinator);
+        let join = join
+            .map(|join| {
+                join.join()
+                    .map_err(|_| fail("join build thread panicked"))?
+            })
+            .transpose()?;
+        Ok::<_, Error>((plan, local, join))
     })?;
-    clock.mark("leaf-relay-done");
-
-    // Workers wait for Finish while the coordinator constructs the join.
-    // Acknowledge completed leaves before the join and the host file check.
-    finish_peers(coordinator);
     let Local::Leaf(local) = local else {
         let Local::Closed(proof) = local else {
             unreachable!()
         };
         return Ok(proof);
     };
-    let leaves = leaves_in_order(owners, local_leaf, *local, &mut replies, |reply| {
-        let artifacts = reply.artifacts.into_artifacts(rounds).map_err(fail)?;
-        let child = WlfmChild {
-            artifacts,
-            num_public_words: plan.child_layout().total(),
-            cap_mux: Some(CapMux::Packed),
-        };
-        Ok((child, reply.proof))
-    })?;
+    let (local_child, local_proof) = *local;
+    let proofs = leaves_in_order(owners, local_leaf, local_proof, &mut proofs, Ok)?;
+    if let Some((children, level)) = built_join {
+        return cluster_levels::prove_built_join(level, &children, proofs, clock).map_err(fail);
+    }
+    let rounds = level_rounds(&plan);
+    let layout = plan.child_layout();
+    let children = leaves_in_order(
+        owners,
+        local_leaf,
+        local_child,
+        &mut legacy_artifacts,
+        |artifacts| worker_child(artifacts, &layout, rounds),
+    )?;
     clock.mark("leaf-artifacts-ready");
-    cluster_levels::prove_join_staged(&plan.child_layout(), rounds, leaves, last, clock)
-        .map_err(fail)
+    let leaves = children.into_iter().zip(proofs).collect();
+    cluster_levels::prove_join_staged(&layout, rounds, leaves, last, clock).map_err(fail)
 }
 
 /// Takes a worker's leaf once, from a machine that owns a leaf, for the plan
@@ -1841,90 +2121,93 @@ impl Worker<'_> {
         self.clock.mark("seal-checked");
         #[cfg(test)]
         fault_pause("bind");
-        let mut leaf_groups = Vec::new();
-        self.clock.mark("base-openings-start");
-        for (
-            committed,
-            prepared,
-            card,
-            CommitReply {
-                group, descriptor, ..
-            },
-        ) in private
-        {
-            let opened = Instant::now();
-            if self.cancelled.load(Ordering::Relaxed) {
-                return Err(fail("coordinator disconnected"));
-            }
-            wire::remaining(deadline).map_err(fail)?;
-            let post = post.clone();
-            let challenges = bind.challenges;
-            let start = starts[group];
-            let (parts, _) = multilinear::gpu::on_indexed_card(card, false, move || {
-                let borrowed = prepared
-                    .as_ref()
-                    .map_or_else(Vec::new, |p| multilinear::stacking::borrow(&p.columns));
-                let prepared_opening: Vec<_> = prepared
-                    .iter()
-                    .map(|p| multilinear_block::BlockPrepared {
-                        card,
-                        group: 0,
-                        tables: p
-                            .tables
-                            .iter()
-                            .map(|&(index, len)| (index - start, len))
-                            .collect(),
-                        commitment: (&p.commitment).into(),
-                        columns: &borrowed,
-                        packed: None,
-                    })
-                    .collect();
-                committed.open_replica_group::<H, _>(
-                    group,
-                    config,
-                    &post,
-                    challenges,
-                    &prepared_opening,
-                )
-                // Everything in this closure, including its prepared stack,
-                // drops before the writer can block on the result.
-            })
-            .map_err(|e| fail(format_args!("group {group}: {e:?}")))?;
-            self.clock.opened(group, opened);
-            #[cfg(test)]
-            let parts = if fault_is("group-verification") {
-                let mut parts = parts;
-                parts.opening.polys[0].rounds.clear();
-                parts
-            } else if fault_is("group-shape") {
-                let mut parts = parts;
-                parts.tables.pop().expect("per-table fixture");
-                parts
-            } else {
-                parts
-            };
-            if level_inputs.is_some() {
-                leaf_groups.push((group, parts));
-                continue;
-            }
-            self.socket
-                .send(
-                    deadline,
-                    self.attempt,
-                    Kind::Result,
-                    &GroupReply {
+        let has_leaf = level_inputs.is_some() && !private.is_empty();
+        let open_groups = || {
+            let mut leaf_groups = Vec::new();
+            self.clock.mark("base-openings-start");
+            for (
+                committed,
+                prepared,
+                card,
+                CommitReply {
+                    group, descriptor, ..
+                },
+            ) in private
+            {
+                let opened = Instant::now();
+                if self.cancelled.load(Ordering::Relaxed) {
+                    return Err(fail("coordinator disconnected"));
+                }
+                wire::remaining(deadline).map_err(fail)?;
+                let post = post.clone();
+                let challenges = bind.challenges;
+                let start = starts[group];
+                let (parts, _) = multilinear::gpu::on_indexed_card(card, false, move || {
+                    let borrowed = prepared
+                        .as_ref()
+                        .map_or_else(Vec::new, |p| multilinear::stacking::borrow(&p.columns));
+                    let prepared_opening: Vec<_> = prepared
+                        .iter()
+                        .map(|p| multilinear_block::BlockPrepared {
+                            card,
+                            group: 0,
+                            tables: p
+                                .tables
+                                .iter()
+                                .map(|&(index, len)| (index - start, len))
+                                .collect(),
+                            commitment: (&p.commitment).into(),
+                            columns: &borrowed,
+                            packed: None,
+                        })
+                        .collect();
+                    committed.open_replica_group::<H, _>(
                         group,
-                        descriptor,
-                        plan: bind.digest,
-                        parts,
-                    },
-                )
-                .map_err(fail)?;
-        }
-        self.clock.mark("base-openings-end");
-        if let Some((elf, opts, format)) = level_inputs
-            && !leaf_groups.is_empty()
-        {
+                        config,
+                        &post,
+                        challenges,
+                        &prepared_opening,
+                    )
+                    // Everything in this closure, including its prepared stack,
+                    // drops before the writer can block on the result.
+                })
+                .map_err(|e| fail(format_args!("group {group}: {e:?}")))?;
+                self.clock.opened(group, opened);
+                #[cfg(test)]
+                let parts = if fault_is("group-verification") {
+                    let mut parts = parts;
+                    parts.opening.polys[0].rounds.clear();
+                    parts
+                } else if fault_is("group-shape") {
+                    let mut parts = parts;
+                    parts.tables.pop().expect("per-table fixture");
+                    parts
+                } else {
+                    parts
+                };
+                if level_inputs.is_some() {
+                    leaf_groups.push((group, parts));
+                    continue;
+                }
+                self.socket
+                    .send(
+                        deadline,
+                        self.attempt,
+                        Kind::Result,
+                        &GroupReply {
+                            group,
+                            descriptor,
+                            plan: bind.digest,
+                            parts,
+                        },
+                    )
+                    .map_err(fail)?;
+            }
+            self.clock.mark("base-openings-end");
+            Ok::<_, Error>(leaf_groups)
+        };
+        let derive_plan = || {
+            let (elf, opts, format) = level_inputs.ok_or_else(|| fail("missing leaf inputs"))?;
             let (map, owners) = LeafMap::from_owners(&plan.owners, self.machines).map_err(fail)?;
             let leaf = owners
                 .iter()
@@ -1950,19 +2233,88 @@ impl Worker<'_> {
                 cluster_levels::cluster_plan(elf, opts, format, statement, Some(&roots), Some(map))
                     .map_err(fail)?;
             self.clock.mark("leaf-plan-done");
+            Ok::<_, Error>((plan, leaf))
+        };
+        let prebuild = |plan: &crate::lfm::whir_block::WhirBlockPlan, leaf| {
+            #[cfg(test)]
+            if fault_is("weakened-leaf") {
+                return cluster_levels::prebuild_weakened_leaf(plan, leaf, self.clock)
+                    .map_err(fail);
+            }
+            cluster_levels::prebuild_leaf(plan, leaf, false, self.clock).map_err(fail)
+        };
+        let (leaf_groups, early_leaf) = if has_leaf && setting(LEAF_AT_BIND).as_deref() == Some("1")
+        {
+            let settings = witness_settings();
+            std::thread::scope(|scope| {
+                let host = scope.spawn(|| {
+                    build_beside_openings(settings, || {
+                        let (plan, leaf) = derive_plan()?;
+                        let pre = prebuild(&plan, leaf)?;
+                        Ok((plan, leaf, pre))
+                    })
+                });
+                let groups = open_groups();
+                let early = host
+                    .join()
+                    .map_err(|_| fail("worker leaf prebuild panicked"))?;
+                Ok::<_, Error>((groups?, Some(early?)))
+            })?
+        } else {
+            (open_groups()?, None)
+        };
+        if has_leaf {
+            let (plan, leaf, pre) = match early_leaf {
+                Some((plan, leaf, pre)) => (plan, leaf, Some(pre)),
+                None => {
+                    let (plan, leaf) = derive_plan()?;
+                    (plan, leaf, None)
+                }
+            };
             let arena = range_leaf_arena(&plan, leaf, &bind, leaf_groups)?;
             self.clock.mark("leaf-arena-done");
-            #[cfg(test)]
-            let prove_leaf = if fault_is("weakened-leaf") {
-                cluster_levels::prove_weakened_leaf
-            } else {
-                cluster_levels::prove_leaf_staged
+            let pre = match pre {
+                Some(pre) => pre,
+                None => prebuild(&plan, leaf)?,
             };
-            #[cfg(not(test))]
-            let prove_leaf = cluster_levels::prove_leaf_staged;
-            let (child, proof) = prove_leaf(&plan, leaf, &arena, self.clock).map_err(fail)?;
-            self.socket
-                .send(
+            let early_join = setting(EARLY_JOIN_ENV).as_deref() == Some("1");
+            let (child, proof) = cluster_levels::prove_leaf_with_artifacts(
+                &plan,
+                leaf,
+                pre,
+                &arena,
+                self.clock,
+                |child| {
+                    if early_join {
+                        self.socket
+                            .send(
+                                deadline,
+                                self.attempt,
+                                Kind::LeafArtifacts,
+                                &LeafArtifactsReply {
+                                    plan: bind.digest,
+                                    artifacts: LeafArtifacts::from_build(&child.artifacts),
+                                },
+                            )
+                            .map_err(|e| e.to_string())?;
+                        self.clock.mark("leaf-artifacts-sent");
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(fail)?;
+            if early_join {
+                self.socket.send(
+                    deadline,
+                    self.attempt,
+                    Kind::Leaf,
+                    &LeafProofReply {
+                        plan: bind.digest,
+                        proof,
+                    },
+                )
+            } else {
+                self.socket.send(
                     deadline,
                     self.attempt,
                     Kind::Leaf,
@@ -1972,7 +2324,8 @@ impl Worker<'_> {
                         proof,
                     },
                 )
-                .map_err(fail)?;
+            }
+            .map_err(fail)?;
             self.clock.mark("leaf-sent");
         }
         self.socket
@@ -2462,6 +2815,11 @@ fn prove_ranges_as(
         options,
     );
     let attempt = coordinator.attempt;
+    let count_kinds = if setting(COMPACT_COUNTS).as_deref() == Some("1") {
+        &[Kind::RangeCounts, Kind::CompactRangeCounts][..]
+    } else {
+        &[Kind::RangeCounts][..]
+    };
     let (mut terminal, remote) = std::thread::scope(|scope| {
         let (stream_tx, stream_rx) = mpsc::channel();
         let readers: Vec<_> = coordinator
@@ -2487,11 +2845,17 @@ fn prove_ranges_as(
                         if metadata.streamed != streamed {
                             return Err(fail("streamed group count disagrees with range receipt"));
                         }
-                        let (_, _, bytes) = reader
-                            .receive(deadline, Some(attempt), &[Kind::RangeCounts])
+                        let (_, kind, bytes) = reader
+                            .receive(deadline, Some(attempt), count_kinds)
                             .map_err(fail)?;
                         clock.mark(format_args!("range-counts-received-W{id}"));
-                        let counts: range::Counts = wire::decode(&bytes).map_err(fail)?;
+                        let counts: range::Counts = if kind == Kind::CompactRangeCounts {
+                            wire::decode::<range::CompactCounts>(&bytes)
+                                .map_err(fail)?
+                                .expand()?
+                        } else {
+                            wire::decode(&bytes).map_err(fail)?
+                        };
                         if metadata.end == 0
                             && (!counts.bitwise.is_empty()
                                 || !counts.decode.is_empty()
@@ -2590,25 +2954,48 @@ fn prove_ranges_as(
     crate::with_base_hash!(format.zf.base, |H| {
         let streamed = metas[id].streamed;
         let mut early = terminal.committed.into_iter();
-        let local = owned_indices
-            .zip(terminal.groups)
-            .map(|(index, group)| {
-                if group.index < streamed {
-                    let (assigned, committed) = early
-                        .next()
-                        .ok_or_else(|| fail("missing coordinator stream commitment"))?;
-                    if assigned != index {
-                        return Err(fail("coordinator index base disagrees with assignment"));
+        let commit_local = || {
+            let local = owned_indices
+                .zip(terminal.groups)
+                .map(|(index, group)| {
+                    if group.index < streamed {
+                        let (assigned, committed) = early
+                            .next()
+                            .ok_or_else(|| fail("missing coordinator stream commitment"))?;
+                        if assigned != index {
+                            return Err(fail("coordinator index base disagrees with assignment"));
+                        }
+                        return Ok((index, committed));
                     }
-                    return Ok((index, committed));
-                }
-                Ok((
-                    index,
-                    range::commit::<H>(group, index, &config, options, format)?,
-                ))
-            })
-            .collect::<Result<Owned<'_>, Error>>()?;
-        clock.mark("final-commits-done");
+                    Ok((
+                        index,
+                        range::commit::<H>(group, index, &config, options, format)?,
+                    ))
+                })
+                .collect::<Result<Owned<'_>, Error>>()?;
+            clock.mark("final-commits-done");
+            Ok::<_, Error>(local)
+        };
+        let (local, prepared) = if coordinator.start.range_levels
+            && setting("LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE").as_deref() == Some("1")
+        {
+            let table_num_vars: Vec<_> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
+            let statement = laid.statement(&table_num_vars);
+            std::thread::scope(|scope| {
+                let prepared = scope.spawn(|| {
+                    crate::base_only::with_blake3_levels(|| {
+                        PreparedFrame::<H>::derive(&laid, statement, elf, opts, format, clock)
+                    })
+                });
+                let local = commit_local();
+                let prepared = prepared
+                    .join()
+                    .map_err(|_| fail("prepared roots thread panicked"))?;
+                Ok::<_, Error>((local?, Some(prepared?)))
+            })?
+        } else {
+            (commit_local()?, None)
+        };
         stamps.phase_a = start.elapsed().as_secs_f64();
         prove_as::<H>(
             coordinator,
@@ -2621,6 +3008,7 @@ fn prove_ranges_as(
             on_group,
             stamps,
             Some(local),
+            prepared,
         )
     })
 }
@@ -2711,16 +3099,33 @@ fn serve_range(
         )
         .map_err(fail)?;
     clock.mark("range-ready-sent");
+    let compact = (setting(COMPACT_COUNTS).as_deref() == Some("1"))
+        .then(|| counts.compact())
+        .flatten();
+    let (kind, bytes) = if let Some(compact) = compact {
+        (
+            Kind::CompactRangeCounts,
+            rkyv::to_bytes::<rkyv::rancor::Error>(&compact),
+        )
+    } else {
+        (
+            Kind::RangeCounts,
+            rkyv::to_bytes::<rkyv::rancor::Error>(&counts),
+        )
+    };
+    let bytes = bytes.map_err(fail)?;
     worker
         .socket
-        .send(
-            worker.commit_deadline,
-            worker.attempt,
-            Kind::RangeCounts,
-            &counts,
-        )
+        .write_frame(worker.commit_deadline, kind, worker.attempt, &bytes)
         .map_err(fail)?;
     clock.mark("range-counts-sent");
+    eprintln!(
+        "CLUSTER TCP: worker {} sent {:?} ({} bytes)",
+        worker.id,
+        kind,
+        bytes.len()
+    );
+    drop(bytes);
     drop(counts);
     clock.mark("wait-assign");
     let bytes = assign

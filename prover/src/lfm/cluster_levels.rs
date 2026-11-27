@@ -18,7 +18,9 @@ use super::{
     },
     merkle_cap::CapMux,
     whir_block::{BlockPartition, WhirBlockPlan, block_leaf_arena, finish_program, top_claims},
-    wlfm::{WlfmArtifacts, WlfmBuild, WlfmFamily, WlfmProof, WlfmProving, verify_wlfm},
+    wlfm::{
+        WlfmArtifacts, WlfmBuild, WlfmFamily, WlfmPrebuild, WlfmProof, WlfmProving, verify_wlfm,
+    },
     wlfm_leg::{WlfmChild, emit_wlfm_leg, wlfm_leg_arena, wlfm_leg_builder, wlfm_leg_program},
 };
 use crate::{
@@ -277,27 +279,63 @@ fn prove_level_staged(
     Ok(proof)
 }
 
-fn with_proving_leaf<T>(
-    leaf: usize,
+pub(crate) struct LeafPrebuild {
     program: LfmProgram,
-    rounds: Option<u8>,
-    last: LastLevel,
+    pre: WlfmPrebuild,
+}
+
+impl LeafPrebuild {
+    fn new(
+        program: LfmProgram,
+        rounds: Option<u8>,
+        last: LastLevel,
+        clock: Clock,
+    ) -> Result<Self, String> {
+        let pre = levels::prepare_level_program(
+            &program,
+            WlfmFamily::B3,
+            rounds,
+            (LevelStop::DEFAULT, 1),
+            last,
+        )?;
+        clock.mark("leaf-prebuild-done");
+        Ok(Self { program, pre })
+    }
+
+    fn prove<T>(
+        self,
+        leaf: usize,
+        clock: Clock,
+        prove: impl FnOnce(&Level) -> Result<T, String>,
+    ) -> Result<T, String> {
+        levels::with_range_leaf_memory(leaf, || {
+            let build = levels::commit_level_staged(self.pre, 1, clock)?;
+            clock.mark("leaf-build-done");
+            prove(&Level {
+                program: self.program,
+                build,
+            })
+        })
+    }
+}
+
+pub(crate) fn prebuild_leaf(
+    plan: &WhirBlockPlan,
+    leaf: usize,
+    closed: bool,
     clock: Clock,
-    prove: impl FnOnce(&Level) -> Result<T, String>,
-) -> Result<T, String> {
-    let pre = levels::prepare_level_program(
-        &program,
-        WlfmFamily::B3,
-        rounds,
-        (LevelStop::DEFAULT, 1),
-        last,
-    )?;
-    clock.mark("leaf-prebuild-done");
-    levels::with_range_leaf_memory(leaf, || {
-        let build = levels::commit_level_staged(pre, 1, clock)?;
-        clock.mark("leaf-build-done");
-        prove(&Level { program, build })
-    })
+) -> Result<LeafPrebuild, String> {
+    let program = if closed {
+        plan.closed_block_program_staged(clock)?
+    } else {
+        plan.leaf_program_marked_staged(leaf, clock)?.0
+    };
+    LeafPrebuild::new(
+        program,
+        level_rounds(plan),
+        LastLevel::pinned(WlfmFamily::B3),
+        clock,
+    )
 }
 
 #[cfg(all(test, feature = "test-security"))]
@@ -315,39 +353,41 @@ pub(crate) fn prove_leaf_staged(
     arena: &[Vec<super::LfmWord>],
     clock: Clock,
 ) -> Result<(WlfmChild, WlfmProof), String> {
-    let (program, _) = plan.leaf_program_marked_staged(leaf, clock)?;
-    prove_leaf_program(plan, leaf, program, arena, clock)
+    let pre = prebuild_leaf(plan, leaf, false, clock)?;
+    prove_prebuilt_leaf(plan, leaf, pre, arena, clock)
 }
 
-fn prove_leaf_program(
+pub(crate) fn prove_prebuilt_leaf(
     plan: &WhirBlockPlan,
     leaf: usize,
-    program: LfmProgram,
+    pre: LeafPrebuild,
     arena: &[Vec<super::LfmWord>],
     clock: Clock,
 ) -> Result<(WlfmChild, WlfmProof), String> {
-    with_proving_leaf(
-        leaf,
-        program,
-        level_rounds(plan),
-        LastLevel::pinned(WlfmFamily::B3),
-        clock,
-        |level| {
-            Ok((
-                leaf_child(plan, &level.build),
-                prove_level_staged(level, arena, clock, "leaf")?,
-            ))
-        },
-    )
+    prove_leaf_with_artifacts(plan, leaf, pre, arena, clock, |_| Ok(()))
+}
+
+pub(crate) fn prove_leaf_with_artifacts(
+    plan: &WhirBlockPlan,
+    leaf: usize,
+    pre: LeafPrebuild,
+    arena: &[Vec<super::LfmWord>],
+    clock: Clock,
+    built: impl FnOnce(&WlfmChild) -> Result<(), String>,
+) -> Result<(WlfmChild, WlfmProof), String> {
+    pre.prove(leaf, clock, |level| {
+        let child = leaf_child(plan, &level.build);
+        built(&child)?;
+        Ok((child, prove_level_staged(level, arena, clock, "leaf")?))
+    })
 }
 
 #[cfg(test)]
-pub(crate) fn prove_weakened_leaf(
+pub(crate) fn prebuild_weakened_leaf(
     plan: &WhirBlockPlan,
     leaf: usize,
-    arena: &[Vec<super::LfmWord>],
     clock: Clock,
-) -> Result<(WlfmChild, WlfmProof), String> {
+) -> Result<LeafPrebuild, String> {
     use super::whir_block::{LeafChecks, leaf_program_with};
     let program = leaf_program_with(
         plan,
@@ -357,7 +397,12 @@ pub(crate) fn prove_weakened_leaf(
             ..LeafChecks::ALL
         },
     )?;
-    prove_leaf_program(plan, leaf, program, arena, clock)
+    LeafPrebuild::new(
+        program,
+        level_rounds(plan),
+        LastLevel::pinned(WlfmFamily::B3),
+        clock,
+    )
 }
 
 #[cfg(all(test, feature = "test-security"))]
@@ -375,27 +420,34 @@ pub(crate) fn prove_single_staged(
     last: LastLevel,
     clock: Clock,
 ) -> Result<WlfmProof, String> {
-    let family = WlfmFamily::B3;
-    let rounds = level_rounds(plan);
-    let (child, proof) = with_proving_leaf(
-        0,
+    let pre = LeafPrebuild::new(
         plan.closed_block_program_staged(clock)?,
-        rounds,
+        level_rounds(plan),
         last,
         clock,
-        |level| {
-            Ok((
-                levels::child_of(plan, level),
-                prove_level_staged(level, arena, clock, "leaf")?,
-            ))
-        },
     )?;
+    prove_prebuilt_single(plan, pre, arena, last, clock)
+}
+
+pub(crate) fn prove_prebuilt_single(
+    plan: &WhirBlockPlan,
+    pre: LeafPrebuild,
+    arena: &[Vec<super::LfmWord>],
+    last: LastLevel,
+    clock: Clock,
+) -> Result<WlfmProof, String> {
+    let (child, proof) = pre.prove(0, clock, |level| {
+        Ok((
+            levels::child_of(plan, level),
+            prove_level_staged(level, arena, clock, "leaf")?,
+        ))
+    })?;
     let arena = wlfm_leg_arena(&child, &proof)?;
     prove_join_program(
         || wlfm_leg_program(&child),
         &[arena],
-        family,
-        rounds,
+        WlfmFamily::B3,
+        level_rounds(plan),
         last,
         clock,
     )
@@ -419,24 +471,53 @@ pub(crate) fn prove_join_staged(
     clock: Clock,
 ) -> Result<WlfmProof, String> {
     let (children, proofs): (Vec<_>, Vec<_>) = leaves.into_iter().unzip();
-    let arenas = children
-        .iter()
-        .zip(&proofs)
-        .map(|(child, proof)| wlfm_leg_arena(child, proof))
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(proofs);
+    let arenas = join_arenas(&children, proofs)?;
+    let level = build_join(&children, layout, rounds, last, clock)?;
+    prove_level_staged(&level, &arenas, clock, "join")
+}
+
+pub(crate) fn build_join(
+    children: &[WlfmChild],
+    layout: &BlockLayout,
+    rounds: Option<u8>,
+    last: LastLevel,
+    clock: Clock,
+) -> Result<Level, String> {
     check_leaf_stop(
         LevelStop::DEFAULT,
         children.iter().map(|c| c.artifacts.sizes.len()).sum(),
     )?;
-    prove_join_program(
-        || join_program(&children, layout),
-        &arenas,
+    build_join_program(
+        || join_program(children, layout),
         WlfmFamily::B3,
         rounds,
         last,
         clock,
     )
+}
+
+fn join_arenas(
+    children: &[WlfmChild],
+    proofs: Vec<WlfmProof>,
+) -> Result<Vec<Vec<super::LfmWord>>, String> {
+    if children.len() != proofs.len() {
+        return Err("the join requires one proof for each leaf".into());
+    }
+    children
+        .iter()
+        .zip(&proofs)
+        .map(|(child, proof)| wlfm_leg_arena(child, proof))
+        .collect()
+}
+
+pub(crate) fn prove_built_join(
+    level: Level,
+    children: &[WlfmChild],
+    proofs: Vec<WlfmProof>,
+    clock: Clock,
+) -> Result<WlfmProof, String> {
+    let arenas = join_arenas(children, proofs)?;
+    prove_level_staged(&level, &arenas, clock, "join")
 }
 
 fn prove_join_program(
@@ -447,6 +528,17 @@ fn prove_join_program(
     last: LastLevel,
     clock: Clock,
 ) -> Result<WlfmProof, String> {
+    let level = build_join_program(program, family, rounds, last, clock)?;
+    prove_level_staged(&level, arenas, clock, "join")
+}
+
+fn build_join_program(
+    program: impl FnOnce() -> Result<LfmProgram, String>,
+    family: WlfmFamily,
+    rounds: Option<u8>,
+    last: LastLevel,
+    clock: Clock,
+) -> Result<Level, String> {
     clock.mark("join-compile-start");
     let program = program()?;
     clock.mark("join-compile-end");
@@ -460,7 +552,7 @@ fn prove_join_program(
         last,
     )?;
     clock.mark("join-build-end");
-    prove_level_staged(&level, arenas, clock, "join")
+    Ok(level)
 }
 
 /// Verify a version-2 file at the pinned BLAKE3 format. Version 1 is
