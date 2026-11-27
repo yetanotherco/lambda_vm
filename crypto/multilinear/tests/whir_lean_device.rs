@@ -148,6 +148,8 @@ enum Arm {
     /// (`LAMBDA_VM_WHIR_LEAN_TILES`): tile form a thread or a block a tile, or
     /// checked against the share form on every round.
     Tiles(gpu::LeanTiles),
+    /// Choose the count per stack and compare each tile round with share form.
+    Auto,
 }
 
 /// One arm: the path before the kernels or the two kernels.
@@ -162,13 +164,14 @@ fn prove_arm<H: WhirHash>(
 ) -> (StackedProof<F, Ext>, Vec<[u8; 32]>) {
     let lean = !matches!(arm, Arm::Materialised);
     gpu::force_encode_successor(match arm {
-        Arm::Defaults | Arm::Tiles(_) => None,
+        Arm::Defaults | Arm::Tiles(_) | Arm::Auto => None,
         _ => Some(false),
     });
     // The arms before the tile form force the share form; the defaults force
     // nothing.
     gpu::force_lean_tiles(match arm {
         Arm::Tiles(tiles) => Some(tiles),
+        Arm::Auto => Some(gpu::LeanTiles::Check),
         Arm::Defaults => None,
         _ => Some(gpu::LeanTiles::Off),
     });
@@ -182,6 +185,10 @@ fn prove_arm<H: WhirHash>(
             gpu::force_lean_rounds(Some(6));
             gpu::force_fused_fold(Some(true));
         }
+        Arm::Auto => {
+            gpu::force_auto_lean_rounds();
+            gpu::force_fused_fold(None);
+        }
         Arm::Folded | Arm::Defaults | Arm::Tiles(_) => {
             gpu::force_lean_rounds(None);
             gpu::force_fused_fold(None);
@@ -192,7 +199,7 @@ fn prove_arm<H: WhirHash>(
                     "the default is three lean rounds"
                 );
             }
-            if matches!(arm, Arm::Defaults | Arm::Tiles(_)) {
+            if matches!(arm, Arm::Defaults | Arm::Tiles(_) | Arm::Auto) {
                 assert!(
                     gpu::encode_successor_in_effect(),
                     "the default encodes the first successor"
@@ -247,7 +254,9 @@ fn prove_arm<H: WhirHash>(
     // chain's later folds still fold.
     assert_eq!(
         gpu::encoded_successors() - encoded_before,
-        if matches!(arm, Arm::Defaults | Arm::Tiles(_)) && gpu::encode_successor_in_effect() {
+        if matches!(arm, Arm::Defaults | Arm::Tiles(_) | Arm::Auto)
+            && gpu::encode_successor_in_effect()
+        {
             opens
         } else {
             0
@@ -264,17 +273,17 @@ fn prove_arm<H: WhirHash>(
     let (tables, positions) = gpu::lean_tile_table_checks();
     let tables = (tables - tables_before.0, positions - tables_before.1);
     match arm {
-        Arm::Tiles(tiles) if tiled => {
+        Arm::Tiles(_) | Arm::Auto if tiled => {
             assert_eq!(
                 tile_opens,
                 opens,
                 "{} {arm:?}: every opening in tile form",
                 H::NAME
             );
-            let (rounds, written) = if tiles == gpu::LeanTiles::Check {
-                (opens * gpu::lean_rounds_in_effect() as u64, opens)
-            } else {
-                (0, 0)
+            let (rounds, written) = match arm {
+                Arm::Auto => (opens * 6, opens),
+                Arm::Tiles(gpu::LeanTiles::Check) => (opens * 3, opens),
+                _ => (0, 0),
             };
             assert_eq!(
                 checked,
@@ -363,6 +372,7 @@ fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>, til
         Arm::Tiles(gpu::LeanTiles::On),
         Arm::Tiles(gpu::LeanTiles::Wide),
         Arm::Tiles(gpu::LeanTiles::Check),
+        Arm::Auto,
     ] {
         let (lean, lean_roots) = prove_arm::<H>(c, arm, resident, tiled);
         assert_eq!(today_roots, lean_roots, "{} {arm:?}: roots", H::NAME);
@@ -403,6 +413,11 @@ fn the_memory_kernels_prove_todays_bytes() {
             multilinear::lean_tiles::plan(&raw, 16, 3).is_some(),
             tiled,
             "which stack the tile form takes"
+        );
+        assert_eq!(
+            multilinear::lean_tiles::plan(&raw, 16, 6).is_some(),
+            tiled,
+            "which stack the tile form takes at six"
         );
         both_arms::<RpxWhir>(&c, None, tiled);
         both_arms::<KeccakWhir>(&c, None, tiled);

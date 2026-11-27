@@ -516,12 +516,9 @@ const LEAN_MAX_SHARES: usize = 0xFFFF;
 /// factors at `2^(n − rounds)`, when `LAMBDA_VM_WHIR_LEAN_ROUNDS` does not say
 /// otherwise. Every setting proves the same values.
 ///
-/// 3, not the 6 WBATCH chose at the 2^25 stack as a memory lever: at today's
-/// 2^27 stack each lean round is a pass over the whole stack, and three of them
-/// plus the materialisation cost less than six. ULTRA 129 (D-SPEED §12):
-/// median phase-B openings −2.74 s (t −141), whole −2.54 s, the top proof's
-/// bytes unchanged at 6, 3 and 2, no refusals; the open peak +672 MiB (20.5 of
-/// 25.1 GiB usable). `LAMBDA_VM_WHIR_LEAN_ROUNDS=6` is the way back.
+/// Three bounds the cost of openings in share form, which scan the stack
+/// once per lean round. The stacked prover also accepts `auto`: six when
+/// its tile plan and commit-time overlay allow it, three otherwise.
 pub const LEAN_ROUNDS_DEFAULT: usize = 3;
 
 /// `LAMBDA_VM_WHIR_LEAN_ROUNDS`'s value read: a count, clamped to the widest

@@ -2,13 +2,13 @@
 //! layers.
 //!
 //! The tree is the biggest structure a table's argument holds — its input
-//! layer spans `interactions × rows` fractions — and GKR walks every level of
-//! it. Building it here and leaving it here means the layers are never copied:
+//! layer spans `interactions × rows` fractions — and GKR walks down from its
+//! output. Building it here lets the card prove the levels in place:
 //! a layer's halves are the sumcheck's factors in place, and the round that
 //! binds them is the same kernel the batched statements use.
 //!
-//! Each layer is visited exactly once, top down, so the rounds fold it where
-//! it lies and nothing reads it again.
+//! Each retained layer used by a sumcheck is visited once, top down, so the
+//! rounds can fold it where it lies.
 
 use std::sync::Arc;
 
@@ -40,12 +40,13 @@ fn invalid() -> cudarc::driver::DriverError {
     cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE)
 }
 
-/// The whole tree, `layers[0]` the output fraction and layer `layers.len()`
+/// The fraction tree, `layers[0]` the output fraction and layer `layers.len()`
 /// the input — the order `multilinear::gkr::FractionTree` uses.
 pub struct DeviceFractionTree {
     stream: Arc<CudaStream>,
-    /// Every level above the input layer.
-    layers: Vec<DeviceLayer>,
+    /// Indexed by distance from the output. Odd levels below the input can
+    /// be absent when the caller uses the double ladder.
+    layers: Vec<Option<DeviceLayer>>,
     /// The input layer, when this tree carries it. A tree built from the
     /// factors does not: it is the biggest thing here — as many fractions as
     /// interactions times rows — and it is read exactly twice, to fold the
@@ -139,8 +140,8 @@ impl DeviceFractionTree {
         Self::from_device_top(stream, p, q, None)
     }
 
-    /// [`from_device`](Self::from_device) with the two levels above the input
-    /// already made by its writer ([`input_fold2_from_columns`]).
+    /// [`from_device`](Self::from_device) with the first fold pass already
+    /// run by its writer ([`input_fold2_from_columns`]).
     pub fn from_device_top(
         stream: Arc<CudaStream>,
         p: CudaSlice<u64>,
@@ -153,15 +154,14 @@ impl DeviceFractionTree {
         assert!(elements.is_power_of_two(), "the cube is a power of two");
 
         let be = backend()?;
-        // The levels above the input layer halve, so the whole tree is twice
-        // it — and the input layer is `p` and `q` together.
-        let Some(room) = be.reserve(p.len() as u64 * 8 * 4) else {
+        let bytes = carried_bytes(elements);
+        let Some(room) = be.reserve(bytes) else {
             crate::device::note_device_fallback();
             return Err(cudarc::driver::DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
-        crate::argue_probe::note_device(crate::argue_probe::Surface::Gkr, p.len() as u64 * 8 * 4);
+        crate::argue_probe::note_device(crate::argue_probe::Surface::Gkr, bytes);
         let input = DeviceLayer {
             p: Arc::new(p),
             q: Arc::new(q),
@@ -248,8 +248,8 @@ impl DeviceFractionTree {
         Self::from_truncated_input_top(stream, p, q, real, num_vars, None)
     }
 
-    /// [`from_truncated_input`](Self::from_truncated_input) with the two levels
-    /// above the input already made by its writer ([`input_fold2_from_columns`]).
+    /// [`from_truncated_input`](Self::from_truncated_input) with the first
+    /// fold pass already run by its writer ([`input_fold2_from_columns`]).
     pub fn from_truncated_input_top(
         stream: Arc<CudaStream>,
         p: CudaSlice<u64>,
@@ -290,9 +290,20 @@ impl DeviceFractionTree {
     }
 
     pub fn layer_num_vars(&self, layer: usize) -> usize {
-        self.layers
-            .get(layer)
-            .map_or(self.input_num_vars, |level| level.num_vars)
+        if layer < self.layers.len() {
+            layer
+        } else {
+            self.input_num_vars
+        }
+    }
+
+    fn layer(&self, layer: usize) -> Result<&DeviceLayer> {
+        match self.layers.get(layer) {
+            Some(level) => level.as_ref(),
+            None if layer == self.layers.len() => self.input.as_ref(),
+            None => None,
+        }
+        .ok_or_else(invalid)
     }
 
     /// Whether [`layer_sumcheck`](Self::layer_sumcheck) can still prove the
@@ -312,6 +323,7 @@ impl DeviceFractionTree {
         let top = self
             .layers
             .first()
+            .and_then(Option::as_ref)
             .or(self.input.as_ref())
             .expect("a tree has a top");
         let p = crate::readback::clone_dtoh(&self.stream, &top.p.slice(0..3))?;
@@ -328,9 +340,11 @@ impl DeviceFractionTree {
     /// input layer is never one of them — it is the biggest thing here, and a
     /// tree that dropped it has nothing to hand over.
     pub fn layer_to_host(&self, layer: usize) -> Result<(Vec<u64>, Vec<u64>)> {
-        let level = self.layers.get(layer).ok_or(cudarc::driver::DriverError(
-            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
-        ))?;
+        let level = self
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or_else(invalid)?;
         let p = crate::readback::clone_dtoh(&self.stream, &level.p.slice(0..level.p.len()))?;
         let q = crate::readback::clone_dtoh(&self.stream, &level.q.slice(0..level.q.len()))?;
         self.stream.synchronize()?;
@@ -353,13 +367,7 @@ impl DeviceFractionTree {
         num_slots: usize,
         root_slot: u32,
     ) -> Result<SumcheckSession> {
-        let level = match self.layers.get(layer) {
-            Some(level) => level,
-            // The input layer, which this tree only has if it kept it.
-            None => self.input.as_ref().ok_or(cudarc::driver::DriverError(
-                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
-            ))?,
-        };
+        let level = self.layer(layer)?;
         // This session reads every cell of the halves: a layer kept without
         // its padding is the Gruen rounds' alone.
         if !level.whole() {
@@ -430,10 +438,52 @@ pub mod two_level_folds {
     }
 }
 
-/// Every level above an input layer of `full` fractions, of which the first
-/// `real` are stored — the rest are the padding's `0/1` and the first fold
-/// reads them as that. Returned with the output first, the way the tree
-/// indexes them.
+std::thread_local! {
+    static SKIP_MIDDLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Builds trees for a double ladder inside `f`. The scope covers both
+/// reservations and launches and is restored on unwind.
+pub fn with_skip_middle<R>(skip: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SKIP_MIDDLE.set(self.0);
+        }
+    }
+    let _restore = Restore(SKIP_MIDDLE.replace(skip && two_level_folds::enabled()));
+    f()
+}
+
+fn skip_middle() -> bool {
+    SKIP_MIDDLE.get()
+}
+
+/// Allocates both output halves of a level. The caller must launch a kernel
+/// that writes every element before handing them to a reader.
+unsafe fn alloc_halves(stream: &Arc<CudaStream>, cells: usize) -> Result<Halves> {
+    unsafe {
+        Ok((
+            crate::device::alloc_or_trim::<u64>(stream, cells * 3)?,
+            crate::device::alloc_or_trim::<u64>(stream, cells * 3)?,
+        ))
+    }
+}
+
+impl DeviceLayer {
+    fn from_halves((p, q): Halves, num_vars: usize) -> Self {
+        Self {
+            p: Arc::new(p),
+            q: Arc::new(q),
+            num_vars,
+            real: 1usize << num_vars,
+        }
+    }
+}
+
+/// The levels above an input of `full` fractions, with padding read as
+/// `0/1`. The double ladder reads even levels, and reads the input however
+/// high it is. An odd input thus folds once before the two-level passes.
 fn fold_upwards(
     stream: &Arc<CudaStream>,
     be: &crate::device::Backend,
@@ -442,122 +492,101 @@ fn fold_upwards(
     real: usize,
     full: usize,
     top: Option<TopLevels>,
-) -> Result<Vec<DeviceLayer>> {
-    let mut layers: Vec<DeviceLayer> = Vec::new();
+) -> Result<Vec<Option<DeviceLayer>>> {
     let mut num_vars = full.trailing_zeros() as usize;
-    // The two levels the input pass already made ([`input_fold2_from_columns`]).
+    let mut layers: Vec<Option<DeviceLayer>> = (0..num_vars).map(|_| None).collect();
+    let mut below = (p.clone(), q.clone());
     if let Some(top) = top {
-        if num_vars < 2 {
-            return Err(invalid());
+        let input_vars = num_vars;
+        num_vars = num_vars.checked_sub(top.folds).ok_or_else(invalid)?;
+        if let Some(mid) = top.mid {
+            layers[input_vars - 1] = Some(DeviceLayer::from_halves(mid, input_vars - 1));
         }
-        let half = full / 2;
-        layers.push(DeviceLayer {
-            p: Arc::new(top.p_mid),
-            q: Arc::new(top.q_mid),
-            num_vars: num_vars - 1,
-            real: half,
-        });
-        layers.push(DeviceLayer {
-            p: Arc::new(top.p_out),
-            q: Arc::new(top.q_out),
-            num_vars: num_vars - 2,
-            real: half / 2,
-        });
-        num_vars -= 2;
+        let out = DeviceLayer::from_halves(top.out, num_vars);
+        below = (out.p.clone(), out.q.clone());
+        layers[num_vars] = Some(out);
     }
     let two_levels = two_level_folds::enabled();
+    let skip = skip_middle();
+    let input_vars = full.trailing_zeros() as usize;
     while num_vars > 0 {
-        let half = (1usize << num_vars) / 2;
-        let padded = layers.is_empty() && real != full;
-        // Two levels at once when two are left above and the level below is
-        // stored whole ([`two_level_folds`]).
-        if two_levels && num_vars >= 2 && !padded {
-            let quarter = half / 2;
-            // SAFETY: the kernel writes every element of both levels it produces.
-            let mut p_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
-            let mut q_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
-            let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
-            let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
-            let (below_p, below_q) = match layers.last() {
-                Some(level) => (level.p.clone(), level.q.clone()),
-                None => (p.clone(), q.clone()),
+        let half = 1usize << (num_vars - 1);
+        let padded = num_vars == input_vars && real != full;
+        let pair = two_levels
+            && num_vars >= 2
+            && if skip {
+                num_vars.is_multiple_of(2)
+            } else {
+                !padded
             };
-            let half_arg = half as u64;
+        let output_vars = num_vars - if pair { 2 } else { 1 };
+        // SAFETY: every element of each allocated level is written below.
+        let (mut p_out, mut q_out) = unsafe { alloc_halves(stream, 1 << output_vars) }?;
+        let half_arg = half as u64;
+        if pair {
+            let mut mid = if skip {
+                None
+            } else {
+                Some(unsafe { alloc_halves(stream, half) }?)
+            };
+            let null = 0u64;
+            let real_arg = if padded { real as u64 } else { 0 };
             let fault = two_level_folds::fault();
             unsafe {
-                stream
-                    .launch_builder(&be.fraction_fold2_ext3)
-                    .arg(below_p.as_ref())
-                    .arg(below_q.as_ref())
-                    .arg(&half_arg)
-                    .arg(&mut p_mid)
-                    .arg(&mut q_mid)
+                let mut launch = stream.launch_builder(&be.fraction_fold2_ext3);
+                launch
+                    .arg(below.0.as_ref())
+                    .arg(below.1.as_ref())
+                    .arg(&half_arg);
+                match &mut mid {
+                    Some((p_mid, q_mid)) => launch.arg(p_mid).arg(q_mid),
+                    None => launch.arg(&null).arg(&null),
+                };
+                launch
                     .arg(&mut p_out)
                     .arg(&mut q_out)
                     .arg(&fault)
+                    .arg(&real_arg)
                     .launch(LaunchConfig {
-                        // 256 threads a block: the kernel takes 72 registers a
-                        // thread, past what a block of 1024 may hold.
-                        grid_dim: ((quarter as u64).div_ceil(256) as u32, 1, 1),
+                        // The kernel's register count limits the block size.
+                        grid_dim: ((half as u64 / 2).div_ceil(256) as u32, 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
             }
-            layers.push(DeviceLayer {
-                p: Arc::new(p_mid),
-                q: Arc::new(q_mid),
-                num_vars: num_vars - 1,
-                real: half,
-            });
-            layers.push(DeviceLayer {
-                p: Arc::new(p_out),
-                q: Arc::new(q_out),
-                num_vars: num_vars - 2,
-                real: quarter,
-            });
-            num_vars -= 2;
-            continue;
-        }
-        // SAFETY: the kernel writes every element of the level it produces.
-        let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
-        let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
-        let (below_p, below_q) = match layers.last() {
-            Some(level) => (level.p.clone(), level.q.clone()),
-            None => (p.clone(), q.clone()),
-        };
-        let half_arg = half as u64;
-        unsafe {
-            if padded {
-                let real_arg = real as u64;
-                stream
-                    .launch_builder(&be.fraction_fold_padded_ext3)
-                    .arg(below_p.as_ref())
-                    .arg(below_q.as_ref())
-                    .arg(&half_arg)
-                    .arg(&real_arg)
-                    .arg(&mut p_out)
-                    .arg(&mut q_out)
-                    .launch(LaunchConfig::for_num_elems(half as u32))?;
-            } else {
-                stream
-                    .launch_builder(&be.fraction_fold_ext3)
-                    .arg(below_p.as_ref())
-                    .arg(below_q.as_ref())
-                    .arg(&half_arg)
-                    .arg(&mut p_out)
-                    .arg(&mut q_out)
-                    .launch(LaunchConfig::for_num_elems(half as u32))?;
+            if let Some(mid) = mid {
+                layers[num_vars - 1] = Some(DeviceLayer::from_halves(mid, num_vars - 1));
+            }
+        } else {
+            unsafe {
+                if padded {
+                    let real_arg = real as u64;
+                    stream
+                        .launch_builder(&be.fraction_fold_padded_ext3)
+                        .arg(below.0.as_ref())
+                        .arg(below.1.as_ref())
+                        .arg(&half_arg)
+                        .arg(&real_arg)
+                        .arg(&mut p_out)
+                        .arg(&mut q_out)
+                        .launch(LaunchConfig::for_num_elems(half as u32))?;
+                } else {
+                    stream
+                        .launch_builder(&be.fraction_fold_ext3)
+                        .arg(below.0.as_ref())
+                        .arg(below.1.as_ref())
+                        .arg(&half_arg)
+                        .arg(&mut p_out)
+                        .arg(&mut q_out)
+                        .launch(LaunchConfig::for_num_elems(half as u32))?;
+                }
             }
         }
-        num_vars -= 1;
-        layers.push(DeviceLayer {
-            p: Arc::new(p_out),
-            q: Arc::new(q_out),
-            num_vars,
-            real: half,
-        });
+        num_vars = output_vars;
+        let out = DeviceLayer::from_halves((p_out, q_out), num_vars);
+        below = (out.p.clone(), out.q.clone());
+        layers[num_vars] = Some(out);
     }
-    layers.reverse();
     Ok(layers)
 }
 
@@ -605,22 +634,50 @@ pub fn sumcheck_over_layer(
     )
 }
 
+/// Cells of each side above the input in a double ladder's tree: the
+/// geometric sum of powers of four, including the root for a nonempty sum.
+fn even_layers(full: usize) -> usize {
+    let odd = full.trailing_zeros() % 2 == 1;
+    let even = full >> u32::from(odd);
+    even / 3 + if odd { even } else { 0 }
+}
+
+/// Whole input plus the retained levels. Dense trees keep their original
+/// reservation, rounded up by one fraction.
+pub fn carried_bytes(full: usize) -> u64 {
+    let above = if skip_middle() {
+        even_layers(full)
+    } else {
+        full
+    };
+    (full + above) as u64 * 48
+}
+
 /// What a tree built by [`DeviceFractionTree::from_padded_input`] holds at
-/// once: the truncated input layer plus the level above it while the first
-/// fold runs, against every level once the input is gone — and, later, the
+/// once: the truncated input layer plus the first pass's outputs while it
+/// runs, against the retained levels once the input is gone — and, later, the
 /// full input layer handed back for its own sumcheck, by which time the levels
 /// are spent.
 pub fn padded_peak_bytes(real: usize, full: usize) -> u64 {
-    ((2 * real + full).max(2 * full)) as u64 * 24
+    let first = if skip_middle() && full.trailing_zeros().is_multiple_of(2) {
+        full / 4
+    } else {
+        full / 2
+    };
+    (real + first).max(full) as u64 * 48
 }
 
 /// What a tree built by [`DeviceFractionTree::from_truncated_input`] holds at
-/// once: the truncated input layer, kept, and every level above it (`full − 1`
-/// cells of each side) — against `4·full` cells for a tree that carries its
-/// padding. Also covers the whole layer written again for today's session
-/// once the tree is gone.
+/// once: the truncated input layer and the retained levels above it. Also
+/// covers the whole input layer if a session needs it written again after
+/// the tree is gone.
 pub fn truncated_peak_bytes(real: usize, full: usize) -> u64 {
-    (2 * real + 2 * full) as u64 * 24
+    let above = if skip_middle() {
+        even_layers(full)
+    } else {
+        full
+    };
+    (real + above).max(full) as u64 * 48
 }
 
 /// The run of an upper half's cells a layer kept without its padding still
@@ -1030,12 +1087,7 @@ impl DeviceFractionTree {
     /// Layer `layer`'s Gruen rounds ([`GruenLayer`]), at most `low` variables
     /// left to the host.
     pub fn layer_gruen(&self, layer: usize, point: &[u64], low: usize) -> Result<GruenLayer> {
-        let level = match self.layers.get(layer) {
-            Some(level) => level,
-            None => self.input.as_ref().ok_or(cudarc::driver::DriverError(
-                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
-            ))?,
-        };
+        let level = self.layer(layer)?;
         GruenLayer::new(
             &self.stream,
             &level.p,
@@ -1449,12 +1501,7 @@ impl DeviceFractionTree {
     /// The two-layer step over layer `layer`'s quarters ([`Gruen2Layer`]), at most `low`
     /// variables left to the host.
     pub fn layer_gruen2(&self, layer: usize, point: &[u64], low: usize) -> Result<Gruen2Layer> {
-        let level = match self.layers.get(layer) {
-            Some(level) => level,
-            None => self.input.as_ref().ok_or(cudarc::driver::DriverError(
-                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
-            ))?,
-        };
+        let level = self.layer(layer)?;
         Gruen2Layer::new(
             &self.stream,
             &level.p,
@@ -1579,10 +1626,9 @@ pub fn input_from_columns(
 
 /// The two tree levels above an input layer, made by the pass that wrote it.
 pub struct TopLevels {
-    p_mid: CudaSlice<u64>,
-    q_mid: CudaSlice<u64>,
-    p_out: CudaSlice<u64>,
-    q_out: CudaSlice<u64>,
+    mid: Option<Halves>,
+    out: Halves,
+    folds: usize,
 }
 
 /// Whether the input layer's writer also makes the two tree levels above it,
@@ -1635,11 +1681,10 @@ pub mod fused_input {
     }
 }
 
-/// [`input_from_columns`] and the two tree levels above the layer in one pass
-/// (`gkr_input_fold2_from_columns`): the same input cells, written the same
-/// way (`padding` writes the padding's `0/1` too), and the levels
-/// `fold_upwards` would make first. `None`-free: a cube of fewer than four
-/// cells is refused (the caller writes the layer alone then).
+/// [`input_from_columns`] and the first tree fold pass in one launch.
+/// `padding` writes its `0/1` input cells too. A compact tree writes only
+/// the first even level above its input. A cube of fewer than four cells
+/// is refused so the caller can write the input alone.
 pub fn input_fold2_from_columns(
     stream: &Arc<CudaStream>,
     columns: &cudarc::driver::CudaView<'_, u64>,
@@ -1657,22 +1702,27 @@ pub fn input_fold2_from_columns(
     let stored_slots = if padding { slots } else { interactions };
     let stored = stored_slots * rows;
     let (half, quarter) = (cube / 2, cube / 4);
-    // SAFETY: the kernel writes every stored input cell and every cell of both
-    // levels.
-    let mut p = unsafe { crate::device::alloc_or_trim::<u64>(stream, stored * 3) }?;
-    let mut q = unsafe { crate::device::alloc_or_trim::<u64>(stream, stored * 3) }?;
-    let mut p_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
-    let mut q_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
-    let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
-    let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
+    let skip = skip_middle();
+    let single = u32::from(skip && !cube.trailing_zeros().is_multiple_of(2));
+    let folds = if single == 1 { 1 } else { 2 };
+    // SAFETY: the kernel writes every stored input cell and every cell of
+    // the allocated levels.
+    let (mut p, mut q) = unsafe { alloc_halves(stream, stored) }?;
+    let mut mid = if skip {
+        None
+    } else {
+        Some(unsafe { alloc_halves(stream, half) }?)
+    };
+    let (mut p_out, mut q_out) = unsafe { alloc_halves(stream, cube >> folds) }?;
+    let null = 0u64;
     let rows_arg = rows as u64;
     let interactions_arg = interactions as u64;
     let stored_arg = stored_slots as u64;
     let cube_arg = cube as u64;
     let fault = fused_input::fault();
     unsafe {
-        stream
-            .launch_builder(&be.gkr_input_fold2_from_columns)
+        let mut launch = stream.launch_builder(&be.gkr_input_fold2_from_columns);
+        launch
             .arg(columns)
             .arg(&rows_arg)
             .arg(&plan.side_start)
@@ -1683,12 +1733,16 @@ pub fn input_fold2_from_columns(
             .arg(&stored_arg)
             .arg(&cube_arg)
             .arg(&mut p)
-            .arg(&mut q)
-            .arg(&mut p_mid)
-            .arg(&mut q_mid)
+            .arg(&mut q);
+        match &mut mid {
+            Some((p_mid, q_mid)) => launch.arg(p_mid).arg(q_mid),
+            None => launch.arg(&null).arg(&null),
+        };
+        launch
             .arg(&mut p_out)
             .arg(&mut q_out)
             .arg(&fault)
+            .arg(&single)
             .launch(LaunchConfig {
                 grid_dim: ((quarter as u64).div_ceil(256).clamp(1, 8192) as u32, 1, 1),
                 block_dim: (256, 1, 1),
@@ -1698,10 +1752,9 @@ pub fn input_fold2_from_columns(
     Ok((
         (p, q),
         TopLevels {
-            p_mid,
-            q_mid,
-            p_out,
-            q_out,
+            mid,
+            out: (p_out, q_out),
+            folds,
         },
     ))
 }

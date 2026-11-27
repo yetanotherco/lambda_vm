@@ -1710,20 +1710,22 @@ where
         if faults.only_bin.is_some_and(|only| only != b) {
             continue;
         }
-        prove_ladder_bin(
-            tables,
-            class,
-            plan,
-            lists,
-            fake_output,
-            faults,
-            ladder,
-            at,
-            transcript,
-            split,
-            b,
-            &mut state,
-        )?;
+        multilinear::gpu::with_gkr_tree_layout(ladder, || {
+            prove_ladder_bin(
+                tables,
+                class,
+                plan,
+                lists,
+                fake_output,
+                faults,
+                ladder,
+                at,
+                transcript,
+                split,
+                b,
+                &mut state,
+            )
+        })?;
     }
     if faults.ladders_only {
         drop(state);
@@ -3260,20 +3262,22 @@ where
         }
         let lists = chunked(&self.plan, &self.interactions);
         let mut split = ArgueSplit::default();
-        prove_ladder_bin(
-            tables,
-            &self.members,
-            &self.plan,
-            &lists,
-            self.fake_output.as_ref(),
-            &self.faults,
-            self.ladder,
-            at,
-            transcript,
-            &mut split,
-            self.next,
-            &mut self.state,
-        )?;
+        multilinear::gpu::with_gkr_tree_layout(self.ladder, || {
+            prove_ladder_bin(
+                tables,
+                &self.members,
+                &self.plan,
+                &lists,
+                self.fake_output.as_ref(),
+                &self.faults,
+                self.ladder,
+                at,
+                transcript,
+                &mut split,
+                self.next,
+                &mut self.state,
+            )
+        })?;
         self.next += 1;
         Ok(())
     }

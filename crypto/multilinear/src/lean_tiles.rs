@@ -19,7 +19,7 @@
 //! This module is the host's part: which `u`, which classes, the tables, and
 //! whether the form fits. It reads no device and is built without one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
@@ -125,6 +125,25 @@ pub fn plan(
     let mut order: Vec<usize> = (0..shares.len()).collect();
     order.sort_by_key(|i| shares[*i].0);
 
+    // Reject shapes before building any tables. In auto mode a stack that
+    // fails the six-round fit is planned again for three.
+    let mut classes = BTreeSet::new();
+    for (offset, point, _) in shares {
+        let num_vars = point.len() / 3;
+        if !point.len().is_multiple_of(3)
+            || num_vars > n_stack
+            || offset & ((1usize << num_vars) - 1) != 0
+        {
+            return None;
+        }
+        classes.insert(&point[(num_vars - tile_bits) * 3..]);
+    }
+    let classes = classes.len();
+    let slots = classes.min(1usize.checked_shl(lean_rounds as u32)?);
+    if !fits(n_stack, tile_bits, lean_rounds, slots) {
+        return None;
+    }
+
     let mut eq: Vec<u64> = Vec::new();
     let mut table = |coordinates: &[u64]| -> usize {
         let point: Vec<FieldElement<Ext3>> = coordinates
@@ -145,13 +164,7 @@ pub fn plan(
     let mut planned = Vec::with_capacity(shares.len());
     for &i in &order {
         let (offset, point, scale) = &shares[i];
-        if !point.len().is_multiple_of(3) {
-            return None;
-        }
         let num_vars = point.len() / 3;
-        if num_vars > n_stack || offset & ((1usize << num_vars) - 1) != 0 {
-            return None;
-        }
         let (head, tail) = point.split_at((num_vars - tile_bits) * 3);
         let hi_at = match heads.get(head) {
             Some(at) => *at,
@@ -176,11 +189,6 @@ pub fn plan(
             lo_at,
             scale: *scale,
         });
-    }
-    let classes = tails.len();
-    let slots = classes.min(1usize.checked_shl(lean_rounds as u32)?);
-    if !fits(n_stack, tile_bits, lean_rounds, slots) {
-        return None;
     }
     Some(TilePlan {
         tile_bits,

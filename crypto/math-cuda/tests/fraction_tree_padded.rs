@@ -88,3 +88,111 @@ fn a_tree_that_drops_its_padding_is_the_same_tree() {
         assert!(!dropped.holds_input(), "the second one gives it back");
     }
 }
+
+/// Both input height parities, with the input carried whole, carried without
+/// padding, or discarded. Compare all the levels read by the double ladder.
+#[test]
+fn the_double_ladder_tree_keeps_exactly_the_levels_it_reads() {
+    use math_cuda::gkr::{self, InputPlan};
+
+    let be = backend().expect("a CUDA device");
+    for (interactions, rows) in [(1usize, 1usize), (1, 2), (1, 4), (3, 32), (5, 32)] {
+        let full = interactions.next_power_of_two() * rows;
+        let real = interactions * rows;
+        let height = full.trailing_zeros() as usize;
+        let (p, q) = padded(real, full, 0x1234 + interactions as u64);
+        let dense = DeviceFractionTree::build(&p, &q).expect("dense tree");
+        let stream = be.next_stream();
+        gkr::with_skip_middle(true, || {
+            let sparse = DeviceFractionTree::build(&p, &q).expect("compact tree");
+            assert_kept_levels(&dense, &sparse, height);
+            if full >= 2 {
+                let sparse = DeviceFractionTree::from_truncated_input(
+                    stream.clone(),
+                    upload(&stream, &p[..real * 3]),
+                    upload(&stream, &q[..real * 3]),
+                    real,
+                    height,
+                )
+                .expect("compact truncated tree");
+                assert!(sparse.holds_input());
+                assert_kept_levels(&dense, &sparse, height);
+
+                let sparse = DeviceFractionTree::from_padded_input(
+                    stream.clone(),
+                    upload(&stream, &p[..real * 3]),
+                    upload(&stream, &q[..real * 3]),
+                    real,
+                    height,
+                )
+                .expect("compact tree that hands the input back");
+                assert!(!sparse.holds_input());
+                assert_kept_levels(&dense, &sparse, height);
+            }
+        });
+
+        if full >= 4 {
+            // A shifted column term per side and distinct constants.
+            let sides = 2 * interactions;
+            let columns = upload(&stream, &layer(rows, 97)[..rows]);
+            let starts: Vec<u32> = (0..=sides as u32).collect();
+            let terms: Vec<u64> = (0..sides).flat_map(|i| [0, (i % rows) as u64]).collect();
+            let plan = InputPlan::upload(
+                &stream,
+                &starts,
+                &terms,
+                &layer(sides, 11),
+                &layer(sides, 19),
+            )
+            .expect("column input plan");
+            let (p, q) = gkr::input_from_columns(&stream, &columns.slice(..), rows, &plan, true)
+                .expect("separate input pass");
+            let dense = DeviceFractionTree::from_device(stream.clone(), p, q).expect("dense tree");
+            gkr::with_skip_middle(true, || {
+                for padding in [false, true] {
+                    let ((p, q), top) = gkr::input_fold2_from_columns(
+                        &stream,
+                        &columns.slice(..),
+                        rows,
+                        &plan,
+                        padding,
+                    )
+                    .expect("fused input pass");
+                    let sparse = if padding {
+                        DeviceFractionTree::from_device_top(stream.clone(), p, q, Some(top))
+                    } else {
+                        DeviceFractionTree::from_truncated_input_top(
+                            stream.clone(),
+                            p,
+                            q,
+                            real,
+                            height,
+                            Some(top),
+                        )
+                    }
+                    .expect("compact tree from the fused input pass");
+                    assert_kept_levels(&dense, &sparse, height);
+                }
+            });
+        }
+    }
+}
+
+fn assert_kept_levels(dense: &DeviceFractionTree, sparse: &DeviceFractionTree, height: usize) {
+    assert_eq!(dense.num_layers(), sparse.num_layers());
+    assert_eq!(dense.output().unwrap(), sparse.output().unwrap());
+    for level in 0..height {
+        assert_eq!(sparse.layer_num_vars(level), level);
+        if level % 2 == 0 {
+            assert_eq!(
+                dense.layer_to_host(level).unwrap(),
+                sparse.layer_to_host(level).unwrap()
+            );
+        } else {
+            assert!(
+                sparse.layer_to_host(level).is_err(),
+                "stored odd level {level}"
+            );
+        }
+    }
+}

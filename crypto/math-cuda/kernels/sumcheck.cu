@@ -611,48 +611,41 @@ __device__ __forceinline__ void fraction_pair(const Fe3 &p_lo, const Fe3 &p_hi, 
     q_up = ext3::mul(q_lo, q_hi);
 }
 
-extern "C" __global__ __launch_bounds__(256) void fraction_fold2_ext3(const uint64_t *__restrict__ p,
-                                               const uint64_t *__restrict__ q, uint64_t half,
-                                               uint64_t *__restrict__ p_mid,
-                                               uint64_t *__restrict__ q_mid,
-                                               uint64_t *__restrict__ p_out,
-                                               uint64_t *__restrict__ q_out, uint32_t fault) {
+__device__ __forceinline__ void store_ext(uint64_t *at, const Fe3 &v) {
+    at[0] = v.a;
+    at[1] = v.b;
+    at[2] = v.c;
+}
+
+extern "C" __global__ __launch_bounds__(256) void fraction_fold2_ext3(
+    const uint64_t *__restrict__ p, const uint64_t *__restrict__ q, uint64_t half,
+    uint64_t *__restrict__ p_mid, uint64_t *__restrict__ q_mid,
+    uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault, uint64_t real) {
     uint64_t quarter = half / 2;
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= quarter) return;
+    uint64_t hi = i + half;
+    uint64_t hi_b = hi + quarter;
+    bool live_a = !real || hi < real;
+    bool live_b = !real || hi_b < real;
     Fe3 pa, qa, pb, qb;
-    fraction_pair(load_ext(p + i * 3), load_ext(p + (i + half) * 3), load_ext(q + i * 3),
-                  load_ext(q + (i + half) * 3), pa, qa);
-    fraction_pair(load_ext(p + (i + quarter) * 3), load_ext(p + (i + quarter + half) * 3),
-                  load_ext(q + (i + quarter) * 3), load_ext(q + (i + quarter + half) * 3), pb, qb);
-    uint64_t *at = p_mid + i * 3;
-    at[0] = pa.a;
-    at[1] = pa.b;
-    at[2] = pa.c;
-    at = q_mid + i * 3;
-    at[0] = qa.a;
-    at[1] = qa.b;
-    at[2] = qa.c;
-    at = p_mid + (i + quarter) * 3;
-    at[0] = pb.a;
-    at[1] = pb.b;
-    at[2] = pb.c;
-    at = q_mid + (i + quarter) * 3;
-    at[0] = qb.a;
-    at[1] = qb.b;
-    at[2] = qb.c;
+    fraction_pair(load_ext(p + i * 3), live_a ? load_ext(p + hi * 3) : ext3::zero(),
+                  load_ext(q + i * 3), live_a ? load_ext(q + hi * 3) : ext3::one(), pa, qa);
+    fraction_pair(load_ext(p + (i + quarter) * 3), live_b ? load_ext(p + hi_b * 3) : ext3::zero(),
+                  load_ext(q + (i + quarter) * 3), live_b ? load_ext(q + hi_b * 3) : ext3::one(),
+                  pb, qb);
+    if (p_mid) {
+        store_ext(p_mid + i * 3, pa);
+        store_ext(q_mid + i * 3, qa);
+        store_ext(p_mid + (i + quarter) * 3, pb);
+        store_ext(q_mid + (i + quarter) * 3, qb);
+    }
     Fe3 pu, qu;
     fraction_pair(pa, pb, qa, qb, pu, qu);
     // ⛔ A negative control's fault only: the upper cell off by one.
     if (fault) pu = ext3::add(pu, ext3::one());
-    at = p_out + i * 3;
-    at[0] = pu.a;
-    at[1] = pu.b;
-    at[2] = pu.c;
-    at = q_out + i * 3;
-    at[0] = qu.a;
-    at[1] = qu.b;
-    at[2] = qu.c;
+    store_ext(p_out + i * 3, pu);
+    store_ext(q_out + i * 3, qu);
 }
 
 // The same, for a layer whose upper half runs out: the interactions are padded
@@ -1962,12 +1955,6 @@ __device__ __forceinline__ void gkr_input_cell(
     q_cell = side[1];
 }
 
-__device__ __forceinline__ void store_ext(uint64_t *at, const Fe3 &v) {
-    at[0] = v.a;
-    at[1] = v.b;
-    at[2] = v.c;
-}
-
 // The input layer and the two tree levels above it in one pass: thread `i` of `quarter = cube/4`
 // makes the four input cells `i`, `i + quarter`, `i + 2·quarter`, `i + 3·quarter` (the four that fold
 // together; cell `s·rows + r` is slot `s` at row `r`), writes those of the first `stored_slots`
@@ -1981,7 +1968,7 @@ extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
     const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,
     uint64_t interactions, uint64_t stored_slots, uint64_t cube, uint64_t *__restrict__ p,
     uint64_t *__restrict__ q, uint64_t *__restrict__ p_mid, uint64_t *__restrict__ q_mid,
-    uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault) {
+    uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault, uint32_t single) {
     uint64_t quarter = cube / 4;
     uint64_t stored = stored_slots * rows;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < quarter;
@@ -2002,10 +1989,23 @@ extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
         Fe3 pa, qa, pb, qb;
         fraction_pair(pc[0], pc[2], qc[0], qc[2], pa, qa);
         fraction_pair(pc[1], pc[3], qc[1], qc[3], pb, qb);
-        store_ext(p_mid + i * 3, pa);
-        store_ext(q_mid + i * 3, qa);
-        store_ext(p_mid + (i + quarter) * 3, pb);
-        store_ext(q_mid + (i + quarter) * 3, qb);
+        if (single) {
+            if (fault) {
+                pa = ext3::add(pa, ext3::one());
+                pb = ext3::add(pb, ext3::one());
+            }
+            store_ext(p_out + i * 3, pa);
+            store_ext(q_out + i * 3, qa);
+            store_ext(p_out + (i + quarter) * 3, pb);
+            store_ext(q_out + (i + quarter) * 3, qb);
+            continue;
+        }
+        if (p_mid) {
+            store_ext(p_mid + i * 3, pa);
+            store_ext(q_mid + i * 3, qa);
+            store_ext(p_mid + (i + quarter) * 3, pb);
+            store_ext(q_mid + (i + quarter) * 3, qb);
+        }
         Fe3 pu, qu;
         fraction_pair(pa, pb, qa, qb, pu, qu);
         // ⛔ A negative control's fault only: the upper cell off by one.

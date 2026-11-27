@@ -1971,10 +1971,32 @@ pub fn bin_hand_back_forced() -> bool {
 }
 
 /// The bytes a tree over `cells` input cells promises when it carries its
-/// input layer: the layer and every level above it, both sides, the levels
-/// summing to the layer again (`4·cells` extension elements of 24 bytes).
+/// input: both sides of the input and each retained level.
 pub fn carry_bytes(cells: usize) -> u64 {
-    (4 * cells) as u64 * 24
+    #[cfg(feature = "cuda")]
+    return math_cuda::gkr::carried_bytes(cells);
+    #[cfg(not(feature = "cuda"))]
+    return (4 * cells) as u64 * 24;
+}
+
+/// Applies the compact tree layout to the current bin's builds when its
+/// ladder skips the odd levels below the input and
+/// `LAMBDA_VM_GKR_TREE_SKIP_MIDDLE=1` is set.
+pub fn with_gkr_tree_layout<R>(ladder: crate::gkr_lockstep::GkrLadder, f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "cuda")]
+    {
+        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let skip = ladder == crate::gkr_lockstep::GkrLadder::Double
+            && *SKIP.get_or_init(|| {
+                std::env::var("LAMBDA_VM_GKR_TREE_SKIP_MIDDLE").is_ok_and(|v| v.trim() == "1")
+            });
+        math_cuda::gkr::with_skip_middle(skip, f)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ladder;
+        f()
+    }
 }
 
 /// Whether a bin whose trees carry `carries` bytes each cannot carry them all
@@ -6732,7 +6754,7 @@ where
     let full = slots * rows;
     // The carry peak — also what `from_device` reserves internally — so a pass
     // here means none of the build's reservations displaces anything.
-    let need = (4 * full) as u64 * 24;
+    let need = carry_bytes(full);
     let be = math_cuda::device::backend().ok()?;
     if be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) < need {
         return None;
@@ -7244,16 +7266,41 @@ static LEAN_ROUNDS_FORCED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum LeanRounds {
+    Fixed(usize),
+    Auto,
+}
+
+#[cfg(feature = "cuda")]
+const AUTO_LEAN_ROUNDS: usize = 6;
+#[cfg(feature = "cuda")]
+const FORCE_AUTO_LEAN_ROUNDS: usize = usize::MAX - 1;
+
+#[cfg(feature = "cuda")]
 fn lean_rounds() -> usize {
-    let forced = LEAN_ROUNDS_FORCED.load(Ordering::Relaxed);
-    if forced != usize::MAX {
-        return forced;
+    match lean_rounds_mode() {
+        LeanRounds::Fixed(rounds) => rounds,
+        // The opening's reservation still has to cover a stack taking three.
+        LeanRounds::Auto => LEAN_ROUNDS_DEFAULT,
     }
-    static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+}
+
+#[cfg(feature = "cuda")]
+fn lean_rounds_mode() -> LeanRounds {
+    let forced = LEAN_ROUNDS_FORCED.load(Ordering::Relaxed);
+    match forced {
+        FORCE_AUTO_LEAN_ROUNDS => return LeanRounds::Auto,
+        usize::MAX => {}
+        rounds => return LeanRounds::Fixed(rounds),
+    }
+    static SET: std::sync::OnceLock<LeanRounds> = std::sync::OnceLock::new();
     *SET.get_or_init(|| {
-        math_cuda::whir_open::lean_rounds_setting(
-            std::env::var("LAMBDA_VM_WHIR_LEAN_ROUNDS").ok().as_deref(),
-        )
+        let value = std::env::var("LAMBDA_VM_WHIR_LEAN_ROUNDS").ok();
+        match value.as_deref().map(str::trim) {
+            Some("auto") => LeanRounds::Auto,
+            value => LeanRounds::Fixed(math_cuda::whir_open::lean_rounds_setting(value)),
+        }
     })
 }
 
@@ -7264,6 +7311,13 @@ fn lean_rounds() -> usize {
 #[cfg(feature = "cuda")]
 pub fn force_lean_rounds(rounds: Option<usize>) {
     LEAN_ROUNDS_FORCED.store(rounds.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+/// Selects the automatic lean round count for a parity test.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_auto_lean_rounds() {
+    LEAN_ROUNDS_FORCED.store(FORCE_AUTO_LEAN_ROUNDS, Ordering::Relaxed);
 }
 
 /// How a lean opening's rounds are computed (`LAMBDA_VM_WHIR_LEAN_TILES`):
@@ -8062,7 +8116,7 @@ where
         .zip(shares)
         .enumerate()
         .map(|(p, (message, shares))| {
-            open_shared(
+            open_stack(
                 message,
                 shares,
                 overlays.map(|overlays| &overlays[p]),
@@ -8071,6 +8125,7 @@ where
             )
         })
         .collect::<Option<Vec<_>>>()?;
+    log_auto_lean_rounds(&parts);
     Some(GroupedFactors { parts })
 }
 
@@ -8318,6 +8373,46 @@ where
     F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
 {
+    let factors = open_stack(message, shares, overlay, n_stack, program)?;
+    log_auto_lean_rounds(core::slice::from_ref(&factors));
+    Some(factors)
+}
+
+#[cfg(feature = "cuda")]
+fn log_auto_lean_rounds(parts: &[OpeningFactors]) {
+    if matches!(lean_rounds_mode(), LeanRounds::Auto) {
+        let six = parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    part.state,
+                    OpeningState::Lean {
+                        rounds: AUTO_LEAN_ROUNDS,
+                        ..
+                    }
+                )
+            })
+            .count();
+        eprintln!(
+            "WHIR LEAN ROUNDS: {six}/{} stacks selected six",
+            parts.len()
+        );
+    }
+}
+
+/// Prepares one stack of a single or grouped opening.
+#[cfg(feature = "cuda")]
+fn open_stack<F, E>(
+    message: &crate::whir_chain::Stacked<'_, F>,
+    shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    overlay: Option<&crate::commit_ood::Overlay<'_, E>>,
+    n_stack: usize,
+    program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
     use math::field::goldilocks::GoldilocksField as Gl;
     use std::any::TypeId;
@@ -8384,12 +8479,8 @@ where
     // factors are then written at `2^(n − rounds)` instead of `2^n`. The same
     // values either way; a stack the lean path cannot read materialises as
     // before, before any challenge is drawn.
-    let rounds = lean_rounds()
-        .min(n_stack)
-        .min(overlay.as_ref().map_or(usize::MAX, |o| o.rounds_left()));
-    if rounds > 0
-        && let Some(lean) = lean_opening(&shares, n_stack, message, &host_parts, rounds)
-    {
+    let max_rounds = n_stack.min(overlay.as_ref().map_or(usize::MAX, |o| o.rounds_left()));
+    if let Some((lean, rounds)) = lean_opening(&shares, n_stack, message, &host_parts, max_rounds) {
         OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
         LEAN_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
         return Some(OpeningFactors {
@@ -8462,8 +8553,8 @@ fn lean_opening<F>(
     n_stack: usize,
     message: &crate::whir_chain::Stacked<'_, F>,
     host_parts: &[(&[u64], usize)],
-    rounds: usize,
-) -> Option<math_cuda::whir_open::LeanRound0>
+    max_rounds: usize,
+) -> Option<(math_cuda::whir_open::LeanRound0, usize)>
 where
     F: math::field::traits::IsField + 'static,
 {
@@ -8478,9 +8569,11 @@ where
         None => math_cuda::whir_open::LeanMessage::Parts(host_parts),
     };
     let tiles = lean_tiles();
-    if tiles != LeanTiles::Off
-        && let Some(plan) = crate::lean_tiles::plan(shares, n_stack, rounds)
-    {
+    let tiled = |rounds| {
+        if tiles == LeanTiles::Off {
+            return None;
+        }
+        let plan = crate::lean_tiles::plan(shares, n_stack, rounds)?;
         let tile_shares: Vec<math_cuda::whir_open::LeanShare> = plan
             .shares
             .iter()
@@ -8511,8 +8604,30 @@ where
             Some(spec),
         ) {
             LEAN_TILE_OPENS.fetch_add(1, Ordering::Relaxed);
-            return Some(lean);
+            Some((lean, rounds))
+        } else {
+            None
         }
+    };
+    let rounds = match lean_rounds_mode() {
+        LeanRounds::Auto => {
+            // Six is worthwhile only in tile form. If either the plan or
+            // the device declines it, retry with the usual three rounds.
+            if max_rounds >= AUTO_LEAN_ROUNDS
+                && let Some(opening) = tiled(AUTO_LEAN_ROUNDS)
+            {
+                return Some(opening);
+            }
+            LEAN_ROUNDS_DEFAULT
+        }
+        LeanRounds::Fixed(rounds) => rounds,
+    }
+    .min(max_rounds);
+    if rounds == 0 {
+        return None;
+    }
+    if let Some(opening) = tiled(rounds) {
+        return Some(opening);
     }
 
     // Sorted by offset: the map from a stack position to its column is a
@@ -8558,6 +8673,7 @@ where
     math_cuda::whir_open::LeanRound0::new(&lean_shares, &eq, n_stack, source())
         .ok()
         .flatten()
+        .map(|lean| (lean, rounds))
 }
 
 #[cfg(not(feature = "cuda"))]
