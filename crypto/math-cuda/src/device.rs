@@ -244,6 +244,8 @@ pub struct Backend {
     pub ntt_cm_dit: [CudaFunction; 5],
     pub ntt_cm_dif: [CudaFunction; 5],
     pub ntt_cm_dit_wide: [CudaFunction; 2],
+    pub ntt_cm_parts: [CudaFunction; 5],
+    pub ntt_cm_mobius: [CudaFunction; 5],
 
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
@@ -1290,6 +1292,20 @@ impl Backend {
             ntt_cm_dit_wide: [
                 ntt_cm.load_function("ntt_cm_dit_k9")?,
                 ntt_cm.load_function("ntt_cm_dit_k10")?,
+            ],
+            ntt_cm_parts: [
+                ntt_cm.load_function("ntt_cm_parts_k6")?,
+                ntt_cm.load_function("ntt_cm_parts_k7")?,
+                ntt_cm.load_function("ntt_cm_parts_k8")?,
+                ntt_cm.load_function("ntt_cm_parts_k9")?,
+                ntt_cm.load_function("ntt_cm_parts_k10")?,
+            ],
+            ntt_cm_mobius: [
+                ntt_cm.load_function("ntt_cm_mobius_k6")?,
+                ntt_cm.load_function("ntt_cm_mobius_k7")?,
+                ntt_cm.load_function("ntt_cm_mobius_k8")?,
+                ntt_cm.load_function("ntt_cm_mobius_k9")?,
+                ntt_cm.load_function("ntt_cm_mobius_k10")?,
             ],
             keccak256_leaves_base_row_major_row_pair: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,

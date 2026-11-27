@@ -8,6 +8,7 @@
 // Twiddle table: `tw[i] = ω^i` for i in [0, n/2). Stride-indexed per level.
 
 #include "goldilocks.cuh"
+#include "stack_parts.cuh"
 
 using goldilocks::add;
 using goldilocks::sub;
@@ -156,26 +157,6 @@ extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_le
 
 #define MOBIUS_WIDE_LOG 11
 
-/// The stack's word at `e`: the part covering it, or zero. `parts` is the
-/// table `(offset, len, src)` per part, sorted by offset, not overlapping;
-/// `[p0, p1)` are the parts that meet this tile (`p0 < p1`).
-__device__ __forceinline__ uint64_t mobius_gather(const uint64_t *parts, uint32_t p0, uint32_t p1,
-                                                  uint64_t e) {
-    uint32_t lo = p0, hi = p1;  // the last part with offset <= e, else p0
-    while (hi - lo > 1) {
-        const uint32_t mid = (lo + hi) / 2;
-        if (parts[3 * mid] <= e) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    const uint64_t off = parts[3 * lo], len = parts[3 * lo + 1];
-    if (e < off || e >= off + len) return 0;
-    const uint64_t *src = reinterpret_cast<const uint64_t *>(parts[3 * lo + 2]);
-    return src[e - off];
-}
-
 extern "C" __global__ void mobius_wide_low(uint64_t *x, const uint64_t *parts, uint32_t n_parts,
                                            uint32_t k_levels) {
     __shared__ uint64_t tile[1 << MOBIUS_WIDE_LOG];
@@ -203,7 +184,7 @@ extern "C" __global__ void mobius_wide_low(uint64_t *x, const uint64_t *parts, u
         __syncthreads();
         const uint32_t p0 = span[0], p1 = span[1];
         for (uint32_t j = threadIdx.x; j < n; j += blockDim.x)
-            tile[j] = (p0 < p1) ? mobius_gather(parts, p0, p1, base + j) : 0;
+            tile[j] = (p0 < p1) ? stack_part_word(parts, p0, p1, base + j) : 0;
     } else {
         for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) tile[j] = x[base + j];
     }
@@ -234,7 +215,7 @@ extern "C" __global__ void mobius_wide_tile(uint64_t *x, uint64_t base, uint32_t
         // covers it, and for an empty table).
         for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
             tile[r * pitch + threadIdx.x] =
-                n_parts ? mobius_gather(parts, 0, n_parts, i0 + r * low) : 0;
+                n_parts ? stack_part_word(parts, 0, n_parts, i0 + r * low) : 0;
     } else {
         for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
             tile[r * pitch + threadIdx.x] = x[i0 + r * low];

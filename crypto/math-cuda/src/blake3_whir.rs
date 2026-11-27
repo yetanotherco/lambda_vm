@@ -46,6 +46,7 @@ pub struct Kernels {
     /// kept in the leaf's slot between steps
     /// (`crate::whir::commit_joint_streamed`).
     pub leaves_base_coset_joint_step: CudaFunction,
+    pub(crate) ntt_joint_step: [CudaFunction; 4],
     /// The joint leaf's prefix midstate, for the host to check
     /// ([`joint_midstate`]).
     pub joint_midstate_probe: CudaFunction,
@@ -93,6 +94,12 @@ pub fn kernels() -> Result<&'static Kernels> {
         leaves_ext3_coset: module.load_function("b3w_leaves_ext3_coset")?,
         leaves_base_coset_joint: module.load_function("b3w_leaves_base_coset_joint")?,
         leaves_base_coset_joint_step: module.load_function("b3w_leaves_base_coset_joint_step")?,
+        ntt_joint_step: [
+            module.load_function("b3w_ntt_joint_k7")?,
+            module.load_function("b3w_ntt_joint_k8")?,
+            module.load_function("b3w_ntt_joint_k9")?,
+            module.load_function("b3w_ntt_joint_k10")?,
+        ],
         joint_midstate_probe: module.load_function("b3w_joint_midstate_probe")?,
         merkle_level: module.load_function("blake3_merkle_level")?,
         merkle_tail: module.load_function("blake3_merkle_tail")?,

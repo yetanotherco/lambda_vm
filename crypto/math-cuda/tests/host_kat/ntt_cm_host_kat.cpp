@@ -819,6 +819,92 @@ void test_fused_mobius() {
           "the unfused partial transform equals the codeword: the check cannot fail");
 }
 
+// Replay the new register rounds phase by phase, keeping their last tile
+// in shared memory on the final pass, as the leaf-hashing variant does.
+template <int K>
+void replay_deferred_pass(std::vector<u64> &words, const uint64_t *roots, unsigned L,
+                          unsigned s, unsigned first_end, bool leaves) {
+    using namespace ntt_cm;
+    const unsigned lt = pass_log_t(L, s, K);
+    const unsigned threads = threads_of<K>(lt);
+    const unsigned blocks = 1u << (L - K - lt);
+    const unsigned start = first_end > s ? first_end - s : 0;
+    std::vector<u64> tile(tile_words<K>(lt)), rad(Radix<K>::SIZE);
+    for (unsigned lane = 0; lane < threads; ++lane)
+        phase_rad<K>(rad.data(), roots, lane, threads);
+    for (unsigned bx = 0; bx < blocks; ++bx) {
+        auto round = [&](auto j, auto store) {
+            for (unsigned lane = 0; lane < threads; ++lane)
+                encode_strided_round<K, decltype(j)::value, true, decltype(store)::value>(
+                    words.data(), tile.data(), roots, rad.data(), s, lt, lane, bx, start);
+        };
+        using J0 = std::integral_constant<int, 0>;
+        using J1 = std::integral_constant<int, 1>;
+        using J2 = std::integral_constant<int, 2>;
+        if constexpr (K <= 4) {
+            round(J0{}, std::true_type{});
+        } else {
+            round(J0{}, std::false_type{});
+            if constexpr (K > 8) {
+                round(J1{}, std::false_type{});
+                if (leaves) round(J2{}, std::false_type{});
+                else round(J2{}, std::true_type{});
+            } else {
+                if (leaves) round(J1{}, std::false_type{});
+                else round(J1{}, std::true_type{});
+            }
+        }
+        if constexpr (K >= 6) {
+            if (!leaves) continue;
+            constexpr unsigned FOLD = 6;
+            for (unsigned lane = 0; lane < (1u << (lt + K - FOLD)); ++lane) {
+                const unsigned t = lane & ((1u << lt) - 1u), low_mid = lane >> lt;
+                const u64 leaf = strided_tile_base(bx, s, K, lt, t) | ((u64)low_mid << s);
+                for (unsigned i = 0; i < (1u << FOLD); ++i)
+                    words[leaf + ((u64)i << (L - FOLD))] =
+                        tile[tile_at<K>(low_mid | (i << (K - FOLD)), lt, t)];
+            }
+        }
+    }
+}
+
+// Compare the landed schedule (two compact high Möbius passes before the
+// spread NTT) with deferring each high level to its own NTT butterfly.
+void test_mobius_commutes_into_ntt() {
+    const std::vector<u64> roots = root_table(false);
+    for (const std::vector<unsigned> &ks : {std::vector<unsigned>{4, 9, 4}, {5, 8, 6}, {6, 8, 6}}) {
+        const unsigned L = ks[0] + ks[1] + ks[2];
+        const unsigned first_end = ks[0] + pass_log_t(L, 0, ks[0]);
+        const unsigned second_end = ks[0] + ks[1];
+        for (unsigned lb : {0u, 1u, 2u, 4u}) {
+            const std::vector<u64> src = edge_words((u64)1 << (L - lb));
+            std::vector<u64> compact = src;
+            host_mobius(compact, first_end - lb, second_end - lb);
+            host_mobius(compact, second_end - lb, L - lb);
+            const auto want = spread_transform(compact, L, lb, ks, ntt_cm::F_MOBIUS);
+
+            std::vector<u64> got((u64)1 << L);
+            replay_pass(ks[0], true, src.data(), 0, got.data(), 0, roots.data(), nullptr,
+                        L, 0, lb, ntt_cm::F_SPREAD | ntt_cm::F_MOBIUS, 1);
+            auto replayed = got;
+            for (unsigned u = ks[0]; u < L; ++u) {
+                if (u >= first_end) host_mobius(got, u, u + 1);
+                textbook_levels(got, L, u, 1, true, false);
+            }
+            size_t where = 0;
+            CHECK(eq_canon(got, want, &where),
+                  "deferred Möbius L=%u passes=[%u,%u,%u] lb=%u first diff at %zu",
+                  L, ks[0], ks[1], ks[2], lb, where);
+            if (ks[1] == 9) replay_deferred_pass<9>(replayed, roots.data(), L, ks[0], first_end, false);
+            else replay_deferred_pass<8>(replayed, roots.data(), L, ks[0], first_end, false);
+            if (ks[2] == 6) replay_deferred_pass<6>(replayed, roots.data(), L, second_end, first_end, true);
+            else replay_deferred_pass<4>(replayed, roots.data(), L, second_end, first_end, false);
+            CHECK(eq_canon(replayed, want, &where),
+                  "replayed deferred Möbius L=%u lb=%u first diff at %zu", L, lb, where);
+        }
+    }
+}
+
 // 10. The spread rule at spacings 32 and 64. Every production encode size
 // (2^20..2^32) admits both in both plans; a short first pass does not, and
 // there the replayed transform is not the DFT — the rule is what keeps such a
@@ -878,6 +964,8 @@ int main() {
     std::printf("+ tile layout: %d checks, %d failures\n", g_checks, g_failures);
     test_fused_mobius();
     std::printf("+ fused Möbius: %d checks, %d failures\n", g_checks, g_failures);
+    test_mobius_commutes_into_ntt();
+    std::printf("+ deferred Möbius: %d checks, %d failures\n", g_checks, g_failures);
     test_spread_rule();
     std::printf("+ spread rule: %d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) {

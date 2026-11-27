@@ -21,6 +21,8 @@
 
 #define BLAKE3_ROUNDS 7
 #include "blake3.cu"
+#define NTT_CM_NO_ENTRYPOINTS
+#include "ntt_cm.cu"
 
 static_assert(BLAKE3_ROUNDS == 7, "the WHIR BLAKE3 kernels are standard BLAKE3");
 
@@ -176,6 +178,110 @@ extern "C" __global__ void b3w_leaves_base_coset_joint_step(
         h.finalize(out + at * 32);
     }
 }
+
+// One thread per complete 64-value leaf. In the NTT rounds each thread
+// handles several 16-value groups. The hash walks the high six mid bits
+// in coset order. At k=9 the final butterfly runs in the hash thread.
+template <int K, bool MOBIUS>
+__device__ __forceinline__ void b3w_last_ntt_rounds(
+    uint64_t *work, uint64_t *tile, const uint64_t *roots, const uint64_t *rad,
+    uint32_t s, uint32_t log_t, uint32_t start) {
+    using namespace ntt_cm;
+    for (uint32_t lane = threadIdx.x; lane < 256; lane += 64)
+        encode_strided_round<K, 0, MOBIUS, false>(
+            work, tile, roots, rad, s, log_t, lane, blockIdx.x, start);
+    __syncthreads();
+    for (uint32_t lane = threadIdx.x; lane < 256; lane += 64)
+        encode_strided_round<K, 1, MOBIUS, false>(
+            work, tile, roots, rad, s, log_t, lane, blockIdx.x, start);
+    if constexpr (K > 9) {
+        __syncthreads();
+        for (uint32_t lane = threadIdx.x; lane < 256; lane += 64)
+            encode_strided_round<K, 2, MOBIUS, false>(
+                work, tile, roots, rad, s, log_t, lane, blockIdx.x, start);
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void b3w_ntt_joint_step(
+    uint64_t *work, const uint64_t *roots, uint32_t s, uint32_t log_t, uint32_t start,
+    uint64_t blocks, uint64_t step, uint32_t leaf_bits, uint8_t *out) {
+    using namespace ntt_cm;
+    constexpr uint32_t FOLD = 6;
+    extern __shared__ uint64_t tile[];
+    __shared__ uint64_t rad[Radix<K>::SIZE];
+    __shared__ uint32_t midstate[8];
+    const uint32_t tid = threadIdx.x;
+    phase_rad<K>(rad, roots, tid, blockDim.x);
+    if (step == 0 && tid == 0) b3w_joint_midstate(blocks, FOLD, midstate);
+    __syncthreads();
+    if (start < K) {
+        b3w_last_ntt_rounds<K, true>(work, tile, roots, rad, s, log_t, start);
+    } else {
+        b3w_last_ntt_rounds<K, false>(work, tile, roots, rad, s, log_t, start);
+    }
+    __syncthreads();
+    const uint32_t t = tid & ((1u << log_t) - 1u), low_mid = tid >> log_t;
+    const uint64_t lo = strided_tile_base(blockIdx.x, s, K, log_t, t);
+    const uint64_t leaf = lo + ((uint64_t)low_mid << s);
+    uint64_t twist_bit = 1;
+    if constexpr (K == 9) {
+        if (start < K) twist_bit = pow_root32(roots, (uint32_t)lo << (32 - s - K));
+    }
+    const uint64_t at = leaf_bits == 0 ? leaf : (__brevll(leaf) >> (64 - leaf_bits));
+    uint32_t *slot = reinterpret_cast<uint32_t *>(out + at * 32);
+    uint32_t cv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) cv[i] = step == 0 ? midstate[i] : slot[i];
+    // A fold-six leaf step has eight full blocks after the prefix. Only the
+    // very last block of the last stack has final flags. The fixed block
+    // packing keeps the message in registers and uses the same canonical
+    // serialization and compression as Blake3Chain.
+    for (uint32_t b = 0; b < 8; ++b) {
+        uint32_t message[16], digest[16];
+#pragma unroll
+        for (uint32_t j = 0; j < 8; ++j) {
+            const uint32_t mid = low_mid | ((8 * b + j) << (K - FOLD));
+            const uint32_t at = tile_at<K>(mid, log_t, t);
+            uint64_t value = tile[at];
+            if constexpr (K == 9) {
+                // The low half of the leaf computes both butterfly outputs.
+                // Its high half later reads the differences from the same
+                // thread's slots, so the sums never take a shared write.
+                if (b < 4) {
+                    const uint32_t high = tile_at<K>(mid | 256u, log_t, t);
+                    uint64_t partner = tile[high];
+                    if (start < K) partner = mul(sub(partner, value), twist_bit);
+                    const uint64_t product = mul(partner, rad[mid]);
+                    tile[high] = sub(value, product);
+                    value = add(value, product);
+                }
+            }
+            blake3_words_of_felt(value, message[2 * j], message[2 * j + 1]);
+        }
+        const uint32_t flags = step + 1 == blocks && b == 7
+                                   ? BLAKE3_FLAG_CHUNK_END | BLAKE3_FLAG_ROOT
+                                   : 0;
+        blake3_compress<BLAKE3_ROUNDS>(cv, message, 0, 64, flags, digest);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) cv[i] = digest[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) slot[i] = cv[i];
+}
+
+#define B3W_NTT_JOINT(K)                                                                       \
+    extern "C" __global__ void __launch_bounds__(64, 2) b3w_ntt_joint_k##K(                      \
+        uint64_t *work, const uint64_t *roots, uint32_t s, uint32_t log_t, uint32_t start,        \
+        uint64_t blocks, uint64_t step, uint32_t leaf_bits, uint8_t *out) {                      \
+        b3w_ntt_joint_step<K>(work, roots, s, log_t, start, blocks, step, leaf_bits, out);         \
+    }
+
+B3W_NTT_JOINT(7)
+B3W_NTT_JOINT(8)
+B3W_NTT_JOINT(9)
+B3W_NTT_JOINT(10)
+
 
 // This module's joint-leaf midstate for `blocks` blocks of `2^log_block` base
 // values, as `b3w_leaves_base_coset_joint` computes it: the host checks it

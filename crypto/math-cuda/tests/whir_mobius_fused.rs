@@ -15,10 +15,12 @@
 use std::time::Instant;
 
 use math_cuda::columns::DeviceColumns;
-use math_cuda::lde_cm::{wide_codewords_encoded, with_ntt_wide};
+use math_cuda::lde_cm::{deferred_mobius_encodings, wide_codewords_encoded, with_ntt_wide};
 use math_cuda::whir::{
-    commit_codeword, encode_codeword_parts, encode_codeword_resident, encode_codeword_slices,
-    mobius_fused_encodes, mobius_wide_gathers, with_mobius_fused, with_mobius_wide,
+    LeafPlacement, commit_codeword, commit_joint_streamed, commit_joint_streamed_encoded,
+    encode_codeword_parts, encode_codeword_resident, encode_codeword_slices, mobius_fused_encodes,
+    mobius_wide_gathers, ntt_last_pass_hashes_count, with_mobius_fused, with_mobius_in_ntt,
+    with_mobius_wide, with_ntt_last_pass_hashes,
 };
 
 const P: u64 = 0xFFFF_FFFF_0000_0001;
@@ -254,25 +256,40 @@ fn the_fused_mobius_encodes_todays_codeword() {
 fn the_fused_mobius_encode_at_the_production_shape() {
     let l = 27;
     let label = "64 columns of 2^21";
-    // (name, wide Möbius, fused, wide NTT)
-    const ARMS: [(&str, bool, bool, bool); 5] = [
-        ("today", false, false, false),
-        ("mobius", true, false, false),
-        ("fused", false, true, false),
-        ("both", true, false, true),
-        ("fused_ntt", false, true, true),
+    // (name, wide Möbius, fused low Möbius, wide NTT, deferred high Möbius)
+    type Arm = (&'static str, bool, bool, bool, bool);
+    const ARMS: [Arm; 6] = [
+        ("today", false, false, false, false),
+        ("mobius", true, false, false, false),
+        ("fused", false, true, false, false),
+        ("both", true, false, true, false),
+        ("fused_ntt", false, true, true, false),
+        ("deferred_ntt", false, true, true, true),
     ];
     let cols: Vec<Vec<u64>> = (0..64).map(|k| words(k + 1, 1 << 21)).collect();
     let refs: Vec<&[u64]> = cols.iter().map(|c| c.as_slice()).collect();
     let store = DeviceColumns::upload(&refs).expect("room for the store");
     let at: Vec<(usize, usize)> = (0..64).map(|k| (k, k << 21)).collect();
-    let encode = |(_, mobius, fused, ntt): (&str, bool, bool, bool)| {
-        with_mobius_wide(mobius, || {
-            with_mobius_fused(fused, || {
-                with_ntt_wide(ntt, || encode_codeword_resident(&store, &at, l, 1, false))
+    let encode = |(_, mobius, fused, ntt, deferred): Arm| {
+        with_mobius_in_ntt(deferred, || {
+            with_mobius_wide(mobius, || {
+                with_mobius_fused(fused, || {
+                    with_ntt_wide(ntt, || encode_codeword_resident(&store, &at, l, 1, false))
+                })
             })
         })
     };
+    let profile = std::env::var("WHIR_ENCODE_PROFILE_ARM").ok();
+    if let Some(arm) = profile {
+        let wanted = ARMS
+            .iter()
+            .find(|a| a.0 == arm)
+            .expect("unknown profile arm");
+        for _ in 0..11 {
+            encode(*wanted).unwrap().synchronize().unwrap();
+        }
+        return;
+    }
 
     // The production shape's codewords in field values, before any timing.
     let today = canonical(read("today's encode", encode(ARMS[0])));
@@ -290,11 +307,12 @@ fn the_fused_mobius_encode_at_the_production_shape() {
     }
     drop(today);
 
-    let run = |a: (&str, bool, bool, bool)| {
-        let (g0, f0, w0) = (
+    let run = |a: Arm| {
+        let (g0, f0, w0, d0) = (
             mobius_wide_gathers(),
             mobius_fused_encodes(),
             wide_codewords_encoded(),
+            deferred_mobius_encodings(),
         );
         let t = Instant::now();
         let cw = encode(a).expect("a timed encode");
@@ -304,7 +322,7 @@ fn the_fused_mobius_encode_at_the_production_shape() {
         // Each arm took exactly its own transforms: the times are the levers'.
         assert_eq!(
             mobius_wide_gathers() - g0,
-            u64::from(a.1 || a.2),
+            u64::from((a.1 || a.2) && !a.4),
             "{}: the gather count is not the arm's",
             a.0
         );
@@ -320,9 +338,15 @@ fn the_fused_mobius_encode_at_the_production_shape() {
             "{}: the wide-NTT count is not the arm's",
             a.0
         );
+        assert_eq!(
+            deferred_mobius_encodings() - d0,
+            u64::from(a.4),
+            "{}: the deferred Möbius count is not the arm's",
+            a.0
+        );
         ms
     };
-    let mut times: [Vec<f64>; 5] = Default::default();
+    let mut times: [Vec<f64>; 6] = Default::default();
     for rep in 0..11 {
         for i in 0..ARMS.len() {
             let a = (rep + i) % ARMS.len();
@@ -347,11 +371,137 @@ fn the_fused_mobius_encode_at_the_production_shape() {
             .collect::<Vec<_>>()
             .join(" · ")
     );
-    let (today, mobius, fused, both, fused_ntt) = (med[0], med[1], med[2], med[3], med[4]);
+    let [today, mobius, fused, both, fused_ntt, deferred_ntt] = med[..] else {
+        unreachable!()
+    };
+    println!(
+        "WHIR DEFERRED MOBIUS BENCH: landed {fused_ntt:.3} ms · deferred {deferred_ntt:.3} ms"
+    );
     println!(
         "WHIR MOBIUS FUSED BENCH: resident 2^{l} → 2^{} · {label} · today {today:.3} ms · mobius {mobius:.3} ms · fused {fused:.3} ms · both {both:.3} ms · fused_ntt {fused_ntt:.3} ms · R_DM {:.3} · R_D {:.3}",
         l + 1,
         fused / mobius,
         fused_ntt / both
     );
+}
+
+fn check_last_pass_hashes(l: usize, reps: usize) {
+    let n = 1usize << (l + 1);
+    let width = (l - 6).min(21);
+    let count = 1 << (l - width);
+    let cols: Vec<_> = (0..count)
+        .map(|i| words(i as u64 + 1, 1 << width))
+        .collect();
+    let refs: Vec<_> = cols.iter().map(Vec::as_slice).collect();
+    let store = DeviceColumns::upload(&refs).unwrap();
+    let parts: Vec<_> = (0..count).map(|i| (i, i << width)).collect();
+    let mut reversed = parts.clone();
+    for (i, (col, _)) in reversed.iter_mut().enumerate() {
+        *col = count - i - 1;
+    }
+    let stacks = [&parts[..], &reversed[..]];
+    let hash = math_cuda::DeviceHash::Blake3;
+    let mut expected = [0; 32];
+    let mut times: [Vec<f64>; 4] = Default::default();
+    for rep in 0..reps {
+        for i in 0..4 {
+            let arm = (rep + i) % 4;
+            let (deferred, fused) = (arm & 1 != 0, arm & 2 != 0);
+            let before = ntt_last_pass_hashes_count();
+            let started = Instant::now();
+            let (_, root) = with_mobius_in_ntt(deferred, || {
+                with_ntt_last_pass_hashes(fused, || {
+                    if fused {
+                        commit_joint_streamed_encoded(
+                            2,
+                            n,
+                            6,
+                            hash,
+                            LeafPlacement::Reversed,
+                            |k, room, step| {
+                                step.encode_resident(&store, stacks[k], 1, false, room)
+                                    .map(Some)
+                            },
+                        )
+                    } else {
+                        commit_joint_streamed(2, n, 6, hash, LeafPlacement::Reversed, |k, room| {
+                            math_cuda::whir::encode_codeword_resident_carrying(
+                                &store, stacks[k], l, 1, false, room,
+                            )
+                            .ok()
+                        })
+                    }
+                })
+            })
+            .unwrap();
+            let ms = started.elapsed().as_secs_f64() * 1e3 / 2.0;
+            assert_eq!(
+                ntt_last_pass_hashes_count() - before,
+                if fused { 2 } else { 0 }
+            );
+            if rep == 0 && arm == 0 {
+                expected = root;
+            }
+            assert_eq!(root, expected, "stack root at 2^{l}, arm {arm}");
+            if rep >= 2 || reps <= 2 {
+                times[arm].push(ms);
+            }
+        }
+    }
+    for (arm, samples) in times.iter_mut().enumerate() {
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "WHIR COMMIT BENCH: stack 2^{l} · deferred {} · last pass hashes {} · {:.3} ms per stack (includes share of tree) · root {}",
+            arm & 1 != 0,
+            arm & 2 != 0,
+            samples[samples.len() / 2],
+            expected
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+}
+
+#[test]
+fn deferred_mobius_and_last_pass_hashes_match_the_landed_pipeline() {
+    for (l, lb) in [(12, 1), (16, 1), (18, 2), (19, 1), (20, 1)] {
+        let cols = layout(l);
+        let refs: Vec<_> = cols.iter().map(|(w, _)| w.as_slice()).collect();
+        let at: Vec<_> = cols.iter().enumerate().map(|(i, (_, o))| (i, *o)).collect();
+        let host: Vec<_> = cols.iter().map(|(w, o)| (w.as_slice(), *o)).collect();
+        let store = DeviceColumns::upload(&refs).unwrap();
+        let read_arm = |deferred| {
+            with_mobius_in_ntt(deferred, || {
+                canonical(read(
+                    "deferred Möbius parity",
+                    encode_codeword_resident(&store, &at, l, lb, false),
+                ))
+            })
+        };
+        let before = deferred_mobius_encodings();
+        let want = read_arm(false);
+        let hashed_before = ntt_last_pass_hashes_count();
+        let retained = with_ntt_last_pass_hashes(true, || read_arm(true));
+        assert_eq!(ntt_last_pass_hashes_count(), hashed_before);
+        assert_eq!(want, retained, "resident 2^{l}, spacing 2^{lb}");
+        let from_host = with_mobius_in_ntt(true, || {
+            canonical(read(
+                "deferred Möbius from host",
+                encode_codeword_parts(&host, l, lb, false),
+            ))
+        });
+        assert_eq!(want, from_host, "host 2^{l}, spacing 2^{lb}");
+        assert_eq!(deferred_mobius_encodings() - before, 2);
+    }
+    // The final pass has 7, 8, 9 and 10 levels respectively.
+    for l in [13, 15, 17, 19] {
+        check_last_pass_hashes(l, 1);
+    }
+}
+
+#[test]
+#[ignore = "box tier: a measurement"]
+fn last_pass_hashes_at_the_production_shape() {
+    check_last_pass_hashes(27, 11);
 }

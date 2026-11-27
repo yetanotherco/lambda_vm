@@ -73,6 +73,7 @@
 // `__global__` wrappers are device-only.
 
 #include "goldilocks.cuh"
+#include "stack_parts.cuh"
 
 namespace ntt_cm {
 
@@ -259,6 +260,37 @@ __device__ __forceinline__ void twist(uint64_t (&x)[E], const uint64_t *roots, u
     }
 }
 
+// Run the Möbius levels of this round before its part of the DIT twist.
+// Both operators on a higher bit commute with every lower butterfly.
+// The rev(width) exponent splits the original twist into one factor per round.
+template <int KLOG, int J>
+__device__ __forceinline__ void run_mobius_round(
+    uint64_t (&x)[E], const uint64_t *roots, const uint64_t *rad, uint32_t s,
+    uint32_t lo, uint32_t g, uint32_t mobius_start) {
+    using R = Round<KLOG, true, J>;
+    constexpr int WIDTH = R::U1 - R::U0 + 1;
+    constexpr int SHIFT = R::U0 - R::A;
+#pragma unroll
+    for (int u = R::U0; u <= R::U1; ++u) {
+        if ((uint32_t)u < mobius_start) continue;
+        const int bit = 1 << (u - R::A);
+#pragma unroll
+        for (int v = 0; v < E; ++v)
+            if (v & bit) x[v] = sub(x[v], x[v ^ bit]);
+    }
+    const uint64_t d = pow_root32(roots, lo << (31 - s - R::U1));
+    uint64_t factor = d;
+#pragma unroll
+    for (int j = 1; j < (1 << WIDTH); ++j) {
+        const int mask = (rev4(j) >> (ELOG - WIDTH)) << SHIFT;
+#pragma unroll
+        for (int v = 0; v < E; ++v)
+            if ((v & (((1 << WIDTH) - 1) << SHIFT)) == mask) x[v] = mul(x[v], factor);
+        if (j + 1 < (1 << WIDTH)) factor = mul(factor, d);
+    }
+    run_round<KLOG, true, J>(x, g, rad);
+}
+
 // Threads in a block: T lanes x K/16 groups.
 template <int KLOG>
 __device__ __forceinline__ uint32_t threads_of(uint32_t log_t) {
@@ -362,7 +394,7 @@ __device__ __forceinline__ void phase_strided_last(
 // ---------------------------------------------------------------------------
 
 // Stage the block's T·K elements into the tile.
-template <int KLOG>
+template <int KLOG, bool PARTS = false>
 __device__ __forceinline__ void phase_contig_stage(const uint64_t *in, uint64_t in_stride,
                                                    const uint64_t *wtab, uint64_t *tile,
                                                    uint32_t L, uint32_t lb, uint32_t log_t,
@@ -373,6 +405,26 @@ __device__ __forceinline__ void phase_contig_stage(const uint64_t *in, uint64_t 
     const uint32_t count = K << log_t;
     const uint64_t *src = in + (uint64_t)col * in_stride;
     const uint64_t block0 = (uint64_t)bx << (KLOG + log_t);
+    if constexpr (PARTS) {
+        const uint32_t n_parts = (uint32_t)in_stride;
+        const uint64_t q0 = block0 >> lb;
+        const uint64_t q1 = (block0 + count) >> lb;
+        const uint32_t p = stack_part_index(in, 0, n_parts, q0);
+        const uint64_t offset = n_parts ? in[3 * p] : 0;
+        const uint64_t end = n_parts ? offset + in[3 * p + 1] : 0;
+        const bool one_part = offset <= q0 && q1 <= end;
+        const auto *words = one_part ? reinterpret_cast<const uint64_t *>(in[3 * p + 2]) : nullptr;
+        const uint32_t mask = (1u << lb) - 1u;
+        for (uint32_t e = tid; e < count; e += nthreads) {
+            uint64_t value = 0;
+            if ((e & mask) == 0) {
+                const uint64_t q = (block0 + e) >> lb;
+                value = one_part ? words[q - offset] : stack_part_word(in, p, n_parts, q);
+            }
+            tile[tile_at<KLOG>(e & (K - 1u), log_t, e >> KLOG)] = value;
+        }
+        return;
+    }
     if (flags & F_SPREAD) {
         // Compact input: the block covers compact positions
         // [block0 >> lb, (block0 + count) >> lb); position B·q of the
@@ -457,13 +509,47 @@ __device__ __forceinline__ void phase_contig_store(uint64_t *out, uint64_t out_s
     }
 }
 
+// The strided encoding variant keeps the existing tile and register exchanges.
+// Its first round reads the input slab, and the others read the shared tile.
+template <int KLOG, int J, bool MOBIUS, bool STORE>
+__device__ __forceinline__ void encode_strided_round(
+    uint64_t *codeword, uint64_t *tile, const uint64_t *roots, const uint64_t *rad,
+    uint32_t s, uint32_t log_t, uint32_t tid, uint32_t bx, uint32_t mobius_start) {
+    using R = Round<KLOG, true, J>;
+    const uint32_t t = tid & ((1u << log_t) - 1u), g = tid >> log_t;
+    const uint64_t tb = strided_tile_base(bx, s, KLOG, log_t, t);
+    const uint32_t base = mid_base<R::A>(g);
+    const uint32_t lo = (uint32_t)(tb & ((1ull << s) - 1ull));
+    uint64_t x[E];
+    if constexpr (J == 0) {
+#pragma unroll
+        for (int v = 0; v < E; ++v)
+            x[v] = codeword[tb + ((uint64_t)(base | ((uint32_t)v << R::A)) << s)];
+    } else {
+        tile_read<KLOG, R::A>(x, tile, log_t, t, g);
+    }
+    if constexpr (MOBIUS) {
+        run_mobius_round<KLOG, J>(x, roots, rad, s, lo, g, mobius_start);
+    } else {
+        if constexpr (J == 0) twist<KLOG>(x, roots, s, lo, g);
+        run_round<KLOG, true, J>(x, g, rad);
+    }
+    if constexpr (STORE) {
+#pragma unroll
+        for (int v = 0; v < E; ++v)
+            codeword[tb + ((uint64_t)(base | ((uint32_t)v << R::A)) << s)] = x[v];
+    } else {
+        tile_write<KLOG, R::A>(x, tile, log_t, t, g);
+    }
+}
+
 }  // namespace ntt_cm
 
 #if defined(__CUDACC__)
 
 // One pass. `s == 0` selects the contiguous (staged) form. The dynamic shared
 // memory is the tile (`tile_words`); the radix table is static.
-template <int KLOG, bool DIT>
+template <int KLOG, bool DIT, bool PARTS = false>
 __device__ __forceinline__ void ntt_cm_pass(const uint64_t *in, uint64_t in_stride, uint64_t *out,
                                             uint64_t out_stride, const uint64_t *roots,
                                             const uint64_t *wtab, uint32_t L, uint32_t s,
@@ -492,7 +578,7 @@ __device__ __forceinline__ void ntt_cm_pass(const uint64_t *in, uint64_t in_stri
                                           tid, bx, col);
         }
     } else {
-        phase_contig_stage<KLOG>(in, in_stride, wtab, ntt_cm_tile, L, lb, log_t, flags, tid, bx, col);
+        phase_contig_stage<KLOG, PARTS>(in, in_stride, wtab, ntt_cm_tile, L, lb, log_t, flags, tid, bx, col);
         __syncthreads();
         if (flags & F_MOBIUS) {
             for (uint32_t l = 0; l < KLOG + log_t - lb; ++l) {
@@ -529,6 +615,7 @@ __device__ __forceinline__ void ntt_cm_pass(const uint64_t *in, uint64_t in_stri
                                flags);                                                          \
     }
 
+#ifndef NTT_CM_NO_ENTRYPOINTS
 NTT_CM_KERNEL(ntt_cm_dit_k4, 4, true)
 NTT_CM_KERNEL(ntt_cm_dit_k5, 5, true)
 NTT_CM_KERNEL(ntt_cm_dit_k6, 6, true)
@@ -541,5 +628,48 @@ NTT_CM_KERNEL(ntt_cm_dif_k5, 5, false)
 NTT_CM_KERNEL(ntt_cm_dif_k6, 6, false)
 NTT_CM_KERNEL(ntt_cm_dif_k7, 7, false)
 NTT_CM_KERNEL(ntt_cm_dif_k8, 8, false)
+#endif
+
+template <int KLOG>
+__device__ __forceinline__ void ntt_cm_mobius(
+    uint64_t *codeword, const uint64_t *roots, uint32_t s, uint32_t log_t,
+    uint32_t mobius_start) {
+    using namespace ntt_cm;
+    extern __shared__ uint64_t ntt_cm_tile[];
+    __shared__ uint64_t rad[Radix<KLOG>::SIZE];
+    const uint32_t tid = threadIdx.x, bx = blockIdx.x;
+    phase_rad<KLOG>(rad, roots, tid, blockDim.x);
+    __syncthreads();
+    encode_strided_round<KLOG, 0, true, false>(
+        codeword, ntt_cm_tile, roots, rad, s, log_t, tid, bx, mobius_start);
+    __syncthreads();
+    encode_strided_round<KLOG, 1, true, (KLOG <= 8)>(
+        codeword, ntt_cm_tile, roots, rad, s, log_t, tid, bx, mobius_start);
+    if constexpr (KLOG > 8) {
+        __syncthreads();
+        encode_strided_round<KLOG, 2, true, true>(
+            codeword, ntt_cm_tile, roots, rad, s, log_t, tid, bx, mobius_start);
+    }
+}
+
+#define NTT_CM_ENCODE(K)                                                                        \
+    extern "C" __global__ void __launch_bounds__(256, 2) ntt_cm_parts_k##K(                       \
+        const uint64_t *parts, uint64_t count, uint64_t *out, const uint64_t *roots,               \
+        uint32_t L, uint32_t lb, uint32_t log_t) {                                                \
+        ntt_cm_pass<K, true, true>(parts, count, out, 0, roots, nullptr, L, 0, log_t, lb,           \
+                                   ntt_cm::F_SPREAD | ntt_cm::F_MOBIUS);                         \
+    }                                                                                           \
+    extern "C" __global__ void __launch_bounds__(256, 2) ntt_cm_mobius_k##K(                      \
+        uint64_t *codeword, const uint64_t *roots, uint32_t s, uint32_t log_t, uint32_t start) {    \
+        ntt_cm_mobius<K>(codeword, roots, s, log_t, start);                                        \
+    }
+
+#ifndef NTT_CM_NO_ENTRYPOINTS
+NTT_CM_ENCODE(6)
+NTT_CM_ENCODE(7)
+NTT_CM_ENCODE(8)
+NTT_CM_ENCODE(9)
+NTT_CM_ENCODE(10)
+#endif
 
 #endif  // __CUDACC__

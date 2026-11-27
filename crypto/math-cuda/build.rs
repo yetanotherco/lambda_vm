@@ -202,6 +202,7 @@ fn main() {
     // Headers aren't compiled, so emit rerun-if-changed to rebuild on
     // header edits.
     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
+    println!("cargo:rerun-if-changed=kernels/stack_parts.cuh");
     println!("cargo:rerun-if-changed=kernels/ext3.cuh");
     println!("cargo:rerun-if-changed=kernels/ext3_inv.cuh");
 

@@ -9171,34 +9171,10 @@ pub(crate) fn encode_parts<F>(
 where
     F: math::field::traits::IsField + 'static,
 {
-    use math::field::goldilocks::GoldilocksField;
-
-    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+    if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD || whir_commit_declined() {
         return None;
     }
-    if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
-        return None;
-    }
-    if whir_commit_declined() {
-        return None;
-    }
-    if parts
-        .iter()
-        .any(|(column, offset)| offset + column.rows() > (1usize << log_evals))
-    {
-        return None;
-    }
-    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
-    let raw: Vec<(&[u64], usize)> = parts
-        .iter()
-        .map(|(column, offset)| unsafe {
-            let column = column.host();
-            (
-                core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len()),
-                *offset,
-            )
-        })
-        .collect();
+    let raw = host_stack_parts(parts, log_evals)?;
     math_cuda::device::backend().ok()?;
     match math_cuda::whir::encode_codeword_parts_carrying(
         &raw, log_evals, log_blowup, transient, carried,
@@ -9209,6 +9185,43 @@ where
             None
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+fn host_stack_parts<'a, F>(
+    parts: &[(&'a dyn crate::narrow::HostColumn<F>, usize)],
+    log_evals: usize,
+) -> Option<Vec<(&'a [u64], usize)>>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|(column, offset)| offset + column.rows() > (1usize << log_evals))
+    {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    Some(
+        parts
+            .iter()
+            .map(|(column, offset)| unsafe {
+                let column = column.host();
+                (
+                    core::slice::from_raw_parts(
+                        column.evals().as_ptr() as *const u64,
+                        column.len(),
+                    ),
+                    *offset,
+                )
+            })
+            .collect(),
+    )
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -9867,6 +9880,90 @@ pub(crate) fn commit_joint_streamed(
             None
         }
     }
+}
+
+/// Stream the retired stacks into their joint BLAKE3 tree.
+pub(crate) fn commit_joint_streamed_stacks<F>(
+    polys: &[crate::whir_chain::Stacked<'_, F>],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::whir_hash::DeviceHashKey,
+    leaves: crate::whir_commit::LeafOrder,
+) -> Option<(JointTree, [u8; 32])>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    let log_elements = log_evals + log_blowup;
+    #[cfg(feature = "cuda")]
+    if hash.into_math_cuda() == math_cuda::DeviceHash::Blake3
+        && math_cuda::whir::ntt_last_pass_hashes(log_elements as u32, log_folding, log_blowup)
+    {
+        if (1usize << log_elements) < COMMIT_THRESHOLD || whir_commit_declined() {
+            return None;
+        }
+        math_cuda::device::backend().ok()?;
+        let decline_at = STREAMED_DECLINE_AT.load(Ordering::Relaxed);
+        let mut declined = false;
+        let built = math_cuda::whir::commit_joint_streamed_encoded(
+            polys.len(),
+            1usize << log_elements,
+            log_folding,
+            hash.into_math_cuda(),
+            placement(leaves),
+            |k, carried, step| {
+                if k > 0 {
+                    probe_streamed_gap();
+                }
+                if k as u64 != decline_at {
+                    let poly = &polys[k];
+                    match &poly.resident {
+                        Some((store, parts)) if store.here().is_some() => {
+                            return step
+                                .encode_resident(&store.0, parts, log_blowup, transient, carried)
+                                .map(Some);
+                        }
+                        None => {
+                            if let Some(parts) = host_stack_parts(&poly.parts, log_evals) {
+                                return step
+                                    .encode_parts(&parts, log_blowup, transient, carried)
+                                    .map(Some);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                declined = true;
+                Ok(None)
+            },
+        );
+        return match built {
+            Ok((tree, root)) => {
+                COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+                Some((JointTree(tree), root))
+            }
+            Err(err) => {
+                if !declined {
+                    note_commit_error("streamed NTT leaves", log_evals, log_blowup, &err);
+                }
+                None
+            }
+        };
+    }
+    commit_joint_streamed(
+        polys.len(),
+        log_elements,
+        log_folding,
+        hash,
+        leaves,
+        |k, carried| match &polys[k].resident {
+            Some((store, parts)) => {
+                encode_resident(store, parts, log_evals, log_blowup, transient, carried)
+            }
+            None => encode_parts(&polys[k].parts, log_evals, log_blowup, transient, carried),
+        },
+    )
 }
 
 /// Test only: the streamed commit's encode of codeword `k` declines (`u64::MAX`:

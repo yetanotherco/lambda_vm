@@ -2103,13 +2103,14 @@ where
     crate::gpu::note_joint_run(retired);
     if retired
         && crate::gpu::streamed_joint_leaves()
-        && let Some((tree, root)) = crate::gpu::commit_joint_streamed(
-            polys.len(),
-            num_vars + config.log_blowup,
+        && let Some((tree, root)) = crate::gpu::commit_joint_streamed_stacks(
+            polys,
+            num_vars,
+            config.log_blowup,
             first,
+            transient,
             H::DEVICE,
             leaves,
-            |k, carried| polys.get(k).and_then(|f| encode_one(f, carried)),
         )
     {
         let commitment = CodewordCommitment::from_device_joint_streamed(

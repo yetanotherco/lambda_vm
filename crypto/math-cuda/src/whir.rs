@@ -2054,50 +2054,9 @@ fn encode_from(
     );
 
     let be = backend()?;
-    // The codeword itself stays until this commitment's opening. On top of it
-    // there is a working set — the tree this commit builds, and later the
-    // folds and the trees the chain's rounds build — which is another
-    // codeword's worth and is **transient**: one commit or one opening uses it
-    // at a time. A caller committing a group of polynomials promises that once
-    // for all of them and passes `transient: false`; one committing alone
-    // promises it here.
-    //
-    // A promise `carried` over from the codeword before this one (a streamed
-    // joint commit's, [`commit_joint_streamed`]) is this codeword's when it is
-    // the same size: nothing is asked of the ledger, so no other caller can
-    // take the room between the two. Any other carried promise goes back
-    // before this one is asked for.
-    let bytes = n as u64 * 8 * codeword_promise(transient);
-    let room = match carried {
-        Some(room) if room.bytes() == bytes => room,
-        other => {
-            drop(other);
-            be.reserve(bytes).ok_or(cudarc::driver::DriverError(
-                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
-            ))?
-        }
-    };
+    let room = reserve_codeword(be, n, transient, carried)?;
     let stream = be.next_stream();
-
-    // The coefficients get a buffer of their own: the Möbius transform runs
-    // over them, and the spread below reads them while it writes the codeword.
-    // SAFETY: every element is written by the copy below, or by the wide
-    // Möbius pass that gathers the stack in its place.
-    let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, 1usize << log_evals) }?;
-    let fused = mobius_fused_levels(log_evals, log_blowup);
-    let x = if mobius_wide_gathered(&stream, be, &source, &mut coeffs, log_evals, fused)? {
-        spread_encode(
-            &stream,
-            be,
-            coeffs,
-            log_evals,
-            log_blowup,
-            fused.unwrap_or(0),
-        )?
-    } else {
-        source.write(&stream, &mut coeffs)?;
-        encode_values(&stream, be, coeffs, log_evals, log_blowup)?
-    };
+    let x = encode_slab(source, &stream, be, log_blowup, None)?;
 
     let codeword = DeviceCodeword {
         buffer: Arc::new(x),
@@ -2114,6 +2073,86 @@ fn encode_from(
     Ok(codeword)
 }
 
+fn reserve_codeword(
+    be: &crate::device::Backend,
+    n: usize,
+    transient: bool,
+    carried: Option<crate::device::DeviceReservation>,
+) -> Result<crate::device::DeviceReservation> {
+    // The codeword itself stays until this commitment's opening. On top of it
+    // there is a working set — the tree this commit builds, and later the
+    // folds and the trees the chain's rounds build — which is another
+    // codeword's worth and is **transient**: one commit or one opening uses it
+    // at a time. A caller committing a group of polynomials promises that once
+    // for all of them and passes `transient: false`; one committing alone
+    // promises it here.
+    //
+    // A promise `carried` over from the codeword before this one (a streamed
+    // joint commit's, [`commit_joint_streamed`]) is this codeword's when it is
+    // the same size: nothing is asked of the ledger, so no other caller can
+    // take the room between the two. Any other carried promise goes back
+    // before this one is asked for.
+    let bytes = n as u64 * 8 * codeword_promise(transient);
+    Ok(match carried {
+        Some(room) if room.bytes() == bytes => room,
+        other => {
+            drop(other);
+            be.reserve(bytes).ok_or(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            ))?
+        }
+    })
+}
+
+fn encode_slab(
+    source: Source<'_>,
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    log_blowup: usize,
+    leaves: Option<crate::lde_cm::NttLeafTarget>,
+) -> Result<CudaSlice<u64>> {
+    let log_evals = source.log_evals();
+    let fused = mobius_fused_levels(log_evals, log_blowup);
+    let deferred = defer_mobius(fused);
+    let gathered = if deferred {
+        with_stack_parts(stream, &source, |tab, count| {
+            spread_encode_input(
+                stream,
+                be,
+                crate::lde_cm::SpreadSource::Parts(tab, count),
+                log_evals,
+                log_blowup,
+                fused.unwrap_or(0),
+                true,
+                leaves,
+            )
+        })?
+    } else {
+        None
+    };
+    if let Some(x) = gathered {
+        Ok(x)
+    } else {
+        // The compact source is either uploaded or gathered and transformed
+        // before the spread. Every word is initialized by one of those paths.
+        let mut coeffs = unsafe { alloc_or_trim::<u64>(stream, 1usize << log_evals) }?;
+        if !deferred && mobius_wide_gathered(stream, be, &source, &mut coeffs, log_evals, fused)? {
+            spread_encode(
+                stream,
+                be,
+                coeffs,
+                log_evals,
+                log_blowup,
+                fused.unwrap_or(0),
+                leaves,
+            )
+        } else {
+            source.write(stream, &mut coeffs)?;
+            encode_values_to(stream, be, coeffs, log_evals, log_blowup, leaves)
+        }
+    }
+}
+
 /// The codeword of the multilinear whose `2^log_evals` hypercube values
 /// `values` holds, base field: the Möbius transform in place, the lift's
 /// spread, the NTT onto the `2^log_blowup`-times larger domain, in domain
@@ -2121,17 +2160,30 @@ fn encode_from(
 fn encode_values(
     stream: &Arc<CudaStream>,
     be: &crate::device::Backend,
-    mut coeffs: CudaSlice<u64>,
+    coeffs: CudaSlice<u64>,
     log_evals: u64,
     log_blowup: usize,
 ) -> Result<CudaSlice<u64>> {
+    encode_values_to(stream, be, coeffs, log_evals, log_blowup, None)
+}
+
+fn encode_values_to(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    mut coeffs: CudaSlice<u64>,
+    log_evals: u64,
+    log_blowup: usize,
+    leaves: Option<crate::lde_cm::NttLeafTarget>,
+) -> Result<CudaSlice<u64>> {
     let len = 1usize << log_evals;
     let fused = mobius_fused_levels(log_evals, log_blowup);
-    if let Some(from) = fused {
-        let (x, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut coeffs, stream);
-        mobius_wide_tiles(stream.as_ref(), be, x, len, log_evals, from, None)?;
-    } else {
-        mobius(stream.as_ref(), be, &mut coeffs, len, log_evals)?;
+    if !defer_mobius(fused) {
+        if let Some(from) = fused {
+            let (x, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut coeffs, stream);
+            mobius_wide_tiles(stream.as_ref(), be, x, len, log_evals, from, None)?;
+        } else {
+            mobius(stream.as_ref(), be, &mut coeffs, len, log_evals)?;
+        }
     }
     spread_encode(
         stream,
@@ -2140,6 +2192,7 @@ fn encode_values(
         log_evals,
         log_blowup,
         fused.unwrap_or(0),
+        leaves,
     )
 }
 
@@ -2154,59 +2207,81 @@ fn spread_encode(
     log_evals: u64,
     log_blowup: usize,
     mobius_levels: u32,
+    leaves: Option<crate::lde_cm::NttLeafTarget>,
 ) -> Result<CudaSlice<u64>> {
     let log_n = log_evals + log_blowup as u64;
-    let n = 1usize << log_n;
+    let lb = log_blowup as u32;
+    if crate::lde_cm::engine_enabled() && crate::lde_cm::spread_supports(log_n as u32, lb) {
+        let (src, _guard) = coeffs.device_ptr(stream);
+        return spread_encode_input(
+            stream,
+            be,
+            crate::lde_cm::SpreadSource::Compact(src),
+            log_evals,
+            log_blowup,
+            mobius_levels,
+            defer_mobius(Some(mobius_levels)),
+            leaves,
+        );
+    }
 
-    // The lift's bit-reverse and the NTT's cancel around the zero padding —
-    // see `lift_spread`. What was two scattered passes over the codeword plus
-    // the memset that zeroed it is one pass that writes all of it.
-    // SAFETY: the spread writes every element, padding included (on the column
-    // engine its first pass does, storing all of its tile).
-    let mut x = unsafe { alloc_or_trim::<u64>(stream, n) }?;
+    assert_eq!(
+        mobius_levels, 0,
+        "the legacy encoding takes separate Möbius levels"
+    );
+    debug_assert!(leaves.is_none());
+    let n = 1usize << log_n;
     let n_u64 = n as u64;
-    let log_blowup_u32 = log_blowup as u32;
-    if crate::lde_cm::engine_enabled()
-        && crate::lde_cm::spread_supports(log_n as u32, log_blowup_u32)
+    // SAFETY: lift_spread writes every element, including padding.
+    let mut x = unsafe { alloc_or_trim::<u64>(stream, n) }?;
+    unsafe {
+        stream
+            .launch_builder(&be.lift_spread)
+            .arg(&coeffs)
+            .arg(&n_u64)
+            .arg(&lb)
+            .arg(&mut x)
+            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    }
+    // The spread has read the coefficients. Recycle them before obtaining
+    // the legacy twiddle table and queuing the in-place NTT.
+    drop(coeffs);
+    let twiddles = be.fwd_twiddles_for(log_n)?;
+    crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
+    Ok(x)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spread_encode_input(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    src: crate::lde_cm::SpreadSource,
+    log_evals: u64,
+    log_blowup: usize,
+    mobius_levels: u32,
+    deferred: bool,
+    leaves: Option<crate::lde_cm::NttLeafTarget>,
+) -> Result<CudaSlice<u64>> {
+    let log_n = log_evals as u32 + log_blowup as u32;
+    let n = 1usize << log_n;
+    // SAFETY: the first pass writes the whole slab, padding included.
+    let mut x = unsafe { alloc_or_trim::<u64>(stream, n) }?;
     {
-        // The same spread and transform in the column engine's ceil(log_n / 8)
-        // passes, the spread fused into the first one, and no twiddle table
-        // (see `lde_cm`). A test's `lde_cm::with_engine(false, ..)` takes the
-        // branch below.
-        let src = coeffs.device_ptr(stream).0;
-        let dst = x.device_ptr(stream).0;
+        let (dst, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut x, stream);
         crate::lde_cm::spread_ntt_column(
             stream,
             be,
             src,
             dst,
-            log_n as u32,
-            log_blowup_u32,
+            log_n,
+            log_blowup as u32,
             mobius_levels,
+            deferred,
+            leaves,
         )?;
-        if mobius_levels > 0 {
-            MOBIUS_FUSED_ENCODES.fetch_add(1, Ordering::Relaxed);
-        }
-        // Spent: the first pass has read them, and the free is stream-ordered.
-        drop(coeffs);
-    } else {
-        assert_eq!(
-            mobius_levels, 0,
-            "the legacy encoding cannot take fused Möbius levels"
-        );
-        unsafe {
-            stream
-                .launch_builder(&be.lift_spread)
-                .arg(&coeffs)
-                .arg(&n_u64)
-                .arg(&log_blowup_u32)
-                .arg(&mut x)
-                .launch(LaunchConfig::for_num_elems(n as u32))?;
-        }
-        // Spent: the spread has read them, and the free is stream-ordered.
-        drop(coeffs);
-        let twiddles = be.fwd_twiddles_for(log_n)?;
-        crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
+    }
+    if mobius_levels > 0 {
+        MOBIUS_FUSED_ENCODES.fetch_add(1, Ordering::Relaxed);
     }
     Ok(x)
 }
@@ -2589,6 +2664,36 @@ pub fn mobius_fused_encodes() -> u64 {
     MOBIUS_FUSED_ENCODES.load(Ordering::Relaxed)
 }
 
+fn defer_mobius(fused: Option<u32>) -> bool {
+    fused.is_some_and(|levels| levels > 0)
+        && crate::lde_cm::ntt_wide_enabled()
+        && MOBIUS_IN_NTT_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or_else(|| {
+                static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ENABLED.get_or_init(|| {
+                    std::env::var_os("LAMBDA_VM_ENCODE_MOBIUS_IN_NTT").is_some_and(|v| v == "1")
+                })
+            })
+}
+
+thread_local! {
+    static MOBIUS_IN_NTT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run an encode bench arm with the deferred Möbius transform forced on or off.
+#[doc(hidden)]
+pub fn with_mobius_in_ntt<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MOBIUS_IN_NTT_OVERRIDE.set(self.0);
+        }
+    }
+    let _restore = Restore(MOBIUS_IN_NTT_OVERRIDE.replace(Some(on)));
+    f()
+}
+
 /// The Möbius level the fused encoding of a `2^log_evals` stack at spacing
 /// `2^log_blowup` starts its strided passes at — the levels below it run in
 /// the NTT's first pass — or `None` where it does not apply: a test's override
@@ -2695,6 +2800,30 @@ fn mobius_wide_gathered(
         return Ok(false);
     }
     let len = 1usize << log_evals;
+    let gathered = with_stack_parts(stream, source, |tab, n_parts| {
+        let (x, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
+        match fused {
+            Some(from) => {
+                mobius_wide_tiles(stream, be, x, len, log_evals, from, Some((tab, n_parts)))
+            }
+            None => mobius_wide(stream, be, x, len, log_evals, Some((tab, n_parts))),
+        }
+    })?
+    .is_some();
+    if gathered {
+        MOBIUS_WIDE_GATHERS.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(gathered)
+}
+
+// The table and source pointers stay alive until the consumer has queued
+// the gather. An overlapping layout goes through Source::write as before.
+fn with_stack_parts<T>(
+    stream: &Arc<CudaStream>,
+    source: &Source<'_>,
+    consume: impl FnOnce(cudarc::driver::sys::CUdeviceptr, u32) -> Result<T>,
+) -> Result<Option<T>> {
+    let len = 1usize << source.log_evals();
     // (offset in the stack, words, source address); the guards hold the
     // borrowed buffers' stream bookkeeping until the first pass is queued.
     let mut parts: Vec<(u64, u64, u64)> = Vec::new();
@@ -2715,24 +2844,24 @@ fn mobius_wide_gathered(
             guards.push(guard);
             for &(at, words, offset) in p.iter() {
                 if at + words > buffer.len() {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 parts.push((offset as u64, words as u64, base + (at * 8) as u64));
             }
         }
-        Source::Whole(_) | Source::Parts { .. } => return Ok(false),
+        Source::Whole(_) | Source::Parts { .. } => return Ok(None),
     }
     parts.retain(|&(_, words, _)| words > 0);
     parts.sort_by_key(|&(offset, _, _)| offset);
     let mut end = 0u64;
     for &(offset, words, _) in &parts {
         if offset < end || offset + words > len as u64 {
-            return Ok(false);
+            return Ok(None);
         }
         end = offset + words;
     }
     let Ok(n_parts) = u32::try_from(parts.len()) else {
-        return Ok(false);
+        return Ok(None);
     };
     let flat: Vec<u64> = parts.iter().flat_map(|&(o, w, s)| [o, w, s]).collect();
     // One word when there is no part, so the kernel gets an address; it reads
@@ -2742,27 +2871,10 @@ fn mobius_wide_gathered(
     } else {
         &flat[..]
     })?;
-    {
-        let (tab, _tab_guard) = table.device_ptr(stream);
-        let (x, _x_guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
-        match fused {
-            Some(from) => mobius_wide_tiles(
-                stream.as_ref(),
-                be,
-                x,
-                len,
-                log_evals,
-                from,
-                Some((tab, n_parts)),
-            )?,
-            None => mobius_wide(stream.as_ref(), be, x, len, log_evals, Some((tab, n_parts)))?,
-        }
-    }
+    let (tab, _tab_guard) = table.device_ptr(stream);
+    let result = consume(tab, n_parts)?;
     drop(guards);
-    // Freed stream-ordered, after the first pass has read it.
-    drop(table);
-    MOBIUS_WIDE_GATHERS.fetch_add(1, Ordering::Relaxed);
-    Ok(true)
+    Ok(Some(result))
 }
 
 #[cfg(test)]
@@ -3461,17 +3573,27 @@ pub fn joint_streamed_builds_on(slot: usize) -> u64 {
 /// The last codeword's promise comes back to the caller (the tree's,
 /// [`commit_joint_streamed`]); an error at any step drops what is held,
 /// promise included.
-pub(crate) fn stream_codewords<C, R, E>(
+#[cfg(test)]
+fn stream_codewords<C, R, E>(
     blocks: usize,
     mut encode: impl FnMut(usize, Option<R>) -> std::result::Result<C, E>,
     mut absorb: impl FnMut(usize, &C) -> std::result::Result<(), E>,
     mut let_go: impl FnMut(C) -> Option<R>,
 ) -> std::result::Result<Option<R>, E> {
+    stream_commit_steps(blocks, |k, carried| {
+        let codeword = encode(k, carried)?;
+        absorb(k, &codeword)?;
+        Ok(let_go(codeword))
+    })
+}
+
+fn stream_commit_steps<R, E>(
+    blocks: usize,
+    mut step: impl FnMut(usize, Option<R>) -> std::result::Result<Option<R>, E>,
+) -> std::result::Result<Option<R>, E> {
     let mut carried = None;
     for k in 0..blocks {
-        let codeword = encode(k, carried.take())?;
-        absorb(k, &codeword)?;
-        carried = let_go(codeword);
+        carried = step(k, carried)?;
     }
     Ok(carried)
 }
@@ -3484,9 +3606,8 @@ const fn joint_step_takes(base: bool, elements: usize, buffer_len: usize, want: 
     base && elements == want && buffer_len >= want
 }
 
-/// A codeword's values freed and its promise handed back
-/// ([`stream_codewords`]' `let_go`): `None` when another holder shares the
-/// promise (a fold or a clone), which then lives on with it.
+/// Free a streamed codeword and hand back its promise when it is the sole
+/// holder. A fold or clone can hold the promise until it goes.
 fn codeword_promise_of(codeword: DeviceCodeword) -> Option<crate::device::DeviceReservation> {
     let DeviceCodeword { buffer, room, .. } = codeword;
     drop(buffer);
@@ -3632,8 +3753,8 @@ mod stream_codewords_tests {
 /// codeword `k`'s reservation is `carried` into codeword `k + 1`'s encode
 /// ([`encode_codeword_resident_carrying`]), so the run holds one codeword's
 /// promise from its first encode to its last step, and no other caller can
-/// take that room between two steps ([`stream_codewords`]); the tree then
-/// keeps the last promise, cut to its nodes' bytes, while it lives. The same tree and root as [`commit_joint`] over the same codewords,
+/// take that room between two steps. The tree keeps the last promise, cut to
+/// its nodes' bytes, while it lives. The same tree and root as [`commit_joint`] over the same codewords,
 /// with one codeword alive at a time instead of the run's. BLAKE3 only, and a
 /// fold block of at least 8 values (a codeword's block a whole number of
 /// 64-byte blocks).
@@ -3644,6 +3765,198 @@ pub fn commit_joint_streamed(
     hash: crate::DeviceHash,
     placement: LeafPlacement,
     mut encode: impl FnMut(usize, Option<crate::device::DeviceReservation>) -> Option<DeviceCodeword>,
+) -> Result<(JointTree, [u8; 32])> {
+    commit_joint_streamed_encoded(
+        blocks,
+        elements,
+        log_folding,
+        hash,
+        placement,
+        |k, carried, mut step| {
+            let codeword = encode(k, carried).ok_or_else(crate::invalid_value)?;
+            step.absorb(&codeword)?;
+            Ok(Some(StreamedJointAbsorbed(codeword_promise_of(codeword))))
+        },
+    )
+}
+
+/// The output of one streamed commitment step. When eligible, its encode
+/// hashes the last pass directly into the tree's leaf slots.
+pub struct StreamedJointStep<'a> {
+    stream: &'a Arc<CudaStream>,
+    nodes: &'a mut CudaSlice<u8>,
+    leaves_offset: usize,
+    elements: usize,
+    log_folding: usize,
+    blocks: u64,
+    step: u64,
+    leaf_bits: u32,
+}
+
+/// Proof that a step has initialized or advanced its leaf slots.
+pub struct StreamedJointAbsorbed(Option<crate::device::DeviceReservation>);
+
+/// Whether a streamed base commitment can hash its last pass from tiles.
+#[doc(hidden)]
+pub fn ntt_last_pass_hashes(log_n: u32, log_folding: usize, log_blowup: usize) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    NTT_LAST_PASS_HASHES_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("LAMBDA_VM_NTT_LAST_PASS_HASHES").is_some_and(|v| v == "1")
+            })
+        })
+        && log_folding == 6
+        && crate::lde_cm::spread_supports(log_n, log_blowup as u32)
+        && crate::lde_cm::last_pass_holds_fold6(log_n)
+}
+
+thread_local! {
+    static NTT_LAST_PASS_HASHES_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run a commit bench arm with last-pass hashing forced on or off.
+#[doc(hidden)]
+pub fn with_ntt_last_pass_hashes<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NTT_LAST_PASS_HASHES_OVERRIDE.set(self.0);
+        }
+    }
+    let _restore = Restore(NTT_LAST_PASS_HASHES_OVERRIDE.replace(Some(on)));
+    f()
+}
+
+impl StreamedJointStep<'_> {
+    pub fn encode_resident(
+        self,
+        store: &crate::columns::DeviceColumns,
+        parts: &[(usize, usize)],
+        log_blowup: usize,
+        transient: bool,
+        carried: Option<crate::device::DeviceReservation>,
+    ) -> Result<StreamedJointAbsorbed> {
+        let log_evals = (self.elements.trailing_zeros() as usize)
+            .checked_sub(log_blowup)
+            .ok_or_else(crate::invalid_value)?;
+        self.encode(
+            Source::Resident {
+                store,
+                parts,
+                log_evals,
+            },
+            log_blowup,
+            transient,
+            carried,
+        )
+    }
+
+    pub fn encode_parts(
+        self,
+        parts: &[(&[u64], usize)],
+        log_blowup: usize,
+        transient: bool,
+        carried: Option<crate::device::DeviceReservation>,
+    ) -> Result<StreamedJointAbsorbed> {
+        let log_evals = (self.elements.trailing_zeros() as usize)
+            .checked_sub(log_blowup)
+            .ok_or_else(crate::invalid_value)?;
+        self.encode(
+            Source::Parts { parts, log_evals },
+            log_blowup,
+            transient,
+            carried,
+        )
+    }
+
+    fn encode(
+        mut self,
+        source: Source<'_>,
+        log_blowup: usize,
+        transient: bool,
+        carried: Option<crate::device::DeviceReservation>,
+    ) -> Result<StreamedJointAbsorbed> {
+        if !ntt_last_pass_hashes(self.elements.trailing_zeros(), self.log_folding, log_blowup) {
+            let codeword = encode_from(source, log_blowup, transient, carried)?;
+            self.absorb(&codeword)?;
+            return Ok(StreamedJointAbsorbed(codeword_promise_of(codeword)));
+        }
+        let be = backend()?;
+        let room = reserve_codeword(be, self.elements, transient, carried)?;
+        let count = self.elements >> self.log_folding;
+        let mut region = self
+            .nodes
+            .slice_mut(self.leaves_offset..self.leaves_offset + count * 32);
+        let (out, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut region, self.stream);
+        let target = crate::lde_cm::NttLeafTarget {
+            out,
+            blocks: self.blocks,
+            step: self.step,
+            leaf_bits: self.leaf_bits,
+        };
+        let work = encode_slab(source, self.stream, be, log_blowup, Some(target))?;
+        drop(work);
+        self.stream.synchronize()?;
+        NTT_LAST_PASS_HASHES.fetch_add(1, Ordering::Relaxed);
+        Ok(StreamedJointAbsorbed(Some(room)))
+    }
+
+    fn absorb(&mut self, codeword: &DeviceCodeword) -> Result<()> {
+        ensure!(
+            joint_step_takes(
+                codeword.base,
+                codeword.elements,
+                codeword.buffer.len(),
+                self.elements,
+            ),
+            "a joint tree's codewords are base and of one length"
+        );
+        codeword.stream.synchronize()?;
+        let num_leaves = (self.elements >> self.log_folding) as u64;
+        let log_folding = self.log_folding as u32;
+        let kernel = &crate::blake3_whir::kernels()?.leaves_base_coset_joint_step;
+        let cfg = crate::blake3_whir::launch_cfg(num_leaves);
+        let mut region = self
+            .nodes
+            .slice_mut(self.leaves_offset..self.leaves_offset + num_leaves as usize * 32);
+        unsafe {
+            self.stream
+                .launch_builder(kernel)
+                .arg(codeword.buffer.as_ref())
+                .arg(&self.blocks)
+                .arg(&self.step)
+                .arg(&num_leaves)
+                .arg(&log_folding)
+                .arg(&self.leaf_bits)
+                .arg(&mut region)
+                .launch(cfg)?;
+        }
+        self.stream.synchronize()
+    }
+}
+
+static NTT_LAST_PASS_HASHES: AtomicU64 = AtomicU64::new(0);
+
+/// Streamed joint steps whose last NTT pass absorbed its leaves.
+pub fn ntt_last_pass_hashes_count() -> u64 {
+    NTT_LAST_PASS_HASHES.load(Ordering::Relaxed)
+}
+
+/// Commit a retired joint tree, letting the caller encode directly into each
+/// streamed leaf step. The closure is called once per stack, in stack order.
+pub fn commit_joint_streamed_encoded(
+    blocks: usize,
+    elements: usize,
+    log_folding: usize,
+    hash: crate::DeviceHash,
+    placement: LeafPlacement,
+    mut encode: impl FnMut(
+        usize,
+        Option<crate::device::DeviceReservation>,
+        StreamedJointStep<'_>,
+    ) -> Result<Option<StreamedJointAbsorbed>>,
 ) -> Result<(JointTree, [u8; 32])> {
     ensure!(
         hash == crate::DeviceHash::Blake3,
@@ -3670,45 +3983,21 @@ pub fn commit_joint_streamed(
         LeafPlacement::Natural => 0,
         LeafPlacement::Reversed => num_leaves.trailing_zeros(),
     };
-    let kernel = &crate::blake3_whir::kernels()?.leaves_base_coset_joint_step;
-    let cfg = crate::blake3_whir::launch_cfg(num_leaves as u64);
-    let (blocks_u64, num_leaves_u64, log_block_u32) =
-        (blocks as u64, num_leaves as u64, log_folding as u32);
-    let last = stream_codewords(
-        blocks,
-        |k, carried| encode(k, carried).ok_or_else(crate::invalid_value),
-        |k, codeword: &DeviceCodeword| {
-            ensure!(
-                joint_step_takes(
-                    codeword.base,
-                    codeword.elements,
-                    codeword.buffer.len(),
-                    elements
-                ),
-                "a joint tree's codewords are base and of one length"
-            );
-            // The codeword's encode, and the step before this one, are done
-            // before this step reads them.
-            codeword.stream.synchronize()?;
-            let step = k as u64;
-            let mut region = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-            unsafe {
-                stream
-                    .launch_builder(kernel)
-                    .arg(codeword.buffer.as_ref())
-                    .arg(&blocks_u64)
-                    .arg(&step)
-                    .arg(&num_leaves_u64)
-                    .arg(&log_block_u32)
-                    .arg(&leaf_bits)
-                    .arg(&mut region)
-                    .launch(cfg)?;
-            }
-            // The step has read the codeword before it goes.
-            stream.synchronize()
-        },
-        codeword_promise_of,
-    )?;
+    let last = stream_commit_steps(blocks, |k, carried| {
+        let step = StreamedJointStep {
+            stream: &stream,
+            nodes: &mut nodes,
+            leaves_offset,
+            elements,
+            log_folding,
+            blocks: blocks as u64,
+            step: k as u64,
+            leaf_bits,
+        };
+        Ok(encode(k, carried, step)?
+            .ok_or_else(crate::invalid_value)?
+            .0)
+    })?;
     // The last codeword's promise, cut to the nodes' bytes (from a fold block
     // of 8 values up a codeword is at least that), is the tree's while it
     // lives: the group's room covers the nodes during the commit, but not

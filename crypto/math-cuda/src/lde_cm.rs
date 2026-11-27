@@ -570,6 +570,35 @@ pub(crate) fn fused_mobius_levels(log_n: u32, log_blowup: u32) -> u32 {
     k + pass_log_t(log_n, 0, k) - log_blowup
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SpreadSource {
+    Compact(sys::CUdeviceptr),
+    Parts(sys::CUdeviceptr, u32),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NttLeafTarget {
+    pub out: sys::CUdeviceptr,
+    pub blocks: u64,
+    pub step: u64,
+    pub leaf_bits: u32,
+}
+
+static DEFERRED_MOBIUS_ENCODINGS: AtomicU64 = AtomicU64::new(0);
+
+/// Encodes that ran the high Möbius levels inside the strided NTT passes.
+pub fn deferred_mobius_encodings() -> u64 {
+    DEFERRED_MOBIUS_ENCODINGS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn last_pass_holds_fold6(log_n: u32) -> bool {
+    if !engine_enabled() || !(13..=31).contains(&log_n) {
+        return false;
+    }
+    let plan = spread_plan(log_n);
+    plan[plan.len() - 1] >= 7
+}
+
 /// The forward transform of ONE spread column — the WHIR commit's encoding
 /// (`whir::commit_from`; the legacy path is `ntt.cu`'s `lift_spread` then
 /// `ntt::run_ntt_body`), fused: position `2^log_blowup · q` of the
@@ -586,14 +615,17 @@ pub(crate) fn fused_mobius_levels(log_n: u32, log_blowup: u32) -> u32 {
 /// [`fused_mobius_levels`]) the first pass also runs the encoding's Möbius
 /// levels `[0, mobius_levels)` over the coefficients it stages: the caller has
 /// run the others (the levels commute).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spread_ntt_column(
     stream: &CudaStream,
     be: &Backend,
-    src: sys::CUdeviceptr,
+    src: SpreadSource,
     dst: sys::CUdeviceptr,
     log_n: u32,
     log_blowup: u32,
     mobius_levels: u32,
+    defer_mobius: bool,
+    leaves: Option<NttLeafTarget>,
 ) -> Result<()> {
     assert!(
         spread_supports(log_n, log_blowup),
@@ -608,6 +640,7 @@ pub(crate) fn spread_ntt_column(
     let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
     let one = |ptr| Cols { ptr, stride: 0 };
     let ks = spread_plan(log_n);
+    debug_assert!(leaves.is_none() || last_pass_holds_fold6(log_n));
     let first_flags = if mobius_levels > 0 {
         F_SPREAD | F_MOBIUS
     } else {
@@ -616,6 +649,68 @@ pub(crate) fn spread_ntt_column(
     let mut s = 0;
     for (i, &k) in ks.iter().enumerate() {
         let first = i == 0;
+        let start = (mobius_levels + log_blowup).saturating_sub(s);
+        let parts = match src {
+            SpreadSource::Parts(ptr, count) if first => Some((ptr, u64::from(count))),
+            _ => None,
+        };
+        let hash = leaves.filter(|_| i + 1 == ks.len());
+        if hash.is_some() || parts.is_some() || (defer_mobius && !first && start < k) {
+            let log_t = pass_log_t(log_n, s, k);
+            let cfg = LaunchConfig {
+                grid_dim: (1 << (log_n - k - log_t), 1, 1),
+                block_dim: (1 << (log_t + k - 4), 1, 1),
+                shared_mem_bytes: tile_bytes(k, log_t),
+            };
+            let index = (k - 6) as usize;
+            unsafe {
+                if let Some(target) = hash {
+                    let mut cfg = cfg;
+                    cfg.block_dim.0 = 64;
+                    let start = if defer_mobius { start } else { k };
+                    stream
+                        .launch_builder(
+                            &crate::blake3_whir::kernels()?.ntt_joint_step[(k - 7) as usize],
+                        )
+                        .arg(&dst)
+                        .arg(&fwd_roots)
+                        .arg(&s)
+                        .arg(&log_t)
+                        .arg(&start)
+                        .arg(&target.blocks)
+                        .arg(&target.step)
+                        .arg(&target.leaf_bits)
+                        .arg(&target.out)
+                        .launch(cfg)?;
+                } else if let Some((table, count)) = parts {
+                    stream
+                        .launch_builder(&be.ntt_cm_parts[index])
+                        .arg(&table)
+                        .arg(&count)
+                        .arg(&dst)
+                        .arg(&fwd_roots)
+                        .arg(&log_n)
+                        .arg(&log_blowup)
+                        .arg(&log_t)
+                        .launch(cfg)?;
+                } else {
+                    stream
+                        .launch_builder(&be.ntt_cm_mobius[index])
+                        .arg(&dst)
+                        .arg(&fwd_roots)
+                        .arg(&s)
+                        .arg(&log_t)
+                        .arg(&start)
+                        .launch(cfg)?;
+                }
+            }
+            s += k;
+            continue;
+        }
+        let input = match src {
+            SpreadSource::Compact(ptr) if first => ptr,
+            _ => dst,
+        };
         launch_pass(
             stream,
             be,
@@ -625,7 +720,7 @@ pub(crate) fn spread_ntt_column(
             s,
             log_blowup,
             if first { first_flags } else { 0 },
-            one(if first { src } else { dst }),
+            one(input),
             one(dst),
             fwd_roots,
             0,
@@ -634,6 +729,9 @@ pub(crate) fn spread_ntt_column(
         s += k;
     }
     CODEWORDS_ENCODED.fetch_add(1, Ordering::Relaxed);
+    if defer_mobius {
+        DEFERRED_MOBIUS_ENCODINGS.fetch_add(1, Ordering::Relaxed);
+    }
     if ks.iter().any(|&k| k > 8) {
         WIDE_CODEWORDS_ENCODED.fetch_add(1, Ordering::Relaxed);
     }
