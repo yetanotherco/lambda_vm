@@ -909,6 +909,7 @@ CLUSTER_TCP_TESTS := two_leaf_tcp_matches_one_process_reference \
 CLUSTER_CUT_KNOBS := LAMBDA_VM_CLUSTER_PREPARED_ROOTS_BESIDE=1 LAMBDA_VM_CLUSTER_LEAF_AT_BIND=1 \
 	LAMBDA_VM_CLUSTER_EARLY_JOIN=1 LAMBDA_VM_CLUSTER_COMPACT_COUNTS=1
 CLUSTER_CUT_TESTS := two_leaf_tcp_matches_one_process_reference tcp_weakened_worker_returns_no_file \
+	four_leaf_tcp_matches_one_process_reference \
 	early_join_refuses_duplicate_artifacts early_join_refuses_a_proof_before_its_artifacts \
 	early_join_refuses_artifacts_for_another_plan \
 	a_worker_that_sends_artifacts_and_no_proof_falls_back_to_a_checked_reference \
@@ -930,6 +931,11 @@ CLUSTER_REPEAT_RUNNER_TESTS := replica_runs_match_local_reference range_runs_mat
 	a_refused_range_file_is_replaced_with_a_checked_local_proof \
 	a_refused_replica_file_is_replaced_with_a_checked_local_proof \
 	a_refused_replacement_ends_in_an_error_with_the_refused_file_in_place
+# The runner's two attempts in one coordinator and one worker process with
+# the four cuts on: the host lane reused across attempts, and
+# publish-then-check, with a forced refusal replaced by a checked local proof.
+CLUSTER_CUT_RUNNER_TESTS := range_runs_match_local_reference \
+	a_refused_range_file_is_replaced_with_a_checked_local_proof
 # The unchecked cluster file's two examples: the checked promotion compiles,
 # a conversion does not. CI's nextest shards run no doctests, so this tier does.
 CLUSTER_DOC_TESTS := lfm::cluster_levels::UncheckedClusterFile
@@ -976,7 +982,12 @@ test-cluster-cuda: compile-programs-asm
 	    $(addprefix tests::tcp::,$(CLUSTER_REPEAT_RUNNER_TESTS)) \
 	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
 	cat "$$output"; \
-	grep -Fq 'test result: ok. $(words $(CLUSTER_REPEAT_RUNNER_TESTS)) passed;' "$$output"
+	grep -Fq 'test result: ok. $(words $(CLUSTER_REPEAT_RUNNER_TESTS)) passed;' "$$output"; \
+	env $(CLUSTER_CUT_KNOBS) $(GPU_TEST_TIMEOUT) "$$runner" --ignored --exact --test-threads=1 \
+	    $(addprefix tests::tcp::,$(CLUSTER_CUT_RUNNER_TESTS)) \
+	    > "$$output" 2>&1 || { cat "$$output"; exit 1; }; \
+	cat "$$output"; \
+	grep -Fq 'test result: ok. $(words $(CLUSTER_CUT_RUNNER_TESTS)) passed;' "$$output"
 
 # Hand honest serialized proofs from the TEST binary to the production binary.
 test-cross-posture-cuda: CROSS_POSTURE_ARGS := --features cuda
