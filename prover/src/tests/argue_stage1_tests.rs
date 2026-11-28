@@ -1727,6 +1727,123 @@ fn grid_production_airs() -> Vec<crate::test_utils::LabeledAir> {
     airs
 }
 
+/// Select the same long programs as the production dispatch.
+fn long_constraint_tables(n: usize, rng: &mut Rng) -> Vec<Table> {
+    use multilinear::gpu_fused::{DEVICE_TAIL_MIN_STEPS, lower_fused};
+
+    let tables: Vec<_> = grid_production_airs()
+        .into_iter()
+        .map(|(label, air)| Table::from_air(&*air, label, n, rng))
+        .filter(|table| {
+            lower_fused(&table.constraints)
+                .expect(&table.label)
+                .nodes
+                .len()
+                / 2
+                >= DEVICE_TAIL_MIN_STEPS
+        })
+        .collect();
+    for label in [
+        "KECCAK_RND",
+        "ECDAS",
+        "ECREC",
+        "ECSM",
+        "KECCAK_W",
+        "ECREC_W",
+    ] {
+        assert!(tables.iter().any(|table| table.label == label), "{label}");
+    }
+    tables
+}
+
+#[test]
+fn production_constraint_chunks_fit_and_sum_to_the_whole_program() {
+    use multilinear::fused_chunks::{CHUNKED_LEAF_CAP, decode, eval_chunked, lower_chunked, op};
+    let mut rng = Rng::new(0xC16);
+    for table in long_constraint_tables(8, &mut rng) {
+        let label = &table.label;
+        let chunked = lower_chunked(&table.constraints, CHUNKED_LEAF_CAP).expect(label);
+        assert!(chunked.chunks() > 1, "{label}");
+        for bounds in chunked.bounds.windows(2) {
+            let reads = chunked.code[bounds[0] as usize..bounds[1] as usize]
+                .iter()
+                .map(|&step| decode(step))
+                .filter_map(|(tag, column, _, _)| (tag == op::VAR).then_some(column))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(reads.len() <= CHUNKED_LEAF_CAP, "{label}: {reads:?}");
+        }
+        let whole = table
+            .constraints
+            .zerocheck_program(&table.betas, table.width())
+            .unwrap();
+        let mut scratch = Vec::new();
+        for _ in 0..3 {
+            let mut values = rng.exts(table.width());
+            values.push(EE::one());
+            assert_eq!(
+                eval_chunked(&chunked, &values, &table.betas),
+                Some(whole.eval(&values, &mut scratch)),
+                "{label}"
+            );
+        }
+        eprintln!("{label}: {} chunks within the column cap", chunked.chunks());
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "one card, run alone"]
+fn thin_constraint_rounds_in_chunks_match_the_whole_card_rounds() {
+    use multilinear::gpu_fused::{FusedFaults, force_zc_chunked, take_tail};
+
+    let _permit = crate::lfm::device_permit::serial_for_test();
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        false,
+    );
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            force_zc_chunked(None);
+        }
+    }
+    let _reset = Reset;
+    let n = 8;
+    let mut rng = Rng::new(0xC16);
+    for table in long_constraint_tables(n, &mut rng) {
+        let session = table.session(table.random_columns(n, &mut rng), &mut rng);
+        let second_point = rng.exts(logup::input_layer_vars(table.interactions.len(), n));
+        let lambda = rng.ext();
+        let _ = take_tail();
+        force_zc_chunked(Some(false));
+        let whole = session.two_buses_proved(&second_point, &lambda, true);
+        assert_eq!(take_tail().chunked_rounds, 0, "{}", table.label);
+        force_zc_chunked(Some(true));
+        let chunked = session.two_buses_proved(&second_point, &lambda, true);
+        let rounds = take_tail().chunked_rounds;
+        assert!(rounds > 0, "{}: no round used chunks", table.label);
+        assert_eq!(
+            chunked.0.rounds.len(),
+            whole.0.rounds.len(),
+            "{}",
+            table.label
+        );
+        for (round, (chunked, whole)) in chunked.0.rounds.iter().zip(&whole.0.rounds).enumerate() {
+            assert_eq!(
+                chunked.evaluations, whole.evaluations,
+                "{}: round {round}",
+                table.label
+            );
+        }
+        assert_eq!(chunked.1, whole.1, "{}: challenges", table.label);
+        assert_eq!(chunked.2, whole.2, "{}: bound factors", table.label);
+        eprintln!("{}: {rounds} chunked card rounds match", table.label);
+    }
+}
+
 #[test]
 fn dump_grid_root_degrees() {
     use multilinear::gpu::op;

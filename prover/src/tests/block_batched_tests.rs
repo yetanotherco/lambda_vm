@@ -736,3 +736,103 @@ fn the_card_argues_the_hosts_bytes() {
         assert!(host.0 == card.0, "{name}: the card's bytes differ");
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "one card, run alone with LAMBDA_VM_DETERMINISTIC_GRIND=1"]
+fn the_chunked_card_rounds_prove_the_same_block_and_a_missing_chunk_fails() {
+    use multilinear::gpu_fused::{FusedFaults, force_fused_faults, force_zc_chunked};
+    use stark::multilinear_table::batched::BatchedArgue;
+
+    let _permit = crate::lfm::device_permit::serial_for_test();
+    assert!(
+        crypto::grinding::deterministic(),
+        "use deterministic grinding"
+    );
+    assert!(multilinear::gpu::reserve_budget() > 0, "needs a CUDA card");
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            force_zc_chunked(None);
+            force_fused_faults(FusedFaults::default());
+        }
+    }
+    let _reset = Reset;
+    let (program, elf, mut traces) =
+        fixed_traces("test_keccak_multi", &MaxRowsConfig::default(), 16);
+    let format = one_group(BATCHED);
+    let opts = options(MaxRowsConfig::default(), 16);
+    let mut prove = |chunked, drop_chunk| {
+        force_zc_chunked(Some(chunked));
+        force_fused_faults(FusedFaults {
+            drop_chunk,
+            ..FusedFaults::default()
+        });
+        prove_fixed(
+            &program,
+            &elf,
+            &mut traces,
+            &format,
+            &opts,
+            &Deviations::default(),
+        )
+    };
+    let mut whole = prove(false, false);
+    let mut chunked = prove(true, false);
+    assert!(verify(&whole, &elf, &format));
+    assert!(verify(&chunked, &elf, &format));
+    assert_ne!(whole.argues.len(), 0);
+    assert_eq!(whole.argues.len(), chunked.argues.len());
+    let same_rounds = |a: &BatchedArgue<E>, b: &BatchedArgue<E>| {
+        a.constraint
+            .rounds
+            .iter()
+            .map(|round| &round.evaluations)
+            .eq(b.constraint.rounds.iter().map(|round| &round.evaluations))
+    };
+    for (whole, chunked) in whole.argues.iter().zip(&chunked.argues) {
+        assert!(same_rounds(whole, chunked));
+    }
+    let bytes = |proof: &BlockWhirProof| rkyv::to_bytes::<rkyv::rancor::Error>(proof).unwrap();
+    let raw = bytes(&whole);
+    if raw.as_slice() == bytes(&chunked).as_slice() {
+        eprintln!("chunked block: {} identical raw proof bytes", raw.len());
+    } else {
+        // Only the order of arithmetic in the constraint rounds changed.
+        // Normalize those limbs and require byte equality of the full archives.
+        for proof in [&mut whole, &mut chunked] {
+            for value in proof.argues.iter_mut().flat_map(|group| {
+                group
+                    .constraint
+                    .rounds
+                    .iter_mut()
+                    .flat_map(|round| &mut round.evaluations)
+            }) {
+                *value = FieldElement::<E>::new(
+                    value
+                        .value()
+                        .map(|limb| FieldElement::from(limb.canonical_u64())),
+                );
+            }
+        }
+        assert!(
+            bytes(&whole).as_slice() == bytes(&chunked).as_slice(),
+            "the canonical proofs differ"
+        );
+        eprintln!("chunked block: raw round limbs differ, canonical proof bytes equal");
+    }
+    let faulted = prove(true, true);
+    assert!(
+        faulted
+            .argues
+            .iter()
+            .zip(&whole.argues)
+            .any(|(faulted, whole)| !same_rounds(faulted, whole)),
+        "dropping a chunk must change a constraint round"
+    );
+    assert!(
+        !verify(&faulted, &elf, &format),
+        "the verifier accepted a dropped chunk"
+    );
+    eprintln!("chunked block: the verifier refused an omitted chunk");
+}

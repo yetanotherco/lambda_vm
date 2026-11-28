@@ -1738,7 +1738,7 @@ where
         // host's over what the card folded.
         eprintln!(
             "BATCHED ARGUE ZC TAIL: long tables {} (past the crossover {}) · card rounds {:.3}s · \
-             host rounds {} in {:.3}s | short tables {} ({}) · card rounds {:.3}s · host rounds {} in {:.3}s",
+             host rounds {} in {:.3}s | short tables {} ({}) · card rounds {:.3}s · host rounds {} in {:.3}s · chunked rounds {}",
             tail.tables[1],
             tail.on_card[1],
             tail.device[1],
@@ -1749,6 +1749,7 @@ where
             tail.device[0],
             tail.host_rounds[0],
             tail.host[0],
+            tail.chunked_rounds,
         );
         // The inputs of D-BATCH §3.2's error terms, measured on this argue.
         eprintln!(

@@ -1264,6 +1264,206 @@ extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
     }
 }
 
+// ── the later rounds in chunks (`multilinear::fused_chunks`, `LAMBDA_VM_ZC_CHUNKED`) ──────────
+//
+// A late round's cube is narrower than the card, so `zc_round_gruen` runs one
+// thread a cube index and costs one walk of the whole program. Here the
+// program comes in chunks of its roots and `blockIdx.y` picks the chunk, so the
+// walk is many short ones side by side. A thread walks its chunk once for
+// every walked node {0, 2..D} (`D` = the walked nodes): a factor's `lo` and
+// `hi` are read once and the node values made by additions (`hi + (hi − lo)`,
+// then `+ (hi − lo)` again). The bus rows are chunk 0's. Row `r < D` of the
+// partials is node `r`'s `Σ eq_r[j]·C_chunk(j, node)`, rows `D` and `D + 1` are
+// `Σ eq_rho[j]·L[j + b·half]` (zero in the other chunks), each at
+// `((r·chunks + chunk)·gridDim.x + blockIdx.x)·3`: a row's partials are
+// contiguous, so `sum_partials_ext3` over `chunks·gridDim.x` of them gives the
+// row's sum, and the chunks' sums add to `zc_round_gruen`'s exactly. Op codes
+// MUST stay in sync with `crypto/multilinear/src/fused_chunks.rs`.
+
+#define ZCC_CONST 0u
+#define ZCC_VAR 1u
+#define ZCC_ADD 2u
+#define ZCC_SUB 3u
+#define ZCC_MUL 4u
+#define ZCC_NEG 5u
+#define ZCC_ACC 6u
+#define ZCC_MULK 7u
+#define ZCC_ADDK 8u
+#define ZCC_SUBK 9u
+#define ZCC_KSUB 10u
+
+__device__ __forceinline__ void zcc_block_sum(uint64_t *sh, const Fe3 &v, uint64_t *out) {
+    sh[threadIdx.x * 3 + 0] = v.a;
+    sh[threadIdx.x * 3 + 1] = v.b;
+    sh[threadIdx.x * 3 + 2] = v.c;
+    __syncthreads();
+    for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width) {
+            Fe3 sum = ext3::add(load_ext(sh + threadIdx.x * 3), load_ext(sh + (threadIdx.x + width) * 3));
+            sh[threadIdx.x * 3 + 0] = sum.a;
+            sh[threadIdx.x * 3 + 1] = sum.b;
+            sh[threadIdx.x * 3 + 2] = sum.c;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[0] = sh[0];
+        out[1] = sh[1];
+        out[2] = sh[2];
+    }
+    __syncthreads();
+}
+
+template <int D>
+__device__ __forceinline__ void zc_round_chunked_body(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_code, const uint32_t *__restrict__ d_bounds,
+    const uint64_t *__restrict__ d_kconst, const uint64_t *__restrict__ d_betas,
+    const uint64_t *__restrict__ d_eq_r, const uint64_t *__restrict__ d_eq_rho,
+    const uint64_t *__restrict__ d_l, uint64_t *__restrict__ d_slots,
+    uint64_t *__restrict__ d_partials) {
+    const uint32_t chunk = blockIdx.y, chunks = gridDim.y;
+    const uint64_t span = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t first = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // In a sub-warp round the idle lanes still reduce, but need no slots.
+    const uint64_t active = min(half, span);
+    const uint64_t nt = active * chunks;
+#define ZCC_AT(slot, node, k) s[((((uint64_t)(slot)) * D + (node)) * 3 + (k)) * nt]
+    const uint32_t cs = d_bounds[chunk], ce = d_bounds[chunk + 1];
+    Fe3 acc[D];
+    for (int n = 0; n < D; n++) acc[n] = ext3::zero();
+    Fe3 bus0 = ext3::zero(), bus1 = ext3::zero();
+    for (uint64_t j = first; j < half; j += span) {
+        uint64_t *s = d_slots + chunk * active + first;
+        Fe3 c[D];
+        for (int n = 0; n < D; n++) c[n] = ext3::zero();
+        for (uint32_t i = cs; i < ce; i++) {
+            const uint64_t w = d_code[i];
+            const uint32_t op = (uint32_t)(w & 0xFF), a = (uint32_t)((w >> 8) & 0xFFFFF),
+                           b = (uint32_t)((w >> 28) & 0xFFFFF), r = (uint32_t)(w >> 48);
+            switch (op) {
+            case ZCC_VAR: {
+                const uint64_t *column = d_factors[a];
+                Fe3 lo = load_ext(column + j * 3);
+                ZCC_AT(r, 0, 0) = lo.a;
+                ZCC_AT(r, 0, 1) = lo.b;
+                ZCC_AT(r, 0, 2) = lo.c;
+                if (D > 1) {
+                    Fe3 hi = load_ext(column + (j + half) * 3);
+                    Fe3 dd = ext3::sub(hi, lo);
+                    Fe3 v = ext3::add(hi, dd);
+                    for (int n = 1; n < D; n++) {
+                        if (n > 1) v = ext3::add(v, dd);
+                        ZCC_AT(r, n, 0) = v.a;
+                        ZCC_AT(r, n, 1) = v.b;
+                        ZCC_AT(r, n, 2) = v.c;
+                    }
+                }
+                break;
+            }
+            case ZCC_CONST: {
+                const uint64_t k = d_kconst[a];
+                for (int n = 0; n < D; n++) {
+                    ZCC_AT(r, n, 0) = k;
+                    ZCC_AT(r, n, 1) = 0;
+                    ZCC_AT(r, n, 2) = 0;
+                }
+                break;
+            }
+            case ZCC_ADD:
+            case ZCC_SUB:
+            case ZCC_MUL:
+                for (int n = 0; n < D; n++) {
+                    Fe3 x = ext3::make(ZCC_AT(a, n, 0), ZCC_AT(a, n, 1), ZCC_AT(a, n, 2));
+                    Fe3 y = ext3::make(ZCC_AT(b, n, 0), ZCC_AT(b, n, 1), ZCC_AT(b, n, 2));
+                    Fe3 v = op == ZCC_ADD ? ext3::add(x, y) : op == ZCC_SUB ? ext3::sub(x, y) : ext3::mul(x, y);
+                    ZCC_AT(r, n, 0) = v.a;
+                    ZCC_AT(r, n, 1) = v.b;
+                    ZCC_AT(r, n, 2) = v.c;
+                }
+                break;
+            case ZCC_NEG:
+                for (int n = 0; n < D; n++) {
+                    Fe3 v = ext3::neg(ext3::make(ZCC_AT(a, n, 0), ZCC_AT(a, n, 1), ZCC_AT(a, n, 2)));
+                    ZCC_AT(r, n, 0) = v.a;
+                    ZCC_AT(r, n, 1) = v.b;
+                    ZCC_AT(r, n, 2) = v.c;
+                }
+                break;
+            case ZCC_MULK: {
+                const uint64_t k = d_kconst[b];
+                for (int n = 0; n < D; n++) {
+                    Fe3 v = ext3::mul_base(ext3::make(ZCC_AT(a, n, 0), ZCC_AT(a, n, 1), ZCC_AT(a, n, 2)), k);
+                    ZCC_AT(r, n, 0) = v.a;
+                    ZCC_AT(r, n, 1) = v.b;
+                    ZCC_AT(r, n, 2) = v.c;
+                }
+                break;
+            }
+            case ZCC_ADDK:
+            case ZCC_SUBK:
+            case ZCC_KSUB: {
+                const uint64_t k = d_kconst[b];
+                for (int n = 0; n < D; n++) {
+                    uint64_t x0 = ZCC_AT(a, n, 0), x1 = ZCC_AT(a, n, 1), x2 = ZCC_AT(a, n, 2);
+                    if (op == ZCC_ADDK) {
+                        x0 = goldilocks::add(x0, k);
+                    } else if (op == ZCC_SUBK) {
+                        x0 = goldilocks::sub(x0, k);
+                    } else {
+                        x0 = goldilocks::sub(k, x0);
+                        x1 = goldilocks::neg(x1);
+                        x2 = goldilocks::neg(x2);
+                    }
+                    ZCC_AT(r, n, 0) = x0;
+                    ZCC_AT(r, n, 1) = x1;
+                    ZCC_AT(r, n, 2) = x2;
+                }
+                break;
+            }
+            case ZCC_ACC: {
+                const Fe3 bt = load_ext(d_betas + (uint64_t)b * 3);
+                for (int n = 0; n < D; n++)
+                    c[n] = ext3::add(c[n], ext3::mul(bt, ext3::make(ZCC_AT(a, n, 0), ZCC_AT(a, n, 1),
+                                                                    ZCC_AT(a, n, 2))));
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        const Fe3 e = load_ext(d_eq_r + j * 3);
+        for (int n = 0; n < D; n++) acc[n] = ext3::add(acc[n], ext3::mul(e, c[n]));
+        if (chunk == 0) {
+            const Fe3 wr = load_ext(d_eq_rho + j * 3);
+            bus0 = ext3::add(bus0, ext3::mul(wr, load_ext(d_l + j * 3)));
+            bus1 = ext3::add(bus1, ext3::mul(wr, load_ext(d_l + (j + half) * 3)));
+        }
+    }
+#undef ZCC_AT
+    extern __shared__ uint64_t shared[];
+    for (int n = 0; n < D + 2; n++) {
+        Fe3 v = n < D ? acc[n] : (n == D ? bus0 : bus1);
+        zcc_block_sum(shared, v, d_partials + ((((uint64_t)n * chunks + chunk) * gridDim.x) + blockIdx.x) * 3);
+    }
+}
+
+#define ZC_ROUND_CHUNKED(D)                                                                              \
+    extern "C" __global__ __launch_bounds__(256) void zc_round_chunked##D(                              \
+        const uint64_t *const *__restrict__ d_factors, uint64_t half,                                  \
+        const uint64_t *__restrict__ d_code, const uint32_t *__restrict__ d_bounds,                    \
+        const uint64_t *__restrict__ d_kconst, const uint64_t *__restrict__ d_betas,                   \
+        const uint64_t *__restrict__ d_eq_r, const uint64_t *__restrict__ d_eq_rho,                    \
+        const uint64_t *__restrict__ d_l, uint64_t *__restrict__ d_slots,                              \
+        uint64_t *__restrict__ d_partials) {                                                           \
+        zc_round_chunked_body<D>(d_factors, half, d_code, d_bounds, d_kconst, d_betas, d_eq_r, d_eq_rho, \
+                                 d_l, d_slots, d_partials);                                            \
+    }
+ZC_ROUND_CHUNKED(1)
+ZC_ROUND_CHUNKED(2)
+ZC_ROUND_CHUNKED(3)
+ZC_ROUND_CHUNKED(4)
+
 // ── a GKR layer's rounds with Gruen's split (D-ARGUE S1-3, `crate::gkr::GruenLayer`) ─────────────
 //
 // The layer relation is `eq(u, x)·h(x)`, `h = p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi`, over `m`

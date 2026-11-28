@@ -400,6 +400,8 @@ pub struct Backend {
     pub zc_bus_column: CudaFunction,
     pub zc_halve: CudaFunction,
     pub zc_round_gruen: CudaFunction,
+    // The later rounds in chunks, one per walked-node count (`crate::argue_fused`).
+    pub zc_round_chunked: [CudaFunction; 4],
     // D-ARGUE S1-3's GKR layer rounds (`crate::gkr::GruenLayer`).
     pub gkr_eq_levels_ext3: CudaFunction,
     pub gkr_round_gruen: CudaFunction,
@@ -1461,6 +1463,12 @@ impl Backend {
             zc_bus_column: sumcheck.load_function("zc_bus_column")?,
             zc_halve: sumcheck.load_function("zc_halve")?,
             zc_round_gruen: sumcheck.load_function("zc_round_gruen")?,
+            zc_round_chunked: [
+                sumcheck.load_function("zc_round_chunked1")?,
+                sumcheck.load_function("zc_round_chunked2")?,
+                sumcheck.load_function("zc_round_chunked3")?,
+                sumcheck.load_function("zc_round_chunked4")?,
+            ],
             gkr_eq_levels_ext3: sumcheck.load_function("gkr_eq_levels_ext3")?,
             gkr_round_gruen: sumcheck.load_function("gkr_round_gruen")?,
             gkr_gruen_finish: sumcheck.load_function("gkr_gruen_finish")?,

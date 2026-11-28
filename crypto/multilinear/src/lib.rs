@@ -12,6 +12,7 @@ pub mod constraint_argument;
 pub mod eq;
 pub mod front_loaded;
 pub mod fused;
+pub mod fused_chunks;
 pub mod gkr;
 pub mod gkr_gruen;
 pub mod gkr_input_real;

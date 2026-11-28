@@ -108,6 +108,7 @@ impl LoweredFused {
             ext_consts: &self.ext_consts,
             betas,
             num_slots: self.num_slots,
+            chunked: None,
         }
     }
 }
@@ -138,7 +139,7 @@ pub fn add_low_grid<E: IsField>(t: &mut [[FieldElement<E>; 4]; 4], low: &[FieldE
 }
 
 /// A base-field element's canonical u64, or `None` off Goldilocks.
-fn base_raw<B: IsField + 'static>(value: &FieldElement<B>) -> Option<u64> {
+pub(crate) fn base_raw<B: IsField + 'static>(value: &FieldElement<B>) -> Option<u64> {
     use math::field::goldilocks::GoldilocksField as Gl;
     if std::any::TypeId::of::<B>() != std::any::TypeId::of::<Gl>() {
         return None;
@@ -390,6 +391,68 @@ fn zc_grid_split_from_env(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
 
+/// Opt in to chunking thin later rounds of long constraint programs.
+#[cfg(feature = "cuda")]
+fn zc_chunked() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    forced(&CHUNKED_FORCED, || {
+        *ENABLED.get_or_init(|| {
+            zc_chunked_from_env(std::env::var("LAMBDA_VM_ZC_CHUNKED").ok().as_deref())
+        })
+    })
+}
+
+#[cfg(feature = "cuda")]
+static CHUNKED_FORCED: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+pub fn force_zc_chunked(on: Option<bool>) {
+    store_forced(&CHUNKED_FORCED, on);
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn zc_chunked_from_env(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Lower each distinct long program once. Betas are specific to a session,
+/// so the cache key uses the whole interpreter's code and base constants.
+#[cfg(feature = "cuda")]
+fn chunked_program<B: IsField + 'static>(
+    constraints: &Constraints<B>,
+    lowered: &LoweredFused,
+) -> Option<std::sync::Arc<crate::fused_chunks::ChunkedFused>> {
+    use crate::fused_chunks::{CHUNKED_LEAF_CAP, ChunkedFused, lower_chunked};
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Entry = (Vec<u64>, Vec<u64>, Option<Arc<ChunkedFused>>);
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<Entry>>>> = OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lowered.nodes.hash(&mut hasher);
+    lowered.base_consts.hash(&mut hasher);
+    let key = hasher.finish();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    let entries = cache.entry(key).or_default();
+    if let Some((_, _, code)) = entries
+        .iter()
+        .find(|(nodes, consts, _)| *nodes == lowered.nodes && *consts == lowered.base_consts)
+    {
+        return code.clone();
+    }
+    let code = lower_chunked(constraints, CHUNKED_LEAF_CAP)
+        .filter(|code| code.chunks() > 1)
+        .map(Arc::new);
+    entries.push((
+        lowered.nodes.clone(),
+        lowered.base_consts.clone(),
+        code.clone(),
+    ));
+    code
+}
+
 static FUSED_FORCED: AtomicU8 = AtomicU8::new(0);
 static FUSED_XCHECK_FORCED: AtomicU8 = AtomicU8::new(0);
 
@@ -503,6 +566,8 @@ pub struct FusedFaults {
     pub xcheck_inert: bool,
     /// The corner check refuses nothing.
     pub corners_inert: bool,
+    /// Omit the final chunk from each chunked round's constraint sum.
+    pub drop_chunk: bool,
 }
 
 thread_local! {
@@ -522,7 +587,8 @@ pub fn force_fused_faults(faults: FusedFaults) {
             u8::from(faults.bus)
                 | (u8::from(faults.keep_corners) << 1)
                 | (u8::from(faults.xcheck_inert) << 2)
-                | (u8::from(faults.corners_inert) << 3),
+                | (u8::from(faults.corners_inert) << 3)
+                | (u8::from(faults.drop_chunk) << 4),
         )
     });
 }
@@ -535,6 +601,7 @@ pub(crate) fn faults() -> FusedFaults {
         keep_corners: f & 2 != 0,
         xcheck_inert: f & 4 != 0,
         corners_inert: f & 8 != 0,
+        drop_chunk: f & 16 != 0,
     }
 }
 
@@ -692,6 +759,7 @@ pub struct FusedTimes {
     pub roots: usize,
     pub terms: usize,
     pub slots: usize,
+    pub chunked_rounds: u32,
 }
 
 static DEVICE_TAILS: AtomicU64 = AtomicU64::new(0);
@@ -714,6 +782,8 @@ pub struct TailTimes {
     pub on_card: [u32; 2],
     /// The card's later rounds and their folds, seconds as the host saw them.
     pub device: [f64; 2],
+    /// Later rounds on the card that used chunks.
+    pub chunked_rounds: u32,
     /// The rounds the host ran over what the card folded, and their seconds
     /// (each round's evaluations and its fold).
     pub host_rounds: [u32; 2],
@@ -984,7 +1054,25 @@ where
         .ok_or_else(unsupported)?;
         let r_tail = flat(&input.r[2..]).ok_or_else(unsupported)?;
         let rho_tail = flat(&rho[2..]).ok_or_else(unsupported)?;
-        let program = lowered.device_program(&betas);
+        let chunked = if steps >= DEVICE_TAIL_MIN_STEPS && zc_chunked() {
+            chunked_program(constraints, &lowered)
+        } else {
+            None
+        };
+        let mut program = lowered.device_program(&betas);
+        program.chunked = chunked
+            .as_deref()
+            .map(crate::fused_chunks::ChunkedFused::device_program);
+        let faulted_bounds;
+        if let Some(code) = &mut program.chunked
+            && faults().drop_chunk
+        {
+            let mut bounds = code.bounds.to_vec();
+            let end = bounds.len() - 1;
+            bounds[end] = bounds[end - 1];
+            faulted_bounds = bounds;
+            code.bounds = &faulted_bounds;
+        }
         let fused_bus = math_cuda::argue_fused::FusedBus {
             slots: &slots,
             coeffs: &coeffs,
@@ -1420,6 +1508,7 @@ where
         SESSIONS.fetch_add(1, Ordering::Relaxed);
         crate::gpu::note_device_sumcheck(self.there as u64);
         self.times.total = self.started.elapsed().as_secs_f64();
+        self.times.chunked_rounds = self.session.chunked_rounds();
         let past = self.there > self.crossover;
         if past {
             DEVICE_TAILS.fetch_add(1, Ordering::Relaxed);
@@ -1430,6 +1519,7 @@ where
             tail.tables[long] += 1;
             tail.on_card[long] += u32::from(past);
             tail.device[long] += rounds;
+            tail.chunked_rounds += self.times.chunked_rounds;
         });
         Ok((factors, self.times))
     }
@@ -1447,6 +1537,14 @@ mod tests {
     use math::field::goldilocks::GoldilocksField as Gl;
 
     type FB = FieldElement<Gl>;
+
+    #[test]
+    fn chunking_is_enabled_only_by_one() {
+        assert!(zc_chunked_from_env(Some("1")));
+        for value in [None, Some("0"), Some("true"), Some("all"), Some(" 1")] {
+            assert!(!zc_chunked_from_env(value));
+        }
+    }
 
     #[cfg(feature = "cuda")]
     #[test]

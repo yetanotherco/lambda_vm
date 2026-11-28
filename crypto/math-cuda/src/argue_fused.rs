@@ -88,6 +88,29 @@ pub struct FusedProgram<'a> {
     pub ext_consts: &'a [u64],
     pub betas: &'a [u64],
     pub num_slots: usize,
+    pub chunked: Option<ChunkedProgram<'a>>,
+}
+
+/// The later-round program split by roots. Each chunk owns the code between
+/// consecutive entries in `bounds` and uses at most `max_slots` live slots.
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkedProgram<'a> {
+    pub code: &'a [u64],
+    pub bounds: &'a [u32],
+    pub kconst: &'a [u64],
+    pub max_slots: usize,
+}
+
+/// Beyond this many index pairs times chunks, the whole-program launch
+/// already fills the card and avoids repeating steps shared by chunks.
+const CHUNKED_MAX_THREADS: u64 = 1 << 18;
+
+struct ChunkedDevice {
+    code: CudaSlice<u64>,
+    bounds: CudaSlice<u32>,
+    kconst: CudaSlice<u64>,
+    chunks: u32,
+    max_slots: u64,
 }
 
 /// The bus column `L = a₀ + Σ a_k·f_k`: each term's factor slot, its ext3
@@ -167,6 +190,8 @@ pub struct FusedZerocheck<'f> {
     /// slab after `L`'s, folded with the factors; its round sums `B'(0)`,
     /// `B'(1)` follow the first bus's in every round's sums.
     second: Option<Second>,
+    chunked: Option<ChunkedDevice>,
+    chunked_rounds: u32,
     _room: DeviceReservation,
 }
 
@@ -306,6 +331,27 @@ impl<'f> FusedZerocheck<'f> {
         }
         let from_rows = bus_rows::enabled();
         let extra = if from_rows { rows as u64 * 24 } else { 0 };
+        // A long program has a card round at four pairs before the device
+        // tail hands over its cube of four. On small tables the whole-program
+        // slot file can be smaller than even that round needs in chunks.
+        let tail_pairs = (rows / 8).min(4) as u64;
+        let chunked = program.chunked.and_then(|code| {
+            let chunks = code.bounds.len().saturating_sub(1) as u64;
+            let nodes = gruen_rows.saturating_sub(2) as u64;
+            let threads = chunks * tail_pairs;
+            let slot_words = threads * code.max_slots as u64 * nodes * 3;
+            (chunks > 1
+                && (1..=4).contains(&nodes)
+                && chunks * gruen_rows as u64 <= u64::from(MAX_GRID) * MAX_ROWS as u64
+                && threads <= CHUNKED_MAX_THREADS
+                && slot_words <= SLOT_BUDGET_BYTES / 8)
+                .then_some((code, slot_words as usize))
+        });
+        let extra_slots = chunked.map_or(0, |(_, need)| need.saturating_sub(words));
+        let chunked_bytes = chunked.map_or(0, |(code, _)| {
+            (code.code.len() as u64 + code.kconst.len().max(1) as u64) * 8
+                + code.bounds.len() as u64 * 4
+        });
         let Some(room) = reserve(
             be,
             Self::device_bytes_with(
@@ -315,7 +361,9 @@ impl<'f> FusedZerocheck<'f> {
                 grid_rows,
                 gruen_rows,
                 second.is_some(),
-            ) + extra,
+            ) + extra
+                + chunked_bytes
+                + extra_slots as u64 * 8,
         ) else {
             return Ok(None);
         };
@@ -368,13 +416,24 @@ impl<'f> FusedZerocheck<'f> {
         let folded_ptrs = htod_or_trim(&stream, &addresses[..width])?;
         let fold_ptrs = htod_or_trim(&stream, &addresses)?;
         // SAFETY: a thread writes a slot before it reads it.
-        let slots = unsafe { alloc_or_trim::<u64>(&stream, words) }?;
+        let slots = unsafe { alloc_or_trim::<u64>(&stream, words + extra_slots) }?;
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_ROWS * MAX_GRID as usize * 3) }?;
         let sums = alloc_zeros_or_trim::<u64>(&stream, MAX_ROWS * 3)?;
         let points = alloc_zeros_or_trim::<u64>(&stream, MAX_ROWS)?;
         let node_ints = alloc_zeros_or_trim::<u32>(&stream, MAX_ROWS)?;
         let scratch = alloc_zeros_or_trim::<u64>(&stream, 12)?;
         let violation = alloc_zeros_or_trim::<u64>(&stream, 1)?;
+        let chunked = chunked
+            .map(|(code, _)| -> Result<_> {
+                Ok(ChunkedDevice {
+                    code: htod_or_trim(&stream, code.code)?,
+                    bounds: htod_or_trim(&stream, code.bounds)?,
+                    kconst: htod_or_trim(&stream, &nonempty(code.kconst))?,
+                    chunks: (code.bounds.len() - 1) as u32,
+                    max_slots: code.max_slots as u64,
+                })
+            })
+            .transpose()?;
         let rows_l = if from_rows {
             // SAFETY: `zc_bus_u_store` writes every row before the folds read it.
             let values = unsafe { alloc_or_trim::<u64>(&stream, rows * 3) }?;
@@ -419,6 +478,8 @@ impl<'f> FusedZerocheck<'f> {
             violation,
             rows_l,
             second,
+            chunked,
+            chunked_rounds: 0,
             _room: room,
         }))
     }
@@ -865,8 +926,22 @@ impl<'f> FusedZerocheck<'f> {
         let rows = nodes.len() + 2;
         let extra = if self.second.is_some() { 2 } else { 0 };
         assert!(rows + extra <= MAX_ROWS, "nodes per launch");
-        let be = backend()?;
         let half = (self.len / 2) as u64;
+        if let Some((grid, block)) = self.chunked_shape(half, nodes) {
+            self.round_chunked_enqueue(half, nodes.len(), grid, block)?;
+            self.chunked_rounds += 1;
+        } else {
+            self.round_whole_enqueue(half, nodes)?;
+        }
+        if self.second.is_some() {
+            self.second_round_enqueue(half, rows)?;
+        }
+        Ok(rows + extra)
+    }
+
+    fn round_whole_enqueue(&mut self, half: u64, nodes: &[u32]) -> Result<()> {
+        let be = backend()?;
+        let rows = nodes.len() + 2;
         {
             let mut head = self.node_ints.slice_mut(0..nodes.len().max(1));
             let ints: Vec<u32> = if nodes.is_empty() {
@@ -904,11 +979,78 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: block * 3 * 8,
                 })?;
         }
-        self.reduce_enqueue(rows, grid)?;
-        if self.second.is_some() {
-            self.second_round_enqueue(half, rows)?;
+        self.reduce_enqueue(rows, grid)
+    }
+
+    /// Reuse the session's slot file and partials for the chunked launch.
+    fn chunked_shape(&self, half: u64, nodes: &[u32]) -> Option<(u32, u32)> {
+        let code = self.chunked.as_ref()?;
+        let d = nodes.len();
+        if !(1..=4).contains(&d) || nodes[0] != 0 || (1..d).any(|i| nodes[i] != i as u32 + 1) {
+            return None;
         }
-        Ok(rows + extra)
+        let chunks = u64::from(code.chunks);
+        if half.saturating_mul(chunks) > CHUNKED_MAX_THREADS {
+            return None;
+        }
+        let per_thread = code.max_slots * d as u64 * 3;
+        let budget = (self.slots.len() as u64 / per_thread).min(CHUNKED_MAX_THREADS);
+        let per_chunk = budget / chunks;
+        if per_chunk < half.min(32) {
+            return None;
+        }
+        let threads = half.min(per_chunk);
+        let mut block = 128u64.min(1 << (63 - per_chunk.max(32).leading_zeros()));
+        while block > 32 && block / 2 >= threads {
+            block /= 2;
+        }
+        let grid = threads
+            .div_ceil(block)
+            .min((per_chunk / block).max(1))
+            .clamp(1, u64::from(MAX_GRID));
+        if (d as u64 + 2) * chunks * grid * 3 > self.partials.len() as u64 {
+            return None;
+        }
+        Some((grid as u32, block as u32))
+    }
+
+    fn round_chunked_enqueue(&mut self, half: u64, d: usize, grid: u32, block: u32) -> Result<()> {
+        let be = backend()?;
+        let q = self.rows / 4;
+        let l = self
+            .folded
+            .slice(self.width * q * 3..(self.width + 1) * q * 3);
+        let code = self
+            .chunked
+            .as_ref()
+            .expect("a chunked shape has chunked code");
+        let chunks = code.chunks;
+        unsafe {
+            self.stream
+                .launch_builder(&be.zc_round_chunked[d - 1])
+                .arg(&self.folded_ptrs)
+                .arg(&half)
+                .arg(&code.code)
+                .arg(&code.bounds)
+                .arg(&code.kconst)
+                .arg(&self.betas)
+                .arg(&self.eq_r)
+                .arg(&self.eq_rho)
+                .arg(&l)
+                .arg(&mut self.slots)
+                .arg(&mut self.partials)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, chunks, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: block * 3 * 8,
+                })?;
+        }
+        self.reduce_enqueue(d + 2, chunks * grid)
+    }
+
+    /// Later rounds evaluated in chunks in this session.
+    pub fn chunked_rounds(&self) -> u32 {
+        self.chunked_rounds
     }
 
     /// The second bus's `B'(0)` and `B'(1)` into the sums at rows `at` and
