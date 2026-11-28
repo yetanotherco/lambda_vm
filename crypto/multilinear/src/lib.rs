@@ -14,6 +14,7 @@ pub mod front_loaded;
 pub mod fused;
 pub mod gkr;
 pub mod gkr_gruen;
+pub mod gkr_input_base;
 pub mod gkr_input_real;
 pub mod gkr_lockstep;
 pub mod gpu;

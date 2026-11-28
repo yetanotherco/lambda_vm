@@ -356,6 +356,92 @@ fn two_layer_rounds_equal_the_composed_reference() {
     );
 }
 
+#[test]
+fn base_numerator_rounds_match_ext3_rounds_and_finish() {
+    use math_cuda::gkr::{InputPlan, input_fold2_from_columns, input_fold2_from_columns_base};
+
+    let _serial = serial();
+    let Ok(be) = backend() else {
+        eprintln!("no device; skipping");
+        return;
+    };
+    let mut rng = Rng(0x4f3917b);
+    let rows = 64;
+    let mut raw_differences = 0;
+    for interactions in [3usize, 5, 7, 8] {
+        let real = rows * interactions;
+        let vars = (rows * interactions.next_power_of_two()).trailing_zeros() as usize;
+        let terms: Vec<_> = (0..interactions)
+            .flat_map(|i| [0, i as u64, rows as u64, (2 * i) as u64])
+            .collect();
+        let coeffs: Vec<_> = (0..interactions)
+            .flat_map(|_| [rng.limb(), 0, 0].into_iter().chain(rng.ext()))
+            .collect();
+        let constants: Vec<_> = (0..interactions)
+            .flat_map(|_| [rng.limb(), 0, 0].into_iter().chain(rng.ext()))
+            .collect();
+        let stream = be.next_stream();
+        let offsets: Vec<_> = (0..=2 * interactions as u32).collect();
+        let plan = InputPlan::upload(&stream, &offsets, &terms, &coeffs, &constants).unwrap();
+        let columns = upload(
+            &stream,
+            &(0..2 * rows).map(|_| rng.limb()).collect::<Vec<_>>(),
+        );
+        let point: Vec<_> = (0..vars - 2).flat_map(|_| rng.ext()).collect();
+        let lambda = rng.ext();
+        let half_lambda = raw(&(value(&lambda) * E::from(2u64).inv().unwrap()));
+        let challenges: Vec<_> = (0..vars - 2).map(|_| rng.ext()).collect();
+        for (slot, h0) in [(RoundSlot::On, false), (RoundSlot::Off, true)] {
+            let (p, q, top) = {
+                let ((p, q), top) =
+                    input_fold2_from_columns(&stream, &columns.slice(..), rows, &plan, false)
+                        .unwrap();
+                (p, q, top)
+            };
+            let today = DeviceFractionTree::from_truncated_input_top(
+                stream.clone(),
+                p,
+                q,
+                real,
+                vars,
+                Some(top),
+            )
+            .unwrap();
+            let ((p, q), top) =
+                input_fold2_from_columns_base(&stream, &columns.slice(..), rows, &plan).unwrap();
+            assert_eq!(p.len(), real);
+            let base =
+                DeviceFractionTree::from_base_input_top(stream.clone(), p, q, real, vars, top)
+                    .unwrap();
+            assert_eq!(today.output().unwrap(), base.output().unwrap());
+            let run = |tree: &DeviceFractionTree| {
+                let mut layer = tree.layer_gruen2(vars, &point, 2).unwrap();
+                assert_eq!(layer.use_slot(slot), slot == RoundSlot::On);
+                run_layer(&mut layer, &lambda, &half_lambda, &challenges, |_| h0)
+            };
+            let (today_sums, today_finish) = run(&today);
+            let (base_sums, base_finish) = run(&base);
+            for (a, b) in today_sums
+                .iter()
+                .zip(&base_sums)
+                .chain(std::iter::once((&today_finish, &base_finish)))
+            {
+                assert_eq!(a.len(), b.len());
+                raw_differences += a.iter().zip(b).filter(|(a, b)| a != b).count();
+                assert!(
+                    a.chunks_exact(3)
+                        .zip(b.chunks_exact(3))
+                        .all(|(a, b)| value(a) == value(b)),
+                    "{interactions} interactions, slot {slot:?}, H(0) {h0}"
+                );
+            }
+        }
+    }
+    eprintln!(
+        "base-numerator card parity: all rounds and finishes equal canonically, {raw_differences} differing raw limbs"
+    );
+}
+
 /// ★ An input layer kept without its padding runs the whole layer's
 /// two-layer rounds, limb for limb: the padding starting in quarter 2 or in
 /// quarter 3, one row in or at a precompile's shapes, every host tail, with

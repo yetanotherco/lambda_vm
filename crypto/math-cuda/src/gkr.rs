@@ -34,6 +34,10 @@ impl DeviceLayer {
     fn whole(&self) -> bool {
         self.real == 1usize << self.num_vars
     }
+
+    fn base_numerators(&self) -> bool {
+        self.p.len() == self.real
+    }
 }
 
 fn invalid() -> cudarc::driver::DriverError {
@@ -258,9 +262,34 @@ impl DeviceFractionTree {
         num_vars: usize,
         top: Option<TopLevels>,
     ) -> Result<Self> {
+        Self::from_kept_input(stream, p, q, real, num_vars, top, false)
+    }
+
+    /// Keeps the one-limb numerators from the fused input writer. Its first
+    /// fold is already in `top`, so only the final two-layer session reads them.
+    pub fn from_base_input_top(
+        stream: Arc<CudaStream>,
+        p: CudaSlice<u64>,
+        q: CudaSlice<u64>,
+        real: usize,
+        num_vars: usize,
+        top: TopLevels,
+    ) -> Result<Self> {
+        Self::from_kept_input(stream, p, q, real, num_vars, Some(top), true)
+    }
+
+    fn from_kept_input(
+        stream: Arc<CudaStream>,
+        p: CudaSlice<u64>,
+        q: CudaSlice<u64>,
+        real: usize,
+        num_vars: usize,
+        top: Option<TopLevels>,
+        base: bool,
+    ) -> Result<Self> {
         let full = 1usize.checked_shl(num_vars as u32).ok_or_else(invalid)?;
         let rounded_up = real <= full && real > full / 2;
-        if p.len() != real * 3 || q.len() != real * 3 || !rounded_up {
+        if p.len() != real * if base { 1 } else { 3 } || q.len() != real * 3 || !rounded_up {
             return Err(invalid());
         }
         let be = backend()?;
@@ -370,7 +399,7 @@ impl DeviceFractionTree {
         let level = self.layer(layer)?;
         // This session reads every cell of the halves: a layer kept without
         // its padding is the Gruen rounds' alone.
-        if !level.whole() {
+        if !level.whole() || level.base_numerators() {
             return Err(invalid());
         }
         sumcheck_over_layer(
@@ -1088,6 +1117,9 @@ impl DeviceFractionTree {
     /// left to the host.
     pub fn layer_gruen(&self, layer: usize, point: &[u64], low: usize) -> Result<GruenLayer> {
         let level = self.layer(layer)?;
+        if level.base_numerators() {
+            return Err(invalid());
+        }
         GruenLayer::new(
             &self.stream,
             &level.p,
@@ -1131,6 +1163,8 @@ pub struct Gruen2Layer {
     _q: Arc<CudaSlice<u64>>,
     p_at: u64,
     q_at: u64,
+    /// The first binding lifts the base input into this compact ext3 buffer.
+    folded_p: Option<CudaSlice<u64>>,
     /// Cells in each quarter: `2^m`.
     stride: usize,
     /// The runs of cells quarters 2 and 3 hold before the next fold — every cell of the cube they
@@ -1178,11 +1212,33 @@ impl Gruen2Layer {
             return Err(invalid());
         }
         let stride = 1usize << m;
-        if p.len() != real * 3 || q.len() != real * 3 || real <= 2 * stride || real > 4 * stride {
+        let base = p.len() == real;
+        if (!base && p.len() != real * 3)
+            || q.len() != real * 3
+            || real <= 2 * stride
+            || real > 4 * stride
+        {
             return Err(invalid());
         }
         let low = low.min(m);
         let rounds = m - low;
+        if base && rounds < 2 {
+            return Err(invalid());
+        }
+        let upper = real - 2 * stride;
+        let stored = [upper.min(stride), upper.saturating_sub(stride)];
+        let folded_p = if base {
+            let half = stride / 2;
+            let end = if stored[1] == 0 {
+                2 * half + stored[0].min(half)
+            } else {
+                3 * half + stored[1].min(half)
+            };
+            // SAFETY: round 1 writes all cells read by later rounds and finish.
+            Some(unsafe { crate::device::alloc_or_trim::<u64>(stream, end * 3) }?)
+        } else {
+            None
+        };
 
         let be = backend()?;
         let cells = (1usize << low) + (1usize << rounds) - 1;
@@ -1219,15 +1275,15 @@ impl Gruen2Layer {
             let (at, _guard) = q.device_ptr(stream);
             at
         };
-        let upper = real - 2 * stride;
         Ok(Self {
             stream: stream.clone(),
             _p: p.clone(),
             _q: q.clone(),
             p_at,
             q_at,
+            folded_p,
             stride,
-            stored: [upper.min(stride), upper.saturating_sub(stride)],
+            stored,
             truncated: real < 4 * stride,
             low,
             rounds,
@@ -1313,11 +1369,21 @@ impl Gruen2Layer {
         let cube = if fold_by.is_some() { 4 } else { 2 } * quarter;
         let real = stored2 < cube || stored3 < cube;
         let slotted = self.slot.is_some() && !want_h0;
-        let kernel = match (real, slotted) {
-            (true, false) => &be.gkr2_round_real,
-            (false, false) => &be.gkr2_round,
-            (true, true) => &be.gkr2_round_real_slot,
-            (false, true) => &be.gkr2_round_slot,
+        let base_input = self.folded_p.is_some();
+        let slot_index = usize::from(slotted);
+        let kernel = match (base_input, self.done, real, slotted) {
+            (true, 0, _, _) => &be.gkr2_round_base[slot_index],
+            (true, 1, _, _) => &be.gkr2_round_bind_base[slot_index],
+            (true, _, _, _) => &be.gkr2_round_compact[slot_index],
+            (false, _, true, false) => &be.gkr2_round_real,
+            (false, _, false, false) => &be.gkr2_round,
+            (false, _, true, true) => &be.gkr2_round_real_slot,
+            (false, _, false, true) => &be.gkr2_round_slot,
+        };
+        let folded_at = if self.done == 1 {
+            self.folded_p.as_ref().map(|p| p.device_ptr(&self.stream).0)
+        } else {
+            None
         };
         let shared = if slotted {
             gruen2_shared(block).max(crate::round_slot::shared_bytes(block))
@@ -1350,6 +1416,10 @@ impl Gruen2Layer {
                 .arg(&stored2)
                 .arg(&stored3)
                 .arg(&mut self.partials);
+            let out_at = folded_at.unwrap_or(0);
+            if base_input {
+                launch.arg(&out_at);
+            }
             if let Some((ticket, dev, seq)) = slot_args.as_mut() {
                 launch.arg(&mut **ticket).arg(&*dev).arg(&*seq);
             }
@@ -1359,6 +1429,9 @@ impl Gruen2Layer {
                 shared_mem_bytes: shared,
             })?;
         }
+        if let Some(at) = folded_at {
+            self.p_at = at;
+        }
         self.stored = self
             .stored
             .map(|run| stored_after_round(run, quarter as usize));
@@ -1366,7 +1439,13 @@ impl Gruen2Layer {
             // On the round's grid and block, so its partials sit where the round's would; it reads
             // the cells the round left, under the runs after its fold.
             let [stored2, stored3] = self.stored.map(|run| run as u64);
-            let kernel = if stored2 < 2 * quarter || stored3 < 2 * quarter {
+            let kernel = if base_input {
+                if self.done == 0 {
+                    &be.gkr2_round_h0_base
+                } else {
+                    &be.gkr2_round_h0_compact
+                }
+            } else if stored2 < 2 * quarter || stored3 < 2 * quarter {
                 &be.gkr2_round_h0_real
             } else {
                 &be.gkr2_round_h0
@@ -1450,6 +1529,7 @@ impl Gruen2Layer {
         let stride = self.stride as u64;
         let [stored2, stored3] = self.stored.map(|run| run as u64);
         let cube = if fold_by.is_some() { 2 * cells } else { cells };
+        let compact = self.folded_p.is_some();
         let real = stored2 < cube || stored3 < cube;
         let config = LaunchConfig {
             grid_dim: ((8 * cells).div_ceil(256).min(4096) as u32, 1, 1),
@@ -1457,7 +1537,9 @@ impl Gruen2Layer {
             shared_mem_bytes: 0,
         };
         unsafe {
-            let mut launch = self.stream.launch_builder(if real {
+            let mut launch = self.stream.launch_builder(if compact {
+                &be.gkr2_finish_compact
+            } else if real {
                 &be.gkr2_finish_real
             } else {
                 &be.gkr2_finish
@@ -1471,7 +1553,7 @@ impl Gruen2Layer {
                 .arg(&s[0])
                 .arg(&s[1])
                 .arg(&s[2]);
-            if real {
+            if real || compact {
                 launch.arg(&stored2).arg(&stored3);
             }
             launch.arg(&mut out).launch(config)?;
@@ -1692,6 +1774,28 @@ pub fn input_fold2_from_columns(
     plan: &InputPlan,
     padding: bool,
 ) -> Result<(Halves, TopLevels)> {
+    input_fold2_from_columns_impl(stream, columns, rows, plan, padding, false)
+}
+
+/// The same fused write with an eight-byte numerator per cell. The caller
+/// checks that the plan's numerator constants and coefficients are base-field.
+pub fn input_fold2_from_columns_base(
+    stream: &Arc<CudaStream>,
+    columns: &cudarc::driver::CudaView<'_, u64>,
+    rows: usize,
+    plan: &InputPlan,
+) -> Result<(Halves, TopLevels)> {
+    input_fold2_from_columns_impl(stream, columns, rows, plan, false, true)
+}
+
+fn input_fold2_from_columns_impl(
+    stream: &Arc<CudaStream>,
+    columns: &cudarc::driver::CudaView<'_, u64>,
+    rows: usize,
+    plan: &InputPlan,
+    padding: bool,
+    base: bool,
+) -> Result<(Halves, TopLevels)> {
     let be = backend()?;
     let interactions = plan.interactions;
     let slots = interactions.next_power_of_two();
@@ -1707,7 +1811,16 @@ pub fn input_fold2_from_columns(
     let folds = if single == 1 { 1 } else { 2 };
     // SAFETY: the kernel writes every stored input cell and every cell of
     // the allocated levels.
-    let (mut p, mut q) = unsafe { alloc_halves(stream, stored) }?;
+    let (mut p, mut q) = unsafe {
+        if base {
+            (
+                crate::device::alloc_or_trim::<u64>(stream, stored)?,
+                crate::device::alloc_or_trim::<u64>(stream, stored * 3)?,
+            )
+        } else {
+            alloc_halves(stream, stored)?
+        }
+    };
     let mut mid = if skip {
         None
     } else {
@@ -1721,7 +1834,11 @@ pub fn input_fold2_from_columns(
     let cube_arg = cube as u64;
     let fault = fused_input::fault();
     unsafe {
-        let mut launch = stream.launch_builder(&be.gkr_input_fold2_from_columns);
+        let mut launch = stream.launch_builder(if base {
+            &be.gkr_input_fold2_from_columns_base
+        } else {
+            &be.gkr_input_fold2_from_columns
+        });
         launch
             .arg(columns)
             .arg(&rows_arg)

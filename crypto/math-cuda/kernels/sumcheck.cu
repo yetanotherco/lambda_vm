@@ -1620,6 +1620,30 @@ __device__ __forceinline__ void gkr2_factor(uint64_t *f, uint64_t at, bool upper
     }
 }
 
+template <bool REAL>
+__device__ __forceinline__ uint64_t gkr2_base_cell(const uint64_t *p, uint64_t at, bool upper,
+                                                   uint64_t x, uint64_t stored) {
+    return gkr2_stored<REAL>(upper, x, stored) ? p[at + x] : 0;
+}
+
+// The first binding lifts p into ext3. Its new quarters have half the original stride.
+template <bool REAL>
+__device__ __forceinline__ void gkr2_base_factor(
+    const uint64_t *p, uint64_t *out, uint64_t at, bool upper, uint64_t x, uint64_t quarter,
+    const Fe3 &s, uint64_t stored, Fe3 &lo, Fe3 &hi) {
+    uint64_t a = gkr2_base_cell<REAL>(p, at, upper, x, stored);
+    uint64_t b = gkr2_base_cell<REAL>(p, at, upper, x + quarter, stored);
+    uint64_t c = gkr2_base_cell<REAL>(p, at, upper, x + 2 * quarter, stored);
+    uint64_t d = gkr2_base_cell<REAL>(p, at, upper, x + 3 * quarter, stored);
+    lo = ext3::add(ext3::make(a, 0, 0), ext3::mul_base(s, goldilocks::sub(c, a)));
+    hi = ext3::add(ext3::make(b, 0, 0), ext3::mul_base(s, goldilocks::sub(d, b)));
+    if (gkr2_stored<REAL>(upper, x, stored)) gkr2_store(out, at / 2 + x, lo);
+    if (gkr2_stored<REAL>(upper, x + quarter, stored))
+        gkr2_store(out, at / 2 + x + quarter, hi);
+}
+
+enum class Gkr2Numerator { Ext, Base, BindBase, Compact };
+
 // A quadratic in `t`: its values at 0 and 1 and its `t²` coefficient.
 struct Gkr2Quad {
     Fe3 v0, v1, c2;
@@ -1675,13 +1699,13 @@ __device__ __forceinline__ void gkr2_block_rows(const Fe3 (&acc)[ROWS], int firs
     }
 }
 
-template <bool REAL, bool SLOT>
+template <bool REAL, bool SLOT, Gkr2Numerator P = Gkr2Numerator::Ext>
 __device__ __forceinline__ void gkr2_round_body(
     uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t h0, uint64_t h1, uint64_t h2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
     uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials,
-    unsigned int *d_ticket, uint64_t *d_slot, uint64_t seq) {
+    unsigned int *d_ticket, uint64_t *d_slot, uint64_t seq, uint64_t *folded_p = nullptr) {
     extern __shared__ uint64_t shared[];
     volatile uint64_t *sacc = shared;
     const unsigned nb = blockDim.x, tid = threadIdx.x;
@@ -1702,10 +1726,22 @@ __device__ __forceinline__ void gkr2_round_body(
         const uint64_t x = g >> 1;
         Fe3 pl_lo = ext3::zero(), pl_hi = ext3::zero(), ph_lo = ext3::zero(), ph_hi = ext3::zero();
         Fe3 ql_lo = ext3::zero(), ql_hi = ext3::zero(), qh_lo = ext3::zero(), qh_hi = ext3::zero();
+        uint64_t ph0 = 0, ph1 = 0;
         Fe3 w = ext3::zero();
         if (g < lanes) {
-            gkr2_factor<REAL>(p, lo_at, false, false, x, quarter, fold, s, 0, pl_lo, pl_hi);
-            gkr2_factor<REAL>(p, hi_at, true, false, x, quarter, fold, s, stored, ph_lo, ph_hi);
+            if constexpr (P == Gkr2Numerator::Base) {
+                pl_lo.a = gkr2_base_cell<REAL>(p, lo_at, false, x, 0);
+                pl_hi.a = gkr2_base_cell<REAL>(p, lo_at, false, x + quarter, 0);
+                ph0 = gkr2_base_cell<REAL>(p, hi_at, true, x, stored);
+                ph1 = gkr2_base_cell<REAL>(p, hi_at, true, x + quarter, stored);
+            } else if constexpr (P == Gkr2Numerator::BindBase) {
+                gkr2_base_factor<REAL>(p, folded_p, lo_at, false, x, quarter, s, 0, pl_lo, pl_hi);
+                gkr2_base_factor<REAL>(p, folded_p, hi_at, true, x, quarter, s, stored, ph_lo, ph_hi);
+            } else {
+                constexpr uint64_t scale = P == Gkr2Numerator::Compact ? 2 : 1;
+                gkr2_factor<REAL>(p, lo_at / scale, false, false, x, quarter, fold, s, 0, pl_lo, pl_hi);
+                gkr2_factor<REAL>(p, hi_at / scale, true, false, x, quarter, fold, s, stored, ph_lo, ph_hi);
+            }
             gkr2_factor<REAL>(q, lo_at, false, true, x, quarter, fold, s, 0, ql_lo, ql_hi);
             gkr2_factor<REAL>(q, hi_at, true, true, x, quarter, fold, s, stored, qh_lo, qh_hi);
             w = ext3::mul(load_ext(e_hi + (x >> low) * 3), load_ext(e_lo + (x & mask) * 3));
@@ -1716,8 +1752,14 @@ __device__ __forceinline__ void gkr2_round_body(
         // Z_r = q_{r+2}·(p_r + h·q_r) + p_{r+2}·q_r.
         const Fe3 b_lo = ext3::add(pl_lo, ext3::mul(h, ql_lo));
         const Fe3 b_hi = ext3::add(pl_hi, ext3::mul(h, ql_hi));
-        const Gkr2Quad z = gkr2_qadd(gkr2_prod(qh_lo, qh_hi, b_lo, b_hi),
-                                     gkr2_prod(ph_lo, ph_hi, ql_lo, ql_hi));
+        Gkr2Quad pq;
+        if constexpr (P == Gkr2Numerator::Base) {
+            pq = {ext3::mul_base(ql_lo, ph0), ext3::mul_base(ql_hi, ph1),
+                  ext3::mul_base(ext3::sub(ql_hi, ql_lo), goldilocks::sub(ph1, ph0))};
+        } else {
+            pq = gkr2_prod(ph_lo, ph_hi, ql_lo, ql_hi);
+        }
+        const Gkr2Quad z = gkr2_qadd(gkr2_prod(qh_lo, qh_hi, b_lo, b_hi), pq);
         Gkr2Quad u;
         u.v0 = gkr2_shfl(y.v0, partner);
         u.v1 = gkr2_shfl(y.v1, partner);
@@ -1779,12 +1821,39 @@ GKR2_ROUND(gkr2_round_real, true)
 GKR2_ROUND_SLOT(gkr2_round_slot, false)
 GKR2_ROUND_SLOT(gkr2_round_real_slot, true)
 
+// Round 0 reads base p. Round 1 binds it into folded_p. Later rounds use that compact ext3 p.
+// All three use the stored runs, including a layer with no padding.
+#define GKR2_INPUT_ROUNDS(NAME, MODE, FOLD)                                                        \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                      \
+        uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,      \
+        uint32_t, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t h0, uint64_t h1, uint64_t h2,    \
+        const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,        \
+        uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials,                     \
+        uint64_t *__restrict__ folded_p) {                                                         \
+        gkr2_round_body<true, false, MODE>(p, q, stride, quarter, FOLD, s0, s1, s2, h0, h1, h2,     \
+                                          e_hi, e_lo, low, stored2, stored3, d_partials, nullptr,  \
+                                          nullptr, 0, folded_p);                                  \
+    }                                                                                             \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME##_slot(                               \
+        uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,      \
+        uint32_t, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t h0, uint64_t h1, uint64_t h2,    \
+        const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,        \
+        uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials,                     \
+        uint64_t *__restrict__ folded_p, unsigned int *d_ticket, uint64_t *d_slot, uint64_t seq) {  \
+        gkr2_round_body<true, true, MODE>(p, q, stride, quarter, FOLD, s0, s1, s2, h0, h1, h2,      \
+                                         e_hi, e_lo, low, stored2, stored3, d_partials, d_ticket,   \
+                                         d_slot, seq, folded_p);                                  \
+    }
+GKR2_INPUT_ROUNDS(gkr2_round_base, Gkr2Numerator::Base, 0)
+GKR2_INPUT_ROUNDS(gkr2_round_bind_base, Gkr2Numerator::BindBase, 1)
+GKR2_INPUT_ROUNDS(gkr2_round_compact, Gkr2Numerator::Compact, 1)
+
 // `H(0)` of a round, after it: one thread a cube index reads the eight factors' cells at `t = 0`
 // (the halves the round folded and wrote back, or the layer's own in a round without a fold) and
 // sums `w·(N + λQ)` there into row 4 of the round's partials. Launched on the round's grid and
 // block, so its partials sit where the round's would. `stored2`, `stored3` are the runs after the
 // round's fold.
-template <bool REAL>
+template <bool REAL, Gkr2Numerator P = Gkr2Numerator::Ext>
 __device__ __forceinline__ void gkr2_round_h0_body(
     const uint64_t *__restrict__ p, const uint64_t *__restrict__ q, uint64_t stride,
     uint64_t quarter, uint64_t l0, uint64_t l1, uint64_t l2, const uint64_t *__restrict__ e_hi,
@@ -1801,11 +1870,18 @@ __device__ __forceinline__ void gkr2_round_h0_body(
         for (int r = 0; r < 2; r++) {
             const uint64_t lo_at = (uint64_t)r * stride, hi_at = (uint64_t)(r + 2) * stride;
             const uint64_t stored = r == 0 ? stored2 : stored3;
-            const Fe3 p_lo = gkr2_cell<REAL>(p, lo_at, false, false, x, 0);
-            const Fe3 p_hi = gkr2_cell<REAL>(p, hi_at, true, false, x, stored);
             const Fe3 q_lo = gkr2_cell<REAL>(q, lo_at, false, true, x, 0);
             const Fe3 q_hi = gkr2_cell<REAL>(q, hi_at, true, true, x, stored);
-            n[r] = ext3::add(ext3::mul(p_lo, q_hi), ext3::mul(p_hi, q_lo));
+            if constexpr (P == Gkr2Numerator::Base) {
+                const uint64_t p_lo = gkr2_base_cell<REAL>(p, lo_at, false, x, 0);
+                const uint64_t p_hi = gkr2_base_cell<REAL>(p, hi_at, true, x, stored);
+                n[r] = ext3::add(ext3::mul_base(q_hi, p_lo), ext3::mul_base(q_lo, p_hi));
+            } else {
+                constexpr uint64_t scale = P == Gkr2Numerator::Compact ? 2 : 1;
+                const Fe3 p_lo = gkr2_cell<REAL>(p, lo_at / scale, false, false, x, 0);
+                const Fe3 p_hi = gkr2_cell<REAL>(p, hi_at / scale, true, false, x, stored);
+                n[r] = ext3::add(ext3::mul(p_lo, q_hi), ext3::mul(p_hi, q_lo));
+            }
             d[r] = ext3::mul(q_lo, q_hi);
         }
         const Fe3 dd = ext3::mul(d[0], d[1]);
@@ -1817,24 +1893,26 @@ __device__ __forceinline__ void gkr2_round_h0_body(
     gkr2_block_rows<1>(acc, 4, shared, d_partials);
 }
 
-#define GKR2_ROUND_H0(NAME, REAL)                                                                 \
+#define GKR2_ROUND_H0(NAME, REAL, P)                                                              \
     extern "C" __global__ __launch_bounds__(256) void NAME(                                       \
         const uint64_t *__restrict__ p, const uint64_t *__restrict__ q, uint64_t stride,          \
         uint64_t quarter, uint64_t l0, uint64_t l1, uint64_t l2,                                  \
         const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,       \
         uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials) {                  \
-        gkr2_round_h0_body<REAL>(p, q, stride, quarter, l0, l1, l2, e_hi, e_lo, low, stored2,    \
+        gkr2_round_h0_body<REAL, P>(p, q, stride, quarter, l0, l1, l2, e_hi, e_lo, low, stored2, \
                                  stored3, d_partials);                                            \
     }
-GKR2_ROUND_H0(gkr2_round_h0, false)
-GKR2_ROUND_H0(gkr2_round_h0_real, true)
+GKR2_ROUND_H0(gkr2_round_h0, false, Gkr2Numerator::Ext)
+GKR2_ROUND_H0(gkr2_round_h0_real, true, Gkr2Numerator::Ext)
+GKR2_ROUND_H0(gkr2_round_h0_base, true, Gkr2Numerator::Base)
+GKR2_ROUND_H0(gkr2_round_h0_compact, true, Gkr2Numerator::Compact)
 
 // The rounds' end: each of the eight factors bound to the last challenge `s` (with `fold`) from
 // its `2·cells` cube down to `cells`, written to `out[(k·cells + y)·3]` in the order the proof lays
 // a step's two halves out — `k = 4b₂ + f`, `f` = `p` of quarter `b₂`, `p` of quarter `b₂ + 2`, `q`
 // of quarter `b₂`, `q` of quarter `b₂ + 2` (`h_{b₂}`'s `p_lo, p_hi, q_lo, q_hi`). Nothing is
 // written back. `gkr2_finish_real` is the same over a layer kept without its padding.
-template <bool REAL>
+template <bool REAL, bool COMPACT = false>
 __device__ __forceinline__ void gkr2_finish_body(const uint64_t *__restrict__ p,
                                                  const uint64_t *__restrict__ q, uint64_t stride,
                                                  uint64_t cells, uint32_t fold, uint64_t s0,
@@ -1851,7 +1929,7 @@ __device__ __forceinline__ void gkr2_finish_body(const uint64_t *__restrict__ p,
         const uint64_t quarter = half + (upper ? 2 : 0);
         const uint64_t stored = quarter == 2 ? stored2 : stored3;
         const uint64_t *base = den ? q : p;
-        const uint64_t at = quarter * stride;
+        const uint64_t at = quarter * (COMPACT && !den ? stride / 2 : stride);
         Fe3 v = gkr2_cell<REAL>(base, at, upper, den, y, stored);
         if (fold) {
             const Fe3 hi = gkr2_cell<REAL>(base, at, upper, den, y + cells, stored);
@@ -1874,6 +1952,13 @@ extern "C" __global__ void gkr2_finish_real(const uint64_t *__restrict__ p,
                                             uint64_t s1, uint64_t s2, uint64_t stored2,
                                             uint64_t stored3, uint64_t *__restrict__ out) {
     gkr2_finish_body<true>(p, q, stride, cells, fold, s0, s1, s2, stored2, stored3, out);
+}
+
+extern "C" __global__ void gkr2_finish_compact(
+    const uint64_t *__restrict__ p, const uint64_t *__restrict__ q, uint64_t stride,
+    uint64_t cells, uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t stored2,
+    uint64_t stored3, uint64_t *__restrict__ out) {
+    gkr2_finish_body<true, true>(p, q, stride, cells, fold, s0, s1, s2, stored2, stored3, out);
 }
 
 // The fraction tree's input layer straight from the table's base columns (D-BATCH M1-2,
@@ -1962,7 +2047,8 @@ __device__ __forceinline__ void gkr_input_cell(
 // cells of the level above (`i`, `i + quarter`) and folds them into cell `i` of the level above
 // that. So the tree never reads the input layer back. The same cells and levels as
 // `gkr_input_from_columns` followed by `fraction_fold2_ext3`.
-extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
+template <bool BASE>
+__device__ __forceinline__ void gkr_input_fold2_from_columns_body(
     const uint64_t *__restrict__ d_columns, uint64_t rows,
     const uint32_t *__restrict__ d_side_start, const uint64_t *__restrict__ d_terms,
     const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,
@@ -1982,7 +2068,8 @@ extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
             gkr_input_cell(d_columns, rows, d_side_start, d_terms, d_coeffs, d_constants,
                            interactions, s, r, pc[k], qc[k]);
             if (cell < stored) {
-                store_ext(p + cell * 3, pc[k]);
+                if constexpr (BASE) p[cell] = pc[k].a;
+                else store_ext(p + cell * 3, pc[k]);
                 store_ext(q + cell * 3, qc[k]);
             }
         }
@@ -2014,3 +2101,17 @@ extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
         store_ext(q_out + i * 3, qu);
     }
 }
+
+#define GKR_INPUT_FOLD2(NAME, BASE)                                                               \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                       \
+        const uint64_t *__restrict__ d_columns, uint64_t rows,                                   \
+        const uint32_t *__restrict__ d_side_start, const uint64_t *__restrict__ d_terms,         \
+        const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,          \
+        uint64_t interactions, uint64_t stored_slots, uint64_t cube, uint64_t *__restrict__ p,   \
+        uint64_t *__restrict__ q, uint64_t *__restrict__ p_mid, uint64_t *__restrict__ q_mid,      \
+        uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault, uint32_t single) { \
+        gkr_input_fold2_from_columns_body<BASE>(d_columns, rows, d_side_start, d_terms, d_coeffs, \
+            d_constants, interactions, stored_slots, cube, p, q, p_mid, q_mid, p_out, q_out, fault, single); \
+    }
+GKR_INPUT_FOLD2(gkr_input_fold2_from_columns, false)
+GKR_INPUT_FOLD2(gkr_input_fold2_from_columns_base, true)

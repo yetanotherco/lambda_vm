@@ -3752,6 +3752,10 @@ fn rta_one_run(
     // that only move when host work runs (under
     // `LAMBDA_VM_DETERMINISTIC_GRIND=1`).
     let base_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&run.base_proof).expect("serializes");
+    println!(
+        "RTA GKR BASE NUMERATOR STEPS: {}",
+        multilinear::gkr_input_base::steps()
+    );
     if std::env::var_os("RTA_COMMIT_IDENTITY").is_some() {
         let roots = &run.base_proof.proof.roots;
         let mut h = blake3::Hasher::new();

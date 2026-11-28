@@ -262,6 +262,19 @@ impl InputPlan {
     pub fn interactions(&self) -> usize {
         self.side_start.len() / 2
     }
+
+    /// The fused writer can store one limb when all numerator constants and
+    /// coefficients have raw-zero upper limbs. Denominator terms stay ext3.
+    pub fn base_numerators(&self) -> bool {
+        let upper_zero = |limbs: &[u64]| limbs[1] == 0 && limbs[2] == 0;
+        (0..self.interactions()).all(|i| {
+            let side = 2 * i;
+            let from = self.side_start[side] as usize;
+            let to = self.side_start[side + 1] as usize;
+            upper_zero(&self.constants[3 * side..3 * side + 3])
+                && (from..to).all(|t| upper_zero(&self.coeffs[3 * t..3 * t + 3]))
+        })
+    }
 }
 
 /// The plan for `interactions` over factors whose sources are `sources` (one
