@@ -3045,6 +3045,9 @@ pub struct WlfmStamps {
     pub records_cells: usize,
     pub records_bytes: usize,
     pub records_prefix_pack: f64,
+    pub host_tables: usize,
+    /// Bytes of fully materialized tables, wide or packed, counted once.
+    pub host_bytes: usize,
     pub phase_a: f64,
     pub phase_b: f64,
     pub groups: Vec<multilinear_block::GroupStamps>,
@@ -3139,6 +3142,7 @@ fn prove_traces_under<H: WhirHash>(
     let mut narrow = (0f64, 0usize, 0usize, 0usize);
     // The chips held as records: tables, cells, records bytes.
     let mut records_held = (0usize, 0usize, 0usize);
+    let mut host = (0usize, 0usize);
     for (t, ((air, table), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
         let (cols, rows) = table.shape();
         if cols != width || rows != 1usize << num_vars {
@@ -3222,12 +3226,7 @@ fn prove_traces_under<H: WhirHash>(
             TableIn::Columns(mut columns) => CommittedTable::from_layout(layout, |col| {
                 core::mem::take(&mut columns[col as usize])
             }),
-            TableIn::Records(records) => {
-                records_held.0 += 1;
-                records_held.1 += records.rows() * records.cols();
-                records_held.2 += records.bytes();
-                CommittedTable::from_records(layout, records)
-            }
+            TableIn::Records(records) => CommittedTable::from_records(layout, records),
             TableIn::Held(held) => match held.take() {
                 super::b3l_tables::HeldTable::Wide(trace) => {
                     let mut columns = trace.main_table.columns_blocked();
@@ -3243,7 +3242,18 @@ fn prove_traces_under<H: WhirHash>(
                 }
             },
         };
-        tables.push(committed.map_err(|e| format!("{}: {e:?}", air.name()))?);
+        let committed = committed.map_err(|e| format!("{}: {e:?}", air.name()))?;
+        if let Some(records) = committed.records() {
+            records_held.0 += 1;
+            records_held.1 += rows * cols;
+            records_held.2 += records.bytes();
+        } else {
+            host.0 += 1;
+            host.1 += committed
+                .compact_bytes()
+                .unwrap_or(rows * cols * size_of::<FieldElement<F>>());
+        }
+        tables.push(committed);
         parts[5] += t_table.elapsed().as_secs_f64();
     }
     parts[5] -= narrow.0;
@@ -3494,6 +3504,8 @@ fn prove_traces_under<H: WhirHash>(
             records_cells: records_held.1,
             records_bytes: records_held.2,
             records_prefix_pack: prefix_pack,
+            host_tables: host.0,
+            host_bytes: host.1,
             phase_a,
             phase_b,
             groups: group_stamps,

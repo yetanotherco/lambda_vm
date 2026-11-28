@@ -19,6 +19,58 @@ const FAMILY: WlfmFamily = WlfmFamily::B3;
 const LAST: LastLevel = LastLevel::pinned(FAMILY);
 
 #[test]
+fn range_levels_print_fill_and_prove_stamps() {
+    const TEST: &str = "lfm::cluster_levels::tests::range_levels_print_fill_and_prove_stamps";
+    const CHILD: &str = "LAMBDA_VM_TEST_RANGE_STAMPS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let mut builder = wlfm_leg_builder(FAMILY);
+        let word = builder.digest_const([FE::zero(); 4]).as_cell();
+        builder.public(word);
+        let level = build_leaf_program(finish_program(builder).unwrap(), None, true).unwrap();
+        let plain = prove_level(&level, &[]).unwrap();
+        for stage in ["leaf", "join"] {
+            let stamped = prove_level_staged(&level, &[], Clock::reference(), stage).unwrap();
+            assert_eq!(
+                super::super::wire::encode(&plain),
+                super::super::wire::encode(&stamped)
+            );
+        }
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD, "1")
+        .env("LAMBDA_VM_DETERMINISTIC_GRIND", "1")
+        .env("LAMBDA_VM_WLFM_CHIP_RECORDS", "0")
+        .env("LAMBDA_VM_PINNED_POOL_GIB", "0")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for stage in ["leaf", "join"] {
+        let fill = stderr
+            .lines()
+            .find(|line| line.contains(&format!(" {stage}-fill-done ")))
+            .unwrap();
+        assert!(
+            fill.contains(" execute=") && fill.contains(" fill="),
+            "{fill}"
+        );
+        let prove = stderr
+            .lines()
+            .find(|line| line.contains(&format!(" {stage}-prove-end ")))
+            .unwrap();
+        assert!(
+            prove.contains(" record_tables=0 record_bytes=0 host_tables=")
+                && prove.contains(" host_bytes=")
+                && prove.contains(" pool_requested=false pool_ready=false"),
+            "{prove}"
+        );
+    }
+}
+
+#[test]
 fn range_leaf_uses_the_local_levels_stack_placement() {
     use crate::lfm::builder::{B3Block, B3Cv};
     use multilinear::gpu;

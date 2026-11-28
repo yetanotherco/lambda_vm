@@ -594,6 +594,11 @@ fn lfm_fill_parts_at_once(
 }
 
 impl LfmFilled {
+    #[cfg(feature = "parallel")]
+    pub(crate) fn execute_and_fill_secs(&self) -> (f64, f64) {
+        (self.execute_secs, self.fill_secs)
+    }
+
     /// Whether the lean round tables came from a prefill made beside the
     /// execution ([`lfm_fill_executed_prefilled`]).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]

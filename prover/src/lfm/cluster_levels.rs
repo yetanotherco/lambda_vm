@@ -271,11 +271,26 @@ fn prove_level_staged(
         arena,
         level.build.artifacts.hasher,
     )?;
-    clock.mark(format_args!("{stage}-fill-done"));
+    let (execute, fill) = filled.execute_and_fill_secs();
+    clock.mark_with(
+        format_args!("{stage}-fill-done"),
+        format_args!(" execute={execute:.6} fill={fill:.6}"),
+    );
     clock.mark(format_args!("{stage}-prove-start"));
     let proof =
         super::wlfm::prove_wlfm_traces_as(&level.build, filled, true, WlfmProving::Streamed)?;
-    clock.mark(format_args!("{stage}-prove-end"));
+    if let Some(stamps) = super::wlfm::take_wlfm_stamps() {
+        let pool_ready = multilinear::pinned::ready();
+        let pool_requested = multilinear::pinned::stats().is_some();
+        clock.mark_with(
+            format_args!("{stage}-prove-end"),
+            format_args!(
+                " prep={:.6} phase_a={:.6} phase_b={:.6} record_tables={} record_bytes={} host_tables={} host_bytes={} pool_requested={pool_requested} pool_ready={pool_ready}",
+                stamps.prep, stamps.phase_a, stamps.phase_b,
+                stamps.records_tables, stamps.records_bytes, stamps.host_tables, stamps.host_bytes,
+            ),
+        );
+    }
     Ok(proof)
 }
 

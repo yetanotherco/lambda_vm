@@ -42,8 +42,12 @@ impl Clock {
     }
 
     pub fn mark(self, stage: impl Display) {
+        self.mark_with(stage, format_args!(""));
+    }
+
+    pub(crate) fn mark_with(self, stage: impl Display, fields: impl Display) {
         if let Some(stamp) = self.sample() {
-            self.mark_at(stage, stamp);
+            self.log(stage, stamp, fields);
         }
     }
 
