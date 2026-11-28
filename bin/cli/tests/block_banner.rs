@@ -1,4 +1,4 @@
-//! The block commands' `ZF FORMAT` banner states the format they run under:
+//! The tree pipeline's `ZF FORMAT` banner states the format it runs under:
 //! `--blowup 4` prints `whir_blowup=4` on the one banner line (and Q 114 on the
 //! schedule line), the default and `--blowup 2` name no blowup (Q 229), and the
 //! format's environment knob for the blowup is refused before any banner. So
@@ -13,9 +13,9 @@
 
 use std::process::Command;
 
-fn run(args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
+fn run_tree(args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cli"));
-    cmd.args(args);
+    cmd.args(args).args(["--pipeline", "tree"]);
     for (name, _) in std::env::vars() {
         if name.starts_with("LAMBDA_VM_ZF_") || name == "LAMBDA_VM_WHIR_GROUP" {
             cmd.env_remove(name);
@@ -57,7 +57,7 @@ fn the_block_commands_banner_states_the_blowup_they_run_under() {
             if let Some(f) = flag {
                 args.extend(["--blowup", f]);
             }
-            let (ok, stdout, stderr) = run(&args, &[]);
+            let (ok, stdout, stderr) = run_tree(&args, &[]);
             let tag = format!("{name} --blowup {flag:?}");
             assert!(!ok, "{tag}: a missing file fails the command");
             let banners = lines(&stdout, "ZF FORMAT:");
@@ -70,7 +70,7 @@ fn the_block_commands_banner_states_the_blowup_they_run_under() {
             assert_eq!(schedules.len(), 1, "{tag}: one schedule line\n{stdout}");
             assert!(schedules[0].contains(q), "{tag}: {}", schedules[0]);
         }
-        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_BLOWUP", "4")]);
+        let (ok, stdout, stderr) = run_tree(base, &[("LAMBDA_VM_ZF_WHIR_BLOWUP", "4")]);
         assert!(!ok, "{name}: the environment knob is refused");
         assert!(
             lines(&stdout, "ZF FORMAT:").is_empty(),
@@ -106,7 +106,7 @@ fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
         ] {
             let mut args = base.clone();
             args.extend(flags);
-            let (ok, stdout, stderr) = run(&args, &[]);
+            let (ok, stdout, stderr) = run_tree(&args, &[]);
             let tag = format!("{name} {flags:?}");
             assert!(!ok, "{tag}: a missing file fails the command");
             let banners = lines(&stdout, "ZF FORMAT:");
@@ -116,7 +116,7 @@ fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
                 None => assert!(!banners[0].contains("whir_leaves"), "{tag}: {}", banners[0]),
             }
         }
-        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_LEAVES", "coset")]);
+        let (ok, stdout, stderr) = run_tree(base, &[("LAMBDA_VM_ZF_WHIR_LEAVES", "coset")]);
         assert!(!ok, "{name}: the environment knob is refused");
         assert!(
             lines(&stdout, "ZF FORMAT:").is_empty(),
@@ -153,7 +153,7 @@ fn the_block_commands_banner_states_the_round0_trees_they_run_under() {
         ] {
             let mut args = base.clone();
             args.extend(flags);
-            let (ok, stdout, stderr) = run(&args, &[]);
+            let (ok, stdout, stderr) = run_tree(&args, &[]);
             let tag = format!("{name} {flags:?}");
             assert!(!ok, "{tag}: a missing file fails the command");
             let banners = lines(&stdout, "ZF FORMAT:");
@@ -167,7 +167,7 @@ fn the_block_commands_banner_states_the_round0_trees_they_run_under() {
         }
         let mut args = base.clone();
         args.extend(["--leaves", "natural", "--trees", "one"]);
-        let (ok, stdout, stderr) = run(&args, &[]);
+        let (ok, stdout, stderr) = run_tree(&args, &[]);
         assert!(!ok, "{name}: one tree a run under the natural order");
         assert!(
             lines(&stdout, "ZF FORMAT:").is_empty(),
@@ -177,7 +177,7 @@ fn the_block_commands_banner_states_the_round0_trees_they_run_under() {
             stderr.contains("LAMBDA_VM_ZF_WHIR_TREES=one"),
             "{name}: the refusal names the setting\n{stderr}"
         );
-        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_TREES", "each")]);
+        let (ok, stdout, stderr) = run_tree(base, &[("LAMBDA_VM_ZF_WHIR_TREES", "each")]);
         assert!(!ok, "{name}: the environment knob is refused");
         assert!(
             lines(&stdout, "ZF FORMAT:").is_empty(),
@@ -204,7 +204,7 @@ fn verify_block_refuses_every_format_knob_in_its_environment() {
         ("LAMBDA_VM_ZF_WHIR_GRIND_BITS", "20"),
         ("LAMBDA_VM_ZF_WHIR_FOLDS", "uniform4"),
     ] {
-        let (ok, stdout, stderr) = run(&["verify-block", missing, missing], &[(knob, value)]);
+        let (ok, stdout, stderr) = run_tree(&["verify-block", missing, missing], &[(knob, value)]);
         assert!(!ok, "verify-block under {knob}");
         assert!(
             lines(&stdout, "ZF FORMAT:").is_empty(),
@@ -214,7 +214,7 @@ fn verify_block_refuses_every_format_knob_in_its_environment() {
             stderr.contains(knob) && stderr.contains("pins the format"),
             "verify-block under {knob}: the refusal names it\n{stderr}"
         );
-        let (ok, stdout, _) = run(&["prove-block", missing, "-o", proof], &[(knob, value)]);
+        let (ok, stdout, _) = run_tree(&["prove-block", missing, "-o", proof], &[(knob, value)]);
         assert!(
             !ok,
             "prove-block under {knob}: a missing file fails the command"

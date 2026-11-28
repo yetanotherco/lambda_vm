@@ -3003,12 +3003,12 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 
 /// ★ A real block through the levels driver (the box's timing harness):
 /// `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`, the tree harness's format and options
-/// words (`WhirTreeConfig::from_env`), `RTA_FAMILY` (`p1`, the default, or
-/// `b3`: the 7-round BLAKE3 base at `prove-block-base --base b3`'s format —
-/// blowup 2, coset leaves, one tree a run, indexed groups — and BLAKE3
+/// words (`WhirTreeConfig::from_env_for_levels`), `RTA_FAMILY` (`p1` or
+/// `b3`, the default: the 7-round BLAKE3 base with blowup 2, coset leaves,
+/// one tree a run, indexed groups, word memory, WHIR3 rounds, and BLAKE3
 /// levels), `RTA_BESIDE` (1, the default: level 1 executes beside phase B; 0
-/// the control), `RTA_BUILD_BESIDE` (1: level 1's stacks' columns prepared on
-/// the host beside phase B; 0, the default: after the base; their commits are
+/// the control), `RTA_BUILD_BESIDE` (1, the BLAKE3 default: level 1's stacks'
+/// columns prepared on the host beside phase B; 0: after the base; their commits are
 /// on the card either way, `LAMBDA_VM_LEVELS_STACKS`), `RTA_LEVELS` (the
 /// chain's length; 2), `RTA_RUNS` (runs in this process, the first a warm-up;
 /// 1). Prints `RTA …` lines, each run's tagged `run k`; everything is verified
@@ -3044,37 +3044,39 @@ fn rta_a_real_block_through_its_levels() {
     println!("RTA POSTURE: {posture}");
     rta_posture_check(std::env::var("RTA_POSTURE").ok().as_deref(), posture)
         .unwrap_or_else(|e| panic!("{e}"));
+    // A cross-process proof comparison needs both the nonce and the row
+    // order fixed. Keep an explicit trace hash setting for measurement runs.
+    if std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some()
+        && std::env::var_os("LAMBDA_VM_FIXED_TRACE_HASH").is_none()
+    {
+        crate::tables::trace_hash::fix_trace_hash_for_test();
+    }
     let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
         .expect("read the input");
     let family = match std::env::var("RTA_FAMILY").as_deref().map(str::trim) {
-        Err(_) | Ok("p1") => WlfmFamily::P1,
-        Ok("b3") => WlfmFamily::B3,
+        Ok("p1") => WlfmFamily::P1,
+        Err(_) | Ok("b3") => WlfmFamily::B3,
         Ok(other) => panic!("RTA_FAMILY is p1 or b3, not {other}"),
     };
     if family == WlfmFamily::B3 {
-        use crate::zf_format::{LeafOrder, ZfFormat};
-        // `prove-block-base --base b3`'s format, installed before anything
-        // reads it.
-        let zf = ZfFormat {
-            whir_blowup: 2,
-            whir_leaves: LeafOrder::Coset,
-            whir_trees: multilinear::whir_chain::Round0Trees::One,
-            base: BaseFormat::B3_WHIR,
-            ..ZfFormat::from_env().expect("the environment's format")
-        };
+        use crate::zf_format::ZfFormat;
+        let zf = super::levels::blake3_levels_zf(
+            ZfFormat::from_env().expect("the environment's format"),
+        );
         zf.check_leaves().expect("leaves");
         zf.check_trees().expect("trees");
         ZfFormat::install(zf).expect("install the format");
     }
-    let mut cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let mut cfg = WhirTreeConfig::from_env_for_levels(family).unwrap_or_else(|e| panic!("{e}"));
     if family == WlfmFamily::B3 {
         cfg.format.group = multilinear::whir_chain::GroupFold::Indexed;
         assert_eq!(cfg.format.zf.base, BaseFormat::B3_WHIR);
     }
     let beside = std::env::var("RTA_BESIDE").map_or(true, |v| v.trim() != "0");
-    let build_beside = std::env::var("RTA_BUILD_BESIDE").is_ok_and(|v| v.trim() == "1");
+    let build_beside =
+        std::env::var("RTA_BUILD_BESIDE").map_or(family == WlfmFamily::B3, |v| v.trim() == "1");
     let levels: usize =
         std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
     let runs: usize = std::env::var("RTA_RUNS").map_or(1, |v| v.trim().parse().expect("RTA_RUNS"));
@@ -5232,6 +5234,14 @@ fn the_pinned_blake3_base_and_both_levels_verify_at_test_security() {
     }
     super::levels::verify_block_levels(&elf, run.base_proof.statement(), family, &run.proofs[1])
         .expect("the public verifier accepts the last level");
+    let file = super::last_level::last_level_file(
+        &run.proofs[1],
+        super::last_level::LastLevel::pinned(family),
+        super::last_level::LAST_WIRE_DEFAULT,
+    )
+    .expect("the split-memory FRI proof has a last-level file");
+    super::levels::verify_blake3_block_levels_file(&elf, run.base_proof.statement(), &file)
+        .expect_err("the CLI verifier refuses split-memory FRI");
 }
 
 /// ★ A public entry accepts: a small block with a keccak call (`test_keccak`,

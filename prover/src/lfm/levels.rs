@@ -49,6 +49,7 @@ use super::wlfm_leg::{
 };
 use crate::block_whir::BlockWhirProof;
 use crate::hash_pin::{BlockFamily, ProofFamily};
+use crate::zf_format::ZfFormat;
 use multilinear::whir_chain::GroupFold;
 use stark::proof::options::BaseFormat;
 use std::sync::mpsc;
@@ -87,6 +88,18 @@ pub enum LevelStop {
 impl LevelStop {
     /// Two levels: level 1 over the base, level 2 over level 1.
     pub const DEFAULT: Self = LevelStop::Levels(2);
+}
+
+/// The BLAKE3 levels' base code and commitment layout, shared with the
+/// timing harness. The remaining fields come from the caller's WHIR format.
+pub const fn blake3_levels_zf(zf: ZfFormat) -> ZfFormat {
+    ZfFormat {
+        base: BaseFormat::B3_WHIR,
+        whir_blowup: 2,
+        whir_leaves: crate::zf_format::LeafOrder::Coset,
+        whir_trees: crate::zf_format::Round0Trees::One,
+        ..zf
+    }
 }
 
 /// The most levels a chain may take: a [`LevelStop::Groups`] chain that does
@@ -2522,6 +2535,43 @@ pub fn verify_block_levels_file(
     verify_block_levels(elf, statement, family, &last)
 }
 
+const DEFAULT_BLOCK_FAMILY: WlfmFamily = WlfmFamily::B3;
+/// The last-level format of the CLI's BLAKE3 block proof.
+pub const DEFAULT_BLOCK_LAST: LastLevel = LastLevel::pinned(DEFAULT_BLOCK_FAMILY);
+
+/// The format the CLI's BLAKE3 prover and verifier both name.
+fn blake3_block_format() -> Result<crate::block_whir::BlockFormat, String> {
+    use crate::block_whir::{B3Rounds, BlockFormat};
+    use crate::tables::fused_memory::MemoryFormat;
+
+    let format = BlockFormat {
+        zf: blake3_levels_zf(ZfFormat::DEFAULT),
+        memory: MemoryFormat::Words,
+        ..BlockFormat::pinned_with(GroupFold::Indexed)
+    };
+    pin_family(format, DEFAULT_BLOCK_FAMILY, B3Rounds::WHIR3)
+}
+
+/// Verify the default BLAKE3 block's last-level file against the trusted ELF
+/// and the claimed statement.
+pub fn verify_blake3_block_levels_file(
+    elf: &[u8],
+    statement: crate::block_whir::BlockStatement<'_>,
+    file: &[u8],
+) -> Result<(), String> {
+    let last = super::last_level::read_last_level_file(file, DEFAULT_BLOCK_LAST)?;
+    verify_block_levels_pinned(
+        elf,
+        &blake3_block_format()?,
+        statement,
+        DEFAULT_BLOCK_FAMILY,
+        LevelStop::DEFAULT,
+        DEFAULT_BLOCK_LAST,
+        CapMux::Packed,
+        &last,
+    )
+}
+
 /// ★ The block's public verifier over its last level, at the pinned format
 /// with the caller's NAMED choices (as the block tree's
 /// `whir_block::verify_block_tree_at` takes them), plus the BLAKE3 base's
@@ -3069,6 +3119,37 @@ pub struct LevelsRun {
     pub levels: Vec<Level>,
     pub proofs: Vec<WlfmProof>,
     pub times: LevelsTimes,
+}
+
+/// Prove a block in the CLI's BLAKE3 format, with level 1's execution and
+/// preparation beside phase B and both levels on the default chain.
+pub fn prove_blake3_block_levels(elf: &[u8], input: &[u8]) -> Result<LevelsRun, String> {
+    use crate::block_whir::BlockOptions;
+
+    let format = blake3_block_format()?;
+    check_process_format(DEFAULT_BLOCK_FAMILY, DEFAULT_BLOCK_LAST)?;
+    let cap_mux = knob_word(
+        super::merkle_cap::CAP_MUX_ENV,
+        super::merkle_cap::cap_mux_setting,
+    )?;
+    if cap_mux != CapMux::Packed {
+        return Err("the default block requires the packed cap check".into());
+    }
+    if !super::whir_block::share_inverse() {
+        return Err("the default block requires LFM_WHIR_SHARE_INVERSE=1".into());
+    }
+    ZfFormat::install(format.zf)?;
+    prove_block_levels(
+        elf,
+        input,
+        &super::proof::block_base_options_under(&format.zf),
+        &format,
+        &BlockOptions::production(),
+        DEFAULT_BLOCK_FAMILY,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
 }
 
 /// The arena pieces level 1's streamed execution lands: the front, then the

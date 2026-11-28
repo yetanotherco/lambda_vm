@@ -789,12 +789,11 @@ const _: () = assert!(B3_ROUND_FORM_STACK_BOUND >= multilinear::whir_chain::Stac
 /// (`zf_format`), whose knobs a pinned verifier refuses.
 pub const B3_BASE_ROUNDS_ENV: &str = "LAMBDA_VM_B3_BASE_ROUNDS";
 
-/// [`B3_BASE_ROUNDS_ENV`]'s value: unset, `0` or `fri` is [`B3Rounds::Fri`]
-/// (today's); `1` or `w3` is [`B3Rounds::WHIR3`] (shrink 3, caps by Q). Only
-/// these two words turn it on: anything else is refused.
+/// [`B3_BASE_ROUNDS_ENV`]'s value: unset, `1` or `w3` is [`B3Rounds::WHIR3`]
+/// (shrink 3, caps by Q); `0` or `fri` selects [`B3Rounds::Fri`].
 pub fn b3_base_rounds_setting(value: Option<&str>) -> Result<B3Rounds, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
-        None => Ok(B3Rounds::Fri),
+        None => Ok(B3Rounds::WHIR3),
         Some(v) => match v.as_str() {
             "0" | "fri" => Ok(B3Rounds::Fri),
             "1" | "w3" => Ok(B3Rounds::WHIR3),
@@ -809,20 +808,24 @@ pub fn b3_base_rounds_setting(value: Option<&str>) -> Result<B3Rounds, String> {
 /// of [`B3_BASE_ROUNDS_ENV`]), read once; a refused value aborts the process
 /// at its first read, as [`b3_base_final`] does.
 pub fn b3_base_rounds() -> B3Rounds {
-    static ROUNDS: std::sync::OnceLock<B3Rounds> = std::sync::OnceLock::new();
+    b3_base_rounds_override().unwrap_or(B3Rounds::WHIR3)
+}
+
+fn b3_base_rounds_override() -> Option<B3Rounds> {
+    static ROUNDS: std::sync::OnceLock<Option<B3Rounds>> = std::sync::OnceLock::new();
     *ROUNDS.get_or_init(|| {
         let value = match std::env::var(B3_BASE_ROUNDS_ENV) {
-            Ok(v) => Some(v),
-            Err(std::env::VarError::NotPresent) => None,
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => return None,
             Err(std::env::VarError::NotUnicode(v)) => {
                 eprintln!("{B3_BASE_ROUNDS_ENV}={v:?}: expected 0, fri, 1 or w3");
                 std::process::abort()
             }
         };
-        b3_base_rounds_setting(value.as_deref()).unwrap_or_else(|e| {
+        Some(b3_base_rounds_setting(Some(&value)).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::abort()
-        })
+        }))
     })
 }
 
@@ -1056,10 +1059,10 @@ impl BlockFormat {
             },
             // The BLAKE3 base's round form ([`b3_base_rounds`]); the knob on
             // any other base is a configuration error.
-            b3_rounds: match (zf.base == BaseFormat::B3_WHIR, b3_base_rounds()) {
-                (true, rounds) => rounds,
-                (false, B3Rounds::Fri) => B3Rounds::Fri,
-                (false, rounds) => {
+            b3_rounds: match (zf.base == BaseFormat::B3_WHIR, b3_base_rounds_override()) {
+                (true, rounds) => rounds.unwrap_or(B3Rounds::WHIR3),
+                (false, None | Some(B3Rounds::Fri)) => B3Rounds::Fri,
+                (false, Some(rounds)) => {
                     eprintln!(
                         "{B3_BASE_ROUNDS_ENV} asks for {rounds:?}: the round form is the BLAKE3 \
                          base's alone"
@@ -12411,7 +12414,7 @@ pub struct BlockStatement<'a> {
 
 /// A [`BlockStatement`] owned: what a statement observer keeps
 /// ([`prove_block_whir_observed`]).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct OwnedBlockStatement {
     pub table_num_vars: Vec<u8>,
     pub runtime_page_ranges: Vec<RuntimePageRange>,

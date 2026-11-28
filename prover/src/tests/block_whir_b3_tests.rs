@@ -419,16 +419,13 @@ fn the_blake3_base_cap_knob_reads_its_words_and_refuses_the_rest() {
 
 // ───────────────────────────── the WHIR round form ───────────────────────────
 
-/// The BLAKE3 base's round-form knob: unset, `0` and `fri` are today's form;
-/// only `1` and `w3` (shrink 3, caps by Q) turn the round form on; anything
-/// else, the other shrinks among it, is refused. No test sets it, and neither the
-/// pinned verifier's format nor a production format without it carries the
-/// round form.
+/// The BLAKE3 base defaults to WHIR3 and still accepts the explicit FRI form.
+/// Other bases and the pinned tree verifier retain their round form.
 #[test]
 fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
     use crate::block_whir::{B3Rounds, b3_base_rounds, b3_base_rounds_setting};
     for (word, want) in [
-        (None, B3Rounds::Fri),
+        (None, B3Rounds::WHIR3),
         (Some("0"), B3Rounds::Fri),
         (Some("fri"), B3Rounds::Fri),
         (Some(" FRI "), B3Rounds::Fri),
@@ -443,9 +440,15 @@ fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
     ] {
         assert!(b3_base_rounds_setting(Some(word)).is_err(), "{word:?}");
     }
-    assert_eq!(b3_base_rounds(), B3Rounds::Fri, "no test sets the knob");
+    assert_eq!(b3_base_rounds(), B3Rounds::WHIR3, "no test sets the knob");
     assert_eq!(BlockFormat::pinned().b3_rounds, B3Rounds::Fri);
-    assert_eq!(BlockFormat::production().b3_rounds, B3Rounds::Fri);
+    let production = BlockFormat::production();
+    let expected = if production.zf.base == stark::proof::options::BaseFormat::B3_WHIR {
+        B3Rounds::WHIR3
+    } else {
+        B3Rounds::Fri
+    };
+    assert_eq!(production.b3_rounds, expected);
     assert_eq!(B3Rounds::Fri.tag_word(), "");
     assert_eq!(B3Rounds::WHIR3.tag_word(), "/W3/Cq");
     assert_eq!(

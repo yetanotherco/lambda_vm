@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -375,15 +375,11 @@ enum Commands {
         whir: bool,
     },
 
-    /// Prove a whole block as a recursion tree, base to top node
+    /// Prove a block with a BLAKE3 WHIR base and two BLAKE3 recursion levels
     ///
-    /// The block's no-epoch WHIR base proof, the leaves that verify its
-    /// groups, the nodes and the top: one proof a consumer verifies with
-    /// `verify-block` against the ELF. Needs a `--features cuda` build. The
-    /// production posture (table parallelism, retention, the grind's search,
-    /// ...) is set for every knob the environment leaves unset; the `BLOCK
-    /// POSTURE` lines on stderr say which. The base hash is the build's
-    /// (`hash_pin::BLOCK_BASE`), a constant `verify-block` shares.
+    /// The file contains the block statement and the last recursion proof.
+    /// Use `--pipeline tree` for the recursion tree at the build's base hash
+    /// and its format flags. Proving on a GPU needs a `--features cuda` build.
     ProveBlock {
         /// Path to the guest ELF
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
@@ -397,16 +393,20 @@ enum Commands {
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: PathBuf,
 
-        /// Print the whole run's wall (base to top node)
+        /// Recursion pipeline
+        #[arg(long, value_enum, default_value = "levels")]
+        pipeline: BlockPipeline,
+
+        /// Print the whole proving time
         #[arg(long)]
         time: bool,
 
-        /// Print the blake3 digest of the top proof's bytes
+        /// Print the blake3 digest of the final proof's bytes
         #[arg(long)]
         digest: bool,
 
-        /// Ship the tree's top file instead of the compressed one (the
-        /// rollback; `verify-block --tree-file` reads it). By default the
+        /// With `--pipeline tree`, ship the tree's top file
+        /// (`verify-block --pipeline tree --tree-file` reads it). By default the
         /// block ships its compressed file, whose format is the CLI's
         /// constant (`whir_block_tree::DEFAULT_SHIPPED`) at the pinned format
         /// flags (their defaults).
@@ -490,6 +490,8 @@ enum Commands {
     },
 
     /// Verify a block proof produced by `prove-block`
+    ///
+    /// The format flags apply to `--pipeline tree`.
     VerifyBlock {
         /// Path to the block proof
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
@@ -499,12 +501,16 @@ enum Commands {
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         elf: PathBuf,
 
+        /// Recursion pipeline used to make the proof
+        #[arg(long, value_enum, default_value = "levels")]
+        pipeline: BlockPipeline,
+
         /// Print verification time
         #[arg(long)]
         time: bool,
 
-        /// Verify the tree's top file (`prove-block --tree-file`) instead of
-        /// the compressed one. Without it the file is verified as the CLI's
+        /// With `--pipeline tree`, verify the tree's top file. Without it
+        /// the tree file is verified as the CLI's
         /// compressed format (`whir_block_tree::DEFAULT_SHIPPED`), at the
         /// pinned format flags (their defaults); the file does not choose.
         #[arg(long)]
@@ -628,16 +634,42 @@ enum Commands {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum BlockPipeline {
+    Levels,
+    Tree,
+}
+
 fn main() -> ExitCode {
     env_logger::init();
     prover::alloc_purge::install(allocator::HOOKS);
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if matches!(
+        cli.command,
+        Commands::ProveBlock {
+            pipeline: BlockPipeline::Levels,
+            ..
+        } | Commands::VerifyBlock {
+            pipeline: BlockPipeline::Levels,
+            ..
+        }
+    ) && let Some((_, args)) = matches.subcommand()
+        && let Err(e) = check_levels_choices(args)
+    {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     // Still single-threaded here: clap and env_logger spawn nothing.
     if matches!(
         cli.command,
-        Commands::ProveBlock { .. }
-            | Commands::VerifyBlock { .. }
-            | Commands::ProveBlockBase { .. }
+        Commands::ProveBlock {
+            pipeline: BlockPipeline::Tree,
+            ..
+        } | Commands::VerifyBlock {
+            pipeline: BlockPipeline::Tree,
+            ..
+        } | Commands::ProveBlockBase { .. }
     ) {
         // SAFETY: no thread but this one exists yet.
         for line in unsafe { apply_posture() } {
@@ -713,6 +745,7 @@ fn main() -> ExitCode {
             elf,
             input,
             output,
+            pipeline,
             time,
             digest,
             tree_file,
@@ -725,14 +758,8 @@ fn main() -> ExitCode {
             argue_pack,
             memory,
             page_run,
-        } => cmd_prove_block(
-            elf,
-            input,
-            output,
-            time,
-            digest,
-            tree_file,
-            BlockChoices {
+        } => {
+            let choices = BlockChoices {
                 group: &group,
                 blowup: &blowup,
                 leaves: &leaves,
@@ -742,11 +769,24 @@ fn main() -> ExitCode {
                 argue_pack: &argue_pack,
                 memory: &memory,
                 page_run: &page_run,
-            },
-        ),
+            };
+            match pipeline {
+                BlockPipeline::Levels => report_block_levels(cmd_prove_block_levels(
+                    &elf,
+                    input.as_ref(),
+                    &output,
+                    time,
+                    digest,
+                )),
+                BlockPipeline::Tree => {
+                    cmd_prove_block(elf, input, output, time, digest, tree_file, choices)
+                }
+            }
+        }
         Commands::VerifyBlock {
             proof,
             elf,
+            pipeline,
             time,
             tree_file,
             group,
@@ -758,12 +798,8 @@ fn main() -> ExitCode {
             argue_pack,
             memory,
             page_run,
-        } => cmd_verify_block(
-            proof,
-            elf,
-            time,
-            tree_file,
-            BlockChoices {
+        } => {
+            let choices = BlockChoices {
                 group: &group,
                 blowup: &blowup,
                 leaves: &leaves,
@@ -773,8 +809,14 @@ fn main() -> ExitCode {
                 argue_pack: &argue_pack,
                 memory: &memory,
                 page_run: &page_run,
-            },
-        ),
+            };
+            match pipeline {
+                BlockPipeline::Levels => {
+                    report_block_levels(cmd_verify_block_levels(&proof, &elf, time))
+                }
+                BlockPipeline::Tree => cmd_verify_block(proof, elf, time, tree_file, choices),
+            }
+        }
         Commands::ProveBlockBase {
             elf,
             input,
@@ -1036,6 +1078,114 @@ fn with_named_choices(
         page_run_log2: page_run,
         ..format
     }
+}
+
+fn check_levels_choices(args: &clap::ArgMatches) -> Result<(), String> {
+    for flag in [
+        "tree_file",
+        "group",
+        "blowup",
+        "leaves",
+        "trees",
+        "leaf_double_from",
+        "leaf_query",
+        "argue_pack",
+        "memory",
+        "page_run",
+    ] {
+        if args.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
+            return Err(format!(
+                "--{} requires --pipeline tree",
+                flag.replace('_', "-")
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct BlockLevelsFile {
+    magic: [u8; 8],
+    statement: prover::block_whir::OwnedBlockStatement,
+    last_level: Vec<u8>,
+}
+
+impl BlockLevelsFile {
+    const MAGIC: [u8; 8] = *b"LVBLOCK1";
+}
+
+fn report_block_levels(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_prove_block_levels(
+    elf: &Path,
+    input: Option<&PathBuf>,
+    output: &Path,
+    time: bool,
+    digest: bool,
+) -> Result<(), String> {
+    use prover::lfm::last_level::{LAST_WIRE_DEFAULT, last_level_file};
+    use prover::lfm::levels::{DEFAULT_BLOCK_LAST, prove_blake3_block_levels};
+
+    let elf = std::fs::read(elf).map_err(|e| format!("Failed to read ELF file: {e}"))?;
+    let input = read_private_input(input)?;
+    let run =
+        prove_blake3_block_levels(&elf, &input).map_err(|e| format!("Block proof failed: {e}"))?;
+    let last = run.proofs.last().ok_or("Block proof has no last level")?;
+    let file = BlockLevelsFile {
+        magic: BlockLevelsFile::MAGIC,
+        statement: run.base_proof.statement().to_owned(),
+        last_level: last_level_file(last, DEFAULT_BLOCK_LAST, LAST_WIRE_DEFAULT)?,
+    };
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&file)
+        .map_err(|e| format!("Failed to serialize the block proof: {e}"))?;
+    std::fs::write(output, &bytes).map_err(|e| format!("Failed to write {output:?}: {e}"))?;
+    eprintln!("Block proof written to {output:?} ({} bytes)", bytes.len());
+    println!("Output: {}", hex(&file.statement.public_output));
+    if digest {
+        println!(
+            "BLOCK LAST LEVEL DIGEST: {} (blake3 of the last-level file's {} bytes)",
+            &blake3::hash(&file.last_level).to_hex()[..32],
+            file.last_level.len()
+        );
+    }
+    if time {
+        let end = run
+            .times
+            .levels
+            .last()
+            .map_or(run.times.base, |level| level.end);
+        println!("Proving time: {end:.3}s");
+    }
+    Ok(())
+}
+
+fn cmd_verify_block_levels(proof: &Path, elf: &Path, time: bool) -> Result<(), String> {
+    use prover::lfm::levels::verify_blake3_block_levels_file;
+
+    let bytes = read_aligned_file(proof).map_err(|e| format!("Failed to read block proof: {e}"))?;
+    let file = rkyv::from_bytes::<BlockLevelsFile, rkyv::rancor::Error>(&bytes)
+        .map_err(|e| format!("Failed to read the block proof: {e}"))?;
+    if file.magic != BlockLevelsFile::MAGIC {
+        return Err("the block proof has no BLAKE3 levels file header".into());
+    }
+    let elf = std::fs::read(elf).map_err(|e| format!("Failed to read ELF file: {e}"))?;
+    let start = Instant::now();
+    verify_blake3_block_levels_file(&elf, file.statement.view(), &file.last_level)
+        .map_err(|e| format!("Verification failed: {e}"))?;
+    eprintln!("Verification succeeded!");
+    println!("Output: {}", hex(&file.statement.public_output));
+    if time {
+        println!("Verification time: {:.3}s", start.elapsed().as_secs_f64());
+    }
+    Ok(())
 }
 
 fn cmd_prove_block(
@@ -2770,7 +2920,6 @@ fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     // The arg graph is well-formed (e.g. `requires`/`conflicts_with` reference real args).
     #[test]
@@ -2932,15 +3081,56 @@ mod tests {
             !ok(&["cli", "verify-block", "block.proof"]),
             "the ELF is required"
         );
+        for args in [
+            &["cli", "prove-block", "guest.elf", "-o", "block.proof"][..],
+            &["cli", "verify-block", "block.proof", "guest.elf"][..],
+        ] {
+            let pipeline = |args: &[&str]| match Cli::parse_from(args).command {
+                Commands::ProveBlock { pipeline, .. } | Commands::VerifyBlock { pipeline, .. } => {
+                    pipeline
+                }
+                _ => unreachable!(),
+            };
+            assert!(matches!(pipeline(args), BlockPipeline::Levels));
+            let parsed = Cli::command().try_get_matches_from(args).unwrap();
+            assert_eq!(check_levels_choices(parsed.subcommand().unwrap().1), Ok(()));
+            let named = [args, &["--memory", "split"]].concat();
+            let parsed = Cli::command().try_get_matches_from(named).unwrap();
+            assert_eq!(
+                check_levels_choices(parsed.subcommand().unwrap().1),
+                Err("--memory requires --pipeline tree".into())
+            );
+            let mut tree = args.to_vec();
+            tree.extend(["--pipeline", "tree"]);
+            assert!(matches!(pipeline(&tree), BlockPipeline::Tree));
+        }
     }
 
-    /// Both block commands take the group opening, one chain per run unless
+    const TREE_PROVE_ARGS: [&str; 7] = [
+        "cli",
+        "prove-block",
+        "guest.elf",
+        "-o",
+        "block.proof",
+        "--pipeline",
+        "tree",
+    ];
+    const TREE_VERIFY_ARGS: [&str; 6] = [
+        "cli",
+        "verify-block",
+        "block.proof",
+        "guest.elf",
+        "--pipeline",
+        "tree",
+    ];
+
+    /// Both tree commands take the group opening, one chain per run unless
     /// told otherwise, and nothing but its two words.
     #[test]
     fn the_block_commands_take_the_group_opening() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let group = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(Commands::ProveBlock { group, .. } | Commands::VerifyBlock { group, .. }) => {
@@ -2962,13 +3152,13 @@ mod tests {
         }
     }
 
-    /// Both block commands take the WHIR blowup, 2 unless told otherwise, and
+    /// Both tree commands take the WHIR blowup, 2 unless told otherwise, and
     /// nothing but its two words; each word reads to the blowup it names.
     #[test]
     fn the_block_commands_take_the_blowup() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let blowup = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(Commands::ProveBlock { blowup, .. } | Commands::VerifyBlock { blowup, .. }) => {
@@ -3001,15 +3191,15 @@ mod tests {
         );
     }
 
-    /// Both block commands take the round-0 leaf order, the coset order unless told
+    /// Both tree commands take the round-0 leaf order, the coset order unless told
     /// otherwise, and nothing but its two words; each word reads to the order
     /// it names.
     #[test]
     fn the_block_commands_take_the_leaf_order() {
         use prover::zf_format::LeafOrder;
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let leaves = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(Commands::ProveBlock { leaves, .. } | Commands::VerifyBlock { leaves, .. }) => {
@@ -3039,7 +3229,7 @@ mod tests {
         );
     }
 
-    /// Both block commands take the round-0 trees, the production's (one tree
+    /// Both tree commands take the round-0 trees, the production's (one tree
     /// a run) unless told otherwise, and nothing but its two words; each word reads to the
     /// trees it names. One tree a run is refused under the natural order by
     /// both commands' installs, before anything is installed.
@@ -3047,8 +3237,8 @@ mod tests {
     fn the_block_commands_take_the_round0_trees() {
         use prover::zf_format::{LeafOrder, Round0Trees};
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let trees = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(Commands::ProveBlock { trees, .. } | Commands::VerifyBlock { trees, .. }) => {
@@ -3088,7 +3278,7 @@ mod tests {
         }
     }
 
-    /// Both block commands take the memory format, `split` unless told
+    /// Both tree commands take the memory format, `split` unless told
     /// otherwise, and nothing but `split`, `fused` or `words`; each reads to
     /// the format it names, and only `split` is at the pinned choices a
     /// compressed file is proved and verified at.
@@ -3096,8 +3286,8 @@ mod tests {
     fn the_block_commands_take_the_memory_format() {
         use prover::tables::fused_memory::MemoryFormat;
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let memory = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(Commands::ProveBlock { memory, .. } | Commands::VerifyBlock { memory, .. }) => {
@@ -3136,15 +3326,15 @@ mod tests {
         assert!(!at_pinned_choices(&choices("fused")));
     }
 
-    /// Both block commands take the page runs, 4 (runs of 16 pages, the
+    /// Both tree commands take the page runs, 4 (runs of 16 pages, the
     /// presets') unless told otherwise, and nothing but a count in 0..=6; each
     /// reads to the count it names. A compressed file is proved and verified
     /// at the pinned choices, whose split format any run leaves as it is.
     #[test]
     fn the_block_commands_take_the_page_runs() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let page_run = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(
@@ -3246,15 +3436,15 @@ mod tests {
         assert!(first.is_some_and(|r| r.starts_with("BLOCK_WHIR_MEMORY")));
     }
 
-    /// Both block commands take the leaf scale, production's threshold of 10
+    /// Both tree commands take the leaf scale, production's threshold of 10
     /// unless told otherwise, and nothing but `off` or a leaf count; each word
     /// reads to the scale it names.
     #[test]
     fn the_block_commands_take_the_leaf_scale() {
         use prover::lfm::whir_block::LeafScale;
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let scale = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(
@@ -3297,15 +3487,15 @@ mod tests {
         );
     }
 
-    /// Both block commands take the leaves' query check, production's `lean`
+    /// Both tree commands take the leaves' query check, production's `lean`
     /// unless told otherwise, and nothing but `v1` or `lean`; each word reads
     /// to the check it names.
     #[test]
     fn the_block_commands_take_the_leaf_query() {
         use prover::lfm::whir_chain::LeafQuery;
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let query = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(
@@ -3336,15 +3526,15 @@ mod tests {
         );
     }
 
-    /// Both block commands take the GKR packing as `--argue-pack`, `off` or a
+    /// Both tree commands take the GKR packing as `--argue-pack`, `off` or a
     /// price; unset, both read the production packing (the harness's unset
     /// reading).
     #[test]
     fn the_block_commands_take_the_argue_pack() {
         use prover::lfm::whir_block_tree::pack_setting;
         let parse = |args: &[&str]| Cli::try_parse_from(args);
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             let pack = |args: &[&str]| match parse(args).map(|cli| cli.command) {
                 Ok(
@@ -3371,13 +3561,13 @@ mod tests {
         }
     }
 
-    /// The block commands take no base hash: the block's base is its proof
+    /// The tree commands take no base hash: the block's base is its proof
     /// family's, a constant of the build, so `--base-hash` is refused on both.
     #[test]
     fn the_block_commands_take_no_base_hash() {
         let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
-        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
-        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        let prove = TREE_PROVE_ARGS;
+        let verify = TREE_VERIFY_ARGS;
         for cmd in [&prove[..], &verify[..]] {
             assert!(ok(cmd));
             for word in ["rpx", "p1"] {

@@ -574,6 +574,16 @@ impl WhirTreeConfig {
     /// harness always read. A value a knob cannot take is an error (the
     /// `BLOCK_WHIR_*` readers of [`crate::block_whir`] keep their own refusals).
     pub fn from_env() -> Result<Self, String> {
+        Self::from_env_with_defaults(false)
+    }
+
+    /// The levels harness reads the same knobs. Its BLAKE3 path defaults to
+    /// word memory and an uncompressed proof.
+    pub fn from_env_for_levels(family: super::wlfm::WlfmFamily) -> Result<Self, String> {
+        Self::from_env_with_defaults(family == super::wlfm::WlfmFamily::B3)
+    }
+
+    fn from_env_with_defaults(blake3_levels: bool) -> Result<Self, String> {
         // The leaves' scale first: the production format reads the same knob
         // and refuses what it cannot take, which this returns as an error.
         let leaf_scale = leaf_scale_from_env()?;
@@ -629,7 +639,10 @@ impl WhirTreeConfig {
             ecdas: ecdas_setting(std::env::var("BLOCK_WHIR_ECDAS").ok().as_deref())?,
             registers: registers_setting(std::env::var("BLOCK_WHIR_REGISTERS").ok().as_deref())?,
             memory: memory_setting(
-                std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref(),
+                std::env::var("BLOCK_WHIR_MEMORY")
+                    .ok()
+                    .as_deref()
+                    .or(blake3_levels.then_some("words")),
                 crate::base_only::declared(),
             )?,
             page_run_log2: page_run_setting(std::env::var("BLOCK_WHIR_PAGE_RUN").ok().as_deref())?,
@@ -721,7 +734,11 @@ impl WhirTreeConfig {
             levers: compress_levers,
             wire: compress_wire,
             c2: compress2,
-        } = super::compress::compress_plan_from_env()?;
+        } = super::compress::compress_plan(|name| {
+            std::env::var(name).ok().or_else(|| {
+                (blake3_levels && name == super::compress::COMPRESS_ENV).then(|| "0".to_owned())
+            })
+        })?;
         let emit_threads = count_knob("W3_EMIT_THREADS")?.unwrap_or(4).max(1);
         Ok(Self {
             leaves,

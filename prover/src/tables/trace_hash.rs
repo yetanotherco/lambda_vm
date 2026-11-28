@@ -20,6 +20,8 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug)]
 pub struct TraceHashState(Option<RandomState>);
 
+static STATE: OnceLock<TraceHashState> = OnceLock::new();
+
 impl TraceHashState {
     /// SipHash-1-3 with zero keys: the same hashes in every process.
     pub fn fixed() -> Self {
@@ -41,7 +43,6 @@ impl BuildHasher for TraceHashState {
 /// The process's state (see the module docs), read from
 /// `LAMBDA_VM_FIXED_TRACE_HASH` once.
 pub fn trace_hash_state() -> TraceHashState {
-    static STATE: OnceLock<TraceHashState> = OnceLock::new();
     STATE
         .get_or_init(|| {
             if std::env::var("LAMBDA_VM_FIXED_TRACE_HASH").is_ok_and(|v| v.trim() == "1") {
@@ -51,6 +52,14 @@ pub fn trace_hash_state() -> TraceHashState {
             }
         })
         .clone()
+}
+
+/// Fix the process's trace order before a standalone proof identity test.
+#[cfg(test)]
+pub(crate) fn fix_trace_hash_for_test() {
+    STATE
+        .set(TraceHashState::fixed())
+        .expect("run the identity test alone, before any traces are built");
 }
 
 /// A deduplicating table's operation map, hashed under [`trace_hash_state`].
