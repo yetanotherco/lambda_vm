@@ -11,6 +11,7 @@
 //! ones cleanly.
 
 use executor::elf::Elf;
+use executor::vm::logs::Log;
 use stark::prover::IsStarkProver;
 
 use super::halt_pc_forgery_poc::{opts, run_logs};
@@ -25,18 +26,18 @@ const GUEST: &str = "all_instructions_64";
 /// Prove `elf` split over 32-row CPU tables, after `tamper` edits the traces.
 fn craft_proof(
     elf_bytes: &[u8],
+    program: &Elf,
+    logs: &[Log],
     tamper: impl FnOnce(&mut Traces),
 ) -> Result<VmProof, stark::prover::ProvingError> {
     let options = opts();
-    let program = Elf::load(elf_bytes).expect("ELF load");
-    let mut traces =
-        Traces::from_elf_and_logs(&program, &run_logs(elf_bytes), &MaxRowsConfig::small(), &[])
-            .expect("trace build");
+    let mut traces = Traces::from_elf_and_logs(program, logs, &MaxRowsConfig::small(), &[])
+        .expect("trace build");
     tamper(&mut traces);
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
-        &program,
+        program,
         &options,
         false,
         &traces.page_configs,
@@ -47,7 +48,7 @@ fn craft_proof(
         None,
         crate::test_utils::halted_register_commitment(
             &options,
-            &program,
+            program,
             &traces.public_output_bytes,
         )
         .preprocessed(),
@@ -87,12 +88,16 @@ fn verifies(crafted: Result<VmProof, stark::prover::ProvingError>, elf: &[u8]) -
 
 /// POSITIVE CONTROL: a run split over several CPU tables verifies, the later
 /// tables continuing the first one's timestamp cadence.
+// split_cpu_tables_verify, hostile_cpu_heights_are_rejected_by_the_verifier,
+// cpu_proof_start_matches_air_refs_layout, swapped_cpu_tables_are_rejected
+// → split_cpu_tables_verify_and_bind_their_heights_and_positions.
 #[test]
-fn split_cpu_tables_verify() {
+fn split_cpu_tables_verify_and_bind_their_heights_and_positions() {
     let elf = asm_elf_bytes(GUEST);
-    let rows = run_logs(&elf).len();
+    let program = Elf::load(&elf).expect("split_cpu_tables_verify: the ELF loads");
+    let logs = run_logs(&elf);
     let mut full_tables = 0;
-    let crafted = craft_proof(&elf, |traces| {
+    let crafted = craft_proof(&elf, &program, &logs, |traces| {
         full_tables = traces
             .cpus
             .iter()
@@ -101,47 +106,48 @@ fn split_cpu_tables_verify() {
         // The heights the prover checks right after execution are the ones the
         // trace builder produces.
         assert_eq!(
-            crate::tables::cpu::table_heights(rows, MaxRowsConfig::small().cpu),
-            crate::cpu_heights_from_traces(traces)
+            crate::tables::cpu::table_heights(logs.len(), MaxRowsConfig::small().cpu),
+            crate::cpu_heights_from_traces(traces),
+            "split_cpu_tables_verify"
         );
     });
     assert!(
         full_tables >= 2,
-        "need two full CPU tables, got {full_tables}"
+        "split_cpu_tables_verify: need two full CPU tables, got {full_tables}"
     );
-    assert!(verifies(crafted, &elf));
+    let honest = crafted.expect("split_cpu_tables_verify: the honest proof builds");
+    assert!(crate::verify_with_options(&honest, &elf, &opts(), None, None)
+        .expect("split_cpu_tables_verify / hostile_cpu_heights_are_rejected_by_the_verifier: verifier runs"), "split_cpu_tables_verify");
+    hostile_cpu_heights_are_rejected_by_the_verifier(&elf, &honest);
+    cpu_proof_start_matches_air_refs_layout(&program, &honest);
+    swapped_cpu_tables_are_rejected(&elf, &program, &logs);
 }
 
 /// Two full CPU tables swapped: same preprocessed commitments, same heights,
 /// same rows — only their timestamp bases differ.
-#[test]
-fn swapped_cpu_tables_are_rejected() {
-    let elf = asm_elf_bytes(GUEST);
-    let crafted = craft_proof(&elf, |traces| traces.cpus.swap(0, 1));
+fn swapped_cpu_tables_are_rejected(elf: &[u8], program: &Elf, logs: &[Log]) {
+    let crafted = craft_proof(elf, program, logs, |traces| traces.cpus.swap(0, 1));
     assert!(
-        !verifies(crafted, &elf),
-        "CPU tables verified at each other's timestamp base"
+        !verifies(crafted, elf),
+        "swapped_cpu_tables_are_rejected: CPU tables verified at each other's timestamp base"
     );
 }
 
 /// Hostile CPU heights in an honest proof: heights `validate_heights` refuses are
 /// an error before any AIR is built; a valid but wrong height picks a different
 /// preprocessed root and the proof is rejected. None of them panics.
-#[test]
-fn hostile_cpu_heights_are_rejected_by_the_verifier() {
-    let elf = asm_elf_bytes(GUEST);
-    let honest = craft_proof(&elf, |_| {}).expect("honest proof");
-    assert!(crate::verify_with_options(&honest, &elf, &opts(), None, None).unwrap());
+fn hostile_cpu_heights_are_rejected_by_the_verifier(elf: &[u8], honest: &VmProof) {
     let cpu = crate::cpu_proof_start(true, &honest.table_counts);
     assert_eq!(
         honest.proof.proofs[cpu].trace_length,
-        MaxRowsConfig::small().cpu
+        MaxRowsConfig::small().cpu,
+        "hostile_cpu_heights_are_rejected_by_the_verifier"
     );
 
     let with_height = |height: usize| {
         let mut proof = honest.clone();
         proof.proof.proofs[cpu].trace_length = height;
-        crate::verify_with_options(&proof, &elf, &opts(), None, None)
+        crate::verify_with_options(&proof, elf, &opts(), None, None)
     };
     for height in [
         0,
@@ -156,11 +162,14 @@ fn hostile_cpu_heights_are_rejected_by_the_verifier() {
                 with_height(height),
                 Err(crate::Error::InvalidTableCounts(_))
             ),
-            "height {height}"
+            "hostile_cpu_heights_are_rejected_by_the_verifier: height {height}"
         );
     }
     for height in [16, 64] {
-        assert!(!with_height(height).unwrap(), "height {height}");
+        assert!(
+            !with_height(height).unwrap(),
+            "hostile_cpu_heights_are_rejected_by_the_verifier: height {height}"
+        );
     }
 }
 
@@ -170,13 +179,9 @@ fn hostile_cpu_heights_are_rejected_by_the_verifier() {
 /// the tables between the fixed ones and CPU on this branch, which main's
 /// formula does not count. Checked in release builds too, unlike the
 /// `debug_assert` in `air_refs`.
-#[test]
-fn cpu_proof_start_matches_air_refs_layout() {
-    let elf = asm_elf_bytes(GUEST);
-    let program = Elf::load(&elf).unwrap();
+fn cpu_proof_start_matches_air_refs_layout(program: &Elf, honest: &VmProof) {
     let options = opts();
-    let honest = craft_proof(&elf, |_| {}).expect("honest proof");
-    let register = crate::test_utils::halted_register_commitment(&options, &program, &[]);
+    let register = crate::test_utils::halted_register_commitment(&options, program, &[]);
     for include_halt in [false, true] {
         for (copy, blake3) in [(0, 0), (3, 1)] {
             for mask in 0u8..64 {
@@ -191,7 +196,7 @@ fn cpu_proof_start_matches_air_refs_layout() {
                 counts.copy = copy;
                 counts.blake3 = blake3;
                 let airs = VmAirs::new(
-                    &program,
+                    program,
                     &options,
                     false,
                     &[],
@@ -208,7 +213,7 @@ fn cpu_proof_start_matches_air_refs_layout() {
                     assert_eq!(
                         refs[start + k].name(),
                         format!("CPU[{k}]"),
-                        "halt={include_halt} copy={copy} blake3={blake3} optional={mask:06b}"
+                        "cpu_proof_start_matches_air_refs_layout: halt={include_halt} copy={copy} blake3={blake3} optional={mask:06b}"
                     );
                 }
             }

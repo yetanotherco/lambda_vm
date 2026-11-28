@@ -441,22 +441,27 @@ fn forgery_fixture(
 fn assert_forgery_cases(
     name: &str,
     max_rows: MaxRowsConfig,
-    cases: &[crate::tables::trace_builder::in_row_forgery_tests::Forgery],
+    cases: &[(
+        &str,
+        crate::tables::trace_builder::in_row_forgery_tests::Forgery,
+    )],
+    control: &str,
 ) {
     use crate::tables::trace_builder::in_row_forgery_tests::{Forgery, forge, recount_is_half};
     let format = in_row();
     let elf = asm_elf_bytes(name);
     let logs = crate::tests::halt_pc_forgery_poc::run_logs(&elf);
     let (program, mut honest) = forgery_fixture(&elf, &logs, &max_rows);
-    let proof = prove_built(&program, &elf, &mut honest, &format).expect("the honest build proves");
+    let proof = prove_built(&program, &elf, &mut honest, &format)
+        .unwrap_or_else(|err| panic!("{control}: the honest build proves: {err:?}"));
     assert!(
         verifies(&proof, &elf, &format),
-        "{name}: the honest build verifies"
+        "{control}: {name}: the honest build verifies"
     );
     drop(honest);
 
     let mut wrong = Vec::new();
-    for &forgery in cases {
+    for &(case, forgery) in cases {
         let check = match forgery {
             Forgery::KeepAliveChangesValue => Check::Constraint,
             _ => Check::Balance,
@@ -464,10 +469,10 @@ fn assert_forgery_cases(
         let (program, mut forged) = forgery_fixture(&elf, &logs, &max_rows);
         forge(forgery, &mut forged);
         let recounted = recount_is_half(&program, &mut forged);
-        let proof =
-            prove_built(&program, &elf, &mut forged, &format).expect("the forged build proves");
+        let proof = prove_built(&program, &elf, &mut forged, &format)
+            .unwrap_or_else(|err| panic!("{case}: {forgery:?}: the forged build proves: {err:?}"));
         if let Some(read) = refused_by(&proof, &elf, &format, check) {
-            wrong.push(format!("{forgery:?}: {read}"));
+            wrong.push(format!("{case}: {forgery:?}: {read}"));
         }
         println!("IN-ROW FORGERY {forgery:?}: {recounted} IS_HALF value(s) recounted, {check:?}");
     }
@@ -488,36 +493,32 @@ mod in_row_forgeries_are_refused_by_the_block_verifier {
             "all_instructions_64",
             MaxRowsConfig::small(),
             &[
-                Forgery::SlotSelfLoop,
-                Forgery::ResidualSelfLoop,
-                Forgery::WrongOldRd,
+                ("cpu_slots_and_residual_reads", Forgery::SlotSelfLoop),
+                ("cpu_slots_and_residual_reads", Forgery::ResidualSelfLoop),
+                ("cpu_slots_and_residual_reads", Forgery::WrongOldRd),
             ],
+            "cpu_slots_and_residual_reads",
         );
     }
 
-    fn assert_keep_alive_cases(cases: &[Forgery]) {
+    // keep_alive_timestamps, keep_alive_values → keep_alive_forgeries.
+    #[test]
+    fn keep_alive_forgeries() {
         // Keep a gap beyond the slot's 16-bit reach with a shorter loop
         // and fewer tables. forge() requires the keep-alive and checks
         // that removing it still takes the slot past that reach.
         assert_forgery_cases(
             "keep_alive_regs_min",
             MaxRowsConfig::uniform(1 << 10),
-            cases,
+            &[
+                ("keep_alive_timestamps", Forgery::SlotCycle),
+                ("keep_alive_timestamps", Forgery::SlotPastReach),
+                ("keep_alive_values", Forgery::KeepAliveChangesValue),
+                ("keep_alive_values", Forgery::KeepAliveInventsValue),
+                ("keep_alive_values", Forgery::ReadWithoutRequester),
+            ],
+            "keep_alive_timestamps / keep_alive_values",
         );
-    }
-
-    #[test]
-    fn keep_alive_timestamps() {
-        assert_keep_alive_cases(&[Forgery::SlotCycle, Forgery::SlotPastReach]);
-    }
-
-    #[test]
-    fn keep_alive_values() {
-        assert_keep_alive_cases(&[
-            Forgery::KeepAliveChangesValue,
-            Forgery::KeepAliveInventsValue,
-            Forgery::ReadWithoutRequester,
-        ]);
     }
 
     #[test]

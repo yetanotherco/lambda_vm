@@ -1279,19 +1279,32 @@ pub(crate) fn streamed(
 
 /// ★ The build streamed into phase A: tables are packed into groups as their
 /// chunks complete, the partition rides the statement, and the proof verifies.
+// a_streamed_block_proves_and_verifies, a_tampered_partition_is_refused,
+// a_partition_missing_a_table_is_refused, a_partition_over_the_group_maximum_is_refused
+// → streamed_block_verifies_and_binds_its_partition.
 #[test]
-fn a_streamed_block_proves_and_verifies() {
+fn streamed_block_verifies_and_binds_its_partition() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
     let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
-    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    assert!(
+        groups_of(&proof) >= 3,
+        "a_streamed_block_proves_and_verifies: {} groups",
+        groups_of(&proof)
+    );
     // Streaming packs in arrival order, not table order.
     let order: Vec<u32> = proof.groups.iter().flatten().copied().collect();
     assert!(
         order.windows(2).any(|w| w[0] > w[1]),
-        "the groups are table order"
+        "a_streamed_block_proves_and_verifies: the groups are table order"
     );
-    assert!(verify(&proof, &elf, &format));
+    assert!(
+        verify(&proof, &elf, &format),
+        "a_streamed_block_proves_and_verifies / a_tampered_partition_is_refused"
+    );
+    a_tampered_partition_is_refused(&elf, &format, &proof);
+    a_partition_missing_a_table_is_refused(&elf, &format, proof.clone());
+    a_partition_over_the_group_maximum_is_refused(&elf, &format, &proof);
 }
 
 /// The stamps of one `BLOCK HEAD` item: the number after each of `prefixes`,
@@ -1746,25 +1759,44 @@ mod phase_b_in_any_order_proves_the_same_bytes {
         (1..n).collect()
     }
 
-    fn check_proof(order: Option<Order>, overlap: PhaseBOverlap) {
-        static BASELINE: std::sync::OnceLock<BlockWhirProof> = std::sync::OnceLock::new();
+    // serial_reversed, serial_odd_first, overlapped_in_order, overlapped_reversed,
+    // pinned_in_order, pinned_reversed → valid_orders_verify_and_preserve_the_proof.
+    #[test]
+    fn valid_orders_verify_and_preserve_the_proof() {
         let elf = asm_elf_bytes("test_keccak_multi");
         let format = many_groups();
-        let in_order = BASELINE.get_or_init(|| {
-            let proof = prove_order(&elf, &format, None, Off).expect("prove");
-            assert!(proof.groups.len() > 3, "{} groups", proof.groups.len());
-            proof
-        });
-        let proof = prove_order(&elf, &format, order, overlap).expect("prove");
-        assert_eq!(proof.groups, in_order.groups, "the partition");
-        assert!(verify(&proof, &elf, &format));
-        if crypto::grinding::deterministic() {
-            let bytes = |p: &BlockWhirProof| {
-                rkyv::to_bytes::<rkyv::rancor::Error>(p)
-                    .expect("serialize")
-                    .to_vec()
-            };
-            assert_eq!(bytes(&proof), bytes(in_order), "the proof");
+        let in_order = prove_order(&elf, &format, None, Off)
+            .expect("serial_reversed / serial_odd_first / overlapped_in_order / overlapped_reversed / pinned_in_order / pinned_reversed: serial control proves");
+        assert!(
+            in_order.groups.len() > 3,
+            "serial_reversed / serial_odd_first / overlapped_in_order / overlapped_reversed / pinned_in_order / pinned_reversed: {} control groups",
+            in_order.groups.len()
+        );
+        let cases: [(&str, Option<Order>, PhaseBOverlap); 6] = [
+            ("serial_reversed", Some(reversed), Off),
+            ("serial_odd_first", Some(odd_first), Off),
+            ("overlapped_in_order", None, On),
+            ("overlapped_reversed", Some(reversed), On),
+            ("pinned_in_order", None, Pinned),
+            ("pinned_reversed", Some(reversed), Pinned),
+        ];
+        let bytes = |p: &BlockWhirProof| rkyv::to_bytes::<rkyv::rancor::Error>(p);
+        for (case, order, overlap) in cases {
+            let proof = prove_order(&elf, &format, order, overlap)
+                .unwrap_or_else(|err| panic!("{case}: prove: {err:?}"));
+            assert_eq!(proof.groups, in_order.groups, "{case}: the partition");
+            assert!(verify(&proof, &elf, &format), "{case}: verifies");
+            if crypto::grinding::deterministic() {
+                assert_eq!(
+                    bytes(&proof)
+                        .unwrap_or_else(|err| panic!("{case}: serialize: {err:?}"))
+                        .as_ref(),
+                    bytes(&in_order)
+                        .unwrap_or_else(|err| panic!("{case}: serialize control: {err:?}"))
+                        .as_ref(),
+                    "{case}: the proof"
+                );
+            }
         }
     }
 
@@ -1784,15 +1816,6 @@ mod phase_b_in_any_order_proves_the_same_bytes {
             )+
         };
     }
-
-    cases!(check_proof;
-        serial_reversed(Some(reversed), Off),
-        serial_odd_first(Some(odd_first), Off),
-        overlapped_in_order(None, On),
-        overlapped_reversed(Some(reversed), On),
-        pinned_in_order(None, Pinned),
-        pinned_reversed(Some(reversed), Pinned),
-    );
 
     cases!(check_invalid;
         serial_repeated_group(repeated_group, Off),
@@ -3140,31 +3163,6 @@ fn phase_a_commits_its_joint_runs_to_be_retired() {
 }
 
 /// The streamed chunks laid out on three threads are packed in the inline
-/// order all the same: the same groups and table counts as laid out on one
-/// thread, and the proof verifies. The page tables in AIR order on both
-/// ([`page_tables_in_air_order`]).
-#[test]
-fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups();
-    let inline = prove_with(
-        &elf,
-        &format,
-        &streamed(MaxRowsConfig::small(), 16, 3),
-        &page_tables_in_air_order(),
-    );
-    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
-    o.layout_workers = 3;
-    let proof = prove_with(&elf, &format, &o, &page_tables_in_air_order());
-    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
-    assert_eq!(proof.groups, inline.groups);
-    assert_eq!(
-        format!("{:?}", proof.table_counts),
-        format!("{:?}", inline.table_counts)
-    );
-    assert!(verify(&proof, &elf, &format));
-}
-
 /// ★ BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
 /// ([`Deviations::bitwise_from_tables`], the block's default), counted from
 /// each table's rows as it is built, commit what BITWISE handed on last
@@ -3540,8 +3538,11 @@ fn an_early_keccak_rnd_table_laid_out_with_another_air_is_refused() {
 /// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
 /// and not yet packed at once, and the groups are the inline layout's. The
 /// page tables in AIR order on both ([`page_tables_in_air_order`]).
+// a_streamed_block_laid_out_on_three_threads_packs_the_same_groups,
+// the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked
+// → streamed_layout_preserves_groups_and_bounds_unpacked_chunks.
 #[test]
-fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
+fn streamed_layout_preserves_groups_and_bounds_unpacked_chunks() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
     let inline = prove_with(
@@ -3550,6 +3551,7 @@ fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
         &streamed(MaxRowsConfig::small(), 16, 3),
         &page_tables_in_air_order(),
     );
+    let three_workers = "a_streamed_block_laid_out_on_three_threads_packs_the_same_groups";
     for k in [0, 2] {
         let mut o = streamed(MaxRowsConfig::small(), 16, 3);
         o.layout_workers = 3;
@@ -3563,29 +3565,46 @@ fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
             &page_tables_in_air_order(),
         )
         .expect("prove");
+        // The three-thread case used the default layout_ahead of Some(2).
+        if k == 2 {
+            assert!(
+                groups_of(&proof) >= 3,
+                "{three_workers}: {} groups",
+                groups_of(&proof)
+            );
+            assert_eq!(proof.groups, inline.groups, "{three_workers}: partition");
+            assert_eq!(
+                format!("{:?}", proof.table_counts),
+                format!("{:?}", inline.table_counts),
+                "{three_workers}: table counts"
+            );
+        }
         let most = stamps.layout.ahead_most;
         assert!(
             (1..=k + 1).contains(&most),
-            "k {k}: {most} chunks unpacked at once"
+            "the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked: k {k}: {most} chunks unpacked at once"
         );
-        assert_eq!(proof.groups, inline.groups, "k {k}");
-        assert!(verify(&proof, &elf, &format));
+        assert_eq!(
+            proof.groups, inline.groups,
+            "the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked: k {k}"
+        );
+        assert!(
+            verify(&proof, &elf, &format),
+            "the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked"
+        );
     }
 }
 
 /// The partition is part of the statement: a table named twice, two tables
 /// swapped inside a group, or a table moved to another group is refused.
-#[test]
-fn a_tampered_partition_is_refused() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups();
-    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
-    assert!(verify(&proof, &elf, &format));
-
+fn a_tampered_partition_is_refused(elf: &[u8], format: &BlockFormat, proof: &BlockWhirProof) {
     let mut twice = proof.clone();
     let first = twice.groups[0][0];
     twice.groups[1][0] = first;
-    assert!(!verify(&twice, &elf, &format));
+    assert!(
+        !verify(&twice, elf, format),
+        "a_tampered_partition_is_refused"
+    );
 
     let mut swapped = proof.clone();
     let g = swapped
@@ -3594,27 +3613,36 @@ fn a_tampered_partition_is_refused() {
         .position(|g| g.len() >= 2)
         .expect("a group of two");
     swapped.groups[g].swap(0, 1);
-    assert!(!verify(&swapped, &elf, &format));
+    assert!(
+        !verify(&swapped, elf, format),
+        "a_tampered_partition_is_refused"
+    );
 
     let mut moved = proof.clone();
     let table = moved.groups[0].pop().expect("a table");
     moved.groups[1].insert(0, table);
-    assert!(!verify(&moved, &elf, &format));
+    assert!(
+        !verify(&moved, elf, format),
+        "a_tampered_partition_is_refused"
+    );
 }
 
 /// A table missing from the partition is refused.
-#[test]
-fn a_partition_missing_a_table_is_refused() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups();
-    let mut proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+fn a_partition_missing_a_table_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    mut proof: BlockWhirProof,
+) {
     let g = proof
         .groups
         .iter()
         .position(|g| g.len() >= 2)
         .expect("a group of two");
     proof.groups[g].pop();
-    assert!(!verify(&proof, &elf, &format));
+    assert!(
+        !verify(&proof, elf, format),
+        "a_partition_missing_a_table_is_refused"
+    );
 }
 
 /// ★ A group over the verifier's polynomial budget is refused — by that check
@@ -3638,23 +3666,32 @@ fn a_group_over_the_stack_budget_is_refused() {
 
 /// ★ More groups than the verifier's maximum is refused — by that check alone:
 /// the same honest proof verifies under a maximum that admits it.
-#[test]
-fn a_partition_over_the_group_maximum_is_refused() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups();
-    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+fn a_partition_over_the_group_maximum_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    proof: &BlockWhirProof,
+) {
     let n = proof.groups.len();
-    assert!(n >= 3 && verify(&proof, &elf, &format));
+    assert!(
+        n >= 3 && verify(proof, elf, format),
+        "a_partition_over_the_group_maximum_is_refused"
+    );
     let tight = BlockFormat {
         max_groups: n - 1,
-        ..format
+        ..*format
     };
-    assert!(!verify(&proof, &elf, &tight));
+    assert!(
+        !verify(proof, elf, &tight),
+        "a_partition_over_the_group_maximum_is_refused"
+    );
     let exact = BlockFormat {
         max_groups: n,
-        ..format
+        ..*format
     };
-    assert!(verify(&proof, &elf, &exact));
+    assert!(
+        verify(proof, elf, &exact),
+        "a_partition_over_the_group_maximum_is_refused"
+    );
 }
 
 /// ★ The prover refuses a partition over the group maximum instead of
@@ -5603,8 +5640,19 @@ fn a_split_table_is_its_rows_in_order() {
 /// host's, under the card's floor), and the proof verifies with the same partition,
 /// tables and statement, its bytes equal under the deterministic grind. The
 /// inline layout's finish is not streamed and holds none.
+/// ★ KECCAK_RND handed out during the windows ([`Deviations::stream_keccak_rnd`],
+/// the `LAMBDA_VM_STREAM_KECCAK_RND` knob, on by default): with the card
+/// filling KECCAK_RND, each table whose operations are all in before the run
+/// ends goes out as its records with the streamed chunks, the finish holds the
+/// others, and the proof verifies with the same tables and statement counts
+/// and a partition of its own (the prover's, bound in the statement). Unset
+/// proves the partition of `true`; under the deterministic grind their bytes
+/// are equal, and the streamed arm's bytes are the same twice. `false` (the
+/// rollback) builds every KECCAK_RND table at the finish.
+// keccak_rnd_filled_from_records_moves_no_byte,
+// keccak_rnd_streamed_during_the_windows_proves_and_verifies → keccak_rnd_record_fills_preserve_the_proof_and_streaming_moves_the_partition.
 #[test]
-fn keccak_rnd_filled_from_records_moves_no_byte() {
+fn keccak_rnd_record_fills_preserve_the_proof_and_streaming_moves_the_partition() {
     let _fills = records_fill_lock();
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -5613,31 +5661,46 @@ fn keccak_rnd_filled_from_records_moves_no_byte() {
             .expect("serialize")
             .to_vec()
     };
+    let fill_case = "keccak_rnd_filled_from_records_moves_no_byte";
+    let stream_case = "keccak_rnd_streamed_during_the_windows_proves_and_verifies";
+    let proved = |workers, card_fill, stream, case| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.layout_workers = workers;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                card_fill: Some(card_fill),
+                stream_keccak_rnd: stream,
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|err| panic!("{case}: prove: {err:?}"));
+        assert!(
+            verify(&proof, &elf, &format),
+            "{case}: card fill {card_fill}, {workers} workers, stream {stream:?}: verifies"
+        );
+        (proof, stamps)
+    };
+    let (finish, finish_stamps) = proved(
+        3,
+        true,
+        Some(false),
+        "keccak_rnd_filled_from_records_moves_no_byte / keccak_rnd_streamed_during_the_windows_proves_and_verifies",
+    );
     for workers in [0usize, 3] {
-        let proved = |card_fill: bool| {
-            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-            o.layout_workers = workers;
-            let (proof, stamps) = prove_block_whir_with(
-                &elf,
-                &[],
-                &ProofOptions::default_test_options(),
-                &format,
-                &o,
-                &Deviations {
-                    card_fill: Some(card_fill),
-                    ..finish_keccak_rnd()
-                },
-            )
-            .expect("prove");
-            assert!(
-                verify(&proof, &elf, &format),
-                "card fill {card_fill}, {workers} workers"
-            );
-            (proof, stamps)
+        let (host, host_stamps) = proved(workers, false, Some(false), fill_case);
+        let inline;
+        let (card, stamps) = if workers == 0 {
+            inline = proved(workers, true, Some(false), fill_case);
+            (&inline.0, &inline.1)
+        } else {
+            (&finish, &finish_stamps)
         };
-        let (host, host_stamps) = proved(false);
-        let (card, stamps) = proved(true);
-        let what = format!("{workers} workers");
+        let what = format!("{fill_case}: {workers} workers");
         assert_eq!(host_stamps.layout.records_rest.0, 0, "{what}: knob off");
         assert_eq!(host_stamps.records_fills, (0, 0), "{what}: knob off");
         let tables = card.table_counts.keccak_rnd;
@@ -5676,8 +5739,60 @@ fn keccak_rnd_filled_from_records_moves_no_byte() {
             "{what}"
         );
         if crypto::grinding::deterministic() {
-            assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
+            assert_eq!(bytes(&host), bytes(card), "{what}: the proof");
         }
+    }
+
+    let (unset, _) = proved(3, true, None, stream_case);
+    let (on, on_stamps) = proved(3, true, Some(true), stream_case);
+    let tables = on.table_counts.keccak_rnd;
+    assert!(
+        tables > 1,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies: {tables} KECCAK_RND tables"
+    );
+    assert_eq!(
+        finish_stamps.layout.records_rest.0, tables,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies: off: every one at the finish"
+    );
+    let streamed = on_stamps.streamed.1 - finish_stamps.streamed.1;
+    assert!(
+        streamed > 0 && streamed < tables,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies: {streamed} of {tables} KECCAK_RND tables streamed"
+    );
+    assert_eq!(
+        on_stamps.layout.records_rest.0,
+        tables - streamed,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies: the finish holds the ones not streamed"
+    );
+    assert_eq!(
+        unset.groups, on.groups,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies: unset is on"
+    );
+    assert_eq!(
+        on.table_num_vars, finish.table_num_vars,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies"
+    );
+    assert_eq!(
+        format!("{:?}", on.table_counts),
+        format!("{:?}", finish.table_counts),
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies"
+    );
+    assert_ne!(
+        on.groups, finish.groups,
+        "keccak_rnd_streamed_during_the_windows_proves_and_verifies: the streamed tables kept the partition"
+    );
+    if crypto::grinding::deterministic() {
+        assert_eq!(
+            bytes(&unset),
+            bytes(&on),
+            "keccak_rnd_streamed_during_the_windows_proves_and_verifies: unset is on, byte for byte"
+        );
+        let (again, _) = proved(3, true, Some(true), stream_case);
+        assert_eq!(
+            bytes(&on),
+            bytes(&again),
+            "keccak_rnd_streamed_during_the_windows_proves_and_verifies: the streamed arm, twice"
+        );
     }
 }
 
@@ -5772,80 +5887,6 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
         !verify(&proof, &elf, &format),
         "a proof over a wrong KECCAK_RND table verified"
     );
-}
-
-/// ★ KECCAK_RND handed out during the windows ([`Deviations::stream_keccak_rnd`],
-/// the `LAMBDA_VM_STREAM_KECCAK_RND` knob, on by default): with the card
-/// filling KECCAK_RND, each table whose operations are all in before the run
-/// ends goes out as its records with the streamed chunks, the finish holds the
-/// others, and the proof verifies with the same tables and statement counts
-/// and a partition of its own (the prover's, bound in the statement). Unset
-/// proves the partition of `true`; under the deterministic grind their bytes
-/// are equal, and the streamed arm's bytes are the same twice. `false` (the
-/// rollback) builds every KECCAK_RND table at the finish.
-#[test]
-fn keccak_rnd_streamed_during_the_windows_proves_and_verifies() {
-    let _fills = records_fill_lock();
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.layout_workers = 3;
-    let bytes = |p: &BlockWhirProof| {
-        rkyv::to_bytes::<rkyv::rancor::Error>(p)
-            .expect("serialize")
-            .to_vec()
-    };
-    let proved = |stream: Option<bool>| {
-        let (proof, stamps) = prove_block_whir_with(
-            &elf,
-            &[],
-            &ProofOptions::default_test_options(),
-            &format,
-            &o,
-            &Deviations {
-                card_fill: Some(true),
-                stream_keccak_rnd: stream,
-                ..Deviations::default()
-            },
-        )
-        .expect("prove");
-        assert!(verify(&proof, &elf, &format), "stream {stream:?}");
-        (proof, stamps)
-    };
-    let (unset, _) = proved(None);
-    let (off, off_stamps) = proved(Some(false));
-    let (on, on_stamps) = proved(Some(true));
-    let tables = on.table_counts.keccak_rnd;
-    assert!(tables > 1, "{tables} KECCAK_RND tables");
-    assert_eq!(
-        off_stamps.layout.records_rest.0, tables,
-        "off: every one at the finish"
-    );
-    let streamed = on_stamps.streamed.1 - off_stamps.streamed.1;
-    assert!(
-        streamed > 0 && streamed < tables,
-        "{streamed} of {tables} KECCAK_RND tables streamed"
-    );
-    assert_eq!(
-        on_stamps.layout.records_rest.0,
-        tables - streamed,
-        "the finish holds the ones not streamed"
-    );
-    assert_eq!(unset.groups, on.groups, "unset is on");
-    assert_eq!(on.table_num_vars, off.table_num_vars);
-    assert_eq!(
-        format!("{:?}", on.table_counts),
-        format!("{:?}", off.table_counts)
-    );
-    assert_ne!(
-        on.groups, off.groups,
-        "the streamed tables kept the partition"
-    );
-    if crypto::grinding::deterministic() {
-        assert_eq!(bytes(&unset), bytes(&on), "unset is on, byte for byte");
-        let (again, _) = proved(Some(true));
-        assert_eq!(bytes(&on), bytes(&again), "the streamed arm, twice");
-    }
 }
 
 /// ★ KECCAK_RND's streamed chunks keep the regenerators' ranks: with live
@@ -6265,21 +6306,16 @@ pub(super) fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
 /// deterministic grind; each family alone, both, and both beside KECCAK_RND's;
 /// laid out inline and on workers; for programs whose chunks lie in several
 /// windows.
-fn cpu_and_memw_r_filled_from_records_move_no_byte(
-    name: &str,
-    workers: usize,
-    (cpu, memw_r, keccak_rnd): (bool, bool, bool),
-    baseline: &std::sync::OnceLock<BlockWhirProof>,
-) {
+fn cpu_and_memw_r_filled_from_records_move_no_byte(name: &str, workers: usize) {
     let _fills = records_fill_lock();
     let format = many_groups();
-    let bytes = |p: &BlockWhirProof| {
+    let bytes = |p: &BlockWhirProof, what: &str| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
-            .expect("serialize")
+            .unwrap_or_else(|err| panic!("{what}: serialize: {err:?}"))
             .to_vec()
     };
     let elf = asm_elf_bytes(name);
-    let proved = |deviations: Deviations| {
+    let proved = |deviations: Deviations, what: &str| {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
         o.layout_workers = workers;
         o.drop_streamed_ops = true;
@@ -6291,105 +6327,97 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte(
             &o,
             &deviations,
         )
-        .expect("prove");
-        assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
+        .unwrap_or_else(|err| panic!("{what}: prove: {err:?}"));
+        assert!(verify(&proof, &elf, &format), "{what}: verifies");
         (proof, stamps)
     };
-    let host = baseline.get_or_init(|| {
-        let (proof, host_stamps) = proved(Deviations {
+    let control = "cpu / memw_r / cpu_and_memw_r / cpu_memw_r_and_keccak";
+    let (host, host_stamps) = proved(
+        Deviations {
             card_fill: Some(false),
             card_fill_streamed: Some([false, false]),
             ..finish_keccak_rnd()
-        });
-        let off = host_stamps.windows.card_fill;
-        assert_eq!(
-            (off.cpu, off.memw_r, off.records_bytes),
-            ([0, 0], [0, 0], 0),
-            "knob off"
-        );
-        assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
-        proof
-    });
-    let what =
-        format!("{name}, {workers} workers, cpu {cpu} memw_r {memw_r} keccak_rnd {keccak_rnd}");
-    // Regeneration is off here, and parked records need it: kept.
-    // KECCAK_RND built at the finish, as the host's run: its
-    // records are then the rest's (`records_rest`, which `held`
-    // counts) and the partition is the host's. Handed out during
-    // the windows (the default where the card fills it) its tables
-    // would be records `held` does not count, in groups of their own.
-    let (card, stamps) = proved(Deviations {
-        card_fill: Some(keccak_rnd),
-        records_keep: Some(true),
-        stream_keccak_rnd: Some(false),
-        ..streamed_records(cpu, memw_r)
-    });
-    let c = stamps.windows.card_fill;
-    assert_eq!(c.out_of_step, 0, "{what}: {c:?}");
-    assert_eq!(c.room_out, None, "{what}: {c:?}");
-    assert_eq!((c.cpu[1], c.memw_r[1]), (0, 0), "{what}: {c:?}");
-    assert_eq!(c.cpu[0] > 0, cpu, "{what}: {c:?}");
-    assert_eq!(c.memw_r[0] > 0, memw_r, "{what}: {c:?}");
-    let held = (c.cpu[0] + c.memw_r[0] + stamps.layout.records_rest.0) as u64;
-    let (on_card, on_host) = stamps.records_fills;
-    if cfg!(feature = "cuda") {
-        // At its commit and at its argument on the card; at this
-        // size a commit under the card's floor encodes on the host
-        // from the host's fill, once a table.
-        assert!(
-            (held..=2 * held).contains(&on_card) && on_host <= held,
-            "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
-        );
-    } else {
-        assert_eq!(
-            (on_card, on_host),
-            (0, held),
-            "{what}: each on the host once"
-        );
-    }
-    assert_eq!(host.groups, card.groups, "{what}: the partition");
-    assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
-    assert_eq!(
-        format!("{:?}", host.table_counts),
-        format!("{:?}", card.table_counts),
-        "{what}"
+        },
+        control,
     );
-    if crypto::grinding::deterministic() {
-        assert_eq!(bytes(host), bytes(&card), "{what}: the proof");
+    let off = host_stamps.windows.card_fill;
+    assert_eq!(
+        (off.cpu, off.memw_r, off.records_bytes),
+        ([0, 0], [0, 0], 0),
+        "{control}: knob off"
+    );
+    assert_eq!(host_stamps.records_fills, (0, 0), "{control}: knob off");
+    for (case, cpu, memw_r, keccak_rnd) in [
+        ("cpu", true, false, false),
+        ("memw_r", false, true, false),
+        ("cpu_and_memw_r", true, true, false),
+        ("cpu_memw_r_and_keccak", true, true, true),
+    ] {
+        let what = format!("{case}, {name}, {workers} workers");
+        // Regeneration is off here, and parked records need it: kept.
+        // KECCAK_RND built at the finish, as the host's run: its
+        // records are then the rest's (`records_rest`, which `held`
+        // counts) and the partition is the host's. Handed out during
+        // the windows (the default where the card fills it) its tables
+        // would be records `held` does not count, in groups of their own.
+        let (card, stamps) = proved(
+            Deviations {
+                card_fill: Some(keccak_rnd),
+                records_keep: Some(true),
+                stream_keccak_rnd: Some(false),
+                ..streamed_records(cpu, memw_r)
+            },
+            &what,
+        );
+        let c = stamps.windows.card_fill;
+        assert_eq!(c.out_of_step, 0, "{what}: {c:?}");
+        assert_eq!(c.room_out, None, "{what}: {c:?}");
+        assert_eq!((c.cpu[1], c.memw_r[1]), (0, 0), "{what}: {c:?}");
+        assert_eq!(c.cpu[0] > 0, cpu, "{what}: {c:?}");
+        assert_eq!(c.memw_r[0] > 0, memw_r, "{what}: {c:?}");
+        let held = (c.cpu[0] + c.memw_r[0] + stamps.layout.records_rest.0) as u64;
+        let (on_card, on_host) = stamps.records_fills;
+        if cfg!(feature = "cuda") {
+            // At its commit and at its argument on the card; at this
+            // size a commit under the card's floor encodes on the host
+            // from the host's fill, once a table.
+            assert!(
+                (held..=2 * held).contains(&on_card) && on_host <= held,
+                "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
+            );
+        } else {
+            assert_eq!(
+                (on_card, on_host),
+                (0, held),
+                "{what}: each on the host once"
+            );
+        }
+        assert_eq!(host.groups, card.groups, "{what}: the partition");
+        assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
+        assert_eq!(
+            format!("{:?}", host.table_counts),
+            format!("{:?}", card.table_counts),
+            "{what}"
+        );
+        if crypto::grinding::deterministic() {
+            assert_eq!(
+                bytes(&host, &what),
+                bytes(&card, &what),
+                "{what}: the proof"
+            );
+        }
     }
 }
 macro_rules! record_fill_cases {
     ($guest:ident, $schedule:ident, $workers:expr) => {
         mod $schedule {
-            fn check(fill: (bool, bool, bool)) {
-                static BASELINE: std::sync::OnceLock<crate::block_whir::BlockWhirProof> =
-                    std::sync::OnceLock::new();
+            // cpu, memw_r, cpu_and_memw_r, cpu_memw_r_and_keccak → every_record_fill.
+            #[test]
+            fn every_record_fill() {
                 super::super::super::cpu_and_memw_r_filled_from_records_move_no_byte(
                     stringify!($guest),
                     $workers,
-                    fill,
-                    &BASELINE,
                 );
-            }
-
-            #[test]
-            fn cpu() {
-                check((true, false, false));
-            }
-
-            #[test]
-            fn memw_r() {
-                check((false, true, false));
-            }
-
-            #[test]
-            fn cpu_and_memw_r() {
-                check((true, true, false));
-            }
-
-            #[test]
-            fn cpu_memw_r_and_keccak() {
-                check((true, true, true));
             }
         }
     };

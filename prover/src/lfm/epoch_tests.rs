@@ -1469,8 +1469,10 @@ pub(super) fn from_proof_gate_options() -> crate::ProofOptions {
 /// the same program and the same arenas. That is what lets level 0 take a
 /// lead-in's prologue in place of its own (the block run's IDENTITY lines are
 /// the same gate at scale).
+// a_lead_in_prologue_is_the_one_built_from_the_bundle,
+// the_from_proof_constructor_matches_the_session_harness → the_fixture_epoch_reconstructs_from_the_bundle_session_and_lead_in.
 #[test]
-fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
+fn the_fixture_epoch_reconstructs_from_the_bundle_session_and_lead_in() {
     let elf_bytes = super::proof_fixture::read_inner_elf();
     let opts = from_proof_gate_options();
     let recorder = std::sync::Arc::new(crate::continuation::RecordingObserver::<
@@ -1486,14 +1488,21 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
     })
     .expect("the fixture continuation must prove");
     let n = bundle.num_epochs();
-    assert!(n >= 2, "the fixture continuation must have a final epoch");
+    assert!(
+        n >= 2,
+        "a_lead_in_prologue_is_the_one_built_from_the_bundle: the fixture continuation must have a final epoch"
+    );
     assert_eq!(
         *recorder.counts.lock().unwrap(),
         vec![n],
-        "the epoch count, exactly once"
+        "a_lead_in_prologue_is_the_one_built_from_the_bundle: the epoch count, exactly once"
     );
     let shared = std::mem::take(&mut *recorder.shared.lock().unwrap());
-    assert_eq!(shared.len(), 1, "the DECODE commitment is shared once");
+    assert_eq!(
+        shared.len(),
+        1,
+        "a_lead_in_prologue_is_the_one_built_from_the_bundle: the DECODE commitment is shared once"
+    );
     let shared = *shared[0]
         .clone()
         .downcast::<Commitment>()
@@ -1502,7 +1511,7 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
     assert_eq!(
         shared,
         crate::tables::decode::commitment_from_elf(&elf, &opts).expect("the DECODE commitment"),
-        "the shared commitment is the ELF's"
+        "a_lead_in_prologue_is_the_one_built_from_the_bundle: the shared commitment is the ELF's"
     );
     let copies = recorder.epochs_in_order(n);
     for (i, (copy, kept)) in copies.iter().zip(bundle.epochs()).enumerate() {
@@ -1513,7 +1522,7 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
             rkyv::to_bytes::<rkyv::rancor::Error>(kept)
                 .expect("serialize")
                 .as_slice(),
-            "the observer's copy of epoch {i} is the bundle's"
+            "a_lead_in_prologue_is_the_one_built_from_the_bundle: the observer's copy of epoch {i} is the bundle's"
         );
     }
 
@@ -1535,51 +1544,63 @@ fn a_lead_in_prologue_is_the_one_built_from_the_bundle() {
                 "{:?}",
                 epoch_program_publishing(&from_lead, true, Publishes::Aggregation)
             ),
-            "wrap {k}'s program"
+            "a_lead_in_prologue_is_the_one_built_from_the_bundle: wrap {k}'s program"
         );
         assert_eq!(
             epoch_arena_words(&from_bundle, true),
             epoch_arena_words(&from_lead, true),
-            "wrap {k}'s arenas"
+            "a_lead_in_prologue_is_the_one_built_from_the_bundle: wrap {k}'s arenas"
         );
     }
     // ⛔ And the leading epochs must reach the one asked for: a list that stops
     // short is refused, never read as a shorter run.
     assert!(
         real_epoch_from_epochs(&opts, &lead_konsts, &copies[..1], n, 1).is_err(),
-        "epoch 1 cannot be built from epoch 0 alone"
+        "a_lead_in_prologue_is_the_one_built_from_the_bundle: epoch 1 cannot be built from epoch 0 alone"
     );
+    the_from_proof_constructor_matches_the_session_harness(&elf_bytes, &opts, &bundle);
 }
 
-#[test]
-fn the_from_proof_constructor_matches_the_session_harness() {
-    let elf_bytes = super::proof_fixture::read_inner_elf();
-    let opts = from_proof_gate_options();
-
-    let session = real_epoch_from(from_proof_gate_options(), EpochInputs::fixture());
-    let bundle = crate::continuation::prove_continuation(
-        &elf_bytes,
-        &[],
-        super::proof_fixture::FIXTURE_EPOCH_LOG2,
-        &opts,
-    )
-    .expect("the fixture continuation must prove");
+fn the_from_proof_constructor_matches_the_session_harness(
+    elf_bytes: &[u8],
+    opts: &crate::ProofOptions,
+    bundle: &crate::continuation::ContinuationProof,
+) {
+    let session = real_epoch_from(opts.clone(), EpochInputs::fixture());
     assert!(
         bundle.num_epochs() >= 2,
-        "the fixture continuation must have a second (final) epoch — \
+        "the_from_proof_constructor_matches_the_session_harness: the fixture continuation must have a second (final) epoch — \
          re-measure FIXTURE_EPOCH_LOG2 (see proof_fixture)"
     );
 
-    let from_proof = real_epoch_from_continuation(&opts, &elf_bytes, &bundle, 0, None)
+    let from_proof = real_epoch_from_continuation(opts, elf_bytes, bundle, 0, None)
         .expect("epoch 0 must reconstruct from the bundle alone");
 
     // Statement-level scalars: two paths, one epoch.
-    assert_eq!(session.register_init, from_proof.register_init);
-    assert_eq!(session.reg_fini, from_proof.reg_fini);
-    assert_eq!(session.public_output, from_proof.public_output);
-    assert_eq!(session.epoch_label, from_proof.epoch_label);
-    assert_eq!(session.start_index, from_proof.start_index);
-    assert_eq!(session.expected_program_id, from_proof.expected_program_id);
+    assert_eq!(
+        session.register_init, from_proof.register_init,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    assert_eq!(
+        session.reg_fini, from_proof.reg_fini,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    assert_eq!(
+        session.public_output, from_proof.public_output,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    assert_eq!(
+        session.epoch_label, from_proof.epoch_label,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    assert_eq!(
+        session.start_index, from_proof.start_index,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    assert_eq!(
+        session.expected_program_id, from_proof.expected_program_id,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
 
     // Preprocessed PROVENANCE is shape/statement-derived and must agree per
     // slot. The committed MAIN roots are allowed to differ: the session
@@ -1590,9 +1611,16 @@ fn the_from_proof_constructor_matches_the_session_harness() {
     // above. A root difference therefore also moves the transcript-derived
     // oracles (`z_alpha`, the bus target), so those are per-proof values,
     // not cross-path invariants. What MUST be invariant is the program.
-    assert_eq!(session.phase_a.len(), from_proof.phase_a.len());
+    assert_eq!(
+        session.phase_a.len(),
+        from_proof.phase_a.len(),
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
     for (i, (s, f)) in session.phase_a.iter().zip(&from_proof.phase_a).enumerate() {
-        assert_eq!(s.0, f.0, "preprocessed provenance differs at sub-proof {i}");
+        assert_eq!(
+            s.0, f.0,
+            "the_from_proof_constructor_matches_the_session_harness: preprocessed provenance differs at sub-proof {i}"
+        );
         if s.1 != f.1 {
             println!(
                 "   note: sub-proof {i}'s committed main root differs between \
@@ -1604,23 +1632,33 @@ fn the_from_proof_constructor_matches_the_session_harness() {
     // The emitted wrap programs, byte-identical through the registry artifacts.
     let p_session = epoch_program(&session, true);
     let p_proof = epoch_program(&from_proof, true);
-    assert_eq!(p_session.instrs.len(), p_proof.instrs.len());
-    let a_session = super::registry::build_artifacts(&p_session, &opts);
-    let a_proof = super::registry::build_artifacts(&p_proof, &opts);
+    assert_eq!(
+        p_session.instrs.len(),
+        p_proof.instrs.len(),
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    let a_session = super::registry::build_artifacts(&p_session, opts);
+    let a_proof = super::registry::build_artifacts(&p_proof, opts);
     assert_eq!(
         a_session.roots, a_proof.roots,
-        "the two paths must emit byte-identical wrap programs"
+        "the_from_proof_constructor_matches_the_session_harness: the two paths must emit byte-identical wrap programs"
     );
-    assert_eq!(a_session.program_id, a_proof.program_id);
-    assert_eq!(a_session.log_heights, a_proof.log_heights);
+    assert_eq!(
+        a_session.program_id, a_proof.program_id,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
+    assert_eq!(
+        a_session.log_heights, a_proof.log_heights,
+        "the_from_proof_constructor_matches_the_session_harness"
+    );
 
     // Epoch 1: the FINAL shape, from proofs alone. The constructor's internal
     // production-verify is the acceptance gate; emission must handle the
     // final-epoch table set (HALT on board).
-    let final_epoch = real_epoch_from_continuation(&opts, &elf_bytes, &bundle, 1, None)
+    let final_epoch = real_epoch_from_continuation(opts, elf_bytes, bundle, 1, None)
         .expect("the FINAL epoch must reconstruct from the bundle alone");
     let p_final = epoch_program(&final_epoch, true);
-    let a_final = super::registry::build_artifacts(&p_final, &opts);
+    let a_final = super::registry::build_artifacts(&p_final, opts);
     println!(
         "★ P1 GATE A: epoch 0 program identical across both paths ({} instrs); \
          FINAL epoch reconstructed and emitted ({} instrs, {} chips)",

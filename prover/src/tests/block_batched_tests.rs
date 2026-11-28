@@ -209,59 +209,117 @@ fn group_with_a_short_table(
 /// carrying one argue a group and no per-table argument. The format is the
 /// verifier's: a batched proof under the per-table format is refused, and the
 /// reverse.
+// a_block_argued_batched_proves_and_verifies,
+// a_batched_group_argued_wrongly_is_refused → batched_blocks_roundtrip_and_refuse_wrong_arguments.
 #[test]
-fn a_block_argued_batched_proves_and_verifies() {
+fn batched_blocks_roundtrip_and_refuse_wrong_arguments() {
     let elf = asm_elf_bytes("sub");
     let proof = prove(
         &elf,
         &one_group(BATCHED),
         &options(MaxRowsConfig::default(), 16),
     );
-    assert_eq!(proof.argues.len(), 1);
-    assert!(proof.proof.tables.is_empty());
-    assert!(verify(&proof, &elf, &one_group(BATCHED)));
-    assert!(!verify(&proof, &elf, &one_group(PER_TABLE)));
+    assert_eq!(
+        proof.argues.len(),
+        1,
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    assert!(
+        proof.proof.tables.is_empty(),
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    assert!(
+        verify(&proof, &elf, &one_group(BATCHED)),
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    assert!(
+        !verify(&proof, &elf, &one_group(PER_TABLE)),
+        "a_block_argued_batched_proves_and_verifies"
+    );
 
     let elf = asm_elf_bytes("all_instructions_64");
     let o = options(MaxRowsConfig::small(), 16);
-    let proof = prove(&elf, &many_groups(BATCHED), &o);
-    assert!(proof.groups.len() >= 3, "{} groups", proof.groups.len());
-    assert_eq!(proof.argues.len(), proof.groups.len());
-    assert!(verify(&proof, &elf, &many_groups(BATCHED)));
-    assert!(!verify(&proof, &elf, &many_groups(PER_TABLE)));
+    let format = many_groups(BATCHED);
+    let proof = prove(&elf, &format, &o);
+    assert!(
+        proof.groups.len() >= 3,
+        "a_block_argued_batched_proves_and_verifies: {} groups",
+        proof.groups.len()
+    );
+    assert_eq!(
+        proof.argues.len(),
+        proof.groups.len(),
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    assert!(
+        verify(&proof, &elf, &format),
+        "a_block_argued_batched_proves_and_verifies / a_batched_group_argued_wrongly_is_refused"
+    );
+    assert!(
+        !verify(&proof, &elf, &many_groups(PER_TABLE)),
+        "a_block_argued_batched_proves_and_verifies"
+    );
     // A cap the verifier does not hold bins the trees otherwise.
     let other_cap = BlockFormat {
         argue: ArgueFormat::batched(0),
         ..many_groups(BATCHED)
     };
-    assert!(!verify(&proof, &elf, &other_cap));
+    assert!(
+        !verify(&proof, &elf, &other_cap),
+        "a_block_argued_batched_proves_and_verifies"
+    );
 
     let per_table = prove(&elf, &many_groups(PER_TABLE), &o);
-    assert!(per_table.argues.is_empty());
-    assert!(verify(&per_table, &elf, &many_groups(PER_TABLE)));
-    assert!(!verify(&per_table, &elf, &many_groups(BATCHED)));
+    assert!(
+        per_table.argues.is_empty(),
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    assert!(
+        verify(&per_table, &elf, &many_groups(PER_TABLE)),
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    assert!(
+        !verify(&per_table, &elf, &many_groups(BATCHED)),
+        "a_block_argued_batched_proves_and_verifies"
+    );
+    a_batched_group_argued_wrongly_is_refused(&elf, &format, &o, &proof);
 }
 
 /// KECCAK_RND cut into many chunks, batched: many trees a bin. No VM table
 /// reads a shifted row, so no table keeps a claim reduction: each reads its
 /// columns at the sumcheck's point directly.
+// keccak_chunks_argue_batched, a_tampered_batched_argue_is_refused,
+// the_bus_balance_binds_the_batched_block → batched_keccak_chunks_verify_and_refuse_tampers.
 #[test]
-fn keccak_chunks_argue_batched() {
+fn batched_keccak_chunks_verify_and_refuse_tampers() {
     let elf = asm_elf_bytes("test_keccak");
     let format = many_groups(BATCHED);
-    let proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 3));
-    assert!(proof.table_counts.keccak_rnd >= 2);
+    let o = options(MaxRowsConfig::small(), 3);
+    let proof = prove(&elf, &format, &o);
+    assert!(
+        proof.table_counts.keccak_rnd >= 2,
+        "keccak_chunks_argue_batched"
+    );
     let tables: usize = proof.argues.iter().map(|a| a.bus_outputs.len()).sum();
-    assert_eq!(tables, proof.table_num_vars.len());
+    assert_eq!(
+        tables,
+        proof.table_num_vars.len(),
+        "keccak_chunks_argue_batched"
+    );
     assert!(
         proof
             .argues
             .iter()
             .flat_map(|a| &a.reduces)
             .all(Option::is_none),
-        "a VM table kept a reduction"
+        "keccak_chunks_argue_batched: a VM table kept a reduction"
     );
-    assert!(verify(&proof, &elf, &format));
+    assert!(
+        verify(&proof, &elf, &format),
+        "keccak_chunks_argue_batched / a_tampered_batched_argue_is_refused"
+    );
+    a_tampered_batched_argue_is_refused(&elf, &format, &proof);
+    the_bus_balance_binds_the_batched_block(&elf, &format, &o, &proof);
 }
 
 /// The prepared openings settle under the batched argue as under the
@@ -293,14 +351,13 @@ fn prepared_openings_settle_under_the_batched_argue() {
 /// ★ A group argued wrongly is refused: a cross-table weight off by `λ`, a
 /// table claim absorbed off by one, `ξ`'s suffix for a short table, a short
 /// table padded the `2^Δ` way, and the trees binned under another cap.
-#[test]
-fn a_batched_group_argued_wrongly_is_refused() {
-    let elf = asm_elf_bytes("all_instructions_64");
-    let format = many_groups(BATCHED);
-    let o = options(MaxRowsConfig::small(), 16);
-    let honest = prove(&elf, &format, &o);
-    assert!(verify(&honest, &elf, &format));
-    let (g, short) = group_with_a_short_table(&honest, &elf, &format);
+fn a_batched_group_argued_wrongly_is_refused(
+    elf: &[u8],
+    format: &BlockFormat,
+    o: &BlockOptions,
+    honest: &BlockWhirProof,
+) {
+    let (g, short) = group_with_a_short_table(honest, elf, format);
     let faults = [
         (
             "weight",
@@ -339,8 +396,11 @@ fn a_batched_group_argued_wrongly_is_refused() {
         ),
     ];
     for (name, fault) in faults {
-        let proof = faulted(&elf, &format, &o, g, fault);
-        assert!(!verify(&proof, &elf, &format), "{name} in group {g}");
+        let proof = faulted(elf, format, o, g, fault);
+        assert!(
+            !verify(&proof, elf, format),
+            "a_batched_group_argued_wrongly_is_refused: {name} in group {g}"
+        );
     }
 }
 
@@ -348,36 +408,43 @@ fn a_batched_group_argued_wrongly_is_refused() {
 /// missing, a factor value moved, two groups' argues swapped, and a reduction
 /// where the format has none. The last is admitted with the reduction's shape
 /// unchecked (the mutation).
-#[test]
-fn a_tampered_batched_argue_is_refused() {
-    let elf = asm_elf_bytes("test_keccak");
-    let format = many_groups(BATCHED);
-    let honest = prove(&elf, &format, &options(MaxRowsConfig::small(), 3));
-    assert!(verify(&honest, &elf, &format));
+fn a_tampered_batched_argue_is_refused(elf: &[u8], format: &BlockFormat, honest: &BlockWhirProof) {
     let tampered = |tamper: &dyn Fn(&mut BlockWhirProof)| {
         let mut proof = honest.clone();
         tamper(&mut proof);
         proof
     };
     let one = FieldElement::<E>::one();
-    assert!(!verify(
-        &tampered(&|p| p.argues[0].bus_outputs[0].0 += one),
-        &elf,
-        &format
-    ));
-    assert!(!verify(
-        &tampered(&|p| {
-            p.argues[0].bus_outputs.pop();
-        }),
-        &elf,
-        &format
-    ));
-    assert!(!verify(
-        &tampered(&|p| p.argues[1].factor_values[0][0] += one),
-        &elf,
-        &format
-    ));
-    assert!(!verify(&tampered(&|p| p.argues.swap(0, 1)), &elf, &format));
+    assert!(
+        !verify(
+            &tampered(&|p| p.argues[0].bus_outputs[0].0 += one),
+            elf,
+            format
+        ),
+        "a_tampered_batched_argue_is_refused"
+    );
+    assert!(
+        !verify(
+            &tampered(&|p| {
+                p.argues[0].bus_outputs.pop();
+            }),
+            elf,
+            format
+        ),
+        "a_tampered_batched_argue_is_refused"
+    );
+    assert!(
+        !verify(
+            &tampered(&|p| p.argues[1].factor_values[0][0] += one),
+            elf,
+            format
+        ),
+        "a_tampered_batched_argue_is_refused"
+    );
+    assert!(
+        !verify(&tampered(&|p| p.argues.swap(0, 1)), elf, format),
+        "a_tampered_batched_argue_is_refused"
+    );
     // A reduction on a table that reads no shifted row (no VM table does).
     let extra = tampered(&|p| {
         p.argues[0].reduces[0] = Some(multilinear::claim_reduce::ReduceProof {
@@ -385,12 +452,18 @@ fn a_tampered_batched_argue_is_refused() {
             column_values: Vec::new(),
         });
     });
-    assert!(!verify(&extra, &elf, &format));
+    assert!(
+        !verify(&extra, elf, format),
+        "a_tampered_batched_argue_is_refused"
+    );
     let inert = VerifierChecks {
         reduce_shape: false,
         ..VerifierChecks::ALL
     };
-    assert!(verify_with(&extra, &elf, &format, false, inert));
+    assert!(
+        verify_with(&extra, elf, format, false, inert),
+        "a_tampered_batched_argue_is_refused"
+    );
 }
 
 /// A batched group argued on another group's fork is refused: the index each
@@ -416,16 +489,16 @@ fn a_batched_group_on_another_fork_is_refused() {
 /// block: a prover leaving one KECCAK_RND chunk out — every table it proves
 /// consistent — is refused, and admitted with the balance unchecked (the
 /// mutation): the block-wide sum is what refuses it.
-#[test]
-fn the_bus_balance_binds_the_batched_block() {
-    let elf = asm_elf_bytes("test_keccak");
-    let format = many_groups(BATCHED);
-    let o = options(MaxRowsConfig::small(), 3);
-    let honest = prove(&elf, &format, &o);
+fn the_bus_balance_binds_the_batched_block(
+    elf: &[u8],
+    format: &BlockFormat,
+    o: &BlockOptions,
+    honest: &BlockWhirProof,
+) {
     let short = prove_with(
-        &elf,
-        &format,
-        &o,
+        elf,
+        format,
+        o,
         &Deviations {
             omit_first_keccak_rnd: true,
             ..Default::default()
@@ -433,14 +506,21 @@ fn the_bus_balance_binds_the_batched_block() {
     );
     assert_eq!(
         short.table_counts.keccak_rnd + 1,
-        honest.table_counts.keccak_rnd
+        honest.table_counts.keccak_rnd,
+        "the_bus_balance_binds_the_batched_block"
     );
-    assert!(!verify(&short, &elf, &format));
+    assert!(
+        !verify(&short, elf, format),
+        "the_bus_balance_binds_the_batched_block"
+    );
     let inert = VerifierChecks {
         balance: false,
         ..VerifierChecks::ALL
     };
-    assert!(verify_with(&short, &elf, &format, false, inert));
+    assert!(
+        verify_with(&short, elf, format, false, inert),
+        "the_bus_balance_binds_the_batched_block"
+    );
 }
 
 /// A program's traces, built once, KECCAK_RND split at 2^`keccak_rnd_log2`.

@@ -3399,10 +3399,13 @@ mod tests {
     // x254 > 0 (the carried commit index), which exercises the cross-epoch commit
     // indexing: both the COPY trace and the verifier's `compute_commit_bus_offset`
     // index from the carried x254 rather than 0. Regression test for that fix.
+    // test_commit_across_epochs_verifies, test_split_verify_roundtrip,
+    // an_out_of_range_trace_length_in_a_continuation_is_refused → test_commit_across_epochs_roundtrips_and_rejects_bad_trace_lengths.
     #[test]
-    fn test_commit_across_epochs_verifies() {
+    fn test_commit_across_epochs_roundtrips_and_rejects_bad_trace_lengths() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
+        let opts = ProofOptions::default_test_options();
         let expected_output: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
 
         let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
@@ -3413,33 +3416,58 @@ mod tests {
             .len();
 
         // Both commits in a single 64-cycle epoch (x254 starts at 0).
-        let single = prove_and_verify_continuation(
-            &elf_bytes,
-            &[],
-            6,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
-        assert_eq!(single.as_deref(), Some(&expected_output[..]));
-        assert!(total <= (1 << 6), "single-epoch log2 must cover the run");
+        let single = prove_and_verify_continuation(&elf_bytes, &[], 6, &opts)
+            .expect("test_commit_across_epochs_verifies: single epoch proves and verifies");
+        assert_eq!(
+            single.as_deref(),
+            Some(&expected_output[..]),
+            "test_commit_across_epochs_verifies: single epoch output"
+        );
+        assert!(
+            total <= (1 << 6),
+            "test_commit_across_epochs_verifies: single-epoch log2 must cover the run"
+        );
 
         // The late commit (only `halt` follows it) lands past the midpoint, so a
         // 16-cycle epoch forces it into a later epoch where x254 is already 2.
         // Prove first so we can assert the run actually split into >1 epoch — without
         // this the test would silently pass even if it degraded to a single epoch.
-        let bundle =
-            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
+        let bundle = prove_continuation(&elf_bytes, &[], 4, &opts)
+            .expect("test_commit_across_epochs_verifies / test_split_verify_roundtrip / an_out_of_range_trace_length_in_a_continuation_is_refused: prove");
         assert!(
             bundle.num_epochs() > 1,
-            "16-cycle epochs must split the run into multiple epochs"
+            "test_commit_across_epochs_verifies: 16-cycle epochs must split the run into multiple epochs"
         );
-        let split = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
-            .unwrap();
+        let split = verify_continuation(&elf_bytes, &bundle, &opts)
+            .expect("test_commit_across_epochs_verifies / test_split_verify_roundtrip / an_out_of_range_trace_length_in_a_continuation_is_refused: verify");
         assert_eq!(
             split.as_deref(),
             Some(&expected_output[..]),
-            "commit in a later epoch must verify and aggregate to the same output"
+            "test_commit_across_epochs_verifies: commit in a later epoch must verify and aggregate to the same output"
         );
+        assert_eq!(
+            split.as_deref(),
+            Some(&expected_output[..]),
+            "test_split_verify_roundtrip: the freshly proved bundle"
+        );
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+            .expect("test_split_verify_roundtrip: serialize");
+        let restored: ContinuationProof = rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes)
+            .expect("test_split_verify_roundtrip: deserialize");
+        let out = verify_continuation(&elf_bytes, &restored, &opts)
+            .expect("test_split_verify_roundtrip: verify the restored bundle");
+        assert_eq!(
+            out.as_deref(),
+            Some(&expected_output[..]),
+            "test_split_verify_roundtrip: the archived and restored bundle"
+        );
+
+        assert!(
+            split.is_some(),
+            "an_out_of_range_trace_length_in_a_continuation_is_refused: the honest bundle verifies"
+        );
+        an_out_of_range_trace_length_in_a_continuation_is_refused(&elf_bytes, bundle, &opts);
     }
 
     /// A claimed trace length out of range — not a power of two, one doubling
@@ -3447,15 +3475,14 @@ mod tests {
     /// epoch or of the global proof is refused, with no panic: the epoch's
     /// commit-bus replay and the STARK verifier both check it before deriving
     /// anything from it.
-    #[test]
-    fn an_out_of_range_trace_length_in_a_continuation_is_refused() {
-        let elf_bytes = asm_elf_bytes("test_commit_split");
-        let opts = ProofOptions::default_test_options();
-        let mut bundle = prove_continuation(&elf_bytes, &[], 4, &opts).unwrap();
-        assert!(bundle.num_epochs() > 1, "the run splits");
+    fn an_out_of_range_trace_length_in_a_continuation_is_refused(
+        elf_bytes: &[u8],
+        mut bundle: ContinuationProof,
+        opts: &ProofOptions,
+    ) {
         assert!(
-            matches!(verify_continuation(&elf_bytes, &bundle, &opts), Ok(Some(_))),
-            "the control: the honest bundle verifies"
+            bundle.num_epochs() > 1,
+            "an_out_of_range_trace_length_in_a_continuation_is_refused: the run splits"
         );
         let lengths = [0usize, 24, 1 << 32, (1 << 63) + 8, 1 << 63];
         let last = bundle.epochs.len() - 1;
@@ -3464,11 +3491,11 @@ mod tests {
                 let honest = bundle.epochs[epoch].proof.proofs[table].trace_length;
                 for &claimed in &lengths {
                     bundle.epochs[epoch].proof.proofs[table].trace_length = claimed;
-                    let verdict = verify_continuation(&elf_bytes, &bundle, &opts);
+                    let verdict = verify_continuation(elf_bytes, &bundle, opts);
                     bundle.epochs[epoch].proof.proofs[table].trace_length = honest;
                     assert!(
                         !matches!(verdict, Ok(Some(_))),
-                        "epoch {epoch} table {table} at length {claimed} was accepted"
+                        "an_out_of_range_trace_length_in_a_continuation_is_refused: epoch {epoch} table {table} at length {claimed} was accepted"
                     );
                 }
             }
@@ -3477,11 +3504,11 @@ mod tests {
             let honest = bundle.global.proofs[table].trace_length;
             for &claimed in &lengths {
                 bundle.global.proofs[table].trace_length = claimed;
-                let verdict = verify_continuation(&elf_bytes, &bundle, &opts);
+                let verdict = verify_continuation(elf_bytes, &bundle, opts);
                 bundle.global.proofs[table].trace_length = honest;
                 assert!(
                     !matches!(verdict, Ok(Some(_))),
-                    "global table {table} at length {claimed} was accepted"
+                    "an_out_of_range_trace_length_in_a_continuation_is_refused: global table {table} at length {claimed} was accepted"
                 );
             }
         }
@@ -3965,39 +3992,11 @@ mod tests {
     /// its timestamps from a non-zero base, the intermediate epochs (no HALT) read
     /// their CPU heights from a shifted sub-proof index, and REGISTER consumes x255
     /// at `4·N + 1` over all of the epoch's tables.
+    // test_continuation_with_several_cpu_tables_per_epoch_verifies,
+    // test_continuation_rejects_hostile_epoch_cpu_heights → test_continuation_with_several_cpu_tables_verifies_and_rejects_hostile_heights.
     #[test]
-    fn test_continuation_with_several_cpu_tables_per_epoch_verifies() {
+    fn test_continuation_with_several_cpu_tables_verifies_and_rejects_hostile_heights() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_instructions_64");
-        let max_rows = MaxRowsConfig::small();
-        let epoch_size_log2 = max_rows.cpu.trailing_zeros() + 1;
-        let opts = ProofOptions::default_test_options();
-        let bundle =
-            prove_continuation_with_max_rows(&elf_bytes, &[], epoch_size_log2, &opts, &max_rows)
-                .unwrap();
-        assert!(
-            bundle.epochs.len() >= 2,
-            "need an intermediate epoch, got {} epochs",
-            bundle.epochs.len()
-        );
-        for epoch in &bundle.epochs[..bundle.epochs.len() - 1] {
-            assert!(
-                epoch.table_counts.cpu >= 2,
-                "every intermediate epoch spans several CPU tables"
-            );
-        }
-        assert!(
-            verify_continuation(&elf_bytes, &bundle, &opts)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// Hostile CPU heights in an intermediate epoch (no HALT, so its CPU
-    /// sub-proofs start one index earlier): heights `validate_heights` refuses
-    /// and a valid but wrong height are both rejected, without panicking.
-    #[test]
-    fn test_continuation_rejects_hostile_epoch_cpu_heights() {
         let elf_bytes = asm_elf_bytes("all_instructions_64");
         let max_rows = MaxRowsConfig::small();
         let epoch_size_log2 = max_rows.cpu.trailing_zeros() + 1;
@@ -4005,25 +4004,63 @@ mod tests {
         let mut bundle =
             prove_continuation_with_max_rows(&elf_bytes, &[], epoch_size_log2, &opts, &max_rows)
                 .unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "test_continuation_with_several_cpu_tables_per_epoch_verifies: need an intermediate epoch, got {} epochs",
+            bundle.epochs.len()
+        );
+        for epoch in &bundle.epochs[..bundle.epochs.len() - 1] {
+            assert!(
+                epoch.table_counts.cpu >= 2,
+                "test_continuation_with_several_cpu_tables_per_epoch_verifies: every intermediate epoch spans several CPU tables"
+            );
+        }
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some(),
+            "test_continuation_with_several_cpu_tables_per_epoch_verifies"
+        );
+        test_continuation_rejects_hostile_epoch_cpu_heights(
+            &elf_bytes,
+            &opts,
+            &mut bundle,
+            &max_rows,
+        );
+    }
+
+    /// Hostile CPU heights in an intermediate epoch (no HALT, so its CPU
+    /// sub-proofs start one index earlier): heights `validate_heights` refuses
+    /// and a valid but wrong height are both rejected, without panicking.
+    fn test_continuation_rejects_hostile_epoch_cpu_heights(
+        elf_bytes: &[u8],
+        opts: &ProofOptions,
+        bundle: &mut ContinuationProof,
+        max_rows: &MaxRowsConfig,
+    ) {
         // Epoch 0 must be intermediate (no HALT) for `cpu_proof_start(false, ..)`.
-        assert!(bundle.epochs.len() >= 2, "need an intermediate epoch");
+        assert!(
+            bundle.epochs.len() >= 2,
+            "test_continuation_rejects_hostile_epoch_cpu_heights: need an intermediate epoch"
+        );
         let cpu = crate::cpu_proof_start(false, &bundle.epochs[0].table_counts);
         assert_eq!(
-            bundle.epochs[0].proof.proofs[cpu].trace_length,
-            max_rows.cpu
+            bundle.epochs[0].proof.proofs[cpu].trace_length, max_rows.cpu,
+            "test_continuation_rejects_hostile_epoch_cpu_heights"
         );
         for height in [6, 2 * crate::tables::cpu::MAX_TABLE_ROWS, 2 * max_rows.cpu] {
             bundle.epochs[0].proof.proofs[cpu].trace_length = height;
             assert!(
-                !matches!(verify_continuation(&elf_bytes, &bundle, &opts), Ok(Some(_))),
-                "height {height}"
+                !matches!(verify_continuation(elf_bytes, bundle, opts), Ok(Some(_))),
+                "test_continuation_rejects_hostile_epoch_cpu_heights: height {height}"
             );
         }
         bundle.epochs[0].proof.proofs[cpu].trace_length = max_rows.cpu;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &opts)
+            verify_continuation(elf_bytes, bundle, opts)
                 .unwrap()
-                .is_some()
+                .is_some(),
+            "test_continuation_rejects_hostile_epoch_cpu_heights"
         );
     }
 
@@ -4121,26 +4158,6 @@ mod tests {
         assert_eq!(ahead.touched_page_bases, on_prover.touched_page_bases);
         let out = verify_continuation(&elf_bytes, &ahead, &opts).unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
-    }
-
-    // A bundle verifies from the ELF alone, both directly and after the rkyv
-    // round-trip used by the CLI's `prove`/`verify --continuations` path.
-    #[test]
-    fn test_split_verify_roundtrip() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_commit_split");
-        let opts = ProofOptions::default_test_options();
-        let bundle = prove_continuation(&elf_bytes, &[], 4, &opts).unwrap();
-        let expected = Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]);
-
-        let out = verify_continuation(&elf_bytes, &bundle, &opts).unwrap();
-        assert_eq!(out.as_deref(), expected, "the freshly proved bundle");
-
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
-        let restored: ContinuationProof =
-            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
-        let out = verify_continuation(&elf_bytes, &restored, &opts).unwrap();
-        assert_eq!(out.as_deref(), expected, "the archived and restored bundle");
     }
 
     // Run every mutation against a fresh copy of one honest proof. Nextest runs
@@ -4334,53 +4351,46 @@ mod tests {
     // reconstructs the committed output. Regression for the genesis leak: the global
     // proof's private-input genesis is a committed, bus-enforced column, not a
     // preprocessed value the verifier would have to recompute from the raw bytes.
+    // test_continuation_private_input_verifies_without_bytes, test_split_verify_private_input_count_tampers,
+    // test_split_verify_rejects_global_proof_from_a_different_run → test_private_input_roundtrips_and_rejects_count_and_global_tampers.
     #[test]
-    fn test_continuation_private_input_verifies_without_bytes() {
+    fn test_private_input_roundtrips_and_rejects_count_and_global_tampers() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let opts = ProofOptions::default_test_options();
         let input: Vec<u8> = (0u8..16).collect();
         let expected = input[4..12].to_vec();
 
         // Smallest epochs (2^2 = 4 cycles) so the short program splits across epochs.
         let bundle =
-            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
-                .unwrap();
+            prove_continuation(&elf_bytes, &input, 2, &opts)
+                .expect("test_continuation_private_input_verifies_without_bytes: build or verify the private-input bundle");
         assert!(
             bundle.num_epochs() > 1,
-            "4-cycle epochs must split the run into multiple epochs"
+            "test_continuation_private_input_verifies_without_bytes: 4-cycle epochs must split the run into multiple epochs"
         );
         assert!(
             bundle.num_private_input_pages > 0,
-            "a program that reads private input must have a private-input page in the global proof"
+            "test_continuation_private_input_verifies_without_bytes: a program that reads private input must have a private-input page in the global proof"
         );
 
         // The serialized bundle must carry no raw private bytes: it survives an rkyv
         // round-trip and still verifies using ONLY the bundle + ELF (no private input
         // is passed to `verify_continuation`).
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).expect("test_continuation_private_input_verifies_without_bytes: build or verify the private-input bundle");
         let restored: ContinuationProof =
-            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
-        let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
-            .unwrap();
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).expect("test_continuation_private_input_verifies_without_bytes: build or verify the private-input bundle");
+        let out = verify_continuation(&elf_bytes, &restored, &opts)
+            .expect("test_continuation_private_input_verifies_without_bytes: build or verify the private-input bundle");
         assert_eq!(
             out.as_deref(),
             Some(&expected[..]),
-            "continuation with private input must verify from the bundle + ELF alone"
+            "test_continuation_private_input_verifies_without_bytes: continuation with private input must verify from the bundle + ELF alone"
         );
-    }
-
-    // Run every mutation against a fresh copy of one honest proof. Nextest runs
-    // each test in its own process, so the cases must share one test entry point.
-    #[test]
-    fn test_split_verify_private_input_count_tampers() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf = asm_elf_bytes("test_private_input_xpage");
-        let input = (0u8..16).collect::<Vec<_>>();
-        let opts = ProofOptions::default_test_options();
-        let honest = prove_continuation(&elf, &input, 2, &opts).unwrap();
-        test_split_verify_rejects_deflated_num_private_input_pages(&elf, honest.clone());
-        test_split_verify_rejects_inflated_num_private_input_pages(&elf, honest.clone());
-        test_split_verify_rejects_oversized_num_private_input_pages(&elf, honest);
+        test_split_verify_rejects_deflated_num_private_input_pages(&elf_bytes, bundle.clone());
+        test_split_verify_rejects_inflated_num_private_input_pages(&elf_bytes, bundle.clone());
+        test_split_verify_rejects_oversized_num_private_input_pages(&elf_bytes, bundle.clone());
+        test_split_verify_rejects_global_proof_from_a_different_run(&elf_bytes, &opts, bundle);
     }
 
     // Negative: `num_private_input_pages` is pinned by the committed AIR shape for TOUCHED
@@ -4396,21 +4406,21 @@ mod tests {
     ) {
         assert!(
             bundle.num_private_input_pages > 0,
-            "baseline must have a touched private-input page"
+            "test_split_verify_private_input_count_tampers: deflation needs a touched private-input page"
         );
         assert!(
             verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
+                .expect("test_split_verify_private_input_count_tampers: verify before deflation")
                 .is_some(),
-            "baseline must verify before tampering"
+            "test_split_verify_private_input_count_tampers: baseline must verify before deflation"
         );
 
         bundle.num_private_input_pages = 0;
         assert!(
             verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
+                .expect("test_split_verify_private_input_count_tampers: verify after deflation")
                 .is_none(),
-            "deflating the count flips a touched page's preprocessed mode → must reject"
+            "test_split_verify_private_input_count_tampers: deflating the count flips a touched page's preprocessed mode → must reject"
         );
     }
 
@@ -4426,22 +4436,22 @@ mod tests {
     ) {
         assert_eq!(
             bundle.num_private_input_pages, 1,
-            "16 bytes of private input fits in one page"
+            "test_split_verify_private_input_count_tampers: 16 bytes of private input fits in one page"
         );
         assert!(
             verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
+                .expect("test_split_verify_private_input_count_tampers: verify before inflation")
                 .is_some(),
-            "baseline must verify before tampering"
+            "test_split_verify_private_input_count_tampers: baseline must verify before inflation"
         );
 
         // In-range (well under the max bound) but one more than the true count.
         bundle.num_private_input_pages = 2;
         assert!(
             verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
+                .expect("test_split_verify_private_input_count_tampers: verify after inflation")
                 .is_none(),
-            "an inflated count diverges the global Fiat-Shamir statement → must reject"
+            "test_split_verify_private_input_count_tampers: an inflated count diverges the global Fiat-Shamir statement → must reject"
         );
     }
 
@@ -4567,10 +4577,13 @@ mod tests {
         mut bundle: ContinuationProof,
     ) {
         bundle.num_private_input_pages = page::max_private_input_pages() + 1;
-        assert!(matches!(
-            verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options()),
-            Err(Error::InvalidTableCounts(_))
-        ));
+        assert!(
+            matches!(
+                verify_continuation(elf_bytes, &bundle, &ProofOptions::default_test_options()),
+                Err(Error::InvalidTableCounts(_))
+            ),
+            "test_split_verify_private_input_count_tampers / test_split_verify_rejects_oversized_num_private_input_pages: reject a count above the maximum"
+        );
     }
 
     // Multi-page private input: the program reads private input across TWO pages
@@ -4768,50 +4781,54 @@ mod tests {
     // per-epoch check and `verify_global`'s own `multi_verify` passing (each half is
     // independently valid for that exact shape) while the per-epoch claimed roots no
     // longer match what the spliced-in global proof's L2G sub-tables actually commit.
-    #[test]
-    fn test_split_verify_rejects_global_proof_from_a_different_run() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
-        let opts = ProofOptions::default_test_options();
-
-        let input_a: Vec<u8> = (0u8..16).collect();
+    fn test_split_verify_rejects_global_proof_from_a_different_run(
+        elf_bytes: &[u8],
+        opts: &ProofOptions,
+        mut bundle_a: ContinuationProof,
+    ) {
         let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
 
-        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
-        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(elf_bytes, &input_b, 2, opts)
+            .expect("test_split_verify_rejects_global_proof_from_a_different_run: prove or verify");
         assert!(
-            verify_continuation(&elf_bytes, &bundle_a, &opts)
-                .unwrap()
+            verify_continuation(elf_bytes, &bundle_a, opts)
+                .expect(
+                    "test_split_verify_rejects_global_proof_from_a_different_run: prove or verify"
+                )
                 .is_some(),
-            "bundle_a must verify standalone before splicing"
+            "test_split_verify_rejects_global_proof_from_a_different_run: bundle_a must verify standalone before splicing"
         );
         assert!(
-            verify_continuation(&elf_bytes, &bundle_b, &opts)
-                .unwrap()
+            verify_continuation(elf_bytes, &bundle_b, opts)
+                .expect(
+                    "test_split_verify_rejects_global_proof_from_a_different_run: prove or verify"
+                )
                 .is_some(),
-            "bundle_b must verify standalone before splicing"
+            "test_split_verify_rejects_global_proof_from_a_different_run: bundle_b must verify standalone before splicing"
         );
         assert_eq!(
             bundle_a.epochs.len(),
             bundle_b.epochs.len(),
-            "same ELF/epoch size/input length must yield the same epoch split"
+            "test_split_verify_rejects_global_proof_from_a_different_run: same ELF/epoch size/input length must yield the same epoch split"
         );
         assert_eq!(
             bundle_a.touched_page_bases, bundle_b.touched_page_bases,
-            "same-length private inputs must touch the same pages"
+            "test_split_verify_rejects_global_proof_from_a_different_run: same-length private inputs must touch the same pages"
         );
         assert_ne!(
             bundle_a.epochs[0].l2g_root, bundle_b.epochs[0].l2g_root,
-            "different private-input bytes must commit different L2G data"
+            "test_split_verify_rejects_global_proof_from_a_different_run: different private-input bytes must commit different L2G data"
         );
 
         bundle_a.global = bundle_b.global;
 
         assert!(
-            verify_continuation(&elf_bytes, &bundle_a, &opts)
-                .unwrap()
+            verify_continuation(elf_bytes, &bundle_a, opts)
+                .expect(
+                    "test_split_verify_rejects_global_proof_from_a_different_run: prove or verify"
+                )
                 .is_none(),
-            "a global proof spliced in from a different run must be rejected"
+            "test_split_verify_rejects_global_proof_from_a_different_run: a global proof spliced in from a different run must be rejected"
         );
     }
 
