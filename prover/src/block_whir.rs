@@ -9824,7 +9824,8 @@ fn prove_streamed(
     refuse_retired_words(|name| std::env::var(name).ok())?;
     // The constraint-sumcheck probes: measurements, off unless asked (the
     // proof is the same); a word they do not take refuses the prove.
-    let cs_probe = multilinear_block::CsProbe::from_env().map_err(Error::Prover)?;
+    let mut cs_probe = multilinear_block::CsProbe::from_env().map_err(Error::Prover)?;
+    cs_probe.phase_b_chain = multilinear_block::PhaseBChain::from_env();
     // Under local lookups, whether phase A's lane runs the local argues: the
     // proof is the same either way; a word it does not take refuses the prove.
     let local_lane = match deviations.local_lane {
@@ -11875,7 +11876,7 @@ fn prove_streamed(
         let probe_first = probe_first_groups()?;
         // A measurement's or a test's order wins over the recursion's lead.
         let lead = lead.filter(|_| deviations.phase_b_order.is_none() && probe_first.is_none());
-        let order = match probe_first {
+        let mut order = match &probe_first {
             None => order,
             Some(_) if classes.iter().any(Option::is_some) => {
                 return Err(Error::Prover(
@@ -11884,8 +11885,25 @@ fn prove_streamed(
                         .into(),
                 ));
             }
-            Some(first) => put_first(&first, order).map_err(Error::Prover)?,
+            Some(first) => put_first(first, order).map_err(Error::Prover)?,
         };
+        if cs_probe.phase_b_chain.start_last {
+            let first = block.phase_b_start_group(|g| {
+                deviations.phase_b_order.is_none()
+                    && probe_first.is_none()
+                    && classes[g].is_none_or(|class| {
+                        classes[..g].iter().all(|&earlier| earlier != Some(class))
+                    })
+                    && !(multilinear::gpu::two_card_split_on()
+                        && multilinear::gpu::two_card_split_ready())
+            });
+            if let Some(g) = first {
+                order = put_first(&[g], order).map_err(Error::Prover)?;
+                eprintln!("BLOCK PHASE-B START LAST: group {g} · refusals 0");
+            } else {
+                eprintln!("BLOCK PHASE-B START LAST: refusals 1");
+            }
+        }
         // Each class's regenerator deposits in its rank order, its groups'
         // order: an order that takes a class's groups otherwise could wait on a
         // deposit its window does not admit yet, so it is refused rather than

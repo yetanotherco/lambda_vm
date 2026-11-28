@@ -301,6 +301,7 @@ fn lane_doing(
             decided: Some(decided.clone()),
             merge,
             limits,
+            ..CsProbe::default()
         },
         decided,
     )

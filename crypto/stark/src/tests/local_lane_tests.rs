@@ -30,8 +30,8 @@ use super::local_lookup_tests::{
 use crate::multilinear_air::Uniforms;
 use crate::multilinear_block::{
     self, ArgueDeviation, BlockCommitted, BlockProved, CsProbe, GroupStamps, LaneDefer, LaneLimits,
-    LaneState, LaneWork, LocalPhaseA, Narrowing, RetryEvent, RetryTest, ZcLaneStamp,
-    local_lane_lines,
+    LaneState, LaneWork, LocalPhaseA, Narrowing, OverlapFaults, PhaseBChain, PhaseBOverlap,
+    RetryEvent, RetryTest, ZcLaneStamp, local_lane_lines,
 };
 use crate::multilinear_table::{
     CommittedTable, TableLayout,
@@ -109,6 +109,16 @@ fn commit_bound<'a>(
     placement: Placement,
     binding: LocalBinding,
 ) -> Result<BlockCommitted<'a, Fp, Ext>, MlError> {
+    commit_with_chain(tables, config, placement, binding, PhaseBChain::default())
+}
+
+fn commit_with_chain<'a>(
+    tables: Vec<CommittedTable<'a, Fp, Ext>>,
+    config: &ChainConfig,
+    placement: Placement,
+    binding: LocalBinding,
+    phase_b_chain: PhaseBChain,
+) -> Result<BlockCommitted<'a, Fp, Ext>, MlError> {
     let mut tables = tables.into_iter();
     let mut groups = SIZES
         .iter()
@@ -146,6 +156,7 @@ fn commit_bound<'a>(
             host: true,
             decided,
             limits,
+            phase_b_chain,
             ..CsProbe::default()
         },
         Some(LocalPhaseA {
@@ -191,6 +202,142 @@ fn prove_committed(
         &order,
         None,
     )
+}
+
+fn phase_b_chain_proof(
+    chain: PhaseBChain,
+    placement: Placement,
+    fork_in_turn_order: bool,
+) -> (Result<(), MlError>, BlockProved<Fp, Ext>) {
+    let airs = Airs::new(None);
+    let block = Block::honest();
+    let config = config(2, GkrPack::Off);
+    let mut committed = commit_with_chain(
+        tables(&airs, &block),
+        &config,
+        placement,
+        LocalBinding::ALL,
+        chain,
+    )
+    .expect("phase A");
+    let mut order: Vec<_> = (0..SIZES.len()).collect();
+    if chain.start_last {
+        let g = committed
+            .phase_b_start_group(|_| true)
+            .expect("last commit retained");
+        assert_eq!(g, order.len() - 1);
+        order.rotate_right(1);
+    }
+    let observed = std::sync::Mutex::new(Vec::new());
+    let proved = multilinear_block::block_prove_in_order::<Fp, Ext, _, H>(
+        committed
+            .with_phase_b_overlap(PhaseBOverlap::On)
+            .with_overlap_faults(OverlapFaults {
+                open_stall: chain.open_overlap.then_some(Duration::from_millis(250)),
+                ..OverlapFaults::default()
+            }),
+        &config,
+        &mut H::sponge(),
+        &[],
+        &[],
+        &|g| {
+            if fork_in_turn_order {
+                order.iter().position(|&h| h == g).unwrap()
+            } else {
+                g
+            }
+        },
+        &honest(),
+        &|opened| observed.lock().unwrap().push(opened.group),
+        &order,
+        None,
+    )
+    .expect("phase B");
+    assert_eq!(observed.into_inner().unwrap(), order);
+    let verified = verify_local(&airs, &block, &config, &proved);
+    (verified, proved)
+}
+
+fn assert_phase_b_chain_pin(proved: &BlockProved<Fp, Ext>) {
+    use sha3::{Digest, Sha3_256};
+    assert_eq!(
+        format!("{:x}", Sha3_256::digest(bytes(proved))),
+        "5a55080caaa49c20007c649ca1b4905b92d38b0a2df35f6e19234e5c57f86157",
+    );
+}
+
+#[test]
+fn phase_b_start_last_preserves_pinned_block_bytes() {
+    let chain = PhaseBChain {
+        start_last: true,
+        ..PhaseBChain::default()
+    };
+    let (verified, proved) = phase_b_chain_proof(chain, Placement::PhaseB, false);
+    verified.expect("the last group proves first on its own fork");
+    assert_phase_b_chain_pin(&proved);
+}
+
+#[test]
+fn phase_b_start_last_verifier_refuses_forks_in_turn_order() {
+    let chain = PhaseBChain {
+        start_last: true,
+        ..PhaseBChain::default()
+    };
+    assert!(
+        phase_b_chain_proof(chain, Placement::PhaseB, true)
+            .0
+            .is_err()
+    );
+}
+
+#[test]
+fn phase_b_lane_beside_preserves_pinned_block_bytes() {
+    let chain = PhaseBChain {
+        lane_beside: true,
+        ..PhaseBChain::default()
+    };
+    let (verified, proved) = phase_b_chain_proof(chain, Placement::PhaseB, false);
+    assert!(proved.3[1].early_local_bins > 0);
+    verified.expect("local bins were bound before the global argument");
+    assert_phase_b_chain_pin(&proved);
+}
+
+#[test]
+fn phase_b_lane_beside_verifier_refuses_local_binding_after_global_argue() {
+    let chain = PhaseBChain {
+        lane_beside: true,
+        local_after_global: true,
+        ..PhaseBChain::default()
+    };
+    let (verified, proved) = phase_b_chain_proof(chain, Placement::PhaseB, false);
+    assert!(proved.3[1].early_local_bins > 0);
+    assert!(verified.is_err());
+}
+
+#[test]
+fn phase_b_open_overlap_preserves_pinned_block_bytes() {
+    let chain = PhaseBChain {
+        open_overlap: true,
+        ..PhaseBChain::default()
+    };
+    let (verified, proved) =
+        phase_b_chain_proof(chain, Placement::Lane(LaneLimits::default()), false);
+    assert!(proved.3[1].opening_carried);
+    verified.expect("the carried opening used its completed argue's fork");
+    assert_phase_b_chain_pin(&proved);
+}
+
+#[test]
+fn phase_b_open_overlap_verifier_refuses_opening_on_pre_argue_fork() {
+    let chain = PhaseBChain {
+        open_overlap: true,
+        open_before_argue: true,
+        ..PhaseBChain::default()
+    };
+    let (verified, proved) =
+        phase_b_chain_proof(chain, Placement::Lane(LaneLimits::default()), false);
+    assert!(proved.3[1].opening_carried);
+    assert!(verified.is_err());
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
