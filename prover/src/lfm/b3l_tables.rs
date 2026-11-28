@@ -378,7 +378,7 @@ pub fn fill_hold() -> B3lHold {
         return hold;
     }
     static RECORDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *RECORDS.get_or_init(|| std::env::var(RECORDS_ENV).is_ok_and(|v| v.trim() == "1")) {
+    if *RECORDS.get_or_init(|| !std::env::var(RECORDS_ENV).is_ok_and(|v| v.trim() == "0")) {
         B3lHold::Records
     } else {
         B3lHold::Narrow

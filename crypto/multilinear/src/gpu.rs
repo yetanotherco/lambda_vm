@@ -672,7 +672,10 @@ pub fn claims_tiled() -> bool {
         2 => false,
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("LAMBDA_VM_CLAIMS_TILED").as_deref() == Ok("1"))
+            // On unless the word is `0` (trimmed).
+            *ON.get_or_init(|| {
+                !std::env::var("LAMBDA_VM_CLAIMS_TILED").is_ok_and(|v| v.trim() == "0")
+            })
         }
     }
 }

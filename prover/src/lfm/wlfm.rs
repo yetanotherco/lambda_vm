@@ -3896,7 +3896,7 @@ pub fn columns_tiled() -> bool {
             super::wlfm_knobs::env_word(COLUMNS_TILED_ENV).as_deref(),
         )
     })
-    .unwrap_or_else(super::wlfm_knobs::two_cards)
+    .unwrap_or(true)
 }
 
 /// `LAMBDA_VM_LEVELS_BUILDER_WHOLE_POOL=1`: level 1's builder, which makes

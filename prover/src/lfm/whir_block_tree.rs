@@ -2837,7 +2837,7 @@ pub fn prove_whir_block_tree(
     // start. `LAMBDA_VM_PINNED_POOL_GIB`: the page-locked pool locked here,
     // after the card and before the clock, once (every driver call waits
     // while it runs).
-    if std::env::var("LAMBDA_VM_BACKEND_BEFORE_PROVE").is_ok_and(|v| v.trim() == "1") {
+    if !std::env::var("LAMBDA_VM_BACKEND_BEFORE_PROVE").is_ok_and(|v| v.trim() == "0") {
         let t = std::time::Instant::now();
         multilinear::gpu::set_up_device();
         sink.line(&format!(

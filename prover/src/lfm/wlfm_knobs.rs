@@ -78,7 +78,7 @@ pub fn chip_records() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| knob_word_on(std::env::var(CHIP_RECORDS_ENV).ok().as_deref()))
+    *ON.get_or_init(|| !knob_word_off(std::env::var(CHIP_RECORDS_ENV).ok().as_deref()))
 }
 
 /// `LAMBDA_VM_WLFM_LEAN_BESIDE=1`: the level driver fills level 1's lean round

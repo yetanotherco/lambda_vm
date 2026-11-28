@@ -3224,9 +3224,9 @@ pub(crate) fn exec_mode(walkers: usize) -> Result<(EngineKind, bool), Error> {
 /// same bytes. Read once a process.
 pub const POOL_EXEC_LOGS_ENV: &str = "LAMBDA_VM_POOL_EXEC_LOGS";
 
-/// [`POOL_EXEC_LOGS_ENV`]'s word: on only for `1`.
+/// [`POOL_EXEC_LOGS_ENV`]'s word: on unless it is `0`.
 pub fn pool_exec_logs_word(word: Option<&str>) -> bool {
-    crate::lfm::wlfm_knobs::knob_word_on(word)
+    !crate::lfm::wlfm_knobs::knob_word_off(word)
 }
 
 /// A test's [`pool_exec_logs`], process wide (0 the knob, 1 off, 2 on).

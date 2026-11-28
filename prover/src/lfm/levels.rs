@@ -707,7 +707,7 @@ pub fn fill_parts() -> bool {
     WORD.get_or_init(|| {
         super::wlfm_knobs::knob_word_two_card(std::env::var(FILL_PARTS_ENV).ok().as_deref())
     })
-    .unwrap_or_else(super::wlfm_knobs::two_cards)
+    .unwrap_or(true)
 }
 
 /// `LAMBDA_VM_LEVELS_COMMIT_NEXT_EARLY=1`: when level 2 executes beside level
@@ -741,7 +741,7 @@ pub fn commit_next_early() -> bool {
     WORD.get_or_init(|| {
         super::wlfm_knobs::knob_word_two_card(std::env::var(COMMIT_NEXT_EARLY_ENV).ok().as_deref())
     })
-    .unwrap_or_else(super::wlfm_knobs::two_cards)
+    .unwrap_or(true)
 }
 
 /// `LAMBDA_VM_LEVELS_PLAN_LEAN`: level 1's plan, made by the prover from its
@@ -891,7 +891,7 @@ pub fn waves_in_order() -> bool {
     WORD.get_or_init(|| {
         super::wlfm_knobs::knob_word_two_card(std::env::var(WAVES_IN_ORDER_ENV).ok().as_deref())
     })
-    .unwrap_or_else(super::wlfm_knobs::two_cards)
+    .unwrap_or(true)
 }
 
 /// How level 2's streamed execution runs, as the driver read its knobs: its
@@ -1361,7 +1361,7 @@ pub fn packs_beside() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(PACKS_BESIDE_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(PACKS_BESIDE_ENV).ok().as_deref())
     })
 }
 
@@ -1532,7 +1532,7 @@ pub fn next_beside() -> bool {
     WORD.get_or_init(|| {
         super::wlfm_knobs::knob_word_two_card(std::env::var(NEXT_BESIDE_ENV).ok().as_deref())
     })
-    .unwrap_or_else(super::wlfm_knobs::two_cards)
+    .unwrap_or(true)
 }
 
 /// [`prepare_next`]'s level: its program, its prebuild and its arena's marks.

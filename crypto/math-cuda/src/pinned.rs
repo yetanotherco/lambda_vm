@@ -58,14 +58,38 @@ pub const PIECE: usize = 1 << 30;
 /// default hooks made is not recorded (and can merge with nothing).
 const MAX_CHUNKS: usize = 1 << 14;
 
-/// The pool's size, `LAMBDA_VM_PINNED_POOL_GIB` GiB; 0 is off.
+/// The pool's size, `LAMBDA_VM_PINNED_POOL_GIB` GiB; 0 is off. Unset, it is
+/// sized from the host's memory: [`DEFAULT_POOL_GIB`] GiB on a host with at
+/// least four times that, a quarter of the memory below it, 0 where the
+/// memory cannot be read.
 pub fn pool_gib() -> usize {
-    *POOL_GIB.get_or_init(|| {
-        std::env::var("LAMBDA_VM_PINNED_POOL_GIB")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
+    *POOL_GIB.get_or_init(|| match std::env::var("LAMBDA_VM_PINNED_POOL_GIB") {
+        Ok(v) => v.trim().parse().unwrap_or(0),
+        Err(_) => default_pool_gib(host_memory_gib()),
     })
+}
+
+/// The pool the timed one-card prover locks: 32 GiB.
+pub const DEFAULT_POOL_GIB: usize = 32;
+
+/// The default pool for a host with `memory_gib` GiB: [`DEFAULT_POOL_GIB`],
+/// or a quarter of the memory on a smaller host.
+pub fn default_pool_gib(memory_gib: Option<usize>) -> usize {
+    memory_gib.map_or(0, |gib| DEFAULT_POOL_GIB.min(gib / 4))
+}
+
+/// The host's memory in whole GiB (`MemTotal` of `/proc/meminfo`), if known.
+fn host_memory_gib() -> Option<usize> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: usize = info
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib >> 20)
 }
 
 static POOL_GIB: OnceLock<usize> = OnceLock::new();
