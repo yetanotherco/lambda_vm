@@ -3,8 +3,8 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-d1 test-cuda-fallback \
-test-prover-cuda test-prover-comprehensive-cuda \
+test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-gkr2-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-prover-cuda test-prover-comprehensive-cuda test-prover-identities-cuda test-cross-posture test-cross-posture-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
@@ -54,9 +54,16 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 
 # Recursion smoke-test guests, in bench_vs/lambda/ (shared with bench_vs/run.sh)
 # rather than executor/programs/. The recursion guest is the in-VM STARK verifier.
+#
+# `continuation-fixture` is the exception and the reason this comment grew: it has
+# no benchmark arm and run.sh does not build it. It lives here anyway because
+# `proof_fixture::read_inner_elf` reads the recursion artifact directory, and
+# because it is a sibling of `fibonacci` in everything but its tail — which is
+# precisely what must not be added to the benchmarked one, whose whole job is to
+# run the same program as bench_vs/sp1/fibonacci. See its own main.rs.
 RECURSION_GUESTS_DIR=./bench_vs/lambda
 RECURSION_ARTIFACTS_DIR=./executor/program_artifacts/recursion
-RECURSION_GUESTS := empty fibonacci
+RECURSION_GUESTS := empty fibonacci continuation-fixture
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # The recursion verifier itself (bench_vs/lambda/recursion) requires picking
@@ -234,9 +241,17 @@ $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_
 # dir "recursion") or copy-paste (presets list is the single source of truth).
 # $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
 # expands at recipe-run time (where $@ is defined).
+#
+# No preset enables `absorb`. That feature routes the verifier legs' coalesced
+# leaf hashing through the chained-absorb ecall, whose accelerator implements
+# six rounds only, so it turns `crypto/blake3-6round` on; every BLAKE3 in a
+# default build is standard 7-round now, and `stark::config` refuses a build of
+# the commitment configuration at six. Add `absorb` here only together with a
+# six-round configuration.
+RECURSION_GUEST_FEATURES :=
 define recursion_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features "$(1) $$(RECURSION_GUEST_FEATURES)")
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
 
@@ -244,7 +259,7 @@ $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_
 # feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
 define recursion_cont_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1) $$(RECURSION_GUEST_FEATURES)")
 endef
 $(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
 
@@ -545,34 +560,49 @@ test-ethrex-crypto:
 
 test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
+	# The hash counters compile to nothing unless the feature is on, so their
+	# own tests only execute here. See the `lint` target for why an instrument
+	# nobody runs is worth a line in the build.
+	cargo test -p crypto --features hash-metrics
+	# The transcript counters answer "which sponge ran". Their own integration
+	# binary, because the counters are process-global and a parallel neighbour's
+	# reset lands inside another test's measurement window — moving them out of
+	# the lib binary left four of five failing until they also took a lock.
+	cargo test -p crypto --features hash-metrics --test transcript_counters
+	# And the system test that reads them through a real prove: it is the one
+	# that says the PROVER picked the configuration's sponge, which the
+	# type-level test next to it cannot observe.
+	cargo test -p lambda-vm-prover --features hash-metrics --test whir_transcript_configuration
+	$(MAKE) test-rpx-host-kat
+	$(MAKE) test-ntt-cm-host-kat
+	$(MAKE) test-whir-host-kat
+	$(MAKE) test-gkr-host-kat
+	$(MAKE) test-gkr2-host-kat
+	$(MAKE) test-eq-dot-host-kat
+	$(MAKE) test-round-slot-host-kat
 
 # === Quick test shortcuts ===
 
 # Fast prover tests (skips ignored slow tests). Recursion smoke/PoC tests read
 # prebuilt guest ELFs, so build them first.
 test-fast: compile-recursion-elfs
-	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
+	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel,lambda-vm-prover/test-security
 
 # Prover tests only
 test-prover: compile-recursion-elfs
-	cargo test -p lambda-vm-prover
+	cargo test -p lambda-vm-prover --features test-security
 
 # Prover tests including slow ones. The recursion smoke tests read prebuilt
 # guest ELFs from executor/program_artifacts/recursion/ — the fast ones on every
 # run, the slow ones (still #[ignore]d) only under --include-ignored — so build
-# them first.
+# them first. The proof exchanges need both binaries and run in test-cross-posture.
 test-prover-all: compile-recursion-elfs
-	cargo test -p lambda-vm-prover -- --include-ignored
+	cargo test -p lambda-vm-prover -- --include-ignored --skip rejects_test_posture
 
 # Prover tests with debug-checks (shows bus balance report). Also unfiltered, so
 # it runs the non-ignored recursion tests that read prebuilt guest ELFs.
 test-prover-debug: compile-recursion-elfs
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
-
-# Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
-test-disk-spill:
-	cargo test --release -p stark --features disk-spill disk_spill
-	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
 # Per-target wall clock for the GPU prover targets below. A panic on a device-only
 # cliff assert can leave the prover hung rather than aborting — the panicking thread
@@ -581,11 +611,206 @@ test-disk-spill:
 # 45 min is generous against their normal runtime; the SIGKILL follows 30s later, and
 # timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
 GPU_TEST_TIMEOUT := timeout -k 30 2700
+GPU_FAULT_CARGO = $(if $(GPU_CUDA_FAULT_TARGET_DIR),env CARGO_TARGET_DIR="$(GPU_CUDA_FAULT_TARGET_DIR)") cargo
 
 # math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
 # so a hang here also costs Groups 2-6: they run after it, sequentially.
 test-math-cuda:
-	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release -- --test-threads=1
+
+# Known-answer tests for the BLAKE3 device kernels, run on the HOST. No GPU, no
+# nvcc, no cargo — a couple of seconds.
+#
+# This exists because `test-math-cuda` above, which is the authority on these
+# kernels, runs only where a GPU does, and the per-PR CI runners have none (GPU
+# jobs are merge_group-only). Without this the kernels have no per-PR gate: an
+# edit to blake3.cu that broke the hash would reach the merge queue before
+# anything caught it. `crypto/math-cuda/tests/host_kat/` compiles the real kernel
+# source as host C++ through a shim and runs the official BLAKE3 vectors, the
+# canonical 6-round table, the official multi-block vectors against the
+# `Blake3Chain` construction, and every leaf kernel's byte stream through it.
+#
+# BOTH ROUND COUNTS are built and run. The 6-round arm is the one the campaign
+# ships and the one no other CI job compiles (risk R10), and the round count is a
+# compile-time knob, so a single-arm run would leave the shipping configuration
+# ungated. The two arms differ only in `-DBLAKE3_ROUNDS`, exactly as build.rs
+# drives the cubin from the `blake3-6round` feature.
+#
+# It checks arithmetic ONLY. Whether nvcc accepts the file, and everything about
+# execution rather than arithmetic — grid indexing, the Merkle tail's barriers,
+# device alignment, register pressure — stays with `test-math-cuda`. Necessary,
+# never sufficient.
+HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
+test-blake3-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/blake3_host_kat $(HOST_KAT_DIR)/blake3_host_kat.cpp
+	./target/host_kat/blake3_host_kat
+	@echo
+	@echo "=== rebuilding for the 6-round arm (BLAKE3_ROUNDS=6) ==="
+	$(CXX) $(HOST_KAT_CXXFLAGS) -DBLAKE3_ROUNDS=6 \
+	    -o target/host_kat/blake3_host_kat_6r $(HOST_KAT_DIR)/blake3_host_kat.cpp
+	./target/host_kat/blake3_host_kat_6r
+
+# Known-answer tests for the RPX256 device kernel source, run on the HOST through
+# the Track G shim (no GPU, no nvcc): the permutation, the rate-8 overwrite-duplex
+# leaf and the parent compress against vectors printed from the Rust oracle
+# (`prover/tests/rpx_host_kat_vectors.rs`), plus miden-crypto's 19 RPO vectors
+# through the shared FB round.
+#
+# ★ It also covers the two WHIR COSET kernels, which exist nowhere else and
+# which GPU CI would not see until merge_group. That is why this target is a
+# per-PR gate and not a GPU one.
+#
+# The second binary replays the kernels whose lanes cooperate (the half-warp
+# permutation and Merkle kernels, the work-queue grind) with every lane a real
+# thread (`cuda_host_simt_shim.h`), against the shipped kernels.
+test-rpx-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
+	./target/host_kat/rpx_host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/rpx_simt_host_kat $(HOST_KAT_DIR)/rpx_simt_host_kat.cpp
+	./target/host_kat/rpx_simt_host_kat
+
+# Known-answer tests for the Poseidon1 width-16 MEASUREMENT kernels
+# (`p1w16.cu`, D-HASH stage 1), run on the HOST through the same shim: the
+# permutation, the rate-12 coset leaves (base and ext3), the 4-ary node and the
+# grind, at both multiply variants, against the vectors the host reference and
+# Plonky3 agree on. Nothing on a proving path uses these kernels.
+test-p1w16-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/p1w16_host_kat $(HOST_KAT_DIR)/p1w16_host_kat.cpp
+	./target/host_kat/p1w16_host_kat
+
+# Known-answer tests for the column-major LDE engine's passes (`ntt_cm.cu`), run
+# on the HOST through the same shim: every pass shape against the
+# textbook radix-2 levels, whole transforms against the naive DFT, and the LDE
+# the driver runs (DIF iNTT, bit-reversed weights, DIT with the fused coset
+# spread) against direct interpolation and evaluation on the coset. Arithmetic
+# and index math only; execution stays with `tests/ntt_cm_parity.rs`.
+test-ntt-cm-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/ntt_cm_host_kat $(HOST_KAT_DIR)/ntt_cm_host_kat.cpp
+	./target/host_kat/ntt_cm_host_kat
+
+# Known-answer tests for the WHIR round kernels (`whir_fold.cu`), run on the HOST
+# through the same shim: the fused fold against the level-by-level kernels it
+# replaces (raw-identical, base and extension, k = 1..6), and the lean first
+# rounds — factors in share form — against the materialised opening (six
+# rounds and the bound tables). Arithmetic only; execution stays with
+# `test-math-cuda`.
+test-whir-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/whir_host_kat $(HOST_KAT_DIR)/whir_host_kat.cpp
+	./target/host_kat/whir_host_kat
+
+# Known-answer tests for the GKR layer rounds over an input layer kept without
+# its padding (`sumcheck.cu`, `LAMBDA_VM_ARGUE_INPUT_REAL`), run on the HOST
+# through the SIMT shim, every thread of a block a real thread so the block
+# reductions run as written: the kept layer's rounds and finish against today's
+# kernels over the whole layer (raw-identical), today's kernels against a copy
+# of their source from before the change, and both against a written-out
+# reference. Arithmetic and indexing only; execution stays with
+# `test-math-cuda`.
+test-gkr-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/gkr_host_kat $(HOST_KAT_DIR)/gkr_host_kat.cpp
+	./target/host_kat/gkr_host_kat
+
+# Known-answer tests for the GKR rounds over two tree layers (`sumcheck.cu`'s
+# `gkr2_round*`, `gkr2_round_h0*`, `gkr2_finish*`), on the host through the
+# SIMT shim: every round and the finish against a written-out reference that
+# composes the two folds, the kept input layer's kernels raw-identical to the
+# whole layer's, the slot's sums, and two negative controls. Arithmetic,
+# indexing and the lane pairs' shuffles only; execution stays with the card.
+test-gkr2-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/gkr2_host_kat $(HOST_KAT_DIR)/gkr2_host_kat.cpp
+	./target/host_kat/gkr2_host_kat
+
+# Known-answer tests for the commit-time out-of-domain answers' column values
+# (`sumcheck.cu`'s `eq_dot_base_ext3_many` and the `sum_partials_ext3` over its
+# partials), run on the HOST through the SIMT shim, against a written-out
+# reference: every column's value at the point, over shapes with blocks fewer
+# than, as many as and more than a column's hi rows. Arithmetic and indexing
+# only; execution stays with `multilinear/tests/whir_commit_ood_device.rs`.
+test-eq-dot-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/eq_dot_host_kat $(HOST_KAT_DIR)/eq_dot_host_kat.cpp
+	./target/host_kat/eq_dot_host_kat
+
+# Known-answer tests for the round kernels whose sums leave through a slot in
+# pinned host memory (`sumcheck.cu`'s `slot_sums` and `_slot` kernels,
+# `LAMBDA_VM_ARGUE_ROUND_SLOT`), on the HOST through the SIMT shim: the last
+# block's sums against today's second launch (`sum_partials_ext3`), raw, with
+# the ticket's reset and the order of the sums, the fence and `seq` checked.
+# Arithmetic and indexing only; the card's memory model stays with
+# `test-math-cuda`.
+test-round-slot-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/round_slot_host_kat $(HOST_KAT_DIR)/round_slot_host_kat.cpp
+	./target/host_kat/round_slot_host_kat
+
+# Known-answer tests for the table fills from records (`fill.cu`), run on the
+# HOST through the same shim: MEMW_R, CPU (every op class, the decode search
+# across runs, a missing pc, the padding rows) and KECCAK_RND (a table cut at
+# both ends, every round, zero rows) against the prover's host fill
+# (`fill_kat_vectors.h`, written and pinned by the prover's
+# `tables::card_fill_inputs`). Arithmetic and indexing only; execution stays
+# with the card test (`tables::card_fill_tests`).
+test-fill-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/fill_host_kat $(HOST_KAT_DIR)/fill_host_kat.cpp
+	./target/host_kat/fill_host_kat
+
+# SECOND-SOURCE validation of the 6-round vectors the KAT above trusts.
+#
+# `test-blake3-host-kat` checks the KERNEL against the committed tables. This
+# checks the TABLES, against upstream BLAKE3's own portable C with its round loop
+# parameterised (`tooling/blake3-second-source/reference-impl/`, a 2 KB reviewable diff in
+# PARAMETERISATION.diff). That reference is a different language and author and —
+# the part that matters — a different message-schedule CONSTRUCTION: it indexes a
+# precomputed MSG_SCHEDULE table where our Rust and CUDA compose one permutation
+# between rounds. A bug in the iterative composition is exactly what a single
+# source cannot catch, and check [C] compares the two constructions directly.
+#
+# It exists because 6-round BLAKE3 is computed by nothing else in the world
+# (assumption A6R), so the 6-round column of every table here rests on oracle
+# agreement rather than on a published vector.
+#
+# ⚠ Checks [D] and [E] were SILENTLY DEAD from P-a Stage 1 — which moved
+# CANONICAL_VECTORS out of `prover/src/lfm/blake3.rs` into `crypto` — until
+# 2026-08-15, because nothing ever ran this: it had no target. That is why it has
+# one now. A ~1 second C compile plus a few seconds of Python; no cargo, no GPU.
+test-blake3-second-source:
+	tooling/blake3-second-source/reference-impl/build.sh
+	python3 tooling/blake3-second-source/reference-impl/check.py
+
+# z3/SMT gate for the BLAKE3 chained-absorb mode's row-local constraints: the
+# compression equivalence under the absorb framing, the flags schedule, the mode
+# gating, the countdown/END logic, and the byte-width assumptions.
+#
+# Read `formal_verification/blake3_absorb/README.md` before extending it. The 6
+# rounds are verified ONE AT A TIME because the composed query does not close —
+# commit 89aeeb8c measured 145 minutes of `unknown` — and the negative controls
+# are what make a green board mean anything.
+#
+# z3's Python bindings are the only dependency. No cargo, no GPU, ~25 seconds.
+test-blake3-absorb-fv:
+	python3 formal_verification/blake3_absorb/test_ref.py
+	python3 formal_verification/blake3_absorb/z3_absorb_verify.py
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
@@ -625,27 +850,65 @@ test-cuda-d1:
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
 test-cuda-fallback:
-	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	$(GPU_TEST_TIMEOUT) $(GPU_FAULT_CARGO) test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
 	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
-# The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
-# GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
-# GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
-# to stark; crypto/ecsm build without it (they have no GPU path).
+# The GPU counterpart of CPU CI's prover suite (requires NVIDIA GPU, nvcc and nextest).
+# The cuda profile schedules fresh processes so dispatch counters and cached settings are
+# private to each test. It bounds the number of tests sharing the card.
 # compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
 # smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
 test-prover-cuda: compile-recursion-elfs
-	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
-	    --features lambda-vm-prover/cuda -- --test-threads=1
+	$(GPU_TEST_TIMEOUT) python3 scripts/test_prover_cuda.py --release \
+	    -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	    --features lambda-vm-prover/cuda,lambda-vm-prover/test-security
 
-# The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
-# NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
-# comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
-test-prover-comprehensive-cuda:
-	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda \
-	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
+# These exact tests pin production parameters or smoke-test proof paths at
+# production settings. Build the unit binary without test-security.
+test-prover-comprehensive-cuda: compile-recursion-elfs
+	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda --lib -- \
+	    --exact --include-ignored --test-threads=1 --nocapture $$(cat .config/production-posture-tests.txt)
+
+# Each identity gets its own process for the prover's format knobs and device
+# fault state. Forced split runs both backends on a single card.
+test-prover-identities-cuda: compile-programs-asm
+	@unset LAMBDA_VM_WORD_CHUNKS LAMBDA_VM_BLOCK_WALKERS LAMBDA_VM_WALK_CUTS; \
+	unset LAMBDA_VM_WHIR_LEAN_ROUNDS LAMBDA_VM_GKR_TREE_SKIP_MIDDLE \
+	    LAMBDA_VM_ENCODE_MOBIUS_IN_NTT LAMBDA_VM_NTT_LAST_PASS_HASHES \
+	    LAMBDA_VM_LEVELS_FREE_BESIDE LAMBDA_VM_LEVELS_PREPARE_PARALLEL \
+	    LAMBDA_VM_LEVELS_NARROW_STORE LAMBDA_VM_LOCAL_LANE_RETRY \
+	    LAMBDA_VM_ZC_GRID_SPLIT LAMBDA_VM_ARGUE_SCOPED_RULES; \
+	export LAMBDA_VM_DETERMINISTIC_GRIND=1 LAMBDA_VM_FIXED_TRACE_HASH=1; \
+	output=$$(mktemp) || exit 1; trap 'rm -f "$$output"' EXIT; \
+	failed=0; \
+	while read -r features test; do \
+	    if ! ( \
+	        if [ "$$features" = test-cuda-faults ] && [ -n "$$GPU_CUDA_FAULT_TARGET_DIR" ]; then \
+	            export CARGO_TARGET_DIR="$$GPU_CUDA_FAULT_TARGET_DIR"; \
+	        fi; \
+	        $(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --lib \
+	            --features "test-security,$$features" -- --ignored --exact --test-threads=1 "$$test"; \
+	    ) > "$$output" 2>&1 || ! grep -Fq 'test result: ok. 1 passed;' "$$output"; then \
+	        echo "CUDA identity failed or missing: $$test" >&2; failed=1; \
+	    fi; \
+	    cat "$$output"; \
+	done < .config/cuda-identity-tests.txt; \
+	exit "$$failed"
+
+# Hand honest serialized proofs from the TEST binary to the production binary.
+test-cross-posture-cuda: CROSS_POSTURE_ARGS := --features cuda
+test-cross-posture-cuda: CROSS_POSTURE_RUN := $(GPU_TEST_TIMEOUT)
+test-cross-posture-cuda: test-cross-posture
+test-cross-posture: $(ASM_ARTIFACTS_DIR)/basic_program.elf
+	@set -eu; \
+	dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
+	export LAMBDA_VM_TEST_POSTURE_PROOFS="$$dir"; \
+	$(CROSS_POSTURE_RUN) cargo test --release -p lambda-vm-prover --lib $(CROSS_POSTURE_ARGS) --features test-security \
+	    rejects_test_posture -- --ignored --test-threads=1; \
+	$(CROSS_POSTURE_RUN) cargo test --release -p lambda-vm-prover --lib $(CROSS_POSTURE_ARGS) \
+	    rejects_test_posture -- --ignored --test-threads=1
 
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
@@ -675,7 +938,21 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# BLAKE3 at SIX rounds — the internal variant, `crypto` alone.
+	#
+	# Seven is the default now: every BLAKE3 in a default build is standard, and
+	# every blessed constant is seven. So the pass that needs writing down is the
+	# six-round one, which nothing else compiles. Scoped to `crypto`, and it has to
+	# be: `stark::config` refuses the commitment configuration at six rounds, so a
+	# workspace build with the feature does not compile by design.
+	cargo clippy -p crypto --all-targets --features blake3-6round -- -D warnings -A clippy::op_ref
+	# The chained-absorb guest arm's feature graph, `crypto` alone for the same
+	# reason (the feature implies six rounds). ⚠ This does NOT compile the guest
+	# absorb arm — that arm is `cfg(all(target_arch = "riscv64", feature =
+	# "blake3-absorb"))` and this is a host pass, so what compiles is its
+	# `cfg(not(...))` stub.
+	cargo clippy -p crypto --all-targets --features blake3-absorb -- -D warnings -A clippy::op_ref
+	cargo clippy -p lambda-vm-prover --all-targets --features test-security -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -685,11 +962,45 @@ lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# BLAKE3 at SIX rounds — the internal variant, `crypto` alone.
+	#
+	# Seven is the default now: every BLAKE3 in a default build is standard, and
+	# every blessed constant is seven. So the pass that needs writing down is the
+	# six-round one, which nothing else compiles. Scoped to `crypto`, and it has to
+	# be: `stark::config` refuses the commitment configuration at six rounds, so a
+	# workspace build with the feature does not compile by design.
+	cargo clippy -p crypto --all-targets --features blake3-6round -- -D warnings -A clippy::op_ref
+	# The chained-absorb guest arm's feature graph, `crypto` alone for the same
+	# reason (the feature implies six rounds). ⚠ This does NOT compile the guest
+	# absorb arm — that arm is `cfg(all(target_arch = "riscv64", feature =
+	# "blake3-absorb"))` and this is a host pass, so what compiles is its
+	# `cfg(not(...))` stub.
+	cargo clippy -p crypto --all-targets --features blake3-absorb -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
+	# `hash-metrics` is host-only and off by default, so no pass above compiles it.
+	# Without this line the feature can rot untouched — which is how its Merkle
+	# counters stayed keccak-only after a second hash arrived, reporting ZERO for
+	# the arm whose whole purpose was to change the hashing. Lints, does not run:
+	# its tests are in the `test` target.
+	cargo clippy -p crypto --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
+	# The prover's own `hash-metrics` passthrough gates the per-arm transcript
+	# line and the system test that reads it; without this line neither compiles
+	# in any pass, which is how an instrument rots.
+	cargo clippy -p lambda-vm-prover --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
+	# ⛔ BOTH AT ONCE, because neither pass above is both. The device pin —
+	# `check_device_pins` and `transcript_pin::commits`, which model the GPU
+	# commit counter against the bundle's own chains — is `cfg(all(cuda,
+	# hash-metrics))`: the cuda pass has no `hash-metrics` and the two
+	# `hash-metrics` passes have no cuda, so until this line the whole model was
+	# compiled by nothing and a box run was its first compiler. No GPU needed;
+	# cuda clippy builds against the cubin stubs like the pass above.
+	cargo clippy -p lambda-vm-prover --all-targets --features cuda,hash-metrics -- -D warnings -A clippy::op_ref
+	# The test security posture (`security_posture`): its test-only half is
+	# `cfg(all(test, feature = "test-security"))`, which no pass above compiles.
+	cargo clippy -p lambda-vm-prover --all-targets --features test-security -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

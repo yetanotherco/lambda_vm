@@ -22,6 +22,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
@@ -103,21 +104,48 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// A single SHIFT operation (hashable for deduplication).
+/// A single SHIFT operation (hashable for deduplication). `#[repr(C)]`, its
+/// fields ordered so it stays 24 bytes: a chunk's ops are the records the card
+/// fills its SHIFT table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ShiftOperation {
+    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
+    pub shift_amount: u64,
     /// Input value as 4 halfwords (DWordHL)
     pub in_halves: [u16; 4],
     /// Shift amount low byte (used by the computation; effective = mod 32/64).
     pub shift: u8,
-    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
-    pub shift_amount: u64,
     /// 0 = left, 1 = right
     pub direction: bool,
     /// Whether arithmetic (signed) right shift
     pub signed: bool,
     /// Whether 32-bit (word) instruction
     pub word_instr: bool,
+}
+
+// The walk keeps one per shift: keep it at 24 bytes.
+const _: () = assert!(std::mem::size_of::<ShiftOperation>() == 24);
+
+/// SHIFT ops as the card's SHIFT fill reads them
+/// (`multilinear::records::ShiftOp`): the same bytes.
+pub(crate) fn card_ops(ops: &[ShiftOperation]) -> &[multilinear::records::ShiftOp] {
+    use multilinear::records::ShiftOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<ShiftOperation>() == size_of::<ShiftOp>());
+        assert!(align_of::<ShiftOperation>() == align_of::<ShiftOp>());
+        assert!(offset_of!(ShiftOperation, shift_amount) == offset_of!(ShiftOp, shift_amount));
+        assert!(offset_of!(ShiftOperation, in_halves) == offset_of!(ShiftOp, in_halves));
+        assert!(offset_of!(ShiftOperation, shift) == offset_of!(ShiftOp, shift));
+        assert!(offset_of!(ShiftOperation, direction) == offset_of!(ShiftOp, direction));
+        assert!(offset_of!(ShiftOperation, signed) == offset_of!(ShiftOp, signed));
+        assert!(offset_of!(ShiftOperation, word_instr) == offset_of!(ShiftOp, word_instr));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const ShiftOp, ops.len()) }
 }
 
 impl ShiftOperation {
@@ -353,65 +381,79 @@ struct ShiftAux {
 pub fn generate_shift_trace(
     operations: &[ShiftOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_shift_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths SHIFT traces needed so far in this process (`tables::gpack`).
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_shift_trace`] in `form` (`tables::gpack`).
+pub fn generate_shift_trace_as(
+    operations: &[ShiftOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_shift_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_shift_trace_as`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_shift_trace_segments_as(
+    segments: &[&[ShiftOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
     // No deduplication: each operation gets its own row with μ=1.
     // Spec declares μ: Bit.
-    let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    let num_rows = len.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            let aux = op.compute_aux();
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        let aux = op.compute_aux();
+            // Input columns
+            table.set_halves(row_idx, cols::IN_0, &op.in_halves);
+            table.set_byte(row_idx, cols::SHIFT_AMOUNT, op.shift);
+            // High bits of the full shift amount (for the ALU bus in2 = arg2).
+            table.set_byte(
+                row_idx,
+                cols::SHIFT_B1,
+                ((op.shift_amount >> 8) & 0xFF) as u8,
+            );
+            table.set_half(
+                row_idx,
+                cols::SHIFT_H1,
+                ((op.shift_amount >> 16) & 0xFFFF) as u16,
+            );
+            table.set_word(row_idx, cols::SHIFT_HIGH, (op.shift_amount >> 32) as u32);
+            table.set_bool(row_idx, cols::DIRECTION, op.direction);
+            table.set_bool(row_idx, cols::SIGNED, op.signed);
+            table.set_bool(row_idx, cols::WORD_INSTR, op.word_instr);
 
-        // Input columns
-        table.set_halves(row_idx, cols::IN_0, &op.in_halves);
-        table.set_byte(row_idx, cols::SHIFT_AMOUNT, op.shift);
-        // High bits of the full shift amount (for the ALU bus in2 = arg2).
-        table.set_byte(
-            row_idx,
-            cols::SHIFT_B1,
-            ((op.shift_amount >> 8) & 0xFF) as u8,
-        );
-        table.set_half(
-            row_idx,
-            cols::SHIFT_H1,
-            ((op.shift_amount >> 16) & 0xFFFF) as u16,
-        );
-        table.set_word(row_idx, cols::SHIFT_HIGH, (op.shift_amount >> 32) as u32);
-        table.set_bool(row_idx, cols::DIRECTION, op.direction);
-        table.set_bool(row_idx, cols::SIGNED, op.signed);
-        table.set_bool(row_idx, cols::WORD_INSTR, op.word_instr);
+            // Output columns
+            table.set_words(row_idx, cols::OUT_0, &aux.out);
 
-        // Output columns
-        table.set_words(row_idx, cols::OUT_0, &aux.out);
+            // Auxiliary columns
+            table.set_bool(row_idx, cols::IS_NEGATIVE, aux.is_negative);
+            table.set_byte(row_idx, cols::BIT_SHIFT, aux.bit_shift);
+            table.set_bool(row_idx, cols::ZBS, aux.zbs);
 
-        // Auxiliary columns
-        table.set_bool(row_idx, cols::IS_NEGATIVE, aux.is_negative);
-        table.set_byte(row_idx, cols::BIT_SHIFT, aux.bit_shift);
-        table.set_bool(row_idx, cols::ZBS, aux.zbs);
+            table.set_halves(row_idx, cols::X_0, &aux.x);
+            table.set_halves(row_idx, cols::Y_0, &aux.y);
+            for i in 0..3 {
+                table.set_bool(row_idx, cols::LIMB_SHIFT_RAW[i], aux.limb_shift[i]);
+            }
+            // limb_shift[3] is virtual: not stored in the trace
 
-        table.set_halves(row_idx, cols::X_0, &aux.x);
-        table.set_halves(row_idx, cols::Y_0, &aux.y);
-        for i in 0..3 {
-            table.set_bool(row_idx, cols::LIMB_SHIFT_RAW[i], aux.limb_shift[i]);
+            // μ = 1 for all active rows (Bit)
+            table.set_bool(row_idx, cols::MU, true);
         }
-        // limb_shift[3] is virtual: not stored in the trace
 
-        // μ = 1 for all active rows (Bit)
-        table.set_bool(row_idx, cols::MU, true);
-    }
-
-    // Padding rows: set ZBS=1 per spec. All other columns remain 0.
-    // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
-    // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
-    for row_idx in operations.len()..num_rows {
-        table.set_bool(row_idx, cols::ZBS, true);
-    }
-
-    trace
+        // Padding rows: set ZBS=1 per spec. All other columns remain 0.
+        // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
+        // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
+        for row_idx in len..num_rows {
+            table.set_bool(row_idx, cols::ZBS, true);
+        }
+    })
 }
 
 // =========================================================================
@@ -923,113 +965,275 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
 // Bitwise operation collection
 // =========================================================================
 
-use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 
 /// Collect BITWISE table lookups needed by a set of shift operations.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
     // No deduplication: each operation has μ=1, matching generate_shift_trace.
     let mut bitwise_ops = Vec::new();
-
     for op in operations {
-        let aux = op.compute_aux();
-        let left = !op.direction;
-        let right = op.direction;
+        for_each_lookup(op, |lookup| bitwise_ops.push(lookup));
+    }
+    bitwise_ops
+}
 
-        // C14: MSB16[in[3]] | signed
-        if op.signed {
-            let x = (op.in_halves[3] & 0xFF) as u8;
-            let y = (op.in_halves[3] >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
+pub(crate) fn count_bitwise_from_shift(
+    operations: &[ShiftOperation],
+    histogram: &mut BitwiseHistogram,
+) {
+    for op in operations {
+        for_each_lookup(op, |lookup| histogram.bump(lookup));
+    }
+}
+
+#[inline]
+fn for_each_lookup(op: &ShiftOperation, mut emit: impl FnMut(BitwiseOperation)) {
+    let aux = op.compute_aux();
+    let left = !op.direction;
+    let right = op.direction;
+
+    // C14: MSB16[in[3]] | signed
+    if op.signed {
+        let x = (op.in_halves[3] & 0xFF) as u8;
+        let y = (op.in_halves[3] >> 8) as u8;
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
+            x,
+            y,
+        ));
+    }
+
+    // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
+    if left {
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            op.shift,
+            15,
+        ));
+    }
+
+    // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
+    if right {
+        let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
+        let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            complement,
+            15,
+        ));
+    }
+
+    // C3: ZERO[bit_shift] | μ (= 1)
+    emit(BitwiseOperation::zero(aux.bit_shift as u32));
+
+    // C4.i + C7: HWSL paired lookups | 1-zbs
+    // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
+    // from the same input in a single bus interaction.
+    if !aux.zbs {
+        for i in 0..4 {
+            let x = (op.in_halves[i] & 0xFF) as u8;
+            let y = (op.in_halves[i] >> 8) as u8;
+            emit(BitwiseOperation::shift_op(
+                BitwiseOperationType::Hwsl,
                 x,
                 y,
-            ));
-        }
-
-        // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
-        if left {
-            bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::ByteAluAnd,
-                op.shift,
-                15,
-            ));
-        }
-
-        // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
-        if right {
-            let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
-            let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
-            bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::ByteAluAnd,
-                complement,
-                15,
-            ));
-        }
-
-        // C3: ZERO[bit_shift] | μ (= 1)
-        bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
-
-        // C4.i + C7: HWSL paired lookups | 1-zbs
-        // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
-        // from the same input in a single bus interaction.
-        if !aux.zbs {
-            for i in 0..4 {
-                let x = (op.in_halves[i] & 0xFF) as u8;
-                let y = (op.in_halves[i] >> 8) as u8;
-                bitwise_ops.push(BitwiseOperation::shift_op(
-                    BitwiseOperationType::Hwsl,
-                    x,
-                    y,
-                    aux.bit_shift,
-                ));
-            }
-            // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
-            let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
-            let ext_x = (extension & 0xFF) as u8;
-            let ext_y = (extension >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::shift_op(
-                BitwiseOperationType::Hwsl,
-                ext_x,
-                ext_y,
                 aux.bit_shift,
             ));
         }
-
-        // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
-        let mask = if op.word_instr { 16 } else { 48 };
-        bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::ByteAluAnd,
-            op.shift,
-            mask,
+        // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
+        let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
+        let ext_x = (extension & 0xFF) as u8;
+        let ext_y = (extension >> 8) as u8;
+        emit(BitwiseOperation::shift_op(
+            BitwiseOperationType::Hwsl,
+            ext_x,
+            ext_y,
+            aux.bit_shift,
         ));
-
-        // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
-        // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
-        // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
-        // equality with the CPU's well-formed arg2 high word, so it needs no check.
-        // Padding rows' ARE_BYTES[0, 0] are counted by
-        // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
-        bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            op.shift,
-            ((op.shift_amount >> 8) & 0xFF) as u8,
-        ));
-        let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
-        bitwise_ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (half & 0xFF) as u8,
-            (half >> 8) as u8,
-        ));
-        // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
-        // active row — matches the four IS_HALF senders added in `bus_interactions`.
-        for i in 0..4 {
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (op.in_halves[i] & 0xFF) as u8,
-                (op.in_halves[i] >> 8) as u8,
-            ));
-        }
     }
 
-    bitwise_ops
+    // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
+    let mask = if op.word_instr { 16 } else { 48 };
+    emit(BitwiseOperation::byte_op(
+        BitwiseOperationType::ByteAluAnd,
+        op.shift,
+        mask,
+    ));
+
+    // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
+    // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
+    // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
+    // equality with the CPU's well-formed arg2 high word, so it needs no check.
+    // Padding rows' ARE_BYTES[0, 0] are counted by
+    // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
+    emit(BitwiseOperation::byte_op(
+        BitwiseOperationType::AreBytes,
+        op.shift,
+        ((op.shift_amount >> 8) & 0xFF) as u8,
+    ));
+    let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
+    emit(BitwiseOperation::halfword(
+        BitwiseOperationType::IsHalf,
+        (half & 0xFF) as u8,
+        (half >> 8) as u8,
+    ));
+    // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
+    // active row — matches the four IS_HALF senders added in `bus_interactions`.
+    for i in 0..4 {
+        emit(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (op.in_halves[i] & 0xFF) as u8,
+            (op.in_halves[i] >> 8) as u8,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod count_direct_tests {
+    use super::*;
+
+    #[test]
+    fn count_direct_shift_lookups_match_the_listed_lookups_on_10000_rows() {
+        let mut seed = 0xb2f8_eae9_9838_ab2fu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut direct = BitwiseHistogram::new();
+        let mut listed = BitwiseHistogram::new();
+        for k in 0..10_000 {
+            let flags = next();
+            let right = flags & 1 != 0;
+            let op = ShiftOperation::new(
+                next(),
+                next(),
+                right,
+                right && flags & 2 != 0,
+                flags & 4 != 0,
+            );
+            let want = listed_before_direct(std::slice::from_ref(&op));
+            let mut got = Vec::new();
+            for_each_lookup(&op, |lookup| got.push(lookup));
+            assert_eq!(got, want, "shift row {k}");
+            assert_eq!(
+                collect_bitwise_from_shift(std::slice::from_ref(&op)),
+                want,
+                "listed shift row {k}"
+            );
+            count_bitwise_from_shift(std::slice::from_ref(&op), &mut direct);
+            listed.add_ops(&want);
+        }
+        assert_eq!(direct.digest(), listed.digest());
+    }
+
+    // Original listed implementation, independent of the shared emitter.
+    fn listed_before_direct(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
+        // No deduplication: each operation has μ=1, matching generate_shift_trace.
+        let mut bitwise_ops = Vec::new();
+
+        for op in operations {
+            let aux = op.compute_aux();
+            let left = !op.direction;
+            let right = op.direction;
+
+            // C14: MSB16[in[3]] | signed
+            if op.signed {
+                let x = (op.in_halves[3] & 0xFF) as u8;
+                let y = (op.in_halves[3] >> 8) as u8;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    x,
+                    y,
+                ));
+            }
+
+            // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
+            if left {
+                bitwise_ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::ByteAluAnd,
+                    op.shift,
+                    15,
+                ));
+            }
+
+            // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
+            if right {
+                let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
+                let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
+                bitwise_ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::ByteAluAnd,
+                    complement,
+                    15,
+                ));
+            }
+
+            // C3: ZERO[bit_shift] | μ (= 1)
+            bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
+
+            // C4.i + C7: HWSL paired lookups | 1-zbs
+            // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
+            // from the same input in a single bus interaction.
+            if !aux.zbs {
+                for i in 0..4 {
+                    let x = (op.in_halves[i] & 0xFF) as u8;
+                    let y = (op.in_halves[i] >> 8) as u8;
+                    bitwise_ops.push(BitwiseOperation::shift_op(
+                        BitwiseOperationType::Hwsl,
+                        x,
+                        y,
+                        aux.bit_shift,
+                    ));
+                }
+                // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
+                let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
+                let ext_x = (extension & 0xFF) as u8;
+                let ext_y = (extension >> 8) as u8;
+                bitwise_ops.push(BitwiseOperation::shift_op(
+                    BitwiseOperationType::Hwsl,
+                    ext_x,
+                    ext_y,
+                    aux.bit_shift,
+                ));
+            }
+
+            // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
+            let mask = if op.word_instr { 16 } else { 48 };
+            bitwise_ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluAnd,
+                op.shift,
+                mask,
+            ));
+
+            // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
+            // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
+            // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
+            // equality with the CPU's well-formed arg2 high word, so it needs no check.
+            // Padding rows' ARE_BYTES[0, 0] are counted by
+            // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
+            bitwise_ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                op.shift,
+                ((op.shift_amount >> 8) & 0xFF) as u8,
+            ));
+            let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+            // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
+            // active row — matches the four IS_HALF senders added in `bus_interactions`.
+            for i in 0..4 {
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (op.in_halves[i] & 0xFF) as u8,
+                    (op.in_halves[i] >> 8) as u8,
+                ));
+            }
+        }
+
+        bitwise_ops
+    }
 }

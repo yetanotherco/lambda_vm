@@ -147,6 +147,9 @@ fn solve_y_rejects_inconsistent_oracle_xc() {
     let inv_den = Option::<FieldElement>::from((yp.double() * dx).invert())
         .expect("dx is nonzero for k=12345");
 
+    let f = Fe::from_k256;
+    let (xp, yp, xa, dx, inv_den) = (f(&xp), f(&yp), f(&xa), f(&dx), f(&inv_den));
+    let (xc_correct, xc_wrong) = (f(&xc_correct), f(&xc_wrong));
     assert!(
         solve_y(&xp, &yp, &xa, &xc_correct, &dx, &inv_den).is_some(),
         "correct xc must pass the lambda² check"
@@ -180,4 +183,46 @@ fn odd_y_base_point_reconstructs_correctly() {
     let got = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle)
         .expect("odd-y base point is non-degenerate and must reconstruct correctly");
     assert_eq!(got, expected.to_affine());
+}
+
+/// The precompile's little-endian encodings: a field element's little-endian bytes
+/// are the reversal of its big-endian ones, and `scalar_le` is the reversal of the
+/// scalar's big-endian bytes, on edge values and seeded random ones.
+#[test]
+fn little_endian_encodings() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut scalars = vec![
+        Scalar::ZERO,
+        Scalar::ONE,
+        -Scalar::ONE,
+        Scalar::from(u64::MAX),
+    ];
+    for _ in 0..200 {
+        let mut bytes = [0u8; 32];
+        for chunk in bytes.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&next().to_le_bytes());
+        }
+        let mut reversed = bytes;
+        reversed.reverse();
+        if let Some(fe) = Fe::from_le_bytes(&bytes) {
+            assert_eq!(fe.to_le_bytes(), bytes);
+            assert_eq!(fe.to_be_bytes(), reversed);
+            assert_eq!(
+                Fe::from_be_bytes(&reversed).map(|f| f.to_le_bytes()),
+                Some(bytes)
+            );
+        }
+        scalars.push(<Scalar as Reduce<U256>>::reduce_bytes(&bytes.into()));
+    }
+    for k in scalars {
+        let mut want: [u8; 32] = k.to_bytes().into();
+        want.reverse();
+        assert_eq!(scalar_le(&k), want);
+    }
 }

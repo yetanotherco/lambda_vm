@@ -16,7 +16,6 @@
 
 use std::collections::HashMap;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{
@@ -26,7 +25,7 @@ use stark::lookup::{
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::branch::{self, BranchOperation, generate_branch_trace};
 use crate::tables::lt::{self, LtOperation};
@@ -258,7 +257,7 @@ fn prove_and_verify(
         (&bytes_air, &mut bytes_trace, &()),
         (&balu_air, &mut balu_trace, &()),
     ];
-    let Ok(proof) = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])) else {
+    let Ok(proof) = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])) else {
         panic!("prover failed: the harness must produce a proof for the verifier to judge");
     };
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
@@ -271,10 +270,10 @@ fn prove_and_verify(
         &bytes_air,
         &balu_air,
     ];
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }

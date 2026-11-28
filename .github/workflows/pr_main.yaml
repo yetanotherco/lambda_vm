@@ -96,6 +96,12 @@ jobs:
         run: |
           make compile-programs-asm
 
+      # The key hashes every source a Rust guest build reads: the guest crates, the guest
+      # runtime (syscalls), the crypto crates guests depend on by path (ethrex-crypto for the
+      # ethrex guest; crypto and math for keccak_transcript_pattern), the target spec and the
+      # Makefile's recipe. An exact hit skips the compile step below, so a change confined to
+      # one of them that the key missed would run every test on a stale ELF. The same key
+      # appears in each job that restores these ELFs.
       - name: Cache compiled Rust ELF artifacts and build cache
         id: cache-rust-elfs
         uses: actions/cache@v4
@@ -103,7 +109,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -197,11 +203,57 @@ jobs:
         run: make test-ethrex-crypto
 
   # "Test" is a required check — keep this name to avoid branch protection changes.
-  # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
+  # This gate job passes only when CLI, executor, and prover tests succeed.
+  host-kat:
+    # The device kernels' known-answer gates. `make test-*-host-kat` compiles the
+    # REAL `.cu` sources as host C++ through
+    # `crypto/math-cuda/tests/host_kat/cuda_host_shim.h` and runs them against
+    # external vectors (the official BLAKE3 vectors, miden-crypto's RPO vectors)
+    # and the committed oracle tables — g++ only, no CUDA, no cargo, seconds. It
+    # is the only per-PR check on the kernel arithmetic: the GPU parity suites
+    # (gpu-tests.yml) run on merge_group alone, and until this job existed the
+    # host-KAT targets lived in no workflow at all. Arithmetic only — nvcc
+    # acceptance and everything about execution stay with the GPU tests.
+    name: Host KAT (kernel pins)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: BLAKE3 host-KAT (7-round and 6-round arms)
+        run: make test-blake3-host-kat
+
+      - name: RPX host-KAT (permutation, leaf sponge, parent, leaf and tree kernels)
+        run: make test-rpx-host-kat
+
+      - name: Column-major LDE engine host-KAT (NTT passes, coset LDE)
+        run: make test-ntt-cm-host-kat
+
+      - name: WHIR host-KAT (fused round fold, lean first rounds)
+        run: make test-whir-host-kat
+
+      - name: GKR host-KAT (layer rounds over an input layer kept without its padding)
+        run: make test-gkr-host-kat
+
+      - name: Commit-time answers host-KAT (columns' values at one point, one pass)
+        run: make test-eq-dot-host-kat
+
+      - name: Round-slot host-KAT (a round's sums reduced by its last block)
+        run: make test-round-slot-host-kat
+
+      # Second source for the TABLES the BLAKE3 host-KAT trusts: upstream
+      # BLAKE3's portable C with its round loop parameterised, against the
+      # committed 6-round vectors and the Python oracle. A ~1 s C compile plus a
+      # few seconds of Python (cc + python3, both on the runner); it too had no
+      # workflow before this job.
+      - name: BLAKE3 second-source check of the 6-round tables
+        run: make test-blake3-second-source
+
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-cli, test-prover, test-disk-spill, test-stark-cuda-lib]
+    needs: [test-executor, test-cli, test-prover, test-stark-cuda-lib, host-kat]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -209,14 +261,14 @@ jobs:
           executor="${{ needs.test-executor.result }}"
           cli="${{ needs.test-cli.result }}"
           prover="${{ needs.test-prover.result }}"
-          disk_spill="${{ needs.test-disk-spill.result }}"
           stark_cuda_lib="${{ needs.test-stark-cuda-lib.result }}"
+          host_kat="${{ needs.host-kat.result }}"
 
           echo "test-executor: $executor"
           echo "test-cli: $cli"
           echo "test-prover: $prover"
-          echo "test-disk-spill: $disk_spill"
           echo "test-stark-cuda-lib: $stark_cuda_lib"
+          echo "host-kat: $host_kat"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
@@ -228,71 +280,12 @@ jobs:
           if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then
             exit 1
           fi
-          if [[ "$disk_spill" != "success" && "$disk_spill" != "skipped" ]]; then
-            exit 1
-          fi
           if [[ "$stark_cuda_lib" != "success" && "$stark_cuda_lib" != "skipped" ]]; then
             exit 1
           fi
-
-  test-disk-spill:
-    name: Disk-spill tests
-    runs-on: ubuntu-latest
-    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Setup Rust Environment
-        uses: ./.github/actions/setup-rust
-
-      - name: Cache cargo build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "lambda-vm-disk-spill"
-          cache-all-crates: "true"
-
-      - name: Cache compiled ASM ELF artifacts
-        id: cache-asm-elfs
-        uses: actions/cache@v4
-        with:
-          path: executor/program_artifacts/asm
-          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
-
-      - name: Install clang and lld
-        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y clang lld
-
-      - name: Compile ASM programs to ELF
-        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
-        run: |
-          make compile-programs-asm
-
-      - name: Cache compiled Rust ELF artifacts and build cache
-        id: cache-rust-elfs
-        uses: actions/cache@v4
-        with:
-          path: |
-            executor/program_artifacts/rust
-            executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
-          restore-keys: |
-            rust-elf-artifacts-
-
-      - name: Compile Rust programs to ELF
-        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
-        run: |
-          make compile-programs-rust
-
-      - name: Run stark disk-spill tests
-        run: |
-          cargo test --release -p stark --features disk-spill disk_spill
-
-      - name: Run prover disk-spill tests
-        env:
-          FORCE_DISK_SPILL: "1"
-        run: |
-          cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
+          if [[ "$host_kat" != "success" && "$host_kat" != "skipped" ]]; then
+            exit 1
+          fi
 
   test-stark-cuda-lib:
     name: Stark cuda-feature lib tests
@@ -347,7 +340,13 @@ jobs:
         run: |
           cargo nextest archive --release \
             -p lambda-vm-prover -p stark -p crypto -p ecsm \
+            --features lambda-vm-prover/test-security \
             --archive-file prover-tests.tar.zst
+
+      # The prover shards skip the tests listed in .config/ci-slow-tests.txt (they run in full on the project's own
+      # machines). Fails unless the filter skips exactly the listed tests and every test binary keeps a test.
+      - name: Check the slow-test list against the archive
+        run: python3 scripts/ci_slow_tests.py check prover-tests.tar.zst
 
       - name: Upload test archive
         uses: actions/upload-artifact@v4
@@ -357,13 +356,15 @@ jobs:
           retention-days: 1
 
   test-prover:
-    name: Prover tests (${{ matrix.partition }}/4)
+    name: Prover tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: build-prover-tests
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4]
+        partition:
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+           23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -391,7 +392,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -432,21 +433,24 @@ jobs:
         with:
           name: prover-tests
 
-      - name: Run prover tests (shard ${{ matrix.partition }}/4)
+      - name: Run prover tests (shard ${{ matrix.partition }}/${{ strategy.job-total }})
         # Shard 1 only: force k > 1 so the per-table admission scheduler really
         # runs several table closures concurrently. ubuntu-latest has 2-4 vCPU
         # and table_parallelism() defaults to (cores / 3).max(1), so every
         # other shard proves with a single driver thread and never exercises
         # the concurrent path or VramGate's blocking path on a PR. The other
-        # three shards keep the default-k coverage. An empty value on those
+        # shards keep the default-k coverage. An empty value on those
         # fails to parse and falls back to the default, so this is inert there.
+        # The project's own machines run the remaining slow fixtures in .config/ci-slow-tests.txt.
+        # Round-robin within each binary spreads adjacent fixture cases across shards.
         env:
           TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
-            --partition hash:${{ matrix.partition }}/4 \
-            --test-threads=1
+            --partition count:${{ matrix.partition }}/${{ strategy.job-total }} \
+            --test-threads=1 \
+            -E "$(python3 scripts/ci_slow_tests.py expr)"
 
   test-prover-comprehensive:
     name: Prover comprehensive tests
@@ -480,7 +484,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -526,7 +530,7 @@ jobs:
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
             --test-threads=1 \
-            -E 'test(test_prove_elfs_all_instructions_64_full) | test(test_recursion_execute)' \
+            -E 'test(=tests::prove_elfs_tests::test_prove_elfs_all_instructions_64_full) | test(=tests::recursion_smoke_test::test_recursion_execute) | test(=tests::recursion_smoke_test::test_recursion_execute_1query)' \
             --run-ignored ignored-only
 
   # Seed ELF caches on refs/heads/main so merge-queue runs can restore them.
@@ -564,7 +568,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 

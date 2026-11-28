@@ -210,3 +210,10 @@ tag = "KECCAK_RC"
 kind = "interaction"
 input = ["BaseField"]
 output = ["Byte", 8]
+
+# Keccak-256 of a buffer: KECCAK's sponge-mode chain from one block to the next
+# KECCAK_SPONGE[key, count, src, out, state]
+[[signatures]]
+tag = "KECCAK_SPONGE"
+kind = "interaction"
+input = ["DWordWL", "BaseField", "DWordWL", "DWordWL", [[["Byte", 8], 5], 5]]

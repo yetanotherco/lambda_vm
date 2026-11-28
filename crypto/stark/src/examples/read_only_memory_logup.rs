@@ -3,13 +3,15 @@
 //! <https://blog.lambdaclass.com/logup-lookup-argument-and-its-implementation-using-lambdaworks-for-continuous-read-only-memory/>
 
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 use crate::{
+    constraint_ir::ConstraintProgram,
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
-            run_transition_prover, run_transition_verifier,
+            CaptureBuilder, ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain,
+            num_base_from_meta, run_transition_prover, run_transition_verifier,
         },
     },
     context::AirContext,
@@ -96,6 +98,11 @@ where
 {
     context: AirContext,
     meta: Vec<ConstraintMeta>,
+    /// The captured IR of [`LogReadOnlyRAPConstraints`], built on first use by
+    /// [`AIR::constraint_program`] (the CUDA composition arm needs it once main
+    /// and aux are device-resident). Same body as the folders, so the device
+    /// evaluates the same polynomials as the CPU path.
+    program: OnceLock<ConstraintProgram<F, E>>,
     phantom: PhantomData<(F, E)>,
 }
 
@@ -148,6 +155,7 @@ where
         Self {
             context,
             meta,
+            program: OnceLock::new(),
             phantom: PhantomData,
         }
     }
@@ -277,6 +285,16 @@ where
 
     fn num_base_transition_constraints(&self) -> usize {
         num_base_from_meta(&ConstraintSet::<F, E>::meta(&LogReadOnlyRAPConstraints))
+    }
+
+    fn constraint_program(&self) -> &ConstraintProgram<Self::Field, Self::FieldExtension> {
+        // Prover/GPU/tests only (the verify path never calls this): capture
+        // the single constraint body once.
+        self.program.get_or_init(|| {
+            let mut cb = CaptureBuilder::<F, E>::new();
+            LogReadOnlyRAPConstraints.eval(&mut cb);
+            cb.finish(num_base_from_meta(&self.meta)).0
+        })
     }
 
     fn context(&self) -> &AirContext {

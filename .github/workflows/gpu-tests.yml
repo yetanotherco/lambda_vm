@@ -56,8 +56,7 @@ jobs:
     # Skip on PRs (reports as Skipped = required check satisfied, no GPU rental); run for
     # real on merge_group and manual dispatch.
     if: github.event_name != 'pull_request'
-    # Provisioning + cuda builds + 6 test groups; the prover suite (single-threaded, real
-    # ELF proves) dominates. Generous ceiling; teardown still always destroys the box.
+    # Provisioning, CUDA builds and all eight test groups. Leave room for a cold build.
     timeout-minutes: 240
     steps:
       - name: Install Vast CLI
@@ -290,9 +289,13 @@ jobs:
           # Check out the ref under test on the box, then run the CUDA test groups.
           # gpu_test.sh owns the SYSROOT_DIR default — don't duplicate it here. (cudarc's CUDA
           # version is pinned in crypto/math-cuda/Cargo.toml, so no CUDARC_PIN is needed.)
-          REMOTE="set -e; cd /workspace/lambda_vm; \
+          REMOTE="set -eo pipefail; cd /workspace/lambda_vm; \
             git fetch --force origin '$REF'; \
             git checkout -f FETCH_HEAD; \
+            nextest_dir=\$(mktemp -d); \
+            trap 'rm -rf \"\$nextest_dir\"' EXIT; \
+            curl --retry 3 -fsSL https://get.nexte.st/0.9.129/linux | tar -xz -C \"\$nextest_dir\" cargo-nextest; \
+            export PATH=\"\$nextest_dir:\$PATH\"; \
             bash scripts/gpu_test.sh"
 
           # pipefail so a test failure on the box propagates through the tee pipe and FAILS this
@@ -300,7 +303,7 @@ jobs:
           # 2>&1 so remote stderr (build errors, panics) is captured too — both into the live
           # step log and the file the run-summary step tails.
           set -o pipefail
-          $SSH "bash -lc \"$REMOTE\"" 2>&1 | tee "$RUNNER_TEMP/gpu_test_out.txt"
+          $SSH "bash -lc $(printf '%q' "$REMOTE")" 2>&1 | tee "$RUNNER_TEMP/gpu_test_out.txt"
 
       - name: Write run summary
         if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
@@ -314,10 +317,19 @@ jobs:
               echo "All GPU test groups passed."
             else
               # Group the failed tests under the make target that ran them: gpu_test.sh prints
-              # "=== make <target> ===" before each group, and cargo prints "test <name> ... FAILED".
+              # "=== make <target> ===" before each group. Accept both libtest and nextest failures.
               report=$(awk '
-                /^=== make / { grp=$3; next }
-                / \.\.\. FAILED/ { fails[grp]=fails[grp] "\n    - " $2; n[grp]++ }
+                function failure(name) {
+                  if (!seen[grp,name]++) { fails[grp]=fails[grp] "\n    - " name; n[grp]++ }
+                }
+                /^=== make / { grp=$3; docs=0; next }
+                /^[[:space:]]*Doc-tests / { docs=1; next }
+                /^test .* \.\.\. FAILED/ && (grp != "test-prover-cuda" || docs) { failure($2) }
+                /^[[:space:]]*(FAIL|TIMEOUT|EXECFAIL)[[:space:]]+\[/ {
+                  name=$0
+                  sub(/^[^]]*\][[:space:]]*(\([^)]*\)[[:space:]]*)?/, "", name)
+                  failure(name)
+                }
                 END { for (g in fails) printf "- **%s** (%d failed):%s\n", g, n[g], fails[g] }
               ' "$OUT" 2>/dev/null || true)
               # Per-test panic/assertion messages: each "thread '…' panicked at …:" block plus

@@ -1,8 +1,7 @@
 //! Tests for the IS_WH table and the IS_WHH template (spec #1003, #1015, #1017),
 //! and for the KECCAK `state_ptr` that is their first caller.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::bitwise::{
@@ -41,6 +40,7 @@ fn keccak_op(state_addr: u64) -> KeccakOperation {
         state_addr,
         input: [0x0102_0304_0506_0708; 25],
         output: [0; 25],
+        sponge: None,
     }
 }
 
@@ -278,15 +278,8 @@ fn full_traces(name: &str) -> (Vec<u8>, Elf, Traces) {
         .run()
         .expect("run")
         .logs;
-    let traces = Traces::from_elf_and_logs(
-        &program,
-        &logs,
-        &MaxRowsConfig::default(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let traces = Traces::from_elf_and_logs(&program, &logs, &MaxRowsConfig::default(), &[])
+        .expect("trace build");
     (elf_bytes, program, traces)
 }
 
@@ -299,7 +292,9 @@ fn prove_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> bool {
 
 /// [`prove_keccak_with`] for any asm program.
 fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
-    let options = crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
+    let options = crate::GoldilocksCubicProofOptions::with_blowup(2)
+        .map(crate::security_posture::stark_options)
+        .expect("blowup=2 is valid");
     let (elf_bytes, program, mut traces) = full_traces(name);
 
     rewrite(&mut traces);
@@ -321,7 +316,8 @@ fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
             &options,
             &crate::tables::register::register_init_from_entry_point(program.entry_point),
             &traces,
-        ),
+        )
+        .preprocessed(),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces
@@ -329,7 +325,7 @@ fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
         .iter()
         .filter(|c| c.is_private_input)
         .count();
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -340,11 +336,10 @@ fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
         &runtime_page_ranges,
         options.fri_final_poly_log_degree,
     );
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .expect("prover must build the crafted proof; a prover refusal is not a verifier rejection");
     let proof = VmProof {

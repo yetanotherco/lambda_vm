@@ -168,6 +168,60 @@ fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
 /// - **`memory` bus (4 total)**: consume_pc (x2) + emit_pc (x2) at `ts = timestamp+1`,
 ///   bridging the last real PC write to the PC=1 padding chain.
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    let mut interactions = finalization_interactions();
+    pc_bridge_tokens32(&mut interactions);
+    interactions
+}
+
+/// HALT's interactions under the register format that checks a CPU row's
+/// accesses in the row itself (`tables::register::RegisterFormat::InRow`):
+/// the ECALL receiver and the 31 MEMW finalizations as today (the residual register table receives
+/// them), and the PC bridge as one 64-bit token on [`BusId::Reg`]: consume
+/// `(255, T + 1, pc)`, produce `(255, T + 1, 1, 0)`.
+pub fn bus_interactions_inrow() -> Vec<BusInteraction> {
+    let mut interactions = finalization_interactions();
+    let ts_plus_one = || {
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP_0,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << 32,
+                column: cols::TIMESTAMP_1,
+            },
+            LinearTerm::Constant(1),
+        ])
+    };
+    let column = |c: usize| BusValue::Packed {
+        start_column: c,
+        packing: Packing::Direct,
+    };
+    interactions.push(BusInteraction::sender(
+        BusId::Reg,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(255),
+            ts_plus_one(),
+            column(cols::PC_0),
+            column(cols::PC_1),
+        ],
+    ));
+    interactions.push(BusInteraction::receiver(
+        BusId::Reg,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(255),
+            ts_plus_one(),
+            BusValue::constant(1),
+            BusValue::constant(0),
+        ],
+    ));
+    interactions
+}
+
+/// The ECALL receiver and the 31 register finalizations (MEMW sends).
+fn finalization_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(36);
 
     // ECALL receiver: receives [timestamp, cast(rv1, DWordWL)] from CPU
@@ -216,6 +270,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
+    interactions
+}
+
+/// Today's PC bridge: two 32-bit word tokens on the Memory bus.
+fn pc_bridge_tokens32(interactions: &mut Vec<BusInteraction>) {
     // PC finalization on the low-level `memory` token bus at ts = timestamp + 1
     // (per spec halt:c:consume_pc / halt:c:emit_pc). The CPU's halting row wrote
     // its real `next_pc` to x255 (addresses 510/511) at this same timestamp; we
@@ -268,6 +327,4 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
     }
-
-    interactions
 }

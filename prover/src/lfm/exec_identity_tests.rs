@@ -1,0 +1,1564 @@
+//! The gate on `execute`'s schedule: the witness is a pure function of the
+//! program and its arenas, so **which order** the executor evaluates the program
+//! in may not change one word of it.
+//!
+//! This is the sibling of [`super::trace_identity_tests`] one stage earlier in
+//! the pipeline. That file gates the row walk that turns records into traces;
+//! this one gates the interpreter that produces the records in the first place.
+//! Together they pin the whole host side of a proof against a schedule change:
+//! program → records (here) → traces (there).
+//!
+//! ## The two arms
+//!
+//! [`reference`] is the serial `for instr in &program.instrs` loop the file has
+//! always had. [`candidate`] is [`Schedule::LevelParallel`]: each depth level's
+//! mutually independent hash instructions on rayon's global pool, everything
+//! else serial and in program order.
+//!
+//! ⚠ The knob that selects the schedule in production cannot be the thing this
+//! test flips. A knob that caches its environment read in a `OnceLock` is
+//! read once a process, so a test that set it per-case would gate whichever
+//! arm happened to run first. The two
+//! arms are therefore reached by an explicit argument, the way
+//! `build_traces_walked` takes a [`super::trace::Walk`], and the environment
+//! chooses only the production default.
+//!
+//! ## What is compared
+//!
+//! Everything an [`LfmExecution`] carries: every memory address through the
+//! public accessor (including *unwritten*, which must stay unwritten on both
+//! sides — the write-once bit is the only thing separating that from a written
+//! zero), the const counter, all ten record vectors element for element, and
+//! `public_words`.
+//!
+//! Elements are compared through their derived `Debug`, which prints a
+//! `FieldElement`'s **raw** `u64` rather than its canonical residue. That is
+//! deliberate and is strictly stronger than `==` on the field, whose `eq`
+//! canonicalises both sides (`goldilocks.rs:157`): two executions of the same
+//! instruction stream perform the same arithmetic in the same order, so they owe
+//! each other bit equality, not just congruence. It also means no field of any
+//! record type is transcribed here — a row that grows a column is compared on
+//! its new column the day it grows one, with no edit to this file.
+
+use super::executor::{LfmExecError, LfmExecution, Schedule, execute_scheduled};
+use super::instr::Addr;
+use super::trace_identity_tests::{Case, cases};
+
+/// The cut-off the candidate arm runs at, and it is not the production one.
+///
+/// ⛔ The laptop cases are 15 wide at their widest level (printed by the gate
+/// below). Anything at or above 16 — which `PRODUCTION_COALESCE_BELOW` is —
+/// would send every level of every case down the serial branch, and this file
+/// would then pass whatever the parallel path did, on every run, forever. At 2,
+/// every level of width ≥ 2 really forks.
+const GATE_COALESCE_BELOW: usize = 2;
+
+/// The serial reference: the interpreter as it stands.
+fn reference(case: &Case) -> LfmExecution {
+    execute_scheduled(&case.program, &case.arenas, &case.hasher, Schedule::Serial)
+        .unwrap_or_else(|e| panic!("{}: the reference must execute: {e:?}", case.name))
+}
+
+/// The schedule under test: levels, on rayon's global pool.
+fn candidate(case: &Case) -> LfmExecution {
+    execute_scheduled(
+        &case.program,
+        &case.arenas,
+        &case.hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{}: the candidate must execute: {e:?}", case.name))
+}
+
+/// Two record vectors, element for element, with the first divergence named.
+///
+/// Generic over the row type and asking only for `Debug`, so it covers a chip
+/// whose row struct this file has never heard of.
+fn assert_rows_identical<T: std::fmt::Debug>(case: &str, chip: &str, a: &[T], b: &[T]) {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{case}/{chip}: the two schedules produced different row counts"
+    );
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let (dx, dy) = (format!("{x:?}"), format!("{y:?}"));
+        assert_eq!(
+            dx,
+            dy,
+            "{case}/{chip}: the two schedules disagree at record {i} of {}",
+            a.len()
+        );
+    }
+}
+
+/// Asserts two executions are the same object, and says where they first differ
+/// if they are not.
+pub(super) fn assert_executions_identical(
+    case: &str,
+    num_addrs: u64,
+    a: &LfmExecution,
+    b: &LfmExecution,
+) {
+    // Memory first: it is the object every record is derived from, so a
+    // divergence here localises the failing instruction by its destination
+    // address, which is its position in emission order.
+    for i in 0..num_addrs {
+        let (x, y) = (a.memory.get(Addr(i)), b.memory.get(Addr(i)));
+        let (dx, dy) = (format!("{x:?}"), format!("{y:?}"));
+        assert_eq!(
+            dx, dy,
+            "{case}: the two schedules left different values at address {i}"
+        );
+    }
+
+    let (ra, rb) = (&a.records, &b.records);
+    assert_eq!(
+        ra.num_consts, rb.num_consts,
+        "{case}: the const count moved with the schedule"
+    );
+    assert_rows_identical(case, "LFM_BALU", &ra.balu, &rb.balu);
+    assert_rows_identical(case, "LFM_XALU", &ra.xalu, &rb.xalu);
+    assert_rows_identical(case, "LFM_SELECT", &ra.select, &rb.select);
+    assert_rows_identical(case, "LFM_BITDEC", &ra.bitdec, &rb.bitdec);
+    assert_rows_identical(case, "LFM_HASH", &ra.hash, &rb.hash);
+    assert_rows_identical(case, "LFM_KECCAK", &ra.keccak, &rb.keccak);
+    assert_rows_identical(case, "LFM_BLAKE3", &ra.blake3, &rb.blake3);
+    assert_rows_identical(case, "LFM_LANES", &ra.lanes, &rb.lanes);
+    assert_rows_identical(case, "LFM_HINT", &ra.hint, &rb.hint);
+    assert_rows_identical(case, "LFM_PUBLIC", &ra.public, &rb.public);
+    assert_rows_identical(case, "LFM_HASH16", &ra.hash16, &rb.hash16);
+    assert_rows_identical(case, "B3L_HEAD", &ra.b3l, &rb.b3l);
+    assert_rows_identical(case, "LEAN_MUX", &ra.mux, &rb.mux);
+    assert_rows_identical(case, "LEAN_CAP", &ra.cap, &rb.cap);
+    assert_rows_identical(case, "LEAN_CAP_READ", &ra.cap_read, &rb.cap_read);
+    assert_rows_identical(case, "public_words", &a.public_words, &b.public_words);
+}
+
+/// ★ Lean BLAKE3 compressions run in the levels as hashes do, beside width-16
+/// hash rows: a program that interleaves the two in independent chains is
+/// byte-identical under the level schedule (forking at every level of width 2
+/// or more) and the serial reference — memory, every record vector, and each
+/// chip's rows in program order, though a level holds the two chips' rows
+/// together.
+#[test]
+fn lean_compressions_and_width_16_hashes_run_in_levels_identically() {
+    use super::builder::{B3Block, B3Cv, Cell, LfmBuilder};
+    use crate::tables::types::FE;
+    let mut b = LfmBuilder::new();
+    let mut publics = Vec::new();
+    for chain in 0..6u64 {
+        let w: Vec<Cell> = (0..4u64)
+            .map(|k| b.digest_const([FE::from(chain * 100 + k); 4]).as_cell())
+            .collect();
+        let mut cv = B3Cv::Iv;
+        let mut h16 = [w[0], w[1], w[2], w[3]];
+        for step in 0..5u64 {
+            let d = b.b3_compress(
+                cv,
+                B3Block::Lanes([w[0], w[1], w[2], w[3]]),
+                64,
+                (step % 16) as u8,
+            );
+            cv = B3Cv::Words(d);
+            h16 = b.hash16(h16);
+            if step % 2 == 1 {
+                let (_, rev) =
+                    b.b3_compress_rev(B3Cv::Iv, B3Block::Felts([h16[0], h16[1]]), 64, 11);
+                publics.push(rev[0]);
+            }
+        }
+        if let B3Cv::Words(d) = cv {
+            publics.push(d[1]);
+        }
+        publics.push(h16[2]);
+    }
+    for c in &publics {
+        b.public(*c);
+    }
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let hasher = super::hash::HasherKind::Poseidon1W16;
+    let a = execute_scheduled(&program, &[], &hasher, Schedule::Serial).expect("serial");
+    let c = execute_scheduled(
+        &program,
+        &[],
+        &hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .expect("levels");
+    assert_executions_identical("lean+hash16", program.num_addrs, &a, &c);
+    assert!(c.split.parallel_levels > 0, "the candidate forked");
+    assert_eq!(a.records.b3l.len(), 6 * 7);
+    assert_eq!(a.records.hash16.len(), 6 * 5);
+}
+
+/// ★ The gate. Both schedules, every case, word for word.
+#[test]
+fn the_parallel_executor_is_byte_identical_to_the_serial_reference() {
+    // Records a schedule change could reorder. A case list that gave some chip
+    // no rows would satisfy the comparison above on that chip vacuously.
+    let mut covered: Vec<&str> = Vec::new();
+    let (mut widest, mut deepest) = (0u32, 0usize);
+
+    for case in cases() {
+        let a = reference(&case);
+        let b = candidate(&case);
+        assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+
+        // ★ The candidate must have USED the path under test. Without this the
+        // whole file is satisfied by a candidate that coalesced every level onto
+        // the calling thread and ran the serial code twice.
+        assert_eq!(
+            a.split.parallel_levels, 0,
+            "{}: the reference arm must not schedule levels at all",
+            case.name
+        );
+        if b.split.levels > 1 {
+            assert!(
+                b.split.parallel_levels > 0 && b.split.parallel_hashes > 0,
+                "{}: the candidate coalesced all {} levels onto the calling \
+                 thread, so nothing this test compares went through rayon",
+                case.name,
+                b.split.levels
+            );
+        }
+
+        let r = &a.records;
+        for (chip, rows) in [
+            ("LFM_BALU", r.balu.len()),
+            ("LFM_XALU", r.xalu.len()),
+            ("LFM_SELECT", r.select.len()),
+            ("LFM_BITDEC", r.bitdec.len()),
+            ("LFM_HASH", r.hash.len()),
+            ("LFM_KECCAK", r.keccak.len()),
+            ("LFM_BLAKE3", r.blake3.len()),
+            ("LFM_LANES", r.lanes.len()),
+            ("LFM_HINT", r.hint.len()),
+            ("LFM_PUBLIC", r.public.len()),
+        ] {
+            if rows > 0 && !covered.contains(&chip) {
+                covered.push(chip);
+            }
+        }
+
+        // ★ The ONE thing that decides whether this gate says anything about a
+        // level-parallel schedule: the shape of the DAG it runs over. A case
+        // whose hash levels are all one wide takes the serial path in both arms
+        // however the candidate is built, and would pass a broken parallel
+        // executor without ever forking.
+        let p = super::reach_profile::profile(&case.program);
+        widest = widest.max(p.widest_level());
+        deepest = deepest.max(p.hash_depth);
+        println!(
+            "{:<18} addrs {:>7}  instrs {:>6}  hash rows {:>6}  \
+             records {:>6}  public {:>4}  hash depth {:>4}  widest level {:>4}",
+            case.name,
+            case.program.num_addrs,
+            case.program.instrs.len(),
+            r.hash.len(),
+            r.balu.len() + r.xalu.len() + r.select.len() + r.bitdec.len() + r.lanes.len(),
+            a.public_words.len(),
+            p.hash_depth,
+            p.widest_level(),
+        );
+    }
+
+    for chip in RECORDED_CHIPS {
+        assert!(
+            covered.contains(chip),
+            "no case gave {chip} a record, so the two schedules were never \
+             compared on it and the gate is vacuous there. Add a case that \
+             exercises it rather than dropping it from this list."
+        );
+    }
+
+    // ⚠ The SHAPE guard, and it is the one that decides what this test is worth.
+    // A schedule can only be wrong where there is a choice to get wrong: over a
+    // program of depth 1, or of width 1 at every level, every schedule is the
+    // same schedule. These bounds are what the case list happens to provide, so
+    // a case list that shrank below them would be caught here rather than by a
+    // green run that gated nothing.
+    assert!(
+        widest >= MIN_WIDEST_LEVEL,
+        "the widest hash level across every case is {widest}, under {MIN_WIDEST_LEVEL}: \
+         there is not enough independent work here for two schedules to differ, \
+         so a green run would mean nothing"
+    );
+    assert!(
+        deepest >= MIN_HASH_DEPTH,
+        "the deepest hash chain across every case is {deepest}, under {MIN_HASH_DEPTH}: \
+         a program this shallow has almost no level boundaries to get wrong"
+    );
+    println!(
+        "shape: widest hash level {widest} · deepest hash chain {deepest} \
+         (floors {MIN_WIDEST_LEVEL} / {MIN_HASH_DEPTH})"
+    );
+}
+
+/// ⛔ The laptop's case list is a TOY next to a wrap (17,627 wide and 2,237 deep
+/// on the 2026-09-12 reading; these cases measure **15 wide and 14 deep**, and
+/// only the two `FriToyV0` cases have any `Instr::Hash` at all — the two sponge
+/// programs drive the keccak and BLAKE3 chips, which are not hash rows). The
+/// floors below are what the list does provide, held against shrinkage; they are
+/// not a claim that this gate covers production shapes. The gate that does is
+/// the tree-scale `IDENTITY:` diff.
+///
+/// ⚠ **A consequence for the schedule, and it is load-bearing.** A level-parallel
+/// executor wants to run narrow levels serially — a width-1 level on rayon is a
+/// fork/join for one permutation. Any such cut-off at or above 15 would send
+/// **every** level of every case here down the serial path, and this test would
+/// then pass whatever the parallel path did. The candidate arm must therefore be
+/// reached with the cut-off lowered to 2, so each of these levels really forks;
+/// the production default is a separate number.
+const MIN_WIDEST_LEVEL: u32 = 8;
+const MIN_HASH_DEPTH: usize = 8;
+
+/// The chips the executor pushes a record for. `LFM_CONST` is absent because it
+/// keeps a counter rather than a vector, and it is asserted separately.
+const RECORDED_CHIPS: &[&str] = &[
+    "LFM_BALU",
+    "LFM_XALU",
+    "LFM_SELECT",
+    "LFM_BITDEC",
+    "LFM_HASH",
+    "LFM_KECCAK",
+    "LFM_BLAKE3",
+    "LFM_LANES",
+    "LFM_HINT",
+    "LFM_PUBLIC",
+];
+
+/// The record-slot plan's unit cost, pinned.
+///
+/// A level-parallel executor pre-sizes `records.hash` and has each hash write
+/// its own slot, so the vector's footprint is the plan's memory cost and is
+/// quoted in the design note. It is twelve `IN` felts and twelve `OUT` felts of
+/// eight bytes with nothing else in the struct; pinning it here is what stops
+/// that quote from becoming a stale number if a column is ever added.
+#[test]
+fn a_hash_record_slot_is_192_bytes() {
+    assert_eq!(
+        std::mem::size_of::<super::executor::HashRow>(),
+        192,
+        "a hash record is 24 Goldilocks felts and nothing else"
+    );
+    assert_eq!(
+        std::mem::size_of::<crate::tables::types::FE>(),
+        8,
+        "a Goldilocks felt is one u64, which is what the 192 above is built on"
+    );
+}
+
+/// Every record row's width, pinned.
+///
+/// ⛔ These are the multipliers in `LfmRecords::bytes`, and `bytes` is what the
+/// split line reports as the size of what `setup` first-touches — the figure the
+/// campaign will size the phase against. A row that silently grew a column would
+/// move that figure with nothing to say so, and the arithmetic in the handoff
+/// would go on quoting the old one.
+#[test]
+fn the_record_rows_are_the_widths_the_sizing_assumes() {
+    use super::blake3_chip::Blake3Values;
+    use super::executor::{BaluRow, BitDecRow, HashRow, KeccakRow, SelectRow, XaluRow};
+    use super::word::LfmWord;
+    use std::mem::size_of;
+
+    for (name, got, want) in [
+        ("BaluRow", size_of::<BaluRow>(), 32),
+        ("XaluRow", size_of::<XaluRow>(), 96),
+        ("SelectRow", size_of::<SelectRow>(), 136),
+        ("BitDecRow", size_of::<BitDecRow>(), 528),
+        ("HashRow", size_of::<HashRow>(), 192),
+        ("KeccakRow", size_of::<KeccakRow>(), 744),
+        ("Blake3Values", size_of::<Blake3Values>(), 112),
+        ("LfmWord", size_of::<LfmWord>(), 32),
+    ] {
+        assert_eq!(
+            got, want,
+            "{name} is {got} bytes, not the {want} the sizing assumes"
+        );
+    }
+}
+
+/// ★★ The property the `unsafe` in `commit_slots` rests on: a walk that fails
+/// partway NEVER yields records.
+///
+/// The level walk writes rows into spare capacity and leaves every vector at
+/// length zero until `commit_slots`, which runs at one place after the last
+/// instruction. So a program that errors mid-walk returns `Err` and the
+/// half-written buffers are freed without a single slot being read — the
+/// uninitialised state is not merely unlikely to be observed, it is not
+/// reachable through the API at all.
+///
+/// The merged schedule is a walk that fails partway by construction, which is
+/// what makes this checkable rather than assertable: it errors with rows already
+/// written, and there is still no value for a caller to inspect.
+#[test]
+fn a_failed_walk_yields_no_records_at_all() {
+    let mut checked = 0;
+    for case in cases() {
+        if super::reach_profile::profile(&case.program).hash_rows == 0 {
+            continue;
+        }
+        let out = super::executor::execute_with_merged_levels(
+            &case.program,
+            &case.arenas,
+            &case.hasher,
+            GATE_COALESCE_BELOW,
+            2,
+        );
+        assert!(
+            out.is_err(),
+            "{}: this walk must fail partway, or it is not the case this test needs",
+            case.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no case exercised a partial walk");
+}
+
+/// ★★ THE MUTATION. Merge adjacent depth levels and the executor must FAIL — at
+/// the same address, on every run.
+///
+/// This is what makes the gate above a gate rather than a green light. The level
+/// boundary is the only thing separating a hash from the input another hash
+/// produces; `merge = 2` removes it, and if the executor still produced a
+/// correct witness that would mean the boundary was never doing anything and the
+/// identity assertion was passing for some other reason.
+///
+/// ⓘ It fails deterministically because the workers hold `&WriteOnceMemory` and
+/// nothing holds `&mut` during a level: the premature read finds an unwritten
+/// cell, which is [`LfmExecError::ReadBeforeWrite`], never a race. Three runs,
+/// asserted to name one address, is how that claim is checked rather than
+/// asserted.
+#[test]
+fn merging_adjacent_levels_fails_at_one_address_every_run() {
+    let mut checked = 0;
+    for case in cases() {
+        // A case with no hashes has no level structure to break.
+        if super::reach_profile::profile(&case.program).hash_rows == 0 {
+            continue;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for run in 0..3 {
+            let err = super::executor::execute_with_merged_levels(
+                &case.program,
+                &case.arenas,
+                &case.hasher,
+                GATE_COALESCE_BELOW,
+                2,
+            )
+            .expect_err("a merged schedule launches a hash before its input exists");
+            let LfmExecError::ReadBeforeWrite(addr) = err else {
+                panic!(
+                    "{}: run {run} failed with {err:?}, not ReadBeforeWrite — \
+                     the merged schedule has to fail for the schedule's reason",
+                    case.name
+                );
+            };
+            // ★ And it has to fail for the RIGHT reason: the cell it read too
+            // early must be one a HASH writes. A merge that collapsed the
+            // constants into the first hash level would also raise
+            // ReadBeforeWrite, and would prove nothing about whether a hash can
+            // be launched before the hash it depends on.
+            let writer = case
+                .program
+                .instrs
+                .iter()
+                .find(|i| i.writes().iter().any(|a| a.0 == addr));
+            assert!(
+                matches!(writer, Some(super::instr::Instr::Hash { .. })),
+                "{}: the premature read was of address {addr}, which is written \
+                 by {writer:?} rather than by a hash — the mutation broke some \
+                 other ordering",
+                case.name
+            );
+            seen.push(format!("{err:?}"));
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "{}: three runs of the merged schedule named different addresses \
+             ({seen:?}) — the failure is timing-dependent, which is exactly what \
+             this design is supposed to make impossible",
+            case.name
+        );
+        println!("{:<18} merged levels -> {}", case.name, seen[0]);
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no case had a hash to mis-schedule, so the mutation proved nothing"
+    );
+}
+
+// ==================== the streamed execution ====================
+
+/// A node-shaped program: three "children", each a BLAKE3 sponge over an arena
+/// of its own (independent, as a node's verification of each child is), then a
+/// little work over all three (as a node's cross-child checks are).
+fn three_children_program(len_bytes: usize) -> super::compiler::LfmProgram {
+    use super::builder::LfmBuilder;
+    use super::edsl::{ByteWrapHash, WrapHash, wrap_hash_bytes};
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
+    let mut firsts = Vec::new();
+    for _ in 0..3 {
+        let arena = b.declare_arena(halves);
+        let stream: Vec<_> = (0..halves).map(|i| b.hint_felt(arena, i)).collect();
+        let digest = wrap_hash_bytes(&mut b, ByteWrapHash::Blake3, &stream, len_bytes);
+        b.public(digest[0]);
+        b.public(digest[1]);
+        firsts.push(stream[0]);
+    }
+    let x = b.add(firsts[0], firsts[2]);
+    let y = b.mul(x, firsts[1]);
+    let joined = b.pack_word([x, y, x, y]);
+    b.public(joined);
+    super::compiler::compile(b.finish())
+}
+
+/// `case` streamed: each arena its own group, landing in `order`.
+fn streamed(case: &Case, order: &[usize]) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let groups: Vec<usize> = (0..case.arenas.len()).collect();
+    let mut ex = StreamedExecution::new(&case.program, groups, &case.hasher)
+        .unwrap_or_else(|e| panic!("{}: a streamed execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &g in order {
+        ex.land(g, std::slice::from_ref(&case.arenas[g]))
+            .unwrap_or_else(|e| panic!("{}: group {g} lands: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the streamed execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+fn three_children_case() -> Case {
+    let len = 202;
+    let arena = |seed: u8| -> Vec<super::word::LfmWord> {
+        let msg: Vec<u8> = (0..len)
+            .map(|i| (37 * i as u32 + 11 + 13 * u32::from(seed)) as u8)
+            .collect();
+        super::keccak_host::pack_stream(&msg)
+            .into_iter()
+            .map(super::word::base_word)
+            .collect()
+    };
+    Case {
+        name: "ThreeChildren(202)",
+        program: three_children_program(len),
+        arenas: vec![arena(0), arena(1), arena(2)],
+        hasher: super::hash::HasherKind::Test,
+    }
+}
+
+/// ★ The streamed execution's gate: whatever order the arena groups land in,
+/// the witness is the serial reference's, word for word — on the node-shaped
+/// case in all six orders and on every identity case in two — and on the
+/// node-shaped case most of the program has run before the last group lands.
+#[test]
+fn a_streamed_execution_is_byte_identical_in_any_landing_order() {
+    let node = three_children_case();
+    let reference_node = reference(&node);
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (got, ran) = streamed(&node, &order);
+        assert_executions_identical(node.name, node.program.num_addrs, &reference_node, &got);
+        let n = node.program.instrs.len();
+        assert_eq!(
+            *ran.last().expect("waves"),
+            n,
+            "{order:?}: every instruction ran once"
+        );
+        assert!(
+            ran[2] * 3 >= n * 2,
+            "{order:?}: only {} of {n} instructions ran before the last group landed",
+            ran[2]
+        );
+    }
+    for case in cases() {
+        let a = reference(&case);
+        let k = case.arenas.len();
+        let forward: Vec<usize> = (0..k).collect();
+        let backward: Vec<usize> = (0..k).rev().collect();
+        for order in [forward, backward] {
+            let (b, ran) = streamed(&case, &order);
+            assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+            assert_eq!(*ran.last().expect("waves"), case.program.instrs.len());
+        }
+    }
+}
+
+/// A streamed execution refuses what it cannot run: finishing before every
+/// group has landed, a group landing twice, a group with the wrong number of
+/// arenas or an arena of the wrong length — each an error, not a witness.
+#[test]
+fn a_streamed_execution_refuses_an_incomplete_or_malformed_landing() {
+    use super::executor::StreamedExecution;
+    let node = three_children_case();
+    let start =
+        || StreamedExecution::new(&node.program, vec![0, 1, 2], &node.hasher).expect("starts");
+
+    let mut ex = start();
+    ex.land(0, std::slice::from_ref(&node.arenas[0]))
+        .expect("lands");
+    assert!(matches!(ex.finish(), Err(LfmExecError::Internal(_))));
+
+    let mut ex = start();
+    ex.land(1, std::slice::from_ref(&node.arenas[1]))
+        .expect("lands");
+    assert!(matches!(
+        ex.land(1, std::slice::from_ref(&node.arenas[1])),
+        Err(LfmExecError::Internal(_))
+    ));
+
+    let mut ex = start();
+    assert!(matches!(
+        ex.land(2, &node.arenas[1..3]),
+        Err(LfmExecError::ArenaCountMismatch { .. })
+    ));
+    let short = vec![node.arenas[2][..node.arenas[2].len() - 1].to_vec()];
+    assert!(matches!(
+        ex.land(2, &short),
+        Err(LfmExecError::ArenaLenMismatch { .. })
+    ));
+}
+
+// ==================== the pieced streamed execution ====================
+
+/// A leaf-shaped program: ONE arena of three runs, each a BLAKE3 sponge over
+/// its own run (as a leaf verifies each base group from its run of the arena),
+/// then a little work over all three, and a `HintOn` whose two words sit in
+/// the first and the last run (so it needs both pieces).
+fn one_arena_case() -> (Case, u32) {
+    use super::builder::LfmBuilder;
+    use super::edsl::{ByteWrapHash, WrapHash, wrap_hash_bytes};
+    let len = 202;
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let halves = super::keccak_host::num_stream_halves(len) as u32;
+    let arena = b.declare_arena(3 * halves);
+    let mut firsts = Vec::new();
+    for run in 0..3 {
+        let stream: Vec<_> = (0..halves)
+            .map(|i| b.hint_felt(arena, run * halves + i))
+            .collect();
+        let digest = wrap_hash_bytes(&mut b, ByteWrapHash::Blake3, &stream, len);
+        b.public(digest[0]);
+        b.public(digest[1]);
+        firsts.push(stream[0]);
+    }
+    let x = b.add(firsts[0], firsts[2]);
+    let y = b.mul(x, firsts[1]);
+    let joined = b.pack_word([x, y, x, y]);
+    b.public(joined);
+    let one = b.bit_const(true);
+    let either = b.hint_word_on(arena, 1, one, 2 * halves + 1);
+    b.public(either);
+    let words: Vec<super::word::LfmWord> = (0..3u32)
+        .flat_map(|seed| {
+            let msg: Vec<u8> = (0..len)
+                .map(|i| (37 * i as u32 + 11 + 13 * seed) as u8)
+                .collect();
+            super::keccak_host::pack_stream(&msg)
+                .into_iter()
+                .map(super::word::base_word)
+        })
+        .collect();
+    let case = Case {
+        name: "OneArenaThreeRuns(202)",
+        program: super::compiler::compile(b.finish()),
+        arenas: vec![words],
+        hasher: super::hash::HasherKind::Test,
+    };
+    (case, halves)
+}
+
+/// Each arena of `case` cut at `cuts` (fractions of its length, in order) into
+/// pieces, numbered as groups arena by arena.
+fn pieces_of(case: &Case, cuts: usize) -> Vec<super::executor::ArenaPiece> {
+    let mut pieces = Vec::new();
+    for (a, words) in case.arenas.iter().enumerate() {
+        let len = words.len() as u32;
+        let n = (cuts as u32).clamp(1, len.max(1));
+        let mut at = 0;
+        for k in 0..n {
+            let end = if k + 1 == n { len } else { len * (k + 1) / n };
+            if end > at {
+                let group = pieces.len();
+                pieces.push(super::executor::ArenaPiece {
+                    arena: a as u32,
+                    start: at,
+                    len: end - at,
+                    group,
+                });
+            }
+            at = end;
+        }
+    }
+    pieces
+}
+
+/// `case` streamed in pieces, landing them in `order` (indices into `pieces`).
+fn pieced(
+    case: &Case,
+    pieces: &[super::executor::ArenaPiece],
+    order: &[usize],
+) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let mut ex = StreamedExecution::new_pieced(&case.program, pieces.to_vec(), &case.hasher)
+        .unwrap_or_else(|e| panic!("{}: a pieced execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &i in order {
+        let p = pieces[i];
+        let words = &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+        ex.land_piece(p.group, words)
+            .unwrap_or_else(|e| panic!("{}: piece {i} lands: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the pieced execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+/// [`pieced`] with its waves walking only the buckets each landing completes
+/// (`StreamedExecution::new_pieced_bucketed`).
+fn pieced_bucketed(
+    case: &Case,
+    pieces: &[super::executor::ArenaPiece],
+    order: &[usize],
+) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let mut ex = StreamedExecution::new_pieced_bucketed(
+        &case.program,
+        pieces.to_vec(),
+        &case.hasher,
+        false,
+        true,
+    )
+    .unwrap_or_else(|e| panic!("{}: a bucketed execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &i in order {
+        let p = pieces[i];
+        let words = &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+        ex.land_piece(p.group, words)
+            .unwrap_or_else(|e| panic!("{}: piece {i} lands bucketed: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the bucketed execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+/// ★ Bucketed waves are the pieced execution: on the leaf-shaped case in all
+/// six landing orders and on every identity case cut in three pieces an arena
+/// (forwards, backwards and interleaved), the bucketed execution gives the
+/// serial reference's witness word for word and runs, wave by wave, as many
+/// instructions as the filtering waves do.
+#[test]
+fn bucketed_waves_are_the_pieced_execution_in_any_landing_order() {
+    let (leaf, halves) = one_arena_case();
+    let reference_leaf = reference(&leaf);
+    let pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (got, ran) = pieced_bucketed(&leaf, &pieces, &order);
+        assert_executions_identical(leaf.name, leaf.program.num_addrs, &reference_leaf, &got);
+        let (_, filtered) = pieced(&leaf, &pieces, &order);
+        assert_eq!(ran, filtered, "{order:?}: the same instructions each wave");
+    }
+    for case in cases() {
+        let a = reference(&case);
+        let pieces = pieces_of(&case, 3);
+        let n = pieces.len();
+        let forward: Vec<usize> = (0..n).collect();
+        let backward: Vec<usize> = (0..n).rev().collect();
+        let interleaved: Vec<usize> = (0..n).step_by(2).chain((1..n).step_by(2)).collect();
+        for order in [forward, backward, interleaved] {
+            let (b, ran) = pieced_bucketed(&case, &pieces, &order);
+            assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+            let (_, filtered) = pieced(&case, &pieces, &order);
+            assert_eq!(
+                ran, filtered,
+                "{}: {order:?}: the same instructions each wave",
+                case.name
+            );
+        }
+    }
+}
+
+/// ★ Bucketed waves run each level's share in the level's own order: wave by
+/// wave and level by level, the bucketed execution runs the very rows and
+/// instructions, in the very order, the filtering waves do — on cases whose
+/// waves pick several buckets at once (a landing that completes more than one
+/// set of groups) with their rows interleaved within a level, where an order
+/// a bucket at a time would differ.
+#[test]
+fn bucketed_waves_run_each_level_in_the_levels_own_order() {
+    use super::executor::wave_trace;
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = Vec::new();
+    for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
+        runs.push((&leaf, leaf_pieces.clone(), order.to_vec()));
+    }
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).rev().collect()));
+        runs.push((
+            case,
+            pieces,
+            (0..n).step_by(2).chain((1..n).step_by(2)).collect(),
+        ));
+    }
+    let reordered_before = wave_trace::reordered();
+    for (case, pieces, order) in &runs {
+        let (_, filtered) = wave_trace::record(|| pieced(case, pieces, order));
+        let (_, bucketed) = wave_trace::record(|| pieced_bucketed(case, pieces, order));
+        assert!(
+            filtered == bucketed,
+            "{}: {order:?}: the bucketed waves ran another order",
+            case.name
+        );
+    }
+    // The cases put two buckets' rows interleaved in one level's share at
+    // least once, so the order above is a check, not a coincidence.
+    assert!(
+        wave_trace::reordered() > reordered_before,
+        "no wave merged two buckets out of a level's order: the test sees nothing"
+    );
+}
+
+/// ★ A setup made the fast way (the schedule beside the need pass, the
+/// buckets found from a neighbour) is the setup: on the leaf case and every
+/// identity case, landing in several orders, the bucketed execution set up
+/// the fast way runs the same rows and instructions in the same order, wave
+/// by wave and level by level, and gives the serial reference's witness.
+#[test]
+fn a_fast_setup_runs_the_same_waves() {
+    use super::executor::{StreamedExecution, wave_trace};
+    let run = |case: &Case, pieces: &[super::executor::ArenaPiece], order: &[usize], fast: bool| {
+        let mut ex = StreamedExecution::new_pieced_setup(
+            &case.program,
+            pieces.to_vec(),
+            &case.hasher,
+            false,
+            true,
+            fast,
+        )
+        .unwrap_or_else(|e| panic!("{}: starts: {e:?}", case.name));
+        for &i in order {
+            let p = pieces[i];
+            let words =
+                &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+            ex.land_piece(p.group, words)
+                .unwrap_or_else(|e| panic!("{}: piece {i} lands: {e:?}", case.name));
+        }
+        ex.finish()
+            .unwrap_or_else(|e| panic!("{}: finishes: {e:?}", case.name))
+    };
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = vec![
+        (&leaf, leaf_pieces.clone(), vec![0, 1, 2]),
+        (&leaf, leaf_pieces, vec![2, 0, 1]),
+    ];
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).collect()));
+        runs.push((case, pieces, (0..n).rev().collect()));
+    }
+    for (case, pieces, order) in &runs {
+        let (plain, plain_trace) = wave_trace::record(|| run(case, pieces, order, false));
+        let (fast, fast_trace) = wave_trace::record(|| run(case, pieces, order, true));
+        assert!(
+            plain_trace == fast_trace,
+            "{}: {order:?}: the fast setup ran another order",
+            case.name
+        );
+        assert_executions_identical(case.name, case.program.num_addrs, &plain, &fast);
+        assert_executions_identical(case.name, case.program.num_addrs, &reference(case), &fast);
+    }
+}
+
+/// [`pieced_bucketed`] with each wave run in program order on its own thread
+/// (`StreamedExecution::new_pieced_in_order`), its setup the fast way when
+/// `fast`.
+fn pieced_in_order(
+    case: &Case,
+    pieces: &[super::executor::ArenaPiece],
+    order: &[usize],
+    fast: bool,
+) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let mut ex = StreamedExecution::new_pieced_in_order(
+        &case.program,
+        pieces.to_vec(),
+        &case.hasher,
+        false,
+        true,
+        fast,
+        true,
+    )
+    .unwrap_or_else(|e| panic!("{}: an in-order execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &i in order {
+        let p = pieces[i];
+        let words = &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+        ex.land_piece(p.group, words)
+            .unwrap_or_else(|e| panic!("{}: piece {i} lands in order: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the in-order execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+/// The leaf-shaped case's three pieces, and every identity case cut in three
+/// pieces an arena, each with landing orders that complete several buckets at
+/// once.
+type InOrderRun<'a> = (&'a Case, Vec<super::executor::ArenaPiece>, Vec<usize>);
+
+fn in_order_runs<'a>(leaf: &'a Case, halves: u32, cases: &'a [Case]) -> Vec<InOrderRun<'a>> {
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<InOrderRun<'a>> = Vec::new();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        runs.push((leaf, leaf_pieces.clone(), order.to_vec()));
+    }
+    for case in cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).collect()));
+        runs.push((case, pieces.clone(), (0..n).rev().collect()));
+        runs.push((
+            case,
+            pieces,
+            (0..n).step_by(2).chain((1..n).step_by(2)).collect(),
+        ));
+    }
+    runs
+}
+
+/// ★ PIN: waves in program order are the pieced execution: on the leaf case
+/// in all six landing orders and on every identity case cut in three pieces
+/// an arena (forwards, backwards, interleaved), set up both ways, the
+/// in-order execution gives the serial reference's witness word for word and
+/// the level-order waves' too, and runs as many instructions each wave as the
+/// filtering waves do.
+#[test]
+fn in_order_waves_are_the_pieced_execution_in_any_landing_order() {
+    let (leaf, halves) = one_arena_case();
+    let cases = cases();
+    for (case, pieces, order) in in_order_runs(&leaf, halves, &cases) {
+        let reference = reference(case);
+        let (_, filtered) = pieced(case, &pieces, &order);
+        let (bucketed, _) = pieced_bucketed(case, &pieces, &order);
+        for fast in [false, true] {
+            let (got, ran) = pieced_in_order(case, &pieces, &order, fast);
+            assert_executions_identical(case.name, case.program.num_addrs, &reference, &got);
+            assert_executions_identical(case.name, case.program.num_addrs, &bucketed, &got);
+            assert_eq!(
+                ran, filtered,
+                "{}: {order:?} fast {fast}: the same instructions each wave",
+                case.name
+            );
+        }
+    }
+}
+
+/// An in-order wave runs its instructions in ascending program index, and
+/// every instruction runs exactly once over the execution, never before its
+/// last group landed (the wave counts match the filtering waves').
+#[test]
+fn an_in_order_wave_runs_each_instruction_once_in_ascending_index() {
+    use super::executor::wave_trace;
+    let (leaf, halves) = one_arena_case();
+    let cases = cases();
+    for (case, pieces, order) in in_order_runs(&leaf, halves, &cases) {
+        let ((_, ran), indices) =
+            wave_trace::indices(|| pieced_in_order(case, &pieces, &order, true));
+        let (_, filtered) = pieced(case, &pieces, &order);
+        assert_eq!(ran, filtered, "{}: {order:?}: the waves' counts", case.name);
+        let mut at = 0usize;
+        for (w, &end) in ran.iter().enumerate() {
+            let wave = &indices[at..end];
+            assert!(
+                wave.windows(2).all(|p| p[0] < p[1]),
+                "{}: {order:?}: wave {w} not in ascending index",
+                case.name
+            );
+            at = end;
+        }
+        let mut seen = indices.clone();
+        seen.sort_unstable();
+        assert!(
+            seen == (0..case.program.instrs.len()).collect::<Vec<_>>(),
+            "{}: {order:?}: every instruction exactly once",
+            case.name
+        );
+    }
+}
+
+/// The in-order buckets are the level-order buckets: the same sets of
+/// groups, each holding the same instructions, on every identity case and the
+/// leaf case, set up both ways.
+#[test]
+fn the_in_order_buckets_are_the_buckets() {
+    use super::executor::StreamedExecution;
+    let (leaf, halves) = one_arena_case();
+    let cases = cases();
+    for (case, pieces, _) in in_order_runs(&leaf, halves, &cases) {
+        for fast in [false, true] {
+            let start = |in_order: bool| {
+                StreamedExecution::new_pieced_in_order(
+                    &case.program,
+                    pieces.clone(),
+                    &case.hasher,
+                    false,
+                    true,
+                    fast,
+                    in_order,
+                )
+                .expect("starts")
+                .buckets_for_test()
+                .expect("bucketed")
+            };
+            assert!(
+                start(false) == start(true),
+                "{}: fast {fast}: the same buckets",
+                case.name
+            );
+        }
+    }
+}
+
+/// An in-order execution refuses the landings the pieced one refuses: a
+/// piece landed twice, a short piece, a group with no piece, and a finish
+/// before every piece landed.
+#[test]
+fn an_in_order_execution_refuses_what_the_pieced_one_refuses() {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    let (leaf, h) = one_arena_case();
+    let piece = |start, len, group| ArenaPiece {
+        arena: 0,
+        start,
+        len,
+        group,
+    };
+    let pieces = vec![piece(0, h, 0), piece(h, h, 1), piece(2 * h, h, 2)];
+    let words = |k: u32| &leaf.arenas[0][(k * h) as usize..((k + 1) * h) as usize];
+    let mut ex = StreamedExecution::new_pieced_in_order(
+        &leaf.program,
+        pieces,
+        &leaf.hasher,
+        false,
+        true,
+        true,
+        true,
+    )
+    .expect("starts");
+    ex.land_piece(1, words(1)).expect("lands");
+    assert!(
+        matches!(ex.land_piece(1, words(1)), Err(LfmExecError::Internal(_))),
+        "a piece landed twice"
+    );
+    assert!(
+        matches!(
+            ex.land_piece(2, &words(2)[1..]),
+            Err(LfmExecError::ArenaLenMismatch { .. })
+        ),
+        "a short piece"
+    );
+    assert!(
+        matches!(ex.land_piece(5, words(2)), Err(LfmExecError::Internal(_))),
+        "a group with no piece"
+    );
+    assert!(
+        matches!(ex.finish(), Err(LfmExecError::Internal(_))),
+        "finished before every piece landed"
+    );
+}
+
+/// ★ The pieced execution's gate: one arena landing in pieces, in any order,
+/// gives the serial reference's witness word for word — on the leaf-shaped
+/// case in all six orders (its `HintOn` reads the first and the last piece)
+/// and on every identity case cut in three pieces an arena, forwards and
+/// backwards — and most of the leaf-shaped program runs before its last piece.
+#[test]
+fn a_pieced_execution_is_byte_identical_in_any_landing_order() {
+    let (leaf, halves) = one_arena_case();
+    let reference_leaf = reference(&leaf);
+    let pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (got, ran) = pieced(&leaf, &pieces, &order);
+        assert_executions_identical(leaf.name, leaf.program.num_addrs, &reference_leaf, &got);
+        let n = leaf.program.instrs.len();
+        assert_eq!(
+            *ran.last().expect("waves"),
+            n,
+            "{order:?}: every instruction ran once"
+        );
+        assert!(
+            ran[2] * 2 >= n,
+            "{order:?}: only {} of {n} instructions ran before the last piece landed",
+            ran[2]
+        );
+    }
+    for case in cases() {
+        let a = reference(&case);
+        let pieces = pieces_of(&case, 3);
+        let forward: Vec<usize> = (0..pieces.len()).collect();
+        let backward: Vec<usize> = (0..pieces.len()).rev().collect();
+        for order in [forward, backward] {
+            let (b, ran) = pieced(&case, &pieces, &order);
+            assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+            assert_eq!(*ran.last().expect("waves"), case.program.instrs.len());
+        }
+    }
+}
+
+/// A pieced execution refuses pieces that do not tile the program's arenas
+/// and landings it cannot run: each an error, never a witness.
+#[test]
+fn a_pieced_execution_refuses_bad_pieces_and_bad_landings() {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    let (leaf, h) = one_arena_case();
+    let piece = |start, len, group| ArenaPiece {
+        arena: 0,
+        start,
+        len,
+        group,
+    };
+    let refused = |pieces: Vec<ArenaPiece>| {
+        matches!(
+            StreamedExecution::new_pieced(&leaf.program, pieces, &leaf.hasher),
+            Err(LfmExecError::Internal(_))
+        )
+    };
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h + 1, 2 * h - 1, 1)]),
+        "a gap"
+    );
+    assert!(
+        refused(vec![piece(0, h + 1, 0), piece(h, 2 * h, 1)]),
+        "an overlap"
+    );
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h, h, 1)]),
+        "short of the arena"
+    );
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h, 2 * h + 1, 1)]),
+        "past the arena"
+    );
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h, 2 * h, 0)]),
+        "one group, two pieces"
+    );
+    assert!(refused(vec![piece(0, 3 * h, 64)]), "group 64");
+    assert!(
+        refused(vec![piece(0, 0, 0), piece(0, 3 * h, 1)]),
+        "an empty piece"
+    );
+    assert!(
+        refused(vec![
+            piece(0, 3 * h, 0),
+            ArenaPiece {
+                arena: 1,
+                start: 0,
+                len: 1,
+                group: 1
+            }
+        ]),
+        "an arena the program does not have"
+    );
+
+    let pieces = vec![piece(0, h, 0), piece(h, h, 1), piece(2 * h, h, 2)];
+    let words = |k: u32| &leaf.arenas[0][(k * h) as usize..((k + 1) * h) as usize];
+    let start = || {
+        StreamedExecution::new_pieced(&leaf.program, pieces.clone(), &leaf.hasher).expect("starts")
+    };
+    let mut ex = start();
+    ex.land_piece(1, words(1)).expect("lands");
+    assert!(
+        matches!(ex.land_piece(1, words(1)), Err(LfmExecError::Internal(_))),
+        "a piece landed twice"
+    );
+    assert!(
+        matches!(ex.land_piece(0, words(1)), Ok(())),
+        "a piece of the right length lands (its words are the caller's)"
+    );
+    assert!(
+        matches!(
+            ex.land_piece(2, &words(2)[1..]),
+            Err(LfmExecError::ArenaLenMismatch { .. })
+        ),
+        "a short piece"
+    );
+    assert!(
+        matches!(ex.land_piece(5, words(2)), Err(LfmExecError::Internal(_))),
+        "a group with no piece"
+    );
+    assert!(
+        matches!(ex.finish(), Err(LfmExecError::Internal(_))),
+        "finished before every piece landed"
+    );
+    let mut ex = start();
+    assert!(
+        matches!(
+            ex.land(0, std::slice::from_ref(&leaf.arenas[0])),
+            Err(LfmExecError::Internal(_))
+        ),
+        "a pieced execution lands pieces only"
+    );
+    let mut plain =
+        StreamedExecution::new(&leaf.program, vec![0], &leaf.hasher).expect("starts unpieced");
+    assert!(
+        matches!(
+            plain.land_piece(0, words(0)),
+            Err(LfmExecError::Internal(_))
+        ),
+        "an unpieced execution lands no piece"
+    );
+}
+
+/// A pieced arena's word comes from the piece that holds it once that piece
+/// has landed; a word in a piece not landed yet, or in no piece, is
+/// `ArenaOutOfBounds` — an error, never a value.
+#[test]
+fn a_word_of_a_piece_not_landed_or_in_no_piece_is_refused() {
+    use super::executor::piece_word;
+    let w = |x: u64| super::word::base_word(crate::tables::types::FE::from(x));
+    let first = [w(10), w(11)];
+    let pieces: Vec<(u32, u32, &[super::word::LfmWord])> = vec![(0, 2, &first), (2, 3, &[])];
+    assert_eq!(piece_word(&pieces, 0, 1).expect("landed"), w(11));
+    for index in [2, 4, 5, 1000] {
+        assert!(
+            matches!(
+                piece_word(&pieces, 0, index),
+                Err(LfmExecError::ArenaOutOfBounds { arena: 0, index: i }) if i == index
+            ),
+            "index {index}"
+        );
+    }
+    assert!(matches!(
+        piece_word(&[], 3, 0),
+        Err(LfmExecError::ArenaOutOfBounds { arena: 3, index: 0 })
+    ));
+}
+
+/// A node-shaped program over children that supply different numbers of
+/// arenas (`counts[c]` for child `c`, declared in child order): a BLAKE3 sponge
+/// over each arena, then a little work across the children — the shape of a
+/// node whose children hold different AIR sets, as under the equal-height
+/// merge.
+fn uneven_children_case(counts: &[usize]) -> Case {
+    use super::builder::LfmBuilder;
+    use super::edsl::{ByteWrapHash, WrapHash, wrap_hash_bytes};
+    let len = 202;
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let halves = super::keccak_host::num_stream_halves(len) as u32;
+    let mut firsts = Vec::new();
+    for _ in 0..counts.iter().sum::<usize>() {
+        let arena = b.declare_arena(halves);
+        let stream: Vec<_> = (0..halves).map(|i| b.hint_felt(arena, i)).collect();
+        let digest = wrap_hash_bytes(&mut b, ByteWrapHash::Blake3, &stream, len);
+        b.public(digest[0]);
+        firsts.push(stream[0]);
+    }
+    let x = b.add(firsts[0], firsts[firsts.len() - 1]);
+    let y = b.mul(x, firsts[1]);
+    let joined = b.pack_word([x, y, x, y]);
+    b.public(joined);
+    let arena = |seed: usize| -> Vec<super::word::LfmWord> {
+        let msg: Vec<u8> = (0..len).map(|i| (37 * i + 11 + 13 * seed) as u8).collect();
+        super::keccak_host::pack_stream(&msg)
+            .into_iter()
+            .map(super::word::base_word)
+            .collect()
+    };
+    Case {
+        name: "UnevenChildren(202)",
+        program: super::compiler::compile(b.finish()),
+        arenas: (0..counts.iter().sum::<usize>()).map(arena).collect(),
+        hasher: super::hash::HasherKind::Test,
+    }
+}
+
+/// The streamed top ([`super::whir_block_tree::execute_streamed_with`]) of
+/// `program` over children supplying `words` (child `c`'s arenas in order),
+/// split at `split` (what the top is told each child supplies), the children
+/// published in `order`: the first before the streamed execution starts, each
+/// later one 10 ms after the one before, so the top lands them in that order.
+pub(super) fn streamed_top_over(
+    program: &super::compiler::LfmProgram,
+    words: &[Vec<Vec<super::word::LfmWord>>],
+    split: &[usize],
+    order: &[usize],
+    hasher: &(impl super::hash::LfmHasher + Sync),
+) -> Result<LfmExecution, String> {
+    use super::whir_block_tree::{Published, execute_streamed_with};
+    let kids: Vec<Published<Vec<Vec<super::word::LfmWord>>>> =
+        words.iter().map(|_| Published::new()).collect();
+    let _ = kids[order[0]].0.set(Ok(words[order[0]].clone()));
+    std::thread::scope(|scope| {
+        let kids = &kids;
+        scope.spawn(move || {
+            for &c in &order[1..] {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let _ = kids[c].0.set(Ok(words[c].clone()));
+            }
+        });
+        let refs: Vec<&Published<_>> = kids.iter().collect();
+        execute_streamed_with(program, split, &refs, hasher, |w| Ok(w.clone()))
+            .map(|(execution, _)| execution)
+    })
+}
+
+/// [`streamed_top_over`] for `case`, its arenas taken by children of `counts`.
+fn streamed_top(
+    case: &Case,
+    counts: &[usize],
+    split: &[usize],
+    order: &[usize],
+) -> Result<LfmExecution, String> {
+    let mut at = 0;
+    let words: Vec<Vec<Vec<super::word::LfmWord>>> = counts
+        .iter()
+        .map(|&n| {
+            at += n;
+            case.arenas[at - n..at].to_vec()
+        })
+        .collect();
+    streamed_top_over(&case.program, &words, split, order, &case.hasher)
+}
+
+/// ★ A streamed top splits its arenas by what each child supplies, not
+/// evenly: over a child of one arena and a child of three (a node whose
+/// children's AIR sets differ, as the equal-height merge makes them), in
+/// either landing order the witness is the serial reference's, word for word.
+/// Told an even split (two each, the split the top assumed before), the first
+/// child lands one arena where two were expected — the large block's
+/// `ArenaCountMismatch { expected: 105, found: 99 }` — and counts that do not
+/// cover the program's arenas are refused before anything runs.
+#[test]
+fn a_streamed_top_splits_its_arenas_by_each_childs_count() {
+    let counts = [1, 3];
+    let case = uneven_children_case(&counts);
+    let reference = reference(&case);
+    for order in [[0, 1], [1, 0]] {
+        let got = streamed_top(&case, &counts, &counts, &order)
+            .unwrap_or_else(|e| panic!("{order:?}: the streamed top executes: {e}"));
+        assert_executions_identical(case.name, case.program.num_addrs, &reference, &got);
+    }
+    let even = streamed_top(&case, &counts, &[2, 2], &[0, 1]).expect_err("an even split");
+    assert!(
+        even.contains("child 0 lands: ArenaCountMismatch { expected: 2, found: 1 }"),
+        "the even split fails as the large block did: {even}"
+    );
+    for bad in [&[1, 2][..], &[4][..], &[1, 3, 0][..]] {
+        let err = streamed_top(&case, &counts, bad, &[0, 1]).expect_err("counts that do not fit");
+        assert!(err.contains("arenas over"), "{bad:?}: {err}");
+    }
+}
+
+/// An execution refuses to set its public words past their buffer's
+/// capacity, rather than asserting it.
+#[test]
+fn public_words_short_of_the_programs_rows_are_refused() {
+    use super::executor::public_rows_fit;
+    let words: Vec<u64> = Vec::with_capacity(4);
+    assert!(public_rows_fit(&words, words.capacity()).is_ok());
+    assert!(matches!(
+        public_rows_fit(&words, words.capacity() + 1),
+        Err(LfmExecError::Internal(_))
+    ));
+}
+
+/// One-output selects (a lean BLAKE3 program's muxes) run in levels exactly
+/// as the serial reference runs them: memory, every record vector, each
+/// chip's rows.
+#[test]
+fn lean_muxes_run_in_levels_identically() {
+    use super::builder::{B3Block, B3Cv, Cell, LfmBuilder};
+    use super::edsl::WrapHash;
+    use crate::tables::types::FE;
+    let mut b = LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(true);
+    let x = b.felt_const(FE::from(0b1011_0110u64));
+    let bits = b.bit_dec(x, 8);
+    let mut publics = Vec::new();
+    // Eight compressions in one level, then in the next eight more beside
+    // eight muxes of the first eight's digests: the muxes run inside a forked
+    // level.
+    for (i, bit) in bits.iter().enumerate() {
+        let w: Vec<Cell> = (0..4u64)
+            .map(|k| {
+                b.digest_const([FE::from(10 * i as u64 + k + 1); 4])
+                    .as_cell()
+            })
+            .collect();
+        let d = b.b3_compress(B3Cv::Iv, B3Block::Lanes([w[0], w[1], w[2], w[3]]), 64, 11);
+        let again = b.b3_compress(
+            B3Cv::Words(d),
+            B3Block::Lanes([w[0], w[1], w[2], w[3]]),
+            64,
+            2,
+        );
+        let (chosen, _) = b.select(*bit, d[0], d[1]);
+        publics.push(chosen);
+        publics.push(again[0]);
+    }
+    for c in &publics {
+        b.public(*c);
+    }
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let hasher = super::hash::HasherKind::Poseidon1W16;
+    let a = execute_scheduled(&program, &[], &hasher, Schedule::Serial).expect("serial");
+    let c = execute_scheduled(
+        &program,
+        &[],
+        &hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .expect("levels");
+    assert_executions_identical("lean muxes", program.num_addrs, &a, &c);
+    assert!(c.split.parallel_levels > 0, "the candidate forked");
+    assert_eq!(a.records.mux.len(), 8);
+    assert!(a.records.select.is_empty(), "every select became a mux");
+}
+
+/// Cap tables and their reads run in levels exactly as the serial reference
+/// runs them: each table over digests a forked level computes, its reads in
+/// later levels beside more compressions (memory, every record vector, each
+/// chip's rows).
+#[test]
+fn lean_cap_reads_run_in_levels_identically() {
+    use super::builder::{B3Block, B3Cv, Cell, LfmBuilder};
+    use super::edsl::WrapHash;
+    use crate::tables::types::FE;
+    let mut b = LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(true);
+    let mut publics = Vec::new();
+    for tree in 0..3u64 {
+        // Eight compressions in one level: the tree's nodes.
+        let nodes: Vec<Cell> = (0..8u64)
+            .map(|i| {
+                let w: Vec<Cell> = (0..4u64)
+                    .map(|k| {
+                        b.digest_const([FE::from(100 * tree + 10 * i + k + 1); 4])
+                            .as_cell()
+                    })
+                    .collect();
+                b.b3_compress(B3Cv::Iv, B3Block::Lanes([w[0], w[1], w[2], w[3]]), 64, 11)[0]
+            })
+            .collect();
+        let handle = b.cap_table(&nodes);
+        for index in [tree, 7 - tree, 3] {
+            let x = b.felt_const(FE::from(index));
+            let bits = b.bit_dec(x, 3);
+            let read = b.cap_read(handle, &bits);
+            // A compression over the read word, in a later level.
+            let again = b.b3_compress(B3Cv::Iv, B3Block::Lanes([read, read, read, read]), 64, 11);
+            publics.push(read);
+            publics.push(again[0]);
+        }
+    }
+    for c in &publics {
+        b.public(*c);
+    }
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let hasher = super::hash::HasherKind::Poseidon1W16;
+    let a = execute_scheduled(&program, &[], &hasher, Schedule::Serial).expect("serial");
+    let c = execute_scheduled(
+        &program,
+        &[],
+        &hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .expect("levels");
+    assert_executions_identical("lean cap reads", program.num_addrs, &a, &c);
+    assert!(c.split.parallel_levels > 0, "the candidate forked");
+    assert_eq!((a.records.cap.len(), a.records.cap_read.len()), (24, 9));
+}

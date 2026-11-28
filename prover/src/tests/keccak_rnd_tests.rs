@@ -208,3 +208,106 @@ mod cxz_right_bit_regression {
         }
     }
 }
+
+// THE PRECONDITION LOCAL LOOKUPS REST ON, PINNED. The static check of local
+// lookups holds RECEIVERS to verifier-fixed columns; it says nothing of a
+// sender. A local sender whose multiplicity can be −1 is a receiver on
+// committed values, and cancels a false tuple with every check on. So every
+// local sender must have multiplicity `One` or a column the AIR holds to
+// {0, 1}. KECCAK_RND, the only local sender today, sends `One` (the byte
+// checks) or `Column(MU)` with MU bit-constrained (`MuIsBit`). This pins both,
+// for every form that sends local lookups: a new multiplicity form, a new
+// column, or the bit constraint dropped turns it red.
+mod local_sender_multiplicity {
+    use crate::tables::keccak_rnd::{
+        KeccakRndConstraints, KeccakRndForm, KeccakRoundOperation, bus_interactions_for, cols,
+        generate_keccak_rnd_trace,
+    };
+    use crate::tables::local_bytes::LOCAL_BUSES;
+    use crate::tables::types::FE;
+    use crate::test_utils::{busless_air, validate_busless};
+    use executor::vm::instruction::execution::keccak_f1600;
+    use stark::lookup::Multiplicity;
+
+    /// Every form, by an exhaustive match: a new form is a compile error here
+    /// until it says whether it sends local lookups.
+    fn forms() -> Vec<KeccakRndForm> {
+        let all = [
+            KeccakRndForm::Full,
+            KeccakRndForm::Lean,
+            KeccakRndForm::LeanLocal,
+        ];
+        for form in all {
+            match form {
+                KeccakRndForm::Full | KeccakRndForm::Lean | KeccakRndForm::LeanLocal => {}
+            }
+        }
+        all.to_vec()
+    }
+
+    #[test]
+    fn keccak_rnds_local_senders_send_one_or_a_bit_constrained_column() {
+        let mut columns: Vec<usize> = Vec::new();
+        let mut local_forms = 0;
+        for form in forms() {
+            let local: Vec<_> = bus_interactions_for(form)
+                .into_iter()
+                .filter(|i| LOCAL_BUSES.contains(&i.bus_id))
+                .collect();
+            assert_eq!(
+                local.is_empty(),
+                !form.byte_lookups_local(),
+                "{form:?}: local interactions exactly under a local form"
+            );
+            if local.is_empty() {
+                continue;
+            }
+            local_forms += 1;
+            let (mut ones, mut mus) = (0usize, 0usize);
+            for interaction in &local {
+                assert!(interaction.is_sender, "{form:?}: KECCAK_RND only sends");
+                match interaction.multiplicity {
+                    Multiplicity::One => ones += 1,
+                    Multiplicity::Column(c) => {
+                        mus += 1;
+                        if !columns.contains(&c) {
+                            columns.push(c);
+                        }
+                    }
+                    ref other => panic!(
+                        "{form:?}: a local sender's multiplicity is {other:?}: only One or a \
+                         bit-constrained column keeps a send from being a receive"
+                    ),
+                }
+            }
+            assert_eq!((ones, mus), (200, 808), "{form:?}: the 1,008 byte lookups");
+        }
+        assert_eq!(local_forms, 1, "one form sends local lookups today");
+        assert_eq!(columns, vec![cols::MU], "the one multiplicity column is MU");
+
+        // MU is held to {0, 1} by KECCAK_RND's own constraints: a value outside
+        // has no valid trace (μ = −1 would turn every μ-weighted send into a
+        // receive).
+        let input = [0x0102030405060708u64; 25];
+        let mut output = input;
+        keccak_f1600(&mut output);
+        let honest = generate_keccak_rnd_trace(&[KeccakRoundOperation {
+            timestamp: 7,
+            input,
+            output,
+        }]);
+        let air = busless_air(cols::NUM_COLUMNS, KeccakRndConstraints);
+        assert!(
+            validate_busless(&air, &honest),
+            "the honest trace validates"
+        );
+        for bad in [-FE::one(), FE::from(2u64)] {
+            let mut t = honest.clone();
+            t.main_table.set(0, cols::MU, bad);
+            assert!(
+                !validate_busless(&air, &t),
+                "MU = {bad:?} must have no valid trace"
+            );
+        }
+    }
+}

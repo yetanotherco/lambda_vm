@@ -1,0 +1,538 @@
+# Tests GitHub CI skips: every test that took more than 45 s in one prover shard of GitHub run 40517634531
+# (a69ccd64f), then every test still run that took more than 42 s in run 40588562061 (d99e180f8, the first run under
+# this list: one shard took 43 min); nextest, one test at a time, on a 4-CPU runner. They still run: the full CI
+# reproduction on the project's own GPU machines runs every test, and so do `cargo test` and `cargo nextest run`
+# locally. Only the workflow's prover shards read this file (scripts/ci_slow_tests.py builds their filter from it).
+#
+# One test a line: `<package> <test name>`, then its seconds in that run. Exact names only: a test that is not
+# listed runs on GitHub, so a new slow test stays in CI until it is listed here, and a renamed test runs again
+# (the build job prints the listed names it no longer finds). Remove a line once its test is fast again.
+
+lambda-vm-prover continuation::tests::an_out_of_range_trace_length_in_a_continuation_is_refused  # 72.7 s on N12: multi-epoch proof and every first, final and global table's length tamper
+lambda-vm-prover tests::trace_length_tests::an_out_of_range_trace_length_in_a_block_proof_is_refused::one_row_dp  # Full blowup-4 DP proof and length mutations through the phase A verifier
+lambda-vm-prover tests::host_hoist_block_tests::the_host_hoist_proves_the_same_block::words
+lambda-vm-prover tests::host_hoist_block_tests::the_host_hoist_proves_the_same_block::words_with_page_runs
+lambda-vm-prover tests::host_hoist_block_tests::the_host_hoist_proves_the_same_block::split
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::fused_mem_cases::regenerate_every_chunk
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::test_copy_ecalls::without_regeneration
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::test_copy_ecalls::regenerate_every_chunk
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::test_commit_split::without_regeneration
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::test_commit_split::regenerate_every_chunk
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::test_keccak256_stream::regenerate_every_chunk
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::test_ecrec_stream::regenerate_every_chunk
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_proves_the_same_block::page_runs::regenerate_every_chunk
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::fused_mem_cases::one_walker
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::fused_mem_cases::three_walkers
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::test_keccak256_stream::one_walker
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::test_keccak256_stream::three_walkers
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::test_ecrec_stream::one_walker
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::test_ecrec_stream::three_walkers
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::page_runs::one_walker
+lambda-vm-prover tests::lean_stream_block_tests::the_lean_stream_with_the_other_host_levers_proves_the_same_block::page_runs::three_walkers
+lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_filled_from_its_records_moves_no_byte  # 81.2 s on N12: full fused-block trace paths and byte comparison
+lambda-vm-prover tests::fused_memory_block_tests::a_wrong_fused_table_is_refused_by_the_verifier  # 80.2 s on N12: honest and modified fused-block proofs
+lambda-vm-prover tests::ecdas_halves_tests::a_limb_form_block_proves_and_each_form_refuses_the_other  # 56.7 s on N12: both ECDAS forms and mutual proof refusal
+lambda-vm-prover tests::fused_memory_block_tests::each_memory_format_refuses_the_others_proof  # 41.5 s on N12: complete proofs for both memory formats
+lambda-vm-prover tests::regs_inrow_tests::each_register_format_refuses_the_others_proof  # 54.9 s on N12: proofs for both register formats and mutual refusal
+lambda-vm-prover tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier::cpu_slots_and_residual_reads
+lambda-vm-prover tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier::keep_alive_timestamps
+lambda-vm-prover tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier::keep_alive_values
+lambda-vm-prover tests::regs_inrow_tests::in_row_forgeries_are_refused_by_the_block_verifier::pc_chain_past_exit
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::dma_memcpy_cases  # Full Rust DMA block with overlapping and page-spanning copies
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::dma_memmove_cases  # Full Rust DMA block with both overlap directions
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_copy_row_is_refused_by_the_balance_alone  # 56.4 s on the CPU box: full honest and edited COPY_W proofs reach the balance check
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_under_the_32_bit_registers_is_refused_by_the_retired_table_rule_alone  # 53.4 s on the CPU box: full proofs under the retired register format
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_holds_its_dense_pages  # 49.8 s on the CPU box: full proofs compare prepared columns across page run sizes
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_private_input_proves_and_its_private_rows_are_held  # 76.4 s on N12: full private-input word proof and retained row checks
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_dense_pages_proves_and_holds_its_pages  # 47.2 s on N12: full word-format proof and dense-page retention checks
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_streamed_word_families_states_the_finish_built_block::fused_mem_cases
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_streamed_word_families_states_the_finish_built_block::test_copy_ecalls
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_streamed_word_families_states_the_finish_built_block::test_keccak256_stream
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_streamed_word_families_states_the_finish_built_block::test_ecrec_stream
+lambda-vm-prover tests::word_memory_block_tests::page_block_columns_are_the_verifiers_at_proof_level  # 52.4 s on N12: proof-level page column checks
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::test_keccak256::split  # Full KECCAK proof for the wire and cross-format checks
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::test_keccak256::fused  # Full KECCAK proof for the wire and cross-format checks
+lambda-vm-prover tests::walk_cuts_block_tests::the_walk_cuts_prove_the_same_block::split_windows::one_walker
+lambda-vm-prover tests::walk_cuts_block_tests::the_walk_cuts_prove_the_same_block::split_windows::three_walkers
+lambda-vm-prover tests::walk_cuts_block_tests::the_walk_cuts_prove_the_same_block::words_with_private_pages::one_walker
+lambda-vm-prover tests::walk_cuts_block_tests::the_walk_cuts_prove_the_same_block::words_with_private_pages::three_walkers
+lambda-vm-prover tests::walk_cuts_block_tests::the_walk_cuts_prove_the_same_block::words_with_ecrec::one_walker
+lambda-vm-prover tests::walk_cuts_block_tests::the_walk_cuts_prove_the_same_block::words_with_ecrec::three_walkers
+lambda-vm-prover tests::block_whir_b3_tests::a_blake3_round_form_proof_under_another_cap_rule_is_refused_and_the_drop_moves_no_byte  # 40.9 s on N12: BLAKE3 round-form proofs at different cap rules and tree depths
+lambda-vm-prover tests::block_whir_b3_tests::a_streamed_blake3_base_under_the_round_form_proves_and_verifies  # 45.5 s on the CPU box: full streamed BLAKE3 round-form block proof
+# Word chunk identities share one copy control per guest and regeneration mode. Each takes over 40 s on CPU at TEST posture.
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::fused_mem_cases::no_regeneration
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::fused_mem_cases::regenerate_every_chunk
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::page_runs::no_regeneration
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::page_runs::regenerate_every_chunk
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::test_copy_ecalls::no_regeneration
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::test_copy_ecalls::regenerate_every_chunk
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::test_ecrec::no_regeneration
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::test_ecrec::regenerate_every_chunk
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::test_keccak256::no_regeneration
+lambda-vm-prover tests::word_chunks_block_tests::word_chunks_in_parts::test_keccak256::regenerate_every_chunk
+
+lambda-vm-prover tests::block_whir_tests::more_walkers_prove_the_same_bytes  # Three full proofs compare the block at four, six, and eight walkers
+lambda-vm-prover tests::block_whir_tests::streamed_keccak_rnd_chunks_keep_the_regenerators_ranks  # 55.7 s on N12: streamed and regenerated full-block proofs
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_in_its_own_groups_proves_and_verifies  # 71.9 s on the CPU box: full-block partition and proof comparisons with KECCAK_RND grouping on, off, and unset
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_in_its_own_groups_keeps_the_regenerators_ranks  # 51.4 s on N12: full block proofs with KECCAK_RND in separate groups
+lambda-vm-prover tests::block_whir_tests::the_head_log_stamps_the_head_and_moves_no_byte  # 52.1 s on N12: full proofs with and without the stamped head
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_streamed_during_the_windows_proves_and_verifies  # 41.7 s on N12: full streamed KECCAK proof
+lambda-vm-prover tests::block_whir_tests::pages_first_moves_the_partition_and_verifies  # 41.5 s on N12: page-first full proofs and partition comparison
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_first_is_the_default_moves_the_partition_and_verifies  # 41.5 s on N12: full KECCAK proofs and partition comparison
+lambda-vm-prover tests::block_whir_tests::phase_b_many_first_proves_the_same_bytes  # 40.2 s on N12: full proofs under both Phase B schedules
+lambda-vm-prover lfm::round_form_level_tests::the_last_levels_levers_reach_the_last_level_alone  # 46.5 s on CPU at TEST posture: a live base proof and five level derivations
+lambda-vm-prover lfm::b3l_wlfm_tests::the_streamed_next_level_matches_under_blake3  # 53.1 s on N12: multiple opening groups and full BLAKE3 next-level proofs
+
+# Each case retains the historical box tier of cpu_and_memw_r_filled_from_records_move_no_byte.
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::inline::cpu
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::inline::memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::inline::cpu_and_memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::inline::cpu_memw_r_and_keccak
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::layout_workers::cpu
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::layout_workers::memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::layout_workers::cpu_and_memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::all_instructions_64::layout_workers::cpu_memw_r_and_keccak
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::inline::cpu
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::inline::memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::inline::cpu_and_memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::inline::cpu_memw_r_and_keccak
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::layout_workers::cpu
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::layout_workers::memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::layout_workers::cpu_and_memw_r
+lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte::test_keccak_multi::layout_workers::cpu_memw_r_and_keccak
+# Each case retains the historical box tier of phase_b_in_any_order_proves_the_same_bytes.
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::serial_reversed
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::serial_odd_first
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::overlapped_in_order
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::overlapped_reversed
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::pinned_in_order
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::pinned_reversed
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::serial_repeated_group
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::serial_missing_group
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::overlapped_repeated_group
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::overlapped_missing_group
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::pinned_repeated_group
+lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes::pinned_missing_group
+# Each case retains the historical box tier of counting_the_hand_out_on_its_own_thread_moves_no_byte.
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::all_instructions_64::inline::host_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::all_instructions_64::inline::records_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::all_instructions_64::layout_workers::host_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::all_instructions_64::layout_workers::records_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::test_keccak_multi::inline::host_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::test_keccak_multi::inline::records_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::test_keccak_multi::layout_workers::host_fill
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte::test_keccak_multi::layout_workers::records_fill
+lambda-vm-prover tests::block_whir_tests::split_keccak_and_ecsm_calls_are_keyed_on_the_bus  # 832 s
+lambda-vm-prover tests::block_whir_tests::live_regeneration_proves_the_same_bytes  # 769 s
+lambda-vm-prover tests::block_whir_tests::a_block_proves_at_the_hosts_memory_target  # not timed: two proves of live_regeneration_proves_the_same_bytes's block
+lambda-vm-prover tests::block_whir_tests::the_rest_in_waves_and_the_finish_packed_move_no_byte::inline
+lambda-vm-prover tests::block_whir_tests::the_rest_in_waves_and_the_finish_packed_move_no_byte::layout_workers
+lambda-vm-prover tests::block_whir_tests::the_shadow_regenerates_every_streamed_chunk_and_moves_no_byte  # 640 s
+lambda-vm-prover tests::block_whir_tests::gpack_moves_no_byte  # 629 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_dropped_ops_proves_and_verifies  # 627 s
+lambda-vm-prover tests::block_whir_tests::streamed_records_chunks_drop_as_records_and_come_back  # 597 s
+lambda-vm-prover tests::block_whir_tests::parked_records_need_live_regeneration  # 483 s
+lambda-vm-prover tests::block_whir_tests::without_live_regeneration_every_table_is_held  # not timed: two of the three proves of the 470 s test it replaced
+lambda-vm-prover tests::block_whir_tests::streamed_records_chunks_kept_are_never_dropped  # 460 s
+lambda-vm-prover tests::block_whir_tests::the_shadow_stays_off_where_it_cannot_rebuild_the_chunks  # 455 s
+lambda-vm-prover tests::block_whir_tests::row_families_filled_from_their_rows_move_no_byte::load_store_inline
+lambda-vm-prover tests::block_whir_tests::row_families_filled_from_their_rows_move_no_byte::load_store_layout_workers
+lambda-vm-prover tests::block_whir_tests::row_families_filled_from_their_rows_move_no_byte::store_shift_layout_workers
+lambda-vm-prover tests::block_batched_tests::a_batched_group_argued_wrongly_is_refused  # 414 s
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_filled_from_records_moves_no_byte  # 358 s
+lambda-vm-prover tests::block_whir_tests::row_records_chunks_drop_as_records_and_come_back  # 352 s
+lambda-vm-prover tests::block_whir_tests::phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial  # 351 s
+lambda-vm-prover tests::block_whir_tests::phase_b_led_by_a_leaf_proves_the_same_bytes  # not timed: four proves of the streamed keccak block, as the 351 s test above
+lambda-vm-prover lfm::machine_tests::tampered_program_id_inputs_change_the_id  # 346 s
+lambda-vm-prover tests::block_whir_tests::keccak_and_ecsm_split_into_chunks_prove_and_verify  # 324 s
+lambda-vm-prover tests::block_whir_tests::a_block_with_keccak256_calls_across_keccak_tables_proves_and_verifies  # not timed on GitHub: 21 s on a 9950X box, a block of KECCAK tables cut to a few rows, as the 324 s test above
+lambda-vm-prover tests::block_whir_tests::ecrec_chains_are_keyed_apart_on_the_bus  # not timed on GitHub: the two ECREC block tests and two others took 102 s together on a 9950X box; ECDAS cut to a few rows, as the 324 s test above
+lambda-vm-prover tests::block_whir_tests::ecrec_chains_swapped_between_keys_are_refused  # not timed on GitHub: three block proves of test_ecrec (two honest, one forged), as the test above
+lambda-vm-prover tests::block_whir_tests::a_wrong_regeneration_is_reported_never_proved  # 320 s
+lambda-vm-prover tests::block_whir_tests::a_split_ecdas_call_is_keyed_on_the_bus  # 317 s
+lambda-vm-prover tests::block_onechain_tests::an_indexed_block_round_trips_and_refuses_the_other_mode  # 305 s
+lambda-vm-prover tests::block_whir_tests::copy_split_into_chunks_proves_and_verifies  # 304 s
+lambda-vm-prover tests::block_whir_tests::a_wrong_row_records_table_is_refused_by_the_verifier  # 302 s
+lambda-vm-prover tests::block_whir_tests::a_regenerator_up_before_the_drops_proves_the_same_bytes  # 300 s
+lambda-vm-prover tests::block_whir_tests::one_byte_windows_take_each_class_in_its_order  # 291 s
+lambda-vm-prover tests::block_whir_tests::the_kept_tree_depth_moves_no_byte_of_the_proof  # 291 s
+lambda-vm-prover tests::is_wh_tests::test_keccak_continuation_carries_is_wh_in_its_epoch  # 278 s
+lambda-vm-prover lfm::machine_tests::keccak_sponge_reference_lengths_prove_and_verify  # 274 s
+lambda-vm-prover tests::block_whir_tests::narrow_storage_moves_no_byte_of_the_proof  # 273 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_keccak_and_ecsm_chunks_proves_and_verifies  # 270 s
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_held_as_records_is_never_dropped  # 270 s
+lambda-vm-prover tests::block_whir_tests::a_hand_off_at_the_walk_arms_live_regeneration_and_moves_no_byte  # not timed: three proves, as the 269 s test it replaced
+lambda-vm-prover tests::is_wh_tests::test_is_wh_noncanonical_word_is_rejected  # 258 s
+lambda-vm-prover tests::block_whir_tests::uploading_ahead_moves_no_byte_of_the_proof  # 256 s
+lambda-vm-prover lfm::blake3_socket_tests::tampering_with_the_witness_is_not_accepted  # 250 s
+lambda-vm-prover tests::block_whir_tests::bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies  # 248 s
+lambda-vm-prover lfm::epoch_tests::the_from_proof_constructor_matches_the_session_harness  # 239 s
+lambda-vm-prover lfm::blake3_chip_tests::the_blake3_chip_proves_and_verifies  # 235 s
+lambda-vm-prover continuation::tests::test_classify_only_matches_byte_level_classification  # 224 s
+lambda-vm-prover tests::block_whir_tests::the_rest_regenerator_refuses_what_it_did_not_rebuild  # 222 s
+lambda-vm-prover continuation::tests::prep_ahead_proves_what_the_prover_thread_schedule_proves  # 217 s
+lambda-vm-prover tests::block_whir_tests::live_regeneration_refuses_what_it_did_not_rebuild  # 215 s
+lambda-vm-prover tests::block_whir_tests::a_block_without_its_is_wh_table_is_refused  # 208 s
+lambda-vm-prover lfm::blake3_chip_tests::the_reversed_digest_send_proves_and_verifies  # 208 s
+lambda-vm-prover tests::block_whir_tests::a_chunked_table_stated_over_its_cap_is_refused  # 204 s
+lambda-vm-prover lfm::machine_tests::tampered_merkle_opening_rejects  # 201 s
+lambda-vm-prover tests::block_batched_tests::the_bus_balance_binds_the_batched_block  # 198 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_laid_out_on_three_threads_packs_the_same_groups  # 197 s
+lambda-vm-prover tests::recursion_smoke_test::test_recursion_continuation_blob_decodes_and_verifies_on_host  # 196 s
+lambda-vm-prover tests::block_whir_tests::ecdas_split_into_chunks_proves_and_verifies  # 190 s
+lambda-vm-prover lfm::machine_tests::machine_proves_the_sample_replay  # 190 s
+lambda-vm-prover tests::recursion_smoke_test::test_recursion_accepts_a_bundle_whose_epochs_carry_different_tables  # 190 s
+lambda-vm-prover tests::block_whir_tests::a_wrong_cpu_records_table_is_refused_by_the_verifier  # 189 s
+lambda-vm-prover continuation::tests::test_split_verify_loadstore_tampers  # shares a single proof across 9 previously listed cases
+lambda-vm-prover tests::block_whir_tests::a_block_missing_an_instance_is_refused_on_the_bus  # 186 s
+lambda-vm-prover continuation::tests::test_continuation_blob_rejects_tampered_l2g_root  # 186 s
+lambda-vm-prover continuation::tests::table_presence_is_decided_per_epoch  # 184 s
+lambda-vm-prover lfm::machine_tests::tampered_statement_or_root_rejects  # 181 s
+lambda-vm-prover continuation::tests::test_split_verify_private_input_count_tampers  # shares a single proof across 3 previously listed cases
+lambda-vm-prover tests::block_whir_tests::a_wrongly_committed_prepared_stack_is_refused  # 174 s
+lambda-vm-prover lfm::epoch_tests::a_lead_in_prologue_is_the_one_built_from_the_bundle  # 170 s
+lambda-vm-prover tests::prove_elfs_tests::test_continuation_pipeline_end_to_end  # 168 s
+lambda-vm-prover lfm::machine_tests::tampered_transcript_absorb_half_rejects  # 168 s
+lambda-vm-prover lfm::blake3_chip_tests::blake3_chunking_does_not_change_what_is_proved  # 167 s
+lambda-vm-prover tests::block_batched_tests::a_block_argued_batched_proves_and_verifies  # 163 s
+lambda-vm-prover continuation::tests::test_dma_memcpy_across_continuation_epochs  # 155 s
+lambda-vm-prover continuation::tests::test_commit_across_epochs_verifies  # 151 s
+lambda-vm-prover tests::block_onechain_tests::an_indexed_coset_block_is_refused_by_a_natural_verifier  # 144 s
+lambda-vm-prover lfm::machine_tests::the_merkle_walk_authenticates_a_real_opening  # 142 s
+lambda-vm-prover tests::block_whir_tests::the_prover_refuses_a_partition_over_the_group_maximum  # 142 s
+lambda-vm-prover lfm::machine_tests::tampering_the_register_files_moves_the_derived_root  # 142 s
+lambda-vm-prover tests::block_whir_tests::split_copy_chains_are_keyed_on_the_bus  # 140 s
+lambda-vm-prover continuation::tests::test_continuation_blob_rejects_global_proof_from_a_different_run  # 136 s
+lambda-vm-prover continuation::tests::test_split_verify_rejects_global_proof_from_a_different_run  # 135 s
+lambda-vm-prover tests::block_whir_tests::a_block_at_blowup_2_is_refused_by_a_verifier_at_blowup_4  # 134 s
+lambda-vm-prover lfm::machine_tests::program_id_folds_pages_in_the_production_layout  # 134 s
+lambda-vm-prover lfm::machine_tests::tampered_stream_half_rejects  # 132 s
+lambda-vm-prover lfm::leaf_tests::fri_toy_proves_and_verifies_under_every_hasher  # 131 s
+lambda-vm-prover lfm::blake3_chip_tests::both_blake3_surfaces_in_one_machine_balance_bitwise  # 131 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_uploading_ahead_proves_and_verifies  # 130 s
+lambda-vm-prover lfm::blake3_chip_tests::the_two_wrap_hashes_produce_mutually_unverifiable_proofs  # 130 s
+lambda-vm-prover tests::is_wh_tests::test_keccak_noncanonical_state_ptr_is_rejected  # 128 s
+lambda-vm-prover continuation::halt_continuation_poc::continuation_continue_past_exit_in_final_of_two_epochs_is_rejected  # 128 s
+lambda-vm-prover tests::block_batched_tests::prepared_openings_settle_under_the_batched_argue  # 128 s
+lambda-vm-prover lfm::wrap_tests::the_fixture_epoch_wraps  # 122 s
+lambda-vm-prover lfm::algebraic_transcript::tests::the_host_transcript_and_the_machine_replay_derive_the_same_challenges  # 119 s
+lambda-vm-prover continuation::tests::test_continuation_epoch_size_log2  # 119 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_ef_io_demo_concatenates  # 119 s
+lambda-vm-prover tests::cpu_timestamp_tests::hostile_cpu_heights_are_rejected_by_the_verifier  # 118 s
+lambda-vm-prover continuation::tests::test_split_verify_roundtrip  # 117 s
+lambda-vm-prover tests::block_whir_tests::the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked  # 115 s
+lambda-vm-prover tests::block_whir_tests::a_memory_log_moves_no_byte_and_its_terms_close  # 114 s
+lambda-vm-prover tests::local_to_global_bus_tests::test_continuation_private_input_spans_epochs  # 113 s
+lambda-vm-prover continuation::tests::test_continuation_private_input_verifies_without_bytes  # 113 s
+lambda-vm-prover continuation::tests::test_split_verify_rejects_undercounted_epoch_table_count  # 112 s
+lambda-vm-prover continuation::tests::test_prove_and_verify_continuation  # 111 s
+lambda-vm-prover tests::page_offset_forgery_poc::dup_duplicate_page_forgery_is_rejected  # 111 s
+lambda-vm-prover lfm::program_shape_tests::dropping_bitwise_under_a_byte_lookup_family_is_refused  # 109 s
+lambda-vm-prover tests::cpu_timestamp_tests::split_cpu_tables_verify  # 108 s
+lambda-vm-prover lfm::algebraic_transcript::tests::the_emitter_replay_derives_the_host_transcripts_challenges_and_state  # 107 s
+lambda-vm-prover lfm::transcript_tests::the_transcript_proves_and_verifies_under_every_hasher  # 106 s
+lambda-vm-prover tests::zf_vm_one_row_tests::a_vm_proof_with_public_output_round_trips_at_one_row  # 105 s
+lambda-vm-prover lfm::machine_tests::keccak_merkle_opening_cost  # 105 s
+lambda-vm-prover continuation::halt_continuation_poc::poc_control_patched_program_two_epochs_verifies  # 104 s
+lambda-vm-prover tests::multiplicity_forgery_poc::dvrm_negative_mu_r_forgery_is_rejected  # 104 s
+lambda-vm-prover tests::block_batched_tests::a_tampered_batched_argue_is_refused  # 103 s
+lambda-vm-prover lfm::machine_tests::real_opening_is_a_usable_tamper_target  # 102 s
+lambda-vm-prover tests::page_offset_forgery_poc::poc_control_honest_harness_verifies  # 102 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_keccak_chunks_proves_and_verifies  # 101 s
+lambda-vm-prover lfm::program_shape_tests::a_program_without_byte_lookups_proves_and_verifies_without_bitwise  # 99 s
+lambda-vm-prover lfm::algebraic_transcript::tests::phase_a_absorbs_derive_the_hosts_shared_pair  # 97 s
+lambda-vm-prover tests::multiplicity_forgery_poc::mul_unanswered_forged_claim_is_rejected  # 97 s
+lambda-vm-prover tests::cpu_timestamp_tests::cpu_proof_start_matches_air_refs_layout  # 96 s
+lambda-vm-prover tests::block_onechain_tests::an_indexed_block_round_trips_under_the_batched_argue  # 96 s
+lambda-vm-prover tests::multiplicity_forgery_poc::load_unanswered_forged_claim_is_rejected  # 95 s
+lambda-vm-prover tests::multiplicity_forgery_poc::mul_negative_mu_hi_forgery_is_rejected  # 95 s
+lambda-vm-prover tests::cpu_timestamp_tests::swapped_cpu_tables_are_rejected  # 95 s
+lambda-vm-prover tests::block_whir_tests::a_wrong_records_table_is_refused_by_the_verifier  # 93 s
+lambda-vm-prover tests::is_wh_tests::test_is_wh_canonical_word_rewrite_verifies  # 93 s
+lambda-vm-prover tests::multiplicity_forgery_poc::shift_unanswered_forged_claim_is_rejected  # 93 s
+lambda-vm-prover tests::static_commitments_tests::a_p1_static_is_taken_at_its_own_key_only  # 93 s
+lambda-vm-prover lfm::algebraic_commit::tests::the_emitted_grinding_check_agrees_with_the_host_on_the_incident_nonces  # 93 s
+lambda-vm-prover tests::is_wh_tests::test_is_wh_negative_mu_is_rejected  # 93 s
+lambda-vm-prover tests::zf_vm_one_row_tests::a_vm_proof_round_trips_at_one_row  # 93 s
+lambda-vm-prover tests::multiplicity_forgery_poc::dvrm_honest_control_verifies  # 92 s
+lambda-vm-prover tests::page_offset_forgery_poc::poc_negative_control_forged_run_without_repointed_row_fails  # 92 s
+lambda-vm-prover tests::is_wh_tests::test_keccak_state_across_64k_boundary_verifies  # 92 s
+lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_private_input_tampers  # shares a single proof across four previously listed cases
+lambda-vm-prover tests::is_wh_tests::test_keccak_lane_on_its_own_is_wh_row_verifies  # 91 s
+lambda-vm-prover tests::zf_vm_one_row_tests::a_vm_proof_round_trips_at_one_row_auto_with_dp  # 91 s
+lambda-vm-prover tests::block_onechain_tests::an_indexed_block_at_blowup_2_is_refused_by_a_verifier_at_blowup_4  # 90 s
+lambda-vm-prover lfm::blake3_chip_tests::a_tampered_non_first_blake3_chunk_rejects  # 89 s
+lambda-vm-prover tests::multiplicity_forgery_poc::load_honest_control_verifies  # 87 s
+lambda-vm-prover lfm::machine_tests::chunking_does_not_change_what_is_proved  # 87 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_held_narrow_proves_and_verifies  # 86 s
+lambda-vm-prover lfm::machine_tests::arena_filler_reads_real_committed_roots  # 86 s
+lambda-vm-prover lfm::machine_tests::continuation_fixture_generates_two_epochs  # 86 s
+lambda-vm-prover tests::multiplicity_forgery_poc::lt_honest_control_verifies  # 86 s
+lambda-vm-prover lfm::machine_tests::the_derivation_extends_a_non_u32_register_value_demonstrating_hazard  # 85 s
+lambda-vm-prover lfm::epoch_tests::the_from_proof_constructor_rejects_a_tampered_bundle  # 85 s
+lambda-vm-prover tests::block_onechain_tests::a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host  # 84 s
+lambda-vm-prover tests::multiplicity_forgery_poc::lt_unanswered_forged_claim_is_rejected  # 84 s
+lambda-vm-prover tests::multiplicity_forgery_poc::mul_honest_control_verifies  # 84 s
+lambda-vm-prover lfm::machine_tests::preprocessed_tags_close_the_output_swap_hazard  # 83 s
+lambda-vm-prover lfm::machine_tests::tampered_keccak_input_half_rejects  # 83 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_ecdas_chunks_proves_and_verifies  # 83 s
+lambda-vm-prover tests::page_offset_forgery_poc::dup_structural_duplicate_page_coverage_is_rejected  # 83 s
+lambda-vm-prover lfm::blake3_chip_tests::chunked_blake3_proves_and_verifies  # 83 s
+lambda-vm-prover tests::page_offset_forgery_poc::dup_negative_control_without_compensating_row_fails  # 82 s
+lambda-vm-prover tests::pc_double_read_poc::preprocessed_timestamp_alone_rejects_the_forgery  # 80 s
+lambda-vm-prover tests::halt_pc_forgery_poc::continue_past_exit_via_halt_pc_is_rejected  # 80 s
+lambda-vm-prover continuation::tests::test_prover_panic_mid_pipeline_returns_err  # 78 s
+lambda-vm-prover tests::multiplicity_forgery_poc::shift_zbs_two_padding_row_forgery_is_rejected  # 78 s
+lambda-vm-prover tests::halt_pc_forgery_poc::continue_past_exit_with_pinned_fini_is_rejected  # 78 s
+lambda-vm-prover lfm::machine_tests::permute_row_cannot_substitute_the_permuted_state  # 77 s
+lambda-vm-prover tests::skip_empty_tables_tests::no_present_table_contributes_zero_to_the_bus  # 77 s
+lambda-vm-prover lfm::machine_tests::permutations_may_be_reassigned_across_chunk_boundaries  # 76 s
+lambda-vm-prover tests::block_onechain_tests::a_composed_block_is_refused_one_setting_away  # 76 s
+lambda-vm-prover tests::pc_double_read_poc::poc_control_honest_exit_five_is_rejected  # 76 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_block_proves_and_verifies  # 76 s
+lambda-vm-prover tests::multiplicity_forgery_poc::shift_honest_control_verifies  # 76 s
+lambda-vm-prover lfm::machine_tests::statement_replay_proves_and_verifies  # 75 s
+lambda-vm-prover lfm::algebraic_transcript::tests::the_statement_replay_absorbs_the_hosts_calls_one_for_one  # 75 s
+lambda-vm-prover tests::pc_double_read_poc::final_pc_pin_alone_rejects_the_forgery  # 75 s
+lambda-vm-prover tests::decode_tests::decode_commitment_compile_time_const_accepts  # 75 s
+lambda-vm-prover lfm::machine_tests::splice_proves_and_verifies  # 75 s
+lambda-vm-prover lfm::machine_tests::append_ext_proves_and_verifies  # 74 s
+lambda-vm-prover tests::prove_elfs_tests::test_proof_does_not_contain_private_input_field  # 74 s
+lambda-vm-prover continuation::tests::test_continuation_rejects_hostile_epoch_cpu_heights  # 74 s
+lambda-vm-prover lfm::machine_tests::verify_rejects_a_chunk_count_that_does_not_match_the_proof  # 74 s
+lambda-vm-prover lfm::blake3_chip_tests::tampering_with_the_blake3_witness_is_not_accepted  # 73 s
+lambda-vm-prover tests::halt_pc_forgery_poc::poc_control_patched_program_verifies  # 73 s
+lambda-vm-prover lfm::algebraic_commit::tests::the_emitted_grinding_check_accepts_exactly_the_hosts_nonces  # 73 s
+lambda-vm-prover tests::decode_tests::decode_commitment_some_matches_default_path  # 73 s
+lambda-vm-prover lfm::blake3_chip_tests::keccak_still_proves_and_verifies_through_the_switched_emitters  # 73 s
+lambda-vm-prover lfm::blake3_chip_tests::verify_rejects_a_blake3_chunk_list_that_does_not_match_the_proof  # 72 s
+lambda-vm-prover tests::pc_double_read_poc::poc_control_patched_program_verifies  # 72 s
+lambda-vm-prover tests::block_whir_p1_tests::the_p1_statement_tag_is_bound  # 71 s
+lambda-vm-prover lfm::blake3_socket_tests::a_blake3_proof_does_not_verify_under_another_hasher  # 70 s
+lambda-vm-prover lfm::machine_tests::keccak_sponge_proves_and_verifies  # 70 s
+lambda-vm-prover tests::halt_pc_forgery_poc::poc_control_honest_exit_one_is_rejected  # 70 s
+lambda-vm-prover lfm::machine_tests::tampered_second_chunk_permutation_rejects  # 68 s
+lambda-vm-prover tests::page_tests::page_commitments_zero_bytes_rejects  # 68 s
+lambda-vm-prover tests::block_whir_tests::a_group_over_the_stack_budget_is_refused  # 68 s
+lambda-vm-prover tests::block_whir_tests::a_block_proof_survives_serialization  # 68 s
+lambda-vm-prover lfm::machine_tests::program_id_matches_production_on_the_real_fixture  # 68 s
+lambda-vm-prover lfm::transcript_tests::the_transcript_proves_and_verifies_under_blake3  # 67 s
+lambda-vm-prover tests::pc_double_read_poc::poc_forgery_verifies_against_prover_chosen_pins  # 66 s
+lambda-vm-prover tests::block_whir_tests::a_program_spread_over_many_groups_proves_and_verifies  # 66 s
+lambda-vm-prover lfm::machine_tests::tampered_absorb_xor_rejects  # 66 s
+lambda-vm-prover lfm::machine_tests::a_blake3_authenticating_program_carries_no_keccak_family  # 66 s
+lambda-vm-prover lfm::leaf_tests::fri_toy_proves_and_verifies_under_blake3  # 65 s
+lambda-vm-prover tests::block_batched_tests::a_batched_group_on_another_fork_is_refused  # 65 s
+lambda-vm-prover tests::block_whir_tests::a_host_only_build_drains_the_groups_the_prove_commits  # 64 s
+lambda-vm-prover tests::block_whir_p1_tests::a_block_proves_under_its_family_base_and_no_other_verifies_it  # 64 s
+lambda-vm-prover lfm::blake3_chip_tests::the_env_knob_value_chunks_a_real_prove  # 63 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_dma_memmove_cases_rust_guest  # 63 s
+lambda-vm-prover tests::block_whir_tests::a_partition_over_the_group_maximum_is_refused  # 62 s
+lambda-vm-prover tests::block_whir_tests::a_group_proved_on_another_fork_is_refused  # 62 s
+lambda-vm-prover tests::block_whir_tests::a_block_with_another_final_register_file_is_refused  # 62 s
+lambda-vm-prover lfm::machine_tests::transcript_replay_proves_and_verifies  # 62 s
+lambda-vm-prover lfm::leaf_tests::fri_toy_rejects_a_fixture_built_under_another_hasher  # 61 s
+lambda-vm-prover tests::block_whir_tests::a_tampered_bus_output_is_refused  # 61 s
+lambda-vm-prover lfm::machine_tests::tampered_keccak_output_half_rejects  # 61 s
+lambda-vm-prover continuation::halt_continuation_poc::poc_control_patched_program_continuation_verifies  # 58 s
+lambda-vm-prover tests::block_whir_tests::a_block_with_a_negative_keccak_multiplicity_is_refused  # 58 s
+lambda-vm-prover tests::block_whir_tests::the_statement_bytes_are_what_absorb_block_appends  # 58 s
+lambda-vm-prover tests::block_batched_tests::keccak_chunks_argue_batched  # 58 s
+lambda-vm-prover tests::block_whir_tests::a_table_stated_over_the_table_cap_is_refused  # 58 s
+lambda-vm-prover tests::is_wh_tests::test_recursion_blob_with_is_wh_verifies_on_host  # 58 s
+lambda-vm-prover tests::block_whir_p1_tests::the_statement_calls_are_absorb_blocks_own  # 57 s
+lambda-vm-prover tests::block_whir_tests::a_partition_missing_a_table_is_refused  # 57 s
+lambda-vm-prover lfm::blake3_socket_tests::the_trivial_program_proves_and_verifies_under_blake3  # 56 s
+lambda-vm-prover tests::recursion_soundness_gap_poc::test_supplied_decode_root_not_bound_to_inner_elf  # 56 s
+lambda-vm-prover tests::is_wh_tests::test_is_wh_positive_split_verifies  # 56 s
+lambda-vm-prover continuation::halt_continuation_poc::continuation_continue_past_exit_is_rejected  # 56 s
+lambda-vm-prover tests::block_whir_tests::two_groups_prepared_openings_swapped_are_refused  # 56 s
+lambda-vm-prover lfm::machine_tests::dropping_the_second_chunks_permutation_rejects  # 56 s
+lambda-vm-prover tests::is_wh_tests::test_is_wh_honest_keccak_verifies  # 56 s
+lambda-vm-prover lfm::keccak_probe::adapter_probe_proves_real_permutations  # 55 s
+lambda-vm-prover continuation::tests::test_continuation_multipage_private_input  # 55 s
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_split_into_chunks_proves_and_verifies  # 54 s
+lambda-vm-prover continuation::halt_continuation_poc::poc_control_honest_exit_one_continuation_is_rejected  # 54 s
+lambda-vm-prover tests::skip_empty_tables_tests::dropping_a_used_table_through_the_real_verifier_is_rejected  # 54 s
+lambda-vm-prover tests::recursion_soundness_gap_poc::test_custom_prover_is_not_vacuous  # 53 s
+lambda-vm-prover lfm::program_shape_tests::a_split_hash_proves_and_verifies_as_its_own_program  # 53 s
+lambda-vm-prover tests::multiplicity_forgery_poc::dvrm_unanswered_forged_claim_is_rejected  # 53 s
+lambda-vm-prover lfm::p1_family_tests::a_p1_lfm_proof_verifies_and_the_families_do_not_cross  # 52 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_dma_memcpy_cases_rust_guest  # 52 s
+lambda-vm-prover tests::skip_empty_tables_tests::counts_the_proof_cannot_back_are_refused_before_verification  # 51 s
+lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_undercounted_table_count  # 51 s
+lambda-vm-prover tests::multiplicity_forgery_poc::load_negative_mu_sign_extension_forgery_is_rejected  # 51 s
+lambda-vm-prover tests::recursion_smoke_test::test_recursion_blob_decodes_and_verifies_on_host  # 51 s
+lambda-vm-prover tests::decode_tests::decode_commitment_wrong_value_rejects  # 51 s
+lambda-vm-prover continuation::tests::test_verify_continuation_with_supplied_roots  # 51 s
+lambda-vm-prover lfm::keccak_probe::padding_row_multiplicity_rejects  # 50 s
+lambda-vm-prover lfm::machine_tests::different_arena_values_change_the_public_output_not_the_program  # 50 s
+lambda-vm-prover continuation::tests::test_ecsm_across_epochs_verifies  # 50 s
+lambda-vm-prover tests::block_whir_tests::a_page_opened_at_another_tables_point_is_refused  # 50 s
+lambda-vm-prover lfm::keccak_probe::duplicate_tag_output_swap_accepts_demonstrating_hazard  # 49 s
+lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_zero_cpu_count  # 49 s
+lambda-vm-prover tests::multiplicity_forgery_poc::lt_negative_mu_twin_forgery_is_rejected  # 48 s
+lambda-vm-prover lfm::keccak_probe::tampered_input_byte_rejects  # 48 s
+lambda-vm-prover lfm::machine_tests::keccak_chain_proves_and_verifies  # 47 s
+lambda-vm-prover lfm::keccak_probe::tampered_output_byte_rejects  # 47 s
+lambda-vm-prover lfm::blake3_probe::falsification_control_the_untampered_proof_verifies  # 47 s
+lambda-vm-prover lfm::blake3_probe::the_hosted_chip_proves_and_verifies  # 47 s
+lambda-vm-prover lfm::machine_tests::chunked_sponge_proves_and_verifies  # 47 s
+lambda-vm-prover lfm::blake3_probe::a_tampered_message_byte_rejects  # 47 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_first_epoch_without_halt  # 47 s
+lambda-vm-prover tests::block_whir_tests::a_mixed_boundary_group_drops_one_class_only  # 47 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_second_epoch_from_snapshot  # 47 s
+lambda-vm-prover tests::decode_tests::decode_commitment_zero_bytes_rejects  # 46 s
+lambda-vm-prover continuation::tests::test_prove_error_mid_pipeline_returns_err  # 46 s
+lambda-vm-prover continuation::tests::test_continuation_with_several_cpu_tables_per_epoch_verifies  # 46 s
+lambda-vm-prover tests::halt_pc_forgery_poc::poc_control_continue_without_halt_pc_tamper_is_rejected  # 45 s
+lambda-vm-prover lfm::machine_tests::the_register_derivation_proves_and_verifies  # 110 s in run 40588562061
+lambda-vm-prover lfm::machine_tests::l2g_binding_proves_and_verifies  # 102 s in run 40588562061
+lambda-vm-prover lfm::machine_tests::l2g_binding_holds_on_the_real_bundle  # 85 s in run 40588562061
+lambda-vm-prover lfm::machine_tests::the_register_derivation_matches_production  # 71 s in run 40588562061
+lambda-vm-prover lfm::algebraic_commit::tests::the_host_grinding_digest_and_the_machine_agree  # 66 s in run 40588562061
+lambda-vm-prover tests::page_tests::page_commitments_some_matches_default_path  # 63 s in run 40588562061
+lambda-vm-prover tests::page_tests::page_commitments_empty_list_matches_none  # 63 s in run 40588562061
+lambda-vm-prover lfm::blake3_socket_tests::the_blake3_socket_proves_and_verifies  # 61 s in run 40588562061
+lambda-vm-prover tests::block_whir_tests::a_tampered_partition_is_refused  # 58 s in run 40588562061
+lambda-vm-prover tests::pc_double_read_poc::poc_control_forgery_without_double_read_is_rejected  # 57 s in run 40588562061
+lambda-vm-prover tests::block_whir_tests::a_block_with_a_moved_cpu_timestamp_is_refused  # 56 s in run 40588562061
+lambda-vm-prover tests::prove_elfs_tests::test_prove_with_input_empty  # 56 s in run 40588562061
+lambda-vm-prover tests::page_tests::page_commitments_wrong_value_rejects  # 56 s in run 40588562061
+lambda-vm-prover tests::block_whir_tests::a_block_proved_without_the_provers_column_check_verifies  # 55 s in run 40588562061
+lambda-vm-prover tests::static_commitments_tests::bitwise_static_matches_recompute_for_all_blowups  # 52 s in run 40588562061
+lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_tampered_public_output  # 48 s in run 40588562061
+lambda-vm-prover lfm::blake3_socket_tests::the_lane_range_check_is_load_bearing_on_its_own  # 48 s in run 40588562061
+lambda-vm-prover lfm::blake3_probe::a_tampered_output_byte_rejects  # 45 s in run 40588562061
+lambda-vm-prover tests::prove_elfs_tests::test_epoch_proof_commits_l2g  # 44 s in run 40588562061
+lambda-vm-prover tests::block_whir_tests::the_dense_fixture_prepares_decode_and_two_pages  # 43 s in run 40588562061
+
+# Pass 4: complete block, epoch, or recursion proofs over 40 s in the CPU replay.
+lambda-vm-prover lfm::levels_tests::the_pinned_blake3_base_and_both_levels_verify_at_test_security  # Pass 4: CPU 169.139 s, N12 CUDA 3.327 s
+lambda-vm-prover security_posture::tests::the_shipped_compressed_block_verifies_at_test_security  # Pass 4: CPU 186.574 s, N12 CUDA 1.353 s
+lambda-vm-prover continuation::tests::test_split_verify_rejects_inflated_epoch_table_count  # Pass 3: CPU 66.858 s, N12 CUDA 0.627 s
+lambda-vm-prover lfm::b3l_wlfm_tests::an_observed_prove_hands_out_the_next_levels_arena_group_by_group  # Pass 3: CPU 51.817 s, N12 CUDA 1.034 s
+lambda-vm-prover lfm::b3l_wlfm_tests::the_streamed_next_level_matches_under_poseidon1  # Pass 3: CPU 41.172 s, N12 CUDA 0.581 s
+lambda-vm-prover lfm::epoch_tests::a_split_decode_cell_forges_the_attestation  # Pass 3: CPU 65.472 s, N12 CUDA 0.606 s
+lambda-vm-prover lfm::epoch_tests::the_assembled_verifier_declares_exactly_the_shape_words  # Pass 3: CPU 66.953 s, N12 CUDA 0.599 s
+lambda-vm-prover lfm::epoch_tests::the_closure_rejects_a_moved_index_or_output  # Pass 3: CPU 64.607 s, N12 CUDA 0.617 s
+lambda-vm-prover lfm::epoch_tests::the_derivation_binds_every_register_boundary_word  # Pass 3: CPU 66.222 s, N12 CUDA 0.597 s
+lambda-vm-prover lfm::epoch_tests::the_epoch_challenge_spine_matches_production  # Pass 3: CPU 66.166 s, N12 CUDA 0.598 s
+lambda-vm-prover lfm::epoch_tests::the_register_boundary_is_width_checked  # Pass 3: CPU 67.119 s, N12 CUDA 0.585 s
+lambda-vm-prover lfm::epoch_tests::the_spine_hints_each_proof_value_once  # Pass 3: CPU 66.661 s, N12 CUDA 0.588 s
+lambda-vm-prover lfm::epoch_verify_tests::the_assembled_epoch_verifier_runs  # Pass 3: CPU 61.893 s, N12 CUDA 0.620 s
+lambda-vm-prover lfm::epoch_verify_tests::the_assembled_verifier_contains_every_composition_and_terminal_check  # Pass 3: CPU 68.294 s, N12 CUDA 0.608 s
+lambda-vm-prover lfm::epoch_verify_tests::the_assembled_verifier_hints_each_proof_value_once  # Pass 3: CPU 60.237 s, N12 CUDA 0.608 s
+lambda-vm-prover lfm::epoch_verify_tests::the_assembled_verifier_rejects_tampered_leg_data  # Pass 3: CPU 58.623 s, N12 CUDA 0.676 s
+lambda-vm-prover lfm::epoch_verify_tests::the_boundary_terms_are_program_shape  # Pass 3: CPU 62.328 s, N12 CUDA 0.595 s
+lambda-vm-prover lfm::epoch_verify_tests::the_preprocessed_commitments_of_a_real_epoch  # Pass 3: CPU 58.894 s, N12 CUDA 0.604 s
+lambda-vm-prover lfm::level_chain_tests::the_fill_parts_at_once_are_the_fill_in_series  # Pass 3: CPU 48.993 s, N12 CUDA 1.883 s
+lambda-vm-prover lfm::logup_tests::a_zero_row_fixed_table_carries_some_zero_not_none  # Pass 3: CPU 55.375 s, N12 CUDA 0.602 s
+lambda-vm-prover lfm::per_table_aggregator_tests::the_aggregation_publish_profile_drops_only_diagnostics  # Pass 3: CPU 54.014 s, N12 CUDA 0.688 s
+lambda-vm-prover lfm::round_form_level_tests::a_level_round_form_the_host_refuses_is_never_built_or_emitted  # Pass 3: CPU 44.808 s, N12 CUDA 3.012 s
+lambda-vm-prover lfm::round_form_level_tests::a_streamed_round_form_base_proves_and_verifies  # Pass 3: CPU 70.499 s, N12 CUDA 0.840 s
+lambda-vm-prover lfm::round_form_level_tests::level_1_round_form_refuses_tampers_with_first_fold  # Pass 3: CPU 68.336 s, N12 CUDA 2.322 s
+lambda-vm-prover lfm::round_form_level_tests::level_1_round_form_refuses_tampers_with_uniform_folds  # Pass 3: CPU 66.645 s, N12 CUDA 2.221 s
+lambda-vm-prover lfm::round_form_level_tests::the_levels_follow_the_bases_round_form  # Pass 3: CPU 113.042 s, N12 CUDA 6.541 s
+lambda-vm-prover lfm::wlfm_leg_tests::the_leg_proved_at_blowup_64_under_the_second_steps_levers_verifies  # Pass 3: CPU 53.341 s, N12 CUDA 0.398 s
+lambda-vm-prover lfm::wlfm_place_tests::a_store_promise_refused_at_admission_opens_the_group_alone_with_the_same_bytes  # Pass 3: CPU 40.991 s, N12 CUDA 0.890 s
+lambda-vm-prover lfm::wlfm_place_tests::a_store_refused_inside_an_overlapped_opening_proves_the_same_bytes  # Pass 3: CPU 57.787 s, N12 CUDA 1.122 s
+lambda-vm-prover lfm::wlfm_place_tests::narrow_commit_moves_no_bytes::blake3_host  # Pass 3: CPU 41.290 s, N12 CUDA 1.085 s
+lambda-vm-prover lfm::wlfm_place_tests::narrow_commit_moves_no_bytes::poseidon1_card  # Pass 3: CPU 52.371 s, N12 CUDA 1.250 s
+lambda-vm-prover lfm::wlfm_place_tests::narrow_commit_moves_no_bytes::poseidon1_host  # Pass 3: CPU 53.412 s, N12 CUDA 1.859 s
+lambda-vm-prover lfm::wlfm_place_tests::narrow_commit_moves_no_bytes::poseidon1_retired  # Pass 3: CPU 52.816 s, N12 CUDA 1.179 s
+lambda-vm-prover lfm::wlfm_place_tests::next_columns_overlap_pricing_moves_no_bytes_under_poseidon1  # Pass 3: CPU 52.537 s, N12 CUDA 1.441 s
+lambda-vm-prover lfm::wlfm_place_tests::the_narrow_store_proves_the_same_bytes_in_every_place  # Pass 3: CPU 88.547 s, N12 CUDA 2.666 s
+lambda-vm-prover lfm::wlfm_place_tests::the_overlap_priced_resident_proves_the_same_bytes_in_every_place  # Pass 3: CPU 90.008 s, N12 CUDA 2.966 s
+lambda-vm-prover lfm::wlfm_place_tests::the_planned_overlap_proves_the_same_bytes_in_every_place  # Pass 3: CPU 91.543 s, N12 CUDA 2.467 s
+lambda-vm-prover lfm::wlfm_place_tests::upload_once_moves_no_bytes_under_poseidon1  # Pass 3: CPU 53.000 s, N12 CUDA 1.186 s
+lambda-vm-prover tests::block_keccak_lean_tests::a_lean_block_proves_and_verifies  # Pass 3: CPU 91.829 s, N12 CUDA 2.241 s
+lambda-vm-prover tests::block_onechain_tests::a_joint_tree_block_round_trips_and_refuses_the_other_mode  # Pass 3: CPU 87.023 s, N12 CUDA 1.055 s
+lambda-vm-prover tests::block_onechain_tests::a_wide_singleton_group_splits_into_runs_of_four  # Pass 3: CPU 54.730 s, N12 CUDA 0.507 s
+lambda-vm-prover tests::block_whir_b3_tests::a_blake3_base_commits_one_tree_a_run_and_refuses_its_tampers  # Pass 3: CPU 72.076 s, N12 CUDA 1.025 s
+lambda-vm-prover tests::block_whir_b3_tests::a_blake3_base_on_the_two_layer_ladder_proves_and_each_ladder_refuses_the_other  # Pass 3: CPU 100.174 s, N12 CUDA 1.382 s
+lambda-vm-prover tests::block_whir_b3_tests::a_blake3_base_proves_verifies_and_refuses_its_tampers  # Pass 3: CPU 124.910 s, N12 CUDA 1.398 s
+lambda-vm-prover tests::block_whir_b3_tests::a_blake3_base_under_the_round_form_proves_and_each_form_refuses_the_other  # Pass 3: CPU 78.491 s, N12 CUDA 0.940 s
+lambda-vm-prover tests::block_whir_pack_tests::a_packed_block_proves_and_verifies  # Pass 3: CPU 112.980 s, N12 CUDA 5.845 s
+lambda-vm-prover tests::block_whir_tests::a_block_without_prepared_openings_verifies_on_the_host  # Pass 3: CPU 64.073 s, N12 CUDA 0.751 s
+lambda-vm-prover tests::block_whir_tests::a_prepared_opening_of_another_program_is_refused  # Pass 3: CPU 52.958 s, N12 CUDA 0.502 s
+lambda-vm-prover tests::block_whir_tests::a_streamed_keccak_rnd_proof_refuses_a_wrong_table_and_a_tampered_partition  # Pass 3: CPU 99.565 s, N12 CUDA 2.546 s
+lambda-vm-prover tests::block_whir_tests::an_inflated_keccak_rnd_count_is_refused  # Pass 3: CPU 58.975 s, N12 CUDA 0.502 s
+lambda-vm-prover tests::block_whir_tests::closing_ahead_of_bitwise_moves_no_byte  # Pass 3: CPU 95.355 s, N12 CUDA 2.589 s
+lambda-vm-prover tests::block_whir_tests::grouped_whir_proof_refuses_tampering  # Pass 3: CPU 48.154 s, N12 CUDA 1.331 s
+lambda-vm-prover tests::block_whir_tests::keccak_rnd_in_its_own_groups_refuses_a_wrong_table_and_a_tampered_partition  # Pass 3: CPU 99.593 s, N12 CUDA 2.552 s
+lambda-vm-prover tests::block_whir_tests::one_group_whir_statement_and_prepared_opening_checks  # Pass 3: CPU 61.144 s, N12 CUDA 0.631 s
+lambda-vm-prover tests::block_whir_tests::the_prepared_set_is_decode_and_the_dense_pages  # Pass 3: CPU 57.678 s, N12 CUDA 0.496 s
+lambda-vm-prover tests::block_whir_tests::the_rest_airs_built_beside_prove_the_same_bytes  # Pass 3: CPU 96.115 s, N12 CUDA 2.514 s
+lambda-vm-prover tests::block_whir_tests::word_family_chunks_keep_the_regenerators_ranks  # Pass 3: CPU 107.067 s, N12 CUDA 1.079 s
+lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_proves_and_verifies::all_instructions_64  # Pass 3: CPU 54.936 s, N12 CUDA 0.487 s
+lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_proves_and_verifies::all_loadstore_32  # Pass 3: CPU 64.587 s, N12 CUDA 0.489 s
+lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_proves_and_verifies::fused_mem_cases  # Pass 3: CPU 54.493 s, N12 CUDA 0.495 s
+lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_proves_and_verifies::test_commit_split  # Pass 3: CPU 64.280 s, N12 CUDA 0.475 s
+lambda-vm-prover tests::fused_memory_block_tests::a_fused_block_proves_and_verifies::test_keccak_multi  # Pass 3: CPU 58.892 s, N12 CUDA 0.705 s
+lambda-vm-prover tests::fused_memory_block_tests::a_split_proof_is_the_bytes_before_the_fused_pair_then_the_pair  # Pass 3: CPU 63.899 s, N12 CUDA 0.454 s
+lambda-vm-prover tests::fused_memory_block_tests::a_split_proof_stating_fused_tables_is_refused  # Pass 3: CPU 55.111 s, N12 CUDA 0.582 s
+lambda-vm-prover tests::multilinear_prove_tests::a_program_proves_and_verifies  # Pass 3: CPU 42.905 s, N12 CUDA 0.510 s
+lambda-vm-prover tests::prove_elfs_tests::test_crafted_zero_count_proof_must_not_verify  # Pass 3: CPU 53.366 s, N12 CUDA 0.455 s
+lambda-vm-prover tests::prove_elfs_tests::test_epoch_memory_bus_with_l2g_bookend  # Pass 3: CPU 54.486 s, N12 CUDA 0.574 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_dma_memset_cases_rust_guest  # Pass 3: CPU 42.418 s, N12 CUDA 0.968 s
+lambda-vm-prover tests::prove_elfs_tests::test_prove_keccak256_forged_padding_rejected  # Pass 3: CPU 42.021 s, N12 CUDA 0.906 s
+lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_inflated_table_counts  # Pass 3: CPU 74.327 s, N12 CUDA 0.703 s
+lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_zero_table_counts  # Pass 3: CPU 70.719 s, N12 CUDA 0.889 s
+lambda-vm-prover tests::regs_inrow_tests::an_in_row_block_proves_and_verifies::all_instructions_64  # Pass 3: CPU 53.498 s, N12 CUDA 0.493 s
+lambda-vm-prover tests::regs_inrow_tests::an_in_row_block_proves_and_verifies::keep_alive_regs  # Pass 3: CPU 72.343 s, N12 CUDA 3.257 s
+lambda-vm-prover tests::regs_inrow_tests::an_in_row_block_proves_and_verifies::test_commit_split  # Pass 3: CPU 61.708 s, N12 CUDA 0.482 s
+lambda-vm-prover tests::regs_inrow_tests::an_in_row_block_proves_and_verifies::test_keccak_multi  # Pass 3: CPU 64.600 s, N12 CUDA 0.736 s
+lambda-vm-prover tests::regs_inrow_tests::an_in_row_block_with_other_register_files_is_refused_at_its_preprocessed_openings  # Pass 3: CPU 68.814 s, N12 CUDA 3.827 s
+lambda-vm-prover tests::skip_empty_tables_tests::dropping_the_committed_output_fails_the_bus_balance  # Pass 3: CPU 54.463 s, N12 CUDA 0.981 s
+lambda-vm-prover tests::skip_empty_tables_tests::omitting_a_chip_dispatched_by_another_chip_fails_the_bus_balance  # Pass 3: CPU 48.242 s, N12 CUDA 0.869 s
+lambda-vm-prover tests::skip_empty_tables_tests::omitting_the_copy_table_and_its_output_fails_the_bus_balance  # Pass 3: CPU 40.759 s, N12 CUDA 0.816 s
+lambda-vm-prover tests::skip_empty_tables_tests::omitting_the_copy_table_fails_the_bus_balance  # Pass 3: CPU 44.189 s, N12 CUDA 0.793 s
+lambda-vm-prover tests::skip_empty_tables_tests::omitting_the_ecrec_table_fails_the_bus_balance  # Pass 3: CPU 43.906 s, N12 CUDA 1.133 s
+lambda-vm-prover tests::trace_length_tests::an_out_of_range_trace_length_in_a_block_proof_is_refused::legacy  # Pass 3: CPU 59.745 s, N12 CUDA 2.294 s
+lambda-vm-prover tests::trace_length_tests::an_out_of_range_trace_length_in_an_lfm_proof_is_refused  # Pass 3: CPU 45.306 s, N12 CUDA 0.479 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_keccak256_and_ecrec_proves_and_verifies::ecrec  # Pass 3: CPU 65.942 s, N12 CUDA 0.768 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_keccak256_and_ecrec_proves_and_verifies::keccak256  # Pass 3: CPU 65.543 s, N12 CUDA 2.572 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::commit  # Pass 3: CPU 40.769 s, N12 CUDA 0.732 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::copy_4gib  # Pass 3: CPU 61.045 s, N12 CUDA 0.673 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::dma_memset_cases  # Pass 3: CPU 81.830 s, N12 CUDA 4.880 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::test_commit_split  # Pass 3: CPU 57.573 s, N12 CUDA 0.638 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::test_copy_ecalls  # Pass 3: CPU 41.142 s, N12 CUDA 0.639 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_calling_the_copy_chip_proves_and_verifies::test_copy_overlaps  # Pass 3: CPU 62.098 s, N12 CUDA 0.662 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::all_instructions_64  # Pass 3: CPU 64.540 s, N12 CUDA 0.669 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::all_loadstore_32  # Pass 3: CPU 57.778 s, N12 CUDA 0.668 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::cross_4gib  # Pass 3: CPU 41.209 s, N12 CUDA 0.680 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::fused_mem_cases  # Pass 3: CPU 61.558 s, N12 CUDA 0.656 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_ld  # Pass 3: CPU 60.094 s, N12 CUDA 0.629 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_lh  # Pass 3: CPU 61.504 s, N12 CUDA 0.650 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_lhu  # Pass 3: CPU 41.308 s, N12 CUDA 0.657 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_lw  # Pass 3: CPU 63.088 s, N12 CUDA 0.644 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_lwu  # Pass 3: CPU 58.826 s, N12 CUDA 0.641 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_sd  # Pass 3: CPU 63.919 s, N12 CUDA 0.639 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_sh  # Pass 3: CPU 41.207 s, N12 CUDA 0.637 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_proves_and_verifies::misalign_sw  # Pass 3: CPU 65.329 s, N12 CUDA 0.636 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_stating_a_chip_table_is_refused_by_the_chip_rule_alone  # Pass 3: CPU 55.087 s, N12 CUDA 0.514 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone::honest  # Pass 3: CPU 59.981 s, N12 CUDA 0.549 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone::mem_load2w  # Pass 3: CPU 50.545 s, N12 CUDA 0.566 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone::mem_load8  # Pass 3: CPU 65.704 s, N12 CUDA 0.580 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone::mem_store2w  # Pass 3: CPU 62.596 s, N12 CUDA 0.581 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone::mem_store8  # Pass 3: CPU 47.788 s, N12 CUDA 0.569 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone::mem_storew  # Pass 3: CPU 66.571 s, N12 CUDA 0.573 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_proves_and_verifies::built_16  # Pass 3: CPU 48.811 s, N12 CUDA 0.559 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_proves_and_verifies::built_2  # Pass 3: CPU 64.713 s, N12 CUDA 0.559 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_proves_and_verifies::built_off  # Pass 3: CPU 42.035 s, N12 CUDA 0.578 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_proves_and_verifies::streamed_16  # Pass 3: CPU 63.120 s, N12 CUDA 0.678 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_proves_and_verifies::streamed_2  # Pass 3: CPU 47.571 s, N12 CUDA 0.691 s
+lambda-vm-prover tests::word_memory_block_tests::a_word_block_with_page_runs_proves_and_verifies::streamed_off  # Pass 3: CPU 67.102 s, N12 CUDA 0.711 s
+lambda-vm-prover tests::word_memory_block_tests::page_w_columns_are_the_verifiers_at_proof_level::elf_page_init  # Pass 3: CPU 41.505 s, N12 CUDA 0.752 s
+lambda-vm-prover tests::word_memory_block_tests::page_w_columns_are_the_verifiers_at_proof_level::elf_page_offset  # Pass 3: CPU 49.631 s, N12 CUDA 0.745 s
+lambda-vm-prover tests::word_memory_block_tests::page_w_columns_are_the_verifiers_at_proof_level::zero_page_init  # Pass 3: CPU 45.811 s, N12 CUDA 0.755 s
+lambda-vm-prover tests::word_memory_block_tests::page_w_columns_are_the_verifiers_at_proof_level::zero_page_offset  # Pass 3: CPU 65.859 s, N12 CUDA 0.753 s
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::fused_mem_cases::fused  # Pass 3: CPU 43.186 s, N12 CUDA 0.562 s
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::fused_mem_cases::split  # Pass 3: CPU 52.482 s, N12 CUDA 0.561 s
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::test_commit_split::fused  # Pass 3: CPU 43.525 s, N12 CUDA 0.495 s
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::test_commit_split::split  # Pass 3: CPU 49.523 s, N12 CUDA 0.473 s
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::test_ecrec::fused  # Pass 3: CPU 42.040 s, N12 CUDA 0.580 s
+lambda-vm-prover tests::word_memory_block_tests::split_and_fused_block_proofs::test_ecrec::split  # Pass 3: CPU 47.167 s, N12 CUDA 0.609 s
+lambda-vm-prover tests::zf_vm_dp_tests::a_vm_proof_round_trips_at_fri_dp  # Pass 3: CPU 47.087 s, N12 CUDA 1.157 s

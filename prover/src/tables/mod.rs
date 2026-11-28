@@ -17,22 +17,37 @@
 //! - **MEMW**: Memory word read/write table (unaligned/split-timestamp path, 49 cols, 26 interactions)
 //! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
+//! - **MEM_LOAD**, **MEM_STORE**: a CPU load or store checked in one row with its memory tokens (the fused memory format)
+//! - **MEM_LOAD8**, **MEM_STORE8**, **MEM_LOADW**, **MEM_STOREW**, **MEM_LOAD2W**, **MEM_STORE2W**: a CPU load or store checked in one row with its words' tokens, by the words it touches (the word memory format, `word_cpu`)
+//! - **PAGE_W**, **MEMW_W**: a page's words' first and last tokens, and a chip's word access (the word memory format)
 //! - **PAGE**: Paged memory init/final table (one per used page)
 //! - **REGISTER**: Register init/final table for x0-x31, x254, and x255 word addresses
 
 pub mod types;
 
+pub mod gpack;
+pub(crate) mod gpack_seeds;
+
 pub mod bitwise;
+pub mod blake3;
 pub mod branch;
 pub mod bytewise;
 pub mod copy;
+pub mod copy_w;
+#[cfg(test)]
+mod copy_w_tests;
 pub mod cpu;
 pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
 pub mod ecdas;
+pub mod ecrec;
+pub mod ecrec_w;
+#[cfg(test)]
+mod ecrec_w_tests;
 pub mod ecsm;
 pub mod eq;
+pub mod fused_memory;
 pub mod global_memory;
 pub mod halt;
 pub mod hint;
@@ -40,18 +55,57 @@ pub mod is_wh;
 pub mod keccak;
 pub mod keccak_rc;
 pub mod keccak_rnd;
+pub mod keccak_w;
+#[cfg(test)]
+mod keccak_w_tests;
 pub mod load;
+pub mod local_bytes;
 pub mod local_to_global;
 pub mod lt;
+/// The fused memory tables' records as the card's fill reads them, as the
+/// streamed hand-out holds their chunks.
+pub(crate) mod mem_card;
+/// The fused memory tables' card fills against the host's: a box test, with
+/// a card.
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod mem_card_tests;
+pub mod mem_load;
+pub mod mem_load2w;
+pub mod mem_load8;
+pub mod mem_loadw;
+pub mod mem_store;
+pub mod mem_store2w;
+pub mod mem_store8;
+pub mod mem_storew;
 pub mod memw;
 pub mod memw_aligned;
 pub mod memw_register;
+pub mod memw_w;
 pub mod mul;
 pub mod page;
+#[cfg(test)]
+mod page_run_tests;
+pub mod page_w;
 pub mod register;
+pub mod register_residual;
 pub mod shift;
 pub mod store;
 pub mod trace_builder;
+pub mod trace_hash;
+pub mod word_cpu;
+#[cfg(test)]
+mod word_cpu_tests;
+pub mod word_memory;
+#[cfg(test)]
+mod word_memory_tests;
+
+/// The card fill's records, synthetic sets and host known-answer vectors.
+#[cfg(test)]
+mod card_fill_inputs;
+/// The card's table fills against the host's, word for word, and timed: a
+/// box test (`--ignored`), with a card.
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod card_fill_tests;
 
 pub use types::BusId;
 
@@ -61,6 +115,23 @@ pub use types::BusId;
 /// between the generator and the drift tests so adding a blowup here cannot
 /// silently skip a test.
 pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
+
+/// Blowup factors for which the ONE-ROW (S2) twins of those static
+/// commitments ship (`static_commitment_one_row` and the page twins), emitted
+/// by `compute_static_commitments --layout row` and pinned by the one-row drift
+/// tests. Only the blowup the knob is measured at (4 for
+/// the base and for the LFM chips): under one row any other blowup is a hard
+/// miss, never a recompute.
+pub const STATIC_BLOWUP_FACTORS_ONE_ROW: &[u8] = &[4];
+
+/// Blowup factors for which the POSEIDON1 twins of the bitwise and keccak_rc
+/// static commitments ship (`static_commitment_p1`), emitted by
+/// `compute_static_commitments --hash p1` and pinned by the Poseidon1 drift
+/// tests. Only the blowup the block's proof family commits its LFM tables at
+/// (4), in row pairs: the one key its provers and verifiers ask for. Any
+/// other key under Poseidon1 is computed
+/// ([`crate::hash_pin::static_root_under`]).
+pub const STATIC_BLOWUP_FACTORS_P1: &[u8] = &[4];
 
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
@@ -100,6 +171,9 @@ pub mod max_rows {
     pub const BYTEWISE: usize = 1 << 20;
     pub const STORE: usize = 1 << 20;
     pub const CPU32: usize = 1 << 19;
+    // The fused memory format's tables, at LOAD's and STORE's rows.
+    pub const MEM_LOAD: usize = 1 << 20;
+    pub const MEM_STORE: usize = 1 << 20;
 }
 
 /// Per-table maximum row limits, configurable for different environments.
@@ -122,10 +196,49 @@ pub struct MaxRowsConfig {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// The fused memory format's MEM_LOAD and MEM_STORE tables.
+    pub mem_load: usize,
+    pub mem_store: usize,
+}
+
+/// The uniform table cap this process proves at, or `None` for the production
+/// per-table values.
+///
+/// ★ ONE READER, AND IT IS THIS ONE. [`MaxRowsConfig::default`] is what decides
+/// how an epoch is chunked, so anything that wants to describe the posture a
+/// run was proven at has to ask the same question the same way. A second parse
+/// of `LAMBDA_VM_MAX_ROWS_LOG2` somewhere else is how a label comes to name a
+/// posture the epochs were not chunked at — and the transcript pin is exactly
+/// such a label, since its counts ARE the chunking.
+pub(crate) fn max_rows_log2_override() -> Option<u32> {
+    let v = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2").ok()?;
+    let n: u32 = v
+        .parse()
+        .expect("LAMBDA_VM_MAX_ROWS_LOG2 must be an integer");
+    assert!(
+        (5..=26).contains(&n),
+        "LAMBDA_VM_MAX_ROWS_LOG2 must be in 5..=26, got {n}"
+    );
+    Some(n)
 }
 
 impl Default for MaxRowsConfig {
+    /// The production values from [`max_rows`], unless
+    /// `LAMBDA_VM_MAX_ROWS_LOG2` overrides them with one uniform cap.
+    ///
+    /// The env knob is a prover-side SHAPE choice, like `TABLE_PARALLELISM` is
+    /// a resource one: chunk counts already ride the statement (the verifier
+    /// reads them from the proof it checks, never from this config), so two
+    /// provers with different caps produce differently-chunked but equally
+    /// verifiable epochs. It exists for compression-posture measurement — the
+    /// production 2^19/2^20 values are sized for equal-memory parallel chunks,
+    /// which multiplies SUB-PROOFS per epoch, and every extra sub-proof is a
+    /// leg the recursion wrap pays for. Tall-table postures (2^24) trade chunk
+    /// parallelism for fewer legs.
     fn default() -> Self {
+        if let Some(n) = max_rows_log2_override() {
+            return Self::uniform(1 << n);
+        }
         Self {
             cpu: max_rows::CPU,
             memw: max_rows::MEMW,
@@ -141,11 +254,35 @@ impl Default for MaxRowsConfig {
             bytewise: max_rows::BYTEWISE,
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
+            mem_load: max_rows::MEM_LOAD,
+            mem_store: max_rows::MEM_STORE,
         }
     }
 }
 
 impl MaxRowsConfig {
+    /// One cap for every table — the tall-table posture the env override uses.
+    pub fn uniform(rows: usize) -> Self {
+        Self {
+            cpu: rows,
+            memw: rows,
+            memw_aligned: rows,
+            dvrm: rows,
+            mul: rows,
+            lt: rows,
+            shift: rows,
+            load: rows,
+            branch: rows,
+            memw_register: rows,
+            eq: rows,
+            bytewise: rows,
+            store: rows,
+            cpu32: rows,
+            mem_load: rows,
+            mem_store: rows,
+        }
+    }
+
     /// Small limits for low-memory testing. Generates multiple chunks
     /// per table even for tiny programs (~32 rows per chunk).
     pub fn small() -> Self {
@@ -164,6 +301,8 @@ impl MaxRowsConfig {
             bytewise: 1 << 5,
             store: 1 << 5,
             cpu32: 1 << 5,
+            mem_load: 1 << 5,
+            mem_store: 1 << 5,
         }
     }
 }

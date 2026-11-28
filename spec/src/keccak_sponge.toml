@@ -1,0 +1,416 @@
+name = "KECCAK_SPONGE"
+
+# The KECCAK table's second mode: one row per permutation of a `keccak256` call
+# (ECALL -5). The table holds both modes; this file lists the columns and the
+# constraints of a sponge row (`μ_s = 1`). The mode bits and how they gate each
+# mode are in keccak.typ.
+
+[[variables.input]]
+name = "key"
+type = "DWordWL"
+desc = "`(T, j)`: the call's timestamp `T` and the block index `j` (the table's `timestamp` columns)"
+pad = 0
+
+[[variables.input]]
+name = "input_state"
+type = [[["Byte", 8], 5], 5]
+desc = "state the permutation starts from: the previous output with the padded block XORed into its rate"
+pad = 0
+
+[[variables.output]]
+name = "output_state"
+type = [[["Byte", 8], 5], 5]
+desc = "state after the permutation"
+pad = 0
+
+[[variables.auxiliary]]
+name = "count"
+type = "BaseField"
+desc = "input bytes left before this row's block (`len − 136·j`)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "src"
+type = "DWordWL"
+desc = "address of this row's block (`ptr + 136·j`)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "out"
+type = "DWordWL"
+desc = "address the digest is written to"
+pad = 0
+
+[[variables.auxiliary]]
+name = "src_end"
+type = ["Half", 2]
+desc = "the low word of `src` plus 135, as two halves"
+pad = 0
+
+[[variables.auxiliary]]
+name = "out_end"
+type = ["Half", 2]
+desc = "the low word of `out` plus 31, as two halves"
+pad = 0
+
+[[variables.auxiliary]]
+name = "prev"
+type = [["Byte", 8], 17]
+desc = "rate lanes of the previous permutation's output (zero on the first row)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "msg"
+type = [["Byte", 8], 17]
+desc = "the block's bytes as read; zero past the input"
+pad = 0
+
+[[variables.auxiliary]]
+name = "full"
+type = ["Bit", 17]
+desc = "lane `L` of the block is input and read as one 8-byte access"
+pad = 0
+
+[[variables.auxiliary]]
+name = "part"
+type = [["Bit", 7], 17]
+desc = "byte `b < 7` of lane `L` is input and read alone"
+pad = 0
+
+[[variables.auxiliary]]
+name = "first"
+type = "Bit"
+desc = "first row of a call"
+pad = 0
+
+[[variables.auxiliary]]
+name = "last"
+type = "Bit"
+desc = "last row of a call"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ_s"
+type = "Bit"
+desc = "sponge row (the table's `MU_S`)"
+pad = 0
+
+# Constraints
+
+[[constraint_groups]]
+name = "call"
+
+[[constraints.call]]
+kind = "interaction"
+tag = "ECALL"
+input = [["arr", ["idx", "key", 0], 0], ["cast", ["-", ["^", 2, 64], 5], "DWordWL"]]
+multiplicity = ["-", "first"]
+ref = "keccak_sponge:c:ecall"
+
+[[constraints.call]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", "src", 0], ["idx", "src", 1], 0, 0, 0, 0, 0, 0], ["arr", ["idx", "key", 0], 0], 1, 0, 0]
+output = ["arr", ["idx", "src", 0], ["idx", "src", 1], 0, 0, 0, 0, 0, 0]
+multiplicity = "first"
+ref = "keccak_sponge:c:read_ptr"
+
+[[constraints.call]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", "count", 0, 0, 0, 0, 0, 0, 0], ["arr", ["idx", "key", 0], 0], 1, 0, 0]
+output = ["arr", "count", 0, 0, 0, 0, 0, 0, 0]
+multiplicity = "first"
+ref = "keccak_sponge:c:read_len"
+
+[[constraints.call]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 12], "DWordWL"], ["arr", ["idx", "out", 0], ["idx", "out", 1], 0, 0, 0, 0, 0, 0], ["arr", ["idx", "key", 0], 0], 1, 0, 0]
+output = ["arr", ["idx", "out", 0], ["idx", "out", 1], 0, 0, 0, 0, 0, 0]
+multiplicity = "first"
+ref = "keccak_sponge:c:read_out"
+
+[[constraints.call]]
+kind = "arith"
+constraint = "the first row is block 0"
+poly = ["*", "first", ["idx", "key", 1]]
+ref = "keccak_sponge:c:first_block"
+
+[[constraints.call]]
+kind = "arith"
+constraint = "the first row starts from the zero state: `prev` is zero"
+poly = ["*", "first", ["idx", ["idx", "prev", "L"], "b"]]
+iters = [["L", 0, 16], ["b", 0, 7]]
+ref = "keccak_sponge:c:first_prev"
+[[constraints.call]]
+kind = "arith"
+constraint = "the first row starts from the zero state: capacity lanes of row 3"
+poly = ["*", "first", ["idx", ["idx", ["idx", "input_state", "x"], 3], "b"]]
+iters = [["x", 2, 4], ["b", 0, 7]]
+ref = "keccak_sponge:c:first_capacity_3"
+
+[[constraints.call]]
+kind = "arith"
+constraint = "the first row starts from the zero state: capacity lanes of row 4"
+poly = ["*", "first", ["idx", ["idx", ["idx", "input_state", "x"], 4], "b"]]
+iters = [["x", 0, 4], ["b", 0, 7]]
+ref = "keccak_sponge:c:first_capacity_4"
+
+[[constraints.call]]
+kind = "arith"
+constraint = "`first` and `last` only on sponge rows"
+poly = ["*", ["+", "first", "last"], ["not", "μ_s"]]
+ref = "keccak_sponge:c:flags_on_sponge_rows"
+
+[[constraint_groups]]
+name = "chain"
+[[constraints.chain]]
+kind = "interaction"
+tag = "KECCAK_SPONGE"
+input = [["arr", ["idx", "key", 0], ["+", ["idx", "key", 1], 1]], ["-", "count", 136], ["arr", ["+", ["idx", "src_end", 0], ["*", ["^", 2, 16], ["idx", "src_end", 1]], 1], ["idx", "src", 1]], "out", ["arr", ["arr", ["arr", ["idx", ["idx", ["idx", "output_state", 0], 0], 0], ["idx", ["idx", ["idx", "output_state", 0], 0], 1], ["idx", ["idx", ["idx", "output_state", 0], 0], 2], ["idx", ["idx", ["idx", "output_state", 0], 0], 3], ["idx", ["idx", ["idx", "output_state", 0], 0], 4], ["idx", ["idx", ["idx", "output_state", 0], 0], 5], ["idx", ["idx", ["idx", "output_state", 0], 0], 6], ["idx", ["idx", ["idx", "output_state", 0], 0], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 0], 1], 0], ["idx", ["idx", ["idx", "output_state", 0], 1], 1], ["idx", ["idx", ["idx", "output_state", 0], 1], 2], ["idx", ["idx", ["idx", "output_state", 0], 1], 3], ["idx", ["idx", ["idx", "output_state", 0], 1], 4], ["idx", ["idx", ["idx", "output_state", 0], 1], 5], ["idx", ["idx", ["idx", "output_state", 0], 1], 6], ["idx", ["idx", ["idx", "output_state", 0], 1], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 0], 2], 0], ["idx", ["idx", ["idx", "output_state", 0], 2], 1], ["idx", ["idx", ["idx", "output_state", 0], 2], 2], ["idx", ["idx", ["idx", "output_state", 0], 2], 3], ["idx", ["idx", ["idx", "output_state", 0], 2], 4], ["idx", ["idx", ["idx", "output_state", 0], 2], 5], ["idx", ["idx", ["idx", "output_state", 0], 2], 6], ["idx", ["idx", ["idx", "output_state", 0], 2], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 0], 3], 0], ["idx", ["idx", ["idx", "output_state", 0], 3], 1], ["idx", ["idx", ["idx", "output_state", 0], 3], 2], ["idx", ["idx", ["idx", "output_state", 0], 3], 3], ["idx", ["idx", ["idx", "output_state", 0], 3], 4], ["idx", ["idx", ["idx", "output_state", 0], 3], 5], ["idx", ["idx", ["idx", "output_state", 0], 3], 6], ["idx", ["idx", ["idx", "output_state", 0], 3], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 0], 4], 0], ["idx", ["idx", ["idx", "output_state", 0], 4], 1], ["idx", ["idx", ["idx", "output_state", 0], 4], 2], ["idx", ["idx", ["idx", "output_state", 0], 4], 3], ["idx", ["idx", ["idx", "output_state", 0], 4], 4], ["idx", ["idx", ["idx", "output_state", 0], 4], 5], ["idx", ["idx", ["idx", "output_state", 0], 4], 6], ["idx", ["idx", ["idx", "output_state", 0], 4], 7]]], ["arr", ["arr", ["idx", ["idx", ["idx", "output_state", 1], 0], 0], ["idx", ["idx", ["idx", "output_state", 1], 0], 1], ["idx", ["idx", ["idx", "output_state", 1], 0], 2], ["idx", ["idx", ["idx", "output_state", 1], 0], 3], ["idx", ["idx", ["idx", "output_state", 1], 0], 4], ["idx", ["idx", ["idx", "output_state", 1], 0], 5], ["idx", ["idx", ["idx", "output_state", 1], 0], 6], ["idx", ["idx", ["idx", "output_state", 1], 0], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 1], 1], 0], ["idx", ["idx", ["idx", "output_state", 1], 1], 1], ["idx", ["idx", ["idx", "output_state", 1], 1], 2], ["idx", ["idx", ["idx", "output_state", 1], 1], 3], ["idx", ["idx", ["idx", "output_state", 1], 1], 4], ["idx", ["idx", ["idx", "output_state", 1], 1], 5], ["idx", ["idx", ["idx", "output_state", 1], 1], 6], ["idx", ["idx", ["idx", "output_state", 1], 1], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 1], 2], 0], ["idx", ["idx", ["idx", "output_state", 1], 2], 1], ["idx", ["idx", ["idx", "output_state", 1], 2], 2], ["idx", ["idx", ["idx", "output_state", 1], 2], 3], ["idx", ["idx", ["idx", "output_state", 1], 2], 4], ["idx", ["idx", ["idx", "output_state", 1], 2], 5], ["idx", ["idx", ["idx", "output_state", 1], 2], 6], ["idx", ["idx", ["idx", "output_state", 1], 2], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 1], 3], 0], ["idx", ["idx", ["idx", "output_state", 1], 3], 1], ["idx", ["idx", ["idx", "output_state", 1], 3], 2], ["idx", ["idx", ["idx", "output_state", 1], 3], 3], ["idx", ["idx", ["idx", "output_state", 1], 3], 4], ["idx", ["idx", ["idx", "output_state", 1], 3], 5], ["idx", ["idx", ["idx", "output_state", 1], 3], 6], ["idx", ["idx", ["idx", "output_state", 1], 3], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 1], 4], 0], ["idx", ["idx", ["idx", "output_state", 1], 4], 1], ["idx", ["idx", ["idx", "output_state", 1], 4], 2], ["idx", ["idx", ["idx", "output_state", 1], 4], 3], ["idx", ["idx", ["idx", "output_state", 1], 4], 4], ["idx", ["idx", ["idx", "output_state", 1], 4], 5], ["idx", ["idx", ["idx", "output_state", 1], 4], 6], ["idx", ["idx", ["idx", "output_state", 1], 4], 7]]], ["arr", ["arr", ["idx", ["idx", ["idx", "output_state", 2], 0], 0], ["idx", ["idx", ["idx", "output_state", 2], 0], 1], ["idx", ["idx", ["idx", "output_state", 2], 0], 2], ["idx", ["idx", ["idx", "output_state", 2], 0], 3], ["idx", ["idx", ["idx", "output_state", 2], 0], 4], ["idx", ["idx", ["idx", "output_state", 2], 0], 5], ["idx", ["idx", ["idx", "output_state", 2], 0], 6], ["idx", ["idx", ["idx", "output_state", 2], 0], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 2], 1], 0], ["idx", ["idx", ["idx", "output_state", 2], 1], 1], ["idx", ["idx", ["idx", "output_state", 2], 1], 2], ["idx", ["idx", ["idx", "output_state", 2], 1], 3], ["idx", ["idx", ["idx", "output_state", 2], 1], 4], ["idx", ["idx", ["idx", "output_state", 2], 1], 5], ["idx", ["idx", ["idx", "output_state", 2], 1], 6], ["idx", ["idx", ["idx", "output_state", 2], 1], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 2], 2], 0], ["idx", ["idx", ["idx", "output_state", 2], 2], 1], ["idx", ["idx", ["idx", "output_state", 2], 2], 2], ["idx", ["idx", ["idx", "output_state", 2], 2], 3], ["idx", ["idx", ["idx", "output_state", 2], 2], 4], ["idx", ["idx", ["idx", "output_state", 2], 2], 5], ["idx", ["idx", ["idx", "output_state", 2], 2], 6], ["idx", ["idx", ["idx", "output_state", 2], 2], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 2], 3], 0], ["idx", ["idx", ["idx", "output_state", 2], 3], 1], ["idx", ["idx", ["idx", "output_state", 2], 3], 2], ["idx", ["idx", ["idx", "output_state", 2], 3], 3], ["idx", ["idx", ["idx", "output_state", 2], 3], 4], ["idx", ["idx", ["idx", "output_state", 2], 3], 5], ["idx", ["idx", ["idx", "output_state", 2], 3], 6], ["idx", ["idx", ["idx", "output_state", 2], 3], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 2], 4], 0], ["idx", ["idx", ["idx", "output_state", 2], 4], 1], ["idx", ["idx", ["idx", "output_state", 2], 4], 2], ["idx", ["idx", ["idx", "output_state", 2], 4], 3], ["idx", ["idx", ["idx", "output_state", 2], 4], 4], ["idx", ["idx", ["idx", "output_state", 2], 4], 5], ["idx", ["idx", ["idx", "output_state", 2], 4], 6], ["idx", ["idx", ["idx", "output_state", 2], 4], 7]]], ["arr", ["arr", ["idx", ["idx", ["idx", "output_state", 3], 0], 0], ["idx", ["idx", ["idx", "output_state", 3], 0], 1], ["idx", ["idx", ["idx", "output_state", 3], 0], 2], ["idx", ["idx", ["idx", "output_state", 3], 0], 3], ["idx", ["idx", ["idx", "output_state", 3], 0], 4], ["idx", ["idx", ["idx", "output_state", 3], 0], 5], ["idx", ["idx", ["idx", "output_state", 3], 0], 6], ["idx", ["idx", ["idx", "output_state", 3], 0], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 3], 1], 0], ["idx", ["idx", ["idx", "output_state", 3], 1], 1], ["idx", ["idx", ["idx", "output_state", 3], 1], 2], ["idx", ["idx", ["idx", "output_state", 3], 1], 3], ["idx", ["idx", ["idx", "output_state", 3], 1], 4], ["idx", ["idx", ["idx", "output_state", 3], 1], 5], ["idx", ["idx", ["idx", "output_state", 3], 1], 6], ["idx", ["idx", ["idx", "output_state", 3], 1], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 3], 2], 0], ["idx", ["idx", ["idx", "output_state", 3], 2], 1], ["idx", ["idx", ["idx", "output_state", 3], 2], 2], ["idx", ["idx", ["idx", "output_state", 3], 2], 3], ["idx", ["idx", ["idx", "output_state", 3], 2], 4], ["idx", ["idx", ["idx", "output_state", 3], 2], 5], ["idx", ["idx", ["idx", "output_state", 3], 2], 6], ["idx", ["idx", ["idx", "output_state", 3], 2], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 3], 3], 0], ["idx", ["idx", ["idx", "output_state", 3], 3], 1], ["idx", ["idx", ["idx", "output_state", 3], 3], 2], ["idx", ["idx", ["idx", "output_state", 3], 3], 3], ["idx", ["idx", ["idx", "output_state", 3], 3], 4], ["idx", ["idx", ["idx", "output_state", 3], 3], 5], ["idx", ["idx", ["idx", "output_state", 3], 3], 6], ["idx", ["idx", ["idx", "output_state", 3], 3], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 3], 4], 0], ["idx", ["idx", ["idx", "output_state", 3], 4], 1], ["idx", ["idx", ["idx", "output_state", 3], 4], 2], ["idx", ["idx", ["idx", "output_state", 3], 4], 3], ["idx", ["idx", ["idx", "output_state", 3], 4], 4], ["idx", ["idx", ["idx", "output_state", 3], 4], 5], ["idx", ["idx", ["idx", "output_state", 3], 4], 6], ["idx", ["idx", ["idx", "output_state", 3], 4], 7]]], ["arr", ["arr", ["idx", ["idx", ["idx", "output_state", 4], 0], 0], ["idx", ["idx", ["idx", "output_state", 4], 0], 1], ["idx", ["idx", ["idx", "output_state", 4], 0], 2], ["idx", ["idx", ["idx", "output_state", 4], 0], 3], ["idx", ["idx", ["idx", "output_state", 4], 0], 4], ["idx", ["idx", ["idx", "output_state", 4], 0], 5], ["idx", ["idx", ["idx", "output_state", 4], 0], 6], ["idx", ["idx", ["idx", "output_state", 4], 0], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 4], 1], 0], ["idx", ["idx", ["idx", "output_state", 4], 1], 1], ["idx", ["idx", ["idx", "output_state", 4], 1], 2], ["idx", ["idx", ["idx", "output_state", 4], 1], 3], ["idx", ["idx", ["idx", "output_state", 4], 1], 4], ["idx", ["idx", ["idx", "output_state", 4], 1], 5], ["idx", ["idx", ["idx", "output_state", 4], 1], 6], ["idx", ["idx", ["idx", "output_state", 4], 1], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 4], 2], 0], ["idx", ["idx", ["idx", "output_state", 4], 2], 1], ["idx", ["idx", ["idx", "output_state", 4], 2], 2], ["idx", ["idx", ["idx", "output_state", 4], 2], 3], ["idx", ["idx", ["idx", "output_state", 4], 2], 4], ["idx", ["idx", ["idx", "output_state", 4], 2], 5], ["idx", ["idx", ["idx", "output_state", 4], 2], 6], ["idx", ["idx", ["idx", "output_state", 4], 2], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 4], 3], 0], ["idx", ["idx", ["idx", "output_state", 4], 3], 1], ["idx", ["idx", ["idx", "output_state", 4], 3], 2], ["idx", ["idx", ["idx", "output_state", 4], 3], 3], ["idx", ["idx", ["idx", "output_state", 4], 3], 4], ["idx", ["idx", ["idx", "output_state", 4], 3], 5], ["idx", ["idx", ["idx", "output_state", 4], 3], 6], ["idx", ["idx", ["idx", "output_state", 4], 3], 7]], ["arr", ["idx", ["idx", ["idx", "output_state", 4], 4], 0], ["idx", ["idx", ["idx", "output_state", 4], 4], 1], ["idx", ["idx", ["idx", "output_state", 4], 4], 2], ["idx", ["idx", ["idx", "output_state", 4], 4], 3], ["idx", ["idx", ["idx", "output_state", 4], 4], 4], ["idx", ["idx", ["idx", "output_state", 4], 4], 5], ["idx", ["idx", ["idx", "output_state", 4], 4], 6], ["idx", ["idx", ["idx", "output_state", 4], 4], 7]]]]]
+multiplicity = ["-", "μ_s", "last"]
+ref = "keccak_sponge:c:send_next"
+
+[[constraints.chain]]
+kind = "interaction"
+tag = "KECCAK_SPONGE"
+input = ["key", "count", "src", "out", ["arr", ["arr", ["arr", ["idx", ["idx", "prev", 0], 0], ["idx", ["idx", "prev", 0], 1], ["idx", ["idx", "prev", 0], 2], ["idx", ["idx", "prev", 0], 3], ["idx", ["idx", "prev", 0], 4], ["idx", ["idx", "prev", 0], 5], ["idx", ["idx", "prev", 0], 6], ["idx", ["idx", "prev", 0], 7]], ["arr", ["idx", ["idx", "prev", 5], 0], ["idx", ["idx", "prev", 5], 1], ["idx", ["idx", "prev", 5], 2], ["idx", ["idx", "prev", 5], 3], ["idx", ["idx", "prev", 5], 4], ["idx", ["idx", "prev", 5], 5], ["idx", ["idx", "prev", 5], 6], ["idx", ["idx", "prev", 5], 7]], ["arr", ["idx", ["idx", "prev", 10], 0], ["idx", ["idx", "prev", 10], 1], ["idx", ["idx", "prev", 10], 2], ["idx", ["idx", "prev", 10], 3], ["idx", ["idx", "prev", 10], 4], ["idx", ["idx", "prev", 10], 5], ["idx", ["idx", "prev", 10], 6], ["idx", ["idx", "prev", 10], 7]], ["arr", ["idx", ["idx", "prev", 15], 0], ["idx", ["idx", "prev", 15], 1], ["idx", ["idx", "prev", 15], 2], ["idx", ["idx", "prev", 15], 3], ["idx", ["idx", "prev", 15], 4], ["idx", ["idx", "prev", 15], 5], ["idx", ["idx", "prev", 15], 6], ["idx", ["idx", "prev", 15], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 0], 4], 0], ["idx", ["idx", ["idx", "input_state", 0], 4], 1], ["idx", ["idx", ["idx", "input_state", 0], 4], 2], ["idx", ["idx", ["idx", "input_state", 0], 4], 3], ["idx", ["idx", ["idx", "input_state", 0], 4], 4], ["idx", ["idx", ["idx", "input_state", 0], 4], 5], ["idx", ["idx", ["idx", "input_state", 0], 4], 6], ["idx", ["idx", ["idx", "input_state", 0], 4], 7]]], ["arr", ["arr", ["idx", ["idx", "prev", 1], 0], ["idx", ["idx", "prev", 1], 1], ["idx", ["idx", "prev", 1], 2], ["idx", ["idx", "prev", 1], 3], ["idx", ["idx", "prev", 1], 4], ["idx", ["idx", "prev", 1], 5], ["idx", ["idx", "prev", 1], 6], ["idx", ["idx", "prev", 1], 7]], ["arr", ["idx", ["idx", "prev", 6], 0], ["idx", ["idx", "prev", 6], 1], ["idx", ["idx", "prev", 6], 2], ["idx", ["idx", "prev", 6], 3], ["idx", ["idx", "prev", 6], 4], ["idx", ["idx", "prev", 6], 5], ["idx", ["idx", "prev", 6], 6], ["idx", ["idx", "prev", 6], 7]], ["arr", ["idx", ["idx", "prev", 11], 0], ["idx", ["idx", "prev", 11], 1], ["idx", ["idx", "prev", 11], 2], ["idx", ["idx", "prev", 11], 3], ["idx", ["idx", "prev", 11], 4], ["idx", ["idx", "prev", 11], 5], ["idx", ["idx", "prev", 11], 6], ["idx", ["idx", "prev", 11], 7]], ["arr", ["idx", ["idx", "prev", 16], 0], ["idx", ["idx", "prev", 16], 1], ["idx", ["idx", "prev", 16], 2], ["idx", ["idx", "prev", 16], 3], ["idx", ["idx", "prev", 16], 4], ["idx", ["idx", "prev", 16], 5], ["idx", ["idx", "prev", 16], 6], ["idx", ["idx", "prev", 16], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 1], 4], 0], ["idx", ["idx", ["idx", "input_state", 1], 4], 1], ["idx", ["idx", ["idx", "input_state", 1], 4], 2], ["idx", ["idx", ["idx", "input_state", 1], 4], 3], ["idx", ["idx", ["idx", "input_state", 1], 4], 4], ["idx", ["idx", ["idx", "input_state", 1], 4], 5], ["idx", ["idx", ["idx", "input_state", 1], 4], 6], ["idx", ["idx", ["idx", "input_state", 1], 4], 7]]], ["arr", ["arr", ["idx", ["idx", "prev", 2], 0], ["idx", ["idx", "prev", 2], 1], ["idx", ["idx", "prev", 2], 2], ["idx", ["idx", "prev", 2], 3], ["idx", ["idx", "prev", 2], 4], ["idx", ["idx", "prev", 2], 5], ["idx", ["idx", "prev", 2], 6], ["idx", ["idx", "prev", 2], 7]], ["arr", ["idx", ["idx", "prev", 7], 0], ["idx", ["idx", "prev", 7], 1], ["idx", ["idx", "prev", 7], 2], ["idx", ["idx", "prev", 7], 3], ["idx", ["idx", "prev", 7], 4], ["idx", ["idx", "prev", 7], 5], ["idx", ["idx", "prev", 7], 6], ["idx", ["idx", "prev", 7], 7]], ["arr", ["idx", ["idx", "prev", 12], 0], ["idx", ["idx", "prev", 12], 1], ["idx", ["idx", "prev", 12], 2], ["idx", ["idx", "prev", 12], 3], ["idx", ["idx", "prev", 12], 4], ["idx", ["idx", "prev", 12], 5], ["idx", ["idx", "prev", 12], 6], ["idx", ["idx", "prev", 12], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 2], 3], 0], ["idx", ["idx", ["idx", "input_state", 2], 3], 1], ["idx", ["idx", ["idx", "input_state", 2], 3], 2], ["idx", ["idx", ["idx", "input_state", 2], 3], 3], ["idx", ["idx", ["idx", "input_state", 2], 3], 4], ["idx", ["idx", ["idx", "input_state", 2], 3], 5], ["idx", ["idx", ["idx", "input_state", 2], 3], 6], ["idx", ["idx", ["idx", "input_state", 2], 3], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 2], 4], 0], ["idx", ["idx", ["idx", "input_state", 2], 4], 1], ["idx", ["idx", ["idx", "input_state", 2], 4], 2], ["idx", ["idx", ["idx", "input_state", 2], 4], 3], ["idx", ["idx", ["idx", "input_state", 2], 4], 4], ["idx", ["idx", ["idx", "input_state", 2], 4], 5], ["idx", ["idx", ["idx", "input_state", 2], 4], 6], ["idx", ["idx", ["idx", "input_state", 2], 4], 7]]], ["arr", ["arr", ["idx", ["idx", "prev", 3], 0], ["idx", ["idx", "prev", 3], 1], ["idx", ["idx", "prev", 3], 2], ["idx", ["idx", "prev", 3], 3], ["idx", ["idx", "prev", 3], 4], ["idx", ["idx", "prev", 3], 5], ["idx", ["idx", "prev", 3], 6], ["idx", ["idx", "prev", 3], 7]], ["arr", ["idx", ["idx", "prev", 8], 0], ["idx", ["idx", "prev", 8], 1], ["idx", ["idx", "prev", 8], 2], ["idx", ["idx", "prev", 8], 3], ["idx", ["idx", "prev", 8], 4], ["idx", ["idx", "prev", 8], 5], ["idx", ["idx", "prev", 8], 6], ["idx", ["idx", "prev", 8], 7]], ["arr", ["idx", ["idx", "prev", 13], 0], ["idx", ["idx", "prev", 13], 1], ["idx", ["idx", "prev", 13], 2], ["idx", ["idx", "prev", 13], 3], ["idx", ["idx", "prev", 13], 4], ["idx", ["idx", "prev", 13], 5], ["idx", ["idx", "prev", 13], 6], ["idx", ["idx", "prev", 13], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 3], 3], 0], ["idx", ["idx", ["idx", "input_state", 3], 3], 1], ["idx", ["idx", ["idx", "input_state", 3], 3], 2], ["idx", ["idx", ["idx", "input_state", 3], 3], 3], ["idx", ["idx", ["idx", "input_state", 3], 3], 4], ["idx", ["idx", ["idx", "input_state", 3], 3], 5], ["idx", ["idx", ["idx", "input_state", 3], 3], 6], ["idx", ["idx", ["idx", "input_state", 3], 3], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 3], 4], 0], ["idx", ["idx", ["idx", "input_state", 3], 4], 1], ["idx", ["idx", ["idx", "input_state", 3], 4], 2], ["idx", ["idx", ["idx", "input_state", 3], 4], 3], ["idx", ["idx", ["idx", "input_state", 3], 4], 4], ["idx", ["idx", ["idx", "input_state", 3], 4], 5], ["idx", ["idx", ["idx", "input_state", 3], 4], 6], ["idx", ["idx", ["idx", "input_state", 3], 4], 7]]], ["arr", ["arr", ["idx", ["idx", "prev", 4], 0], ["idx", ["idx", "prev", 4], 1], ["idx", ["idx", "prev", 4], 2], ["idx", ["idx", "prev", 4], 3], ["idx", ["idx", "prev", 4], 4], ["idx", ["idx", "prev", 4], 5], ["idx", ["idx", "prev", 4], 6], ["idx", ["idx", "prev", 4], 7]], ["arr", ["idx", ["idx", "prev", 9], 0], ["idx", ["idx", "prev", 9], 1], ["idx", ["idx", "prev", 9], 2], ["idx", ["idx", "prev", 9], 3], ["idx", ["idx", "prev", 9], 4], ["idx", ["idx", "prev", 9], 5], ["idx", ["idx", "prev", 9], 6], ["idx", ["idx", "prev", 9], 7]], ["arr", ["idx", ["idx", "prev", 14], 0], ["idx", ["idx", "prev", 14], 1], ["idx", ["idx", "prev", 14], 2], ["idx", ["idx", "prev", 14], 3], ["idx", ["idx", "prev", 14], 4], ["idx", ["idx", "prev", 14], 5], ["idx", ["idx", "prev", 14], 6], ["idx", ["idx", "prev", 14], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 4], 3], 0], ["idx", ["idx", ["idx", "input_state", 4], 3], 1], ["idx", ["idx", ["idx", "input_state", 4], 3], 2], ["idx", ["idx", ["idx", "input_state", 4], 3], 3], ["idx", ["idx", ["idx", "input_state", 4], 3], 4], ["idx", ["idx", ["idx", "input_state", 4], 3], 5], ["idx", ["idx", ["idx", "input_state", 4], 3], 6], ["idx", ["idx", ["idx", "input_state", 4], 3], 7]], ["arr", ["idx", ["idx", ["idx", "input_state", 4], 4], 0], ["idx", ["idx", ["idx", "input_state", 4], 4], 1], ["idx", ["idx", ["idx", "input_state", 4], 4], 2], ["idx", ["idx", ["idx", "input_state", 4], 4], 3], ["idx", ["idx", ["idx", "input_state", 4], 4], 4], ["idx", ["idx", ["idx", "input_state", 4], 4], 5], ["idx", ["idx", ["idx", "input_state", 4], 4], 6], ["idx", ["idx", ["idx", "input_state", 4], 4], 7]]]]]
+multiplicity = ["-", ["-", "μ_s", "first"]]
+ref = "keccak_sponge:c:receive_previous"
+
+[[constraint_groups]]
+name = "read"
+
+[[constraints.read]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["arr", ["+", ["idx", "src", 0], ["*", 8, "L"]], ["idx", "src", 1]], ["idx", "msg", "L"], ["arr", ["idx", "key", 0], 0], 0, 0, 1]
+output = ["idx", "msg", "L"]
+iter = ["L", 0, 16]
+multiplicity = ["idx", "full", "L"]
+ref = "keccak_sponge:c:read_lane"
+
+[[constraints.read]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["arr", ["+", ["idx", "src", 0], ["*", 8, "L"], "b"], ["idx", "src", 1]], ["arr", ["idx", ["idx", "msg", "L"], "b"], 0, 0, 0, 0, 0, 0, 0], ["arr", ["idx", "key", 0], 0], 0, 0, 0]
+output = ["arr", ["idx", ["idx", "msg", "L"], "b"], 0, 0, 0, 0, 0, 0, 0]
+iters = [["L", 0, 16], ["b", 0, 6]]
+multiplicity = ["idx", ["idx", "part", "L"], "b"]
+ref = "keccak_sponge:c:read_byte"
+
+[[constraint_groups]]
+name = "mask"
+
+[[constraints.mask]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "full", "L"]]
+iter = ["L", 0, 16]
+ref = "keccak_sponge:c:range_full"
+
+[[constraints.mask]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", ["idx", "part", "L"], "b"]]
+iters = [["L", 0, 16], ["b", 0, 6]]
+ref = "keccak_sponge:c:range_part"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "each byte is read at most once: `full` and `part` exclude each other"
+poly = ["*", ["idx", "full", "L"], ["idx", ["idx", "part", "L"], "b"]]
+iters = [["L", 0, 16], ["b", 0, 6]]
+ref = "keccak_sponge:c:one_read"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "the mask is a prefix, within a lane"
+poly = ["*", ["-", 1, ["+", ["idx", "full", "L"], ["idx", ["idx", "part", "L"], "b"]]], ["+", ["idx", "full", "L"], ["idx", ["idx", "part", "L"], ["+", "b", 1]]]]
+iters = [["L", 0, 16], ["b", 0, 5]]
+ref = "keccak_sponge:c:prefix_in_lane"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "the mask is a prefix, at a lane's last byte"
+poly = ["*", ["-", 1, ["+", ["idx", "full", "L"], ["idx", ["idx", "part", "L"], 6]]], ["idx", "full", "L"]]
+iter = ["L", 0, 16]
+ref = "keccak_sponge:c:prefix_lane_end"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "the mask is a prefix, across lanes"
+poly = ["*", ["not", ["idx", "full", "L"]], ["+", ["idx", "full", ["+", "L", 1]], ["idx", ["idx", "part", ["+", "L", 1]], 0]]]
+iter = ["L", 0, 15]
+ref = "keccak_sponge:c:prefix_across_lanes"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "no read off a sponge row"
+poly = ["*", ["not", "μ_s"], ["+", ["idx", "full", 0], ["idx", ["idx", "part", 0], 0]]]
+ref = "keccak_sponge:c:reads_on_sponge_rows"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "a row that is not last reads a whole block"
+poly = ["*", ["-", "μ_s", "last"], ["not", ["idx", "full", 16]]]
+ref = "keccak_sponge:c:full_unless_last"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "the last block holds at most 135 input bytes"
+poly = ["*", "last", ["idx", "full", 16]]
+ref = "keccak_sponge:c:last_not_full"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "the last row reads exactly `count` bytes"
+poly = ["*", "last", ["-", "count", ["sum", ["=", "L", 0], 16, ["+", ["*", 8, ["idx", "full", "L"]], ["sum", ["=", "b", 0], 6, ["idx", ["idx", "part", "L"], "b"]]]]]]
+ref = "keccak_sponge:c:count_on_last"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "a byte past the input is zero"
+poly = ["*", ["-", 1, ["+", ["idx", "full", "L"], ["idx", ["idx", "part", "L"], "b"]]], ["idx", ["idx", "msg", "L"], "b"]]
+iters = [["L", 0, 16], ["b", 0, 6]]
+ref = "keccak_sponge:c:msg_zero_in_lane"
+
+[[constraints.mask]]
+kind = "arith"
+constraint = "a byte past the input is zero, at a lane's last byte"
+poly = ["*", ["not", ["idx", "full", "L"]], ["idx", ["idx", "msg", "L"], 7]]
+iter = ["L", 0, 16]
+ref = "keccak_sponge:c:msg_zero_lane_end"
+
+[[constraint_groups]]
+name = "absorb"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", ["+", "x", ["*", 5, "y"]]], "b"], ["-", ["+", ["idx", ["idx", "msg", ["+", "x", ["*", 5, "y"]]], "b"], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], ["-", "b", 1]]], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], "b"]]]
+output = ["idx", ["idx", ["idx", "input_state", "x"], "y"], "b"]
+iters = [["y", 0, 2], ["x", 0, 4], ["b", 1, 6]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_mid_0"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", 0], 0], ["-", ["+", ["idx", ["idx", "msg", 0], 0], 1], ["idx", "full", 0], ["idx", ["idx", "part", 0], 0]]]
+output = ["idx", ["idx", ["idx", "input_state", 0], 0], 0]
+iters = [["x", 0, 0]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_first_byte"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", ["+", "x", ["*", 5, "y"]]], 0], ["-", ["+", ["idx", ["idx", "msg", ["+", "x", ["*", 5, "y"]]], 0], ["idx", "full", ["-", ["+", "x", ["*", 5, "y"]], 1]]], ["idx", "full", ["+", "x", ["*", 5, "y"]]], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], 0]]]
+output = ["idx", ["idx", ["idx", "input_state", "x"], "y"], 0]
+iters = [["y", 0, 0], ["x", 1, 4]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_lane_start_0"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", ["+", "x", ["*", 5, "y"]]], 0], ["-", ["+", ["idx", ["idx", "msg", ["+", "x", ["*", 5, "y"]]], 0], ["idx", "full", ["-", ["+", "x", ["*", 5, "y"]], 1]]], ["idx", "full", ["+", "x", ["*", 5, "y"]]], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], 0]]]
+output = ["idx", ["idx", ["idx", "input_state", "x"], "y"], 0]
+iters = [["y", 1, 2], ["x", 0, 4]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_lane_start_12"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", ["+", "x", ["*", 5, "y"]]], 7], ["+", ["idx", ["idx", "msg", ["+", "x", ["*", 5, "y"]]], 7], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], 6]]]
+output = ["idx", ["idx", ["idx", "input_state", "x"], "y"], 7]
+iters = [["y", 0, 2], ["x", 0, 4]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_lane_end_012"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", ["+", "x", ["*", 5, "y"]]], "b"], ["-", ["+", ["idx", ["idx", "msg", ["+", "x", ["*", 5, "y"]]], "b"], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], ["-", "b", 1]]], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], "b"]]]
+output = ["idx", ["idx", ["idx", "input_state", "x"], "y"], "b"]
+iters = [["y", 3, 3], ["x", 0, 1], ["b", 1, 6]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_mid_3"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", ["+", "x", ["*", 5, "y"]]], 0], ["-", ["+", ["idx", ["idx", "msg", ["+", "x", ["*", 5, "y"]]], 0], ["idx", "full", ["-", ["+", "x", ["*", 5, "y"]], 1]]], ["idx", "full", ["+", "x", ["*", 5, "y"]]], ["idx", ["idx", "part", ["+", "x", ["*", 5, "y"]]], 0]]]
+output = ["idx", ["idx", ["idx", "input_state", "x"], "y"], 0]
+iters = [["y", 3, 3], ["x", 0, 1]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_lane_start_3"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", 15], 7], ["+", ["idx", ["idx", "msg", 15], 7], ["idx", ["idx", "part", 15], 6]]]
+output = ["idx", ["idx", ["idx", "input_state", 0], 3], 7]
+iters = [["y", 3, 3], ["x", 0, 0]]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_lane_end_15"
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", "prev", 16], 7], ["+", ["idx", ["idx", "msg", 16], 7], ["idx", ["idx", "part", 16], 6], ["*", 128, "last"]]]
+output = ["idx", ["idx", ["idx", "input_state", 1], 3], 7]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:absorb_last_byte"
+[[constraint_groups]]
+name = "round"
+
+[[constraints.round]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["key", 0, "input_state"]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:send_round"
+
+[[constraints.round]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["key", 24, "output_state"]
+multiplicity = ["-", "μ_s"]
+ref = "keccak_sponge:c:receive_round"
+
+[[constraint_groups]]
+name = "digest"
+
+[[constraints.digest]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["arr", ["+", ["idx", "out", 0], ["*", 8, "x"]], ["idx", "out", 1]], ["idx", ["idx", "output_state", "x"], 0], ["arr", ["+", ["idx", "key", 0], 1], 0], 0, 0, 1]
+iter = ["x", 0, 3]
+multiplicity = "last"
+ref = "keccak_sponge:c:write_digest"
+
+[[constraint_groups]]
+name = "range"
+
+[[constraints.range]]
+kind = "arith"
+constraint = "`src_end` holds the low word of `src` plus 135"
+poly = ["*", "μ_s", ["-", ["+", ["idx", "src", 0], 135], ["+", ["idx", "src_end", 0], ["*", ["^", 2, 16], ["idx", "src_end", 1]]]]]
+ref = "keccak_sponge:c:src_end"
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "src_end", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "μ_s"
+ref = "keccak_sponge:c:range_src_end"
+
+[[constraints.range]]
+kind = "arith"
+constraint = "`out_end` holds the low word of `out` plus 31"
+poly = ["*", "last", ["-", ["+", ["idx", "out", 0], 31], ["+", ["idx", "out_end", 0], ["*", ["^", 2, 16], ["idx", "out_end", 1]]]]]
+ref = "keccak_sponge:c:out_end"
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "out_end", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "last"
+ref = "keccak_sponge:c:range_out_end"

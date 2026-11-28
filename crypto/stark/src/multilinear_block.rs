@@ -1,0 +1,7939 @@
+//! One multilinear proof for a whole block, proved in two phases.
+//!
+//! The block's tables — every chunk of every table type, run at full height —
+//! are split into **groups**: contiguous runs in table order, each as many
+//! tables as fit a few stacked polynomials. That is the unit a card holds. The
+//! proof then goes:
+//!
+//! 1. **Phase A (commit).** Group by group: the columns go up, the stack is
+//!    committed, the roots are taken, and the codewords go — only the top of
+//!    each tree stays, on the host ([`RetiredStack`]). No card holds a block's
+//!    codewords, and every root must exist before the first challenge. Each
+//!    group then answers its commit-time out-of-domain point
+//!    ([`commit_ood_point`]) from its columns, still where its commit read
+//!    them.
+//! 2. **The roots block.** Every root, in group order, into the transcript;
+//!    then every commit-time answer; then `(z, α, β)` once, shared by every
+//!    table of the block ([`absorb_roots_answers_and_challenge`]). The
+//!    transcript's state after the draw is the block's `S_post`. Each group's
+//!    opening batches its answers into its chains (`stacked_eval::OodClaims`).
+//! 3. **Phase B (prove), per group `g`, on the fork `S_post ‖ g`.** The group's
+//!    columns go up again; each of its tables is argued (today's
+//!    [`prove`]) — or, under [`ArgueFormat::Batched`], the group's tables are
+//!    argued together ([`batched::prove_argue`]: a lockstep GKR per bin and one
+//!    constraint sumcheck for the group); the group's codewords are recomputed
+//!    — no hash, the tree's top is kept — and its stack is opened at the
+//!    tables' points ([`stacked_eval::prove`]).
+//!
+//! Between the phases a group's columns can be held **narrow** ([`Narrowing`]):
+//! packed on the card right after the group's commit, each column at the bytes
+//! its words need, and widened on the card again when phase B uploads the group.
+//! The words come back bit for bit, so the proof is the same byte for byte; a
+//! widening that went wrong is refused when the opening reads a path from the
+//! kept tree top (the recomputed codeword does not hash to it).
+//!
+//! The tables whose leading preprocessed columns are settled out of band are
+//! stacked per group ([`BlockPrepared`]): each such stack's derived roots are
+//! absorbed after the groups' roots, and its opening proved on its group's fork
+//! after the group's own opening.
+//!
+//! The verifier mirrors it and checks the bus balance ONCE, over every table of
+//! the block: the LogUp challenges are shared, so the block's fractions sum to
+//! what the statement owes exactly as one monolithic proof's do.
+//!
+//! # Why a fork per group is sound
+//!
+//! Each fork starts from `S_post`, which binds the statement and every root of
+//! the block, and then the group's index; everything the group's argument and
+//! opening draw is a function of that and of the group's own messages. This is
+//! the STARK prover's per-table fork (`crypto/stark/src/prover.rs`, `append(idx)`)
+//! at the granularity of a group. A prover cannot move a group's messages to
+//! another group (the index is absorbed), cannot choose a root after a
+//! challenge (all are absorbed before `z`), and cannot mix columns of two
+//! groups (each opening is against its own group's roots, sliced by the
+//! verifier's own layouts).
+//!
+//! ★ THE GROUPS ARE THE VERIFIER'S, never the proof's: [`block_groups`] is a
+//! function of the tables' shapes and two format constants, and both sides call
+//! it.
+//!
+//! # Why every committed word answers before `(z, α, β)`
+//!
+//! WHIR's commitment ends with an out-of-domain point after the root and the
+//! committed word's value there, answered; the answer names the one codeword
+//! the word stands for, and the opening carries it into its chain's first
+//! claim (`multilinear::commit_ood`). The block's shared challenges come
+//! after every answer, so each argues about one codeword per committed word.
+//! Here the point is each group's own ([`commit_ood_point`]), drawn the moment
+//! its roots exist, so phase A answers while the group's columns are on the
+//! card; every answer still enters the main transcript before `(z, α, β)`.
+//! Prepared roots need none: the verifier derives them, so each is a codeword.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::time::Instant;
+
+use math::{
+    field::{
+        element::FieldElement,
+        traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
+    },
+    traits::AsBytes,
+};
+use multilinear::{
+    Error as MlError,
+    mle::Mle,
+    narrow::ColumnOf,
+    stacked_eval::{
+        self, Claimed, ColumnsAt, CommitOod, OodClaims, OodCounts, RetiredStack, StackedCommitment,
+        StackedProof,
+    },
+    stacking::StackedLayout,
+    whir::Domain,
+    whir_chain::{ArgueFormat, ChainConfig, StackVars},
+    whir_commit::Commitment,
+    whir_hash::WhirHash,
+};
+
+use crate::phase_b_split;
+use crate::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
+
+use crate::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing as BusPacking};
+use crate::multilinear_table::{
+    CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots,
+    batched::{
+        self, BatchedArgue, ClassTables, LocalArgue, LocalBinding, ProverFaults, VerifierChecks,
+        Where,
+    },
+    check_preprocessed, contribution, global_layout, prove, verify,
+};
+
+/// How the block's tables split into groups: contiguous runs in table order,
+/// each as many tables as its stack holds in at most `max_polys` polynomials
+/// under the stack cap. A table that alone needs more is a group of its own.
+///
+/// `shapes` is `(committed columns, height in variables)` per table. Returns
+/// the size of each group, in order; they sum to `shapes.len()`.
+pub fn block_groups(
+    shapes: &[(usize, usize)],
+    cap: StackVars,
+    max_polys: usize,
+) -> Result<Vec<usize>, MlError> {
+    let mut sizes = Vec::new();
+    let mut start = 0usize;
+    for end in 1..=shapes.len() {
+        let polys = global_layout(&shapes[start..end], cap)?.num_polys();
+        if polys > max_polys && end - start > 1 {
+            sizes.push(end - 1 - start);
+            start = end - 1;
+        }
+    }
+    if start < shapes.len() {
+        sizes.push(shapes.len() - start);
+    }
+    Ok(sizes)
+}
+
+/// Under [`BlockCommitted::with_prepared_upload_once`], what happened to a
+/// group's retired prepared stack: its columns put on the card once (`used`,
+/// `bytes` of them, the ledger holding `after` once they were up: the copy the
+/// opening no longer makes), or the plan kept the two copies (`planned_out`,
+/// with what it `need`ed and what the budget had `free`), or the card refused
+/// the store (`refused`). All `false` / 0 without a retired stack or a card.
+/// `upload_secs` is the store's upload; under
+/// [`BlockCommitted::with_prepared_store_narrow`] the store went up `narrow`,
+/// `packed_bytes` crossing the bus after `pack_secs` of packing them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UploadOnce {
+    pub used: bool,
+    pub bytes: u64,
+    pub after: u64,
+    pub planned_out: bool,
+    pub refused: bool,
+    pub need: u64,
+    pub free: u64,
+    pub upload_secs: f64,
+    pub narrow: bool,
+    pub packed_bytes: u64,
+    pub pack_secs: f64,
+    /// The narrow store sent the bytes packed at the stack's commit
+    /// ([`BlockPrepared::packed`]): no pack here, `pack_secs` 0.
+    pub prepacked: bool,
+    /// The store went up into the promise its overlap's plan took at
+    /// admission ([`GroupStamps::store_promised`]): no plan or ledger here.
+    pub promised: bool,
+}
+
+/// What a group cost, for the readout. Seconds of wall time on the prover's
+/// thread.
+#[derive(Clone, Debug, Default)]
+pub struct GroupStamps {
+    /// The card phase B proved the group on: 0, or 1 under the two-card split
+    /// ([`BlockCommitted::with_two_card_split`]).
+    pub card: u8,
+    /// The commit lane phase A committed the group on: 0, or 1 for the second
+    /// card's lane ([`BlockCommitted::commit_on_lanes`]).
+    pub commit_card: u8,
+    pub tables: usize,
+    pub polys: usize,
+    pub cells: usize,
+    /// Phase A: the wait for the group's tables (a streamed producer), the
+    /// columns up, the commit, the roots, the tops home.
+    pub wait_a: f64,
+    pub upload_a: f64,
+    /// Of `upload_a`, the seconds the committer waited for: all of it unless
+    /// the upload ran beside the previous group's commit, when only what
+    /// outlasted that commit is paid (`upload_a − upload_paid` is hidden).
+    pub upload_paid: f64,
+    pub commit: f64,
+    pub retire: f64,
+    /// Phase B: the columns up again, the tables' arguments, the codewords
+    /// recomputed, the opening.
+    pub upload_b: f64,
+    pub argue: f64,
+    pub encode: f64,
+    pub open: f64,
+    /// Of `open`, the seconds the group's prepared stack took to come back
+    /// when it was committed and let go ([`PreparedCommitment::Retired`]); 0
+    /// for a held one.
+    pub prepared_revive: f64,
+    /// Phase B: when the group's turn began and ended, seconds since phase B
+    /// began (its columns back, up, argued, opened and let go). Under
+    /// [`PhaseBOverlap::On`] a group's turn ends once the next group's
+    /// argument does, so the turns overlap.
+    pub start_b: f64,
+    pub end_b: f64,
+    /// Host bytes kept of the group's trees between the phases.
+    pub tree_bytes: usize,
+    /// Phase B: the bytes of records its tables held as their records, let go
+    /// with the group after its openings (under a spill).
+    pub records_released: usize,
+    /// Of those records, what their pages handed back to the OS came to
+    /// ([`RecordsReturner`]), and the seconds the handing back took on its
+    /// thread.
+    pub records_pages: multilinear::records::PagesReturned,
+    pub records_return_secs: f64,
+    /// The device ledger's peak promise through the group's argue — the
+    /// argue's own and the next group's columns uploaded beside it, and under
+    /// [`PhaseBOverlap::On`] the previous group's openings beside it too
+    /// (`transition_reserved`). Bytes; 0 without a device.
+    pub argue_reserved: u64,
+    /// The real card through the group's argue (the same window as
+    /// `argue_reserved`): the memory pool's high-water marks and the device's
+    /// free bytes at its end ([`multilinear::gpu::CardWindow`]). `None`
+    /// without a device.
+    pub argue_card: Option<multilinear::gpu::CardWindow>,
+    /// The ledger's promise just before the group's argue (its own columns
+    /// on the card), and the ledger's peak through its revive and openings
+    /// (the next group's columns, uploaded beside the argue, included), with
+    /// what the revive itself added (the openings' room). Bytes; 0 without a
+    /// device. Phase B's overlap reads them: group g's openings beside group
+    /// g + 1's argue would hold about `open_reserved[g] + argue_reserved[g+1]
+    /// − argue_base[g+1]`. When the openings ran beside the next group's
+    /// argue, the two share one window: `open_reserved` is that window's peak
+    /// (the next group's `transition_reserved`), and `open_room` is 0.
+    pub argue_base: u64,
+    pub open_reserved: u64,
+    pub open_room: u64,
+    /// Of the group's openings (`encode` + `open`), the seconds phase B's
+    /// driver waited for: all of them when it ran them itself; beside the next
+    /// group's argue ([`PhaseBOverlap::On`]), what outlasted that argue and
+    /// the upload beside it.
+    pub open_paid: f64,
+    /// The group's openings ran beside the next group's argue.
+    pub overlapped: bool,
+    /// The group opened alone with a retired prepared stack, and its columns
+    /// went off the card before that stack was revived.
+    pub columns_gone_before_revive: bool,
+    /// Under the planned overlap ([`BlockCommitted::with_phase_b_overlap_planned`]):
+    /// the plan kept the group's openings alone, and the plan's bytes (what
+    /// it needed beside the next group's argue, and what the budget had free).
+    pub overlap_planned_out: bool,
+    pub overlap_plan_need: u64,
+    pub overlap_plan_free: u64,
+    /// Under resident pricing, the plan admitted the group's openings beside
+    /// the next argue and took its prepared store's promise then
+    /// (`store_promised`), or the card refused that promise and the group
+    /// opened alone (`store_promise_refused`, with `overlap_planned_out`).
+    pub store_promised: bool,
+    pub store_promise_refused: bool,
+    /// Under [`BlockCommitted::with_prepared_upload_once`], the group's retired
+    /// prepared stack's store ([`UploadOnce`]).
+    pub upload_once: UploadOnce,
+    /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
+    /// earlier transition saw the card refuse a promise.
+    pub serial_after_refusal: bool,
+    /// The ledger's peak through the group's argue with the previous group's
+    /// openings beside it (and the next group's upload); 0 when no openings
+    /// ran beside it. Bytes.
+    pub transition_reserved: u64,
+    /// Stream draws while the group's openings ran, `(foreground pool,
+    /// background pool)`. Beside an argue the foreground count holds the
+    /// argue's draws too; alone, only the openings'.
+    pub open_draws: (u64, u64),
+    /// Phase B's driver thread over the group's turn on it (from the turn's
+    /// start to the next turn's), `(CPU ns, run-queue delay ns)` from its
+    /// schedstat, when [`BlockCommitted::with_sched_stamps`] asks for them
+    /// and the file reads; `None` otherwise.
+    pub sched_b: Option<(u64, u64)>,
+    /// Phase A's ledger: the promise just before the group's commit (its own
+    /// columns on the card, and the previous group's while it packs) and the
+    /// peak through the commit (the next group's columns, uploaded beside it,
+    /// included). Bytes; 0 without a device.
+    pub commit_base: u64,
+    pub commit_reserved: u64,
+    /// The real card beside that ledger: what the memory pool held just before
+    /// the group's commit and just after it
+    /// (`multilinear::gpu::pool_reserved_now`). Bytes; 0 without a device.
+    pub commit_pool_before: u64,
+    pub commit_pool_after: u64,
+    /// The commit's joint runs: committed, of them committed to be retired,
+    /// of them streamed into their leaves (`multilinear::gpu::joint_runs`).
+    pub joint_runs: [u64; 3],
+    /// Codeword bytes the commit did not hold that the batched commit would
+    /// have, because its joint runs streamed into their leaves
+    /// (`multilinear::gpu::StreamedNotHeld::add_back` over the commit's
+    /// window): with `commit_reserved − commit_base`, the batched commit's
+    /// growth. 0 when nothing streamed.
+    pub commit_streamed_not_held: u64,
+    /// What a card commit of the group would hold at most
+    /// ([`multilinear::stacked_eval::commit_card_bytes`]), and how many of the
+    /// process's commits fell back to the host while the group committed: the
+    /// planned overlap's stand-in for a growth it did not see
+    /// ([`planned_commit_growth`]).
+    pub commit_priced: u64,
+    pub commit_host_fallbacks: u64,
+    /// The group's columns were to go up beside the previous group's commit
+    /// and the ledger refused them; they went up after it.
+    pub ahead_refused: bool,
+    /// When the group's commit ended, seconds since phase A started.
+    pub committed_at: f64,
+    /// Phase A: the group's tables packed narrow after the commit
+    /// ([`Narrowing`]) — the seconds the committer waited for the pack, the
+    /// packer's own seconds (beside the next group's upload), how many tables,
+    /// their cells and the packed bytes.
+    pub pack: f64,
+    pub pack_busy: f64,
+    pub packed_tables: usize,
+    pub packed_cells: usize,
+    pub packed_bytes: usize,
+    /// Phase A: the group's commit-time out-of-domain answers
+    /// ([`commit_ood_point`]) — the seconds on the committer's thread, and how
+    /// many columns the card evaluated in place and the host did.
+    pub ood: f64,
+    pub ood_counts: OodCounts,
+    /// Phase A: the constraint-sumcheck probe after the group's commit
+    /// ([`CsProbe`]); [`CsProbeState::Off`] unless it is on.
+    pub cs_probe: CsProbeStamp,
+    /// Phase A: the group's job on the constraint-sumcheck lane
+    /// ([`CsProbeMode::Lane`]); [`LaneState::Off`] unless it is on.
+    pub zc_lane: ZcLaneStamp,
+    /// Phase B: the batched argue's constraint sumcheck (its set-up and
+    /// rounds), seconds; 0 under the per-table argue.
+    pub zc_b: f64,
+    /// Phase B: the merge probe after the group's argue ([`CsProbe::merge`]).
+    pub merge: MergeStamp,
+    /// Phase B: each bin's seconds in the batched argue (its trees built and
+    /// its ladder run), in plan order; empty under the per-table argue.
+    pub bins_b: Vec<f64>,
+    /// Under local lookups, phase B: each local bin's seconds run at the
+    /// group's turn (the bins the lane left), in plan order.
+    pub local_b: Vec<f64>,
+}
+
+/// ⛔ A MEASUREMENT KNOB, never a proof's: phase A runs each group's
+/// constraint sumcheck after its commit, as phase B would
+/// ([`batched::probe_constraint_sumcheck`]), on a throwaway transcript of its
+/// own, and drops what it proved; and, with [`Self::merge`], phase B runs after
+/// each group's argue the sumcheck a format that moved the constraint sumcheck
+/// into phase A would run there instead ([`batched::probe_merge_sumcheck`]),
+/// on a throwaway copy of the group's fork. It reads how much of that sumcheck
+/// the card's idle time in phase A holds, and what the phase-B sumcheck in its
+/// place would cost. The proof is the same byte for byte: nothing either probe
+/// draws or sends reaches the block's transcript or the proof.
+///
+/// Phase A's probe runs only with the next group taken while the current one
+/// commits (`upload_ahead`) and under [`ArgueFormat::Batched`]; the merge only
+/// under [`ArgueFormat::Batched`]; otherwise they do nothing. Production reads
+/// `LAMBDA_VM_PHASE_A_CS_PROBE` and `LAMBDA_VM_PHASE_B_MERGE_PROBE`
+/// ([`Self::from_env`]; both off by default).
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct CsProbe {
+    pub mode: CsProbeMode,
+    /// A table the card declines (or a group with no store on the card) is
+    /// run on the host: a test without a card. Off, such a group is not
+    /// probed ([`CsProbeState::Declined`], [`LaneState::Declined`]).
+    pub host: bool,
+    /// Counts each group whose probe was decided (run or not), after it ran:
+    /// a test's producer holds the next group back on it.
+    pub decided: Option<Arc<AtomicUsize>>,
+    /// Phase B: the merge probe after each group's argue.
+    pub merge: bool,
+    /// What the lane ([`CsProbeMode::Lane`]) may hold.
+    pub limits: LaneLimits,
+}
+
+/// Where phase A's probe runs ([`CsProbe`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CsProbeMode {
+    /// No probe in phase A.
+    #[default]
+    Off,
+    /// On the committer's thread right after the group's commit, when no next
+    /// group has arrived; today's whole phase-C batch (`LAMBDA_VM_PHASE_A_CS_PROBE=1`).
+    AfterCommit,
+    /// On a lane of its own beside phase A ([`zc_lane`]): each committed
+    /// group's columns held on the card as a job, the jobs run oldest first on
+    /// background streams, never started while a commit runs, and stopped at
+    /// phase A's end; what each job runs is [`LaneWork`].
+    Lane(LaneWork),
+}
+
+/// What a lane job runs ([`CsProbeMode::Lane`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaneWork {
+    /// The constraint sumcheck alone, the bus weighted 0
+    /// (`LAMBDA_VM_PHASE_A_CS_PROBE=queue`).
+    #[default]
+    Zc,
+    /// The group's fraction trees and GKR ladders, one bin of the batched
+    /// argue's plan at a time, on throwaway challenges
+    /// (`LAMBDA_VM_PHASE_A_CS_PROBE=ladders`).
+    Ladders,
+    /// The ladders, then the constraint sumcheck alone
+    /// (`LAMBDA_VM_PHASE_A_CS_PROBE=ladders+zc`).
+    LaddersZc,
+}
+
+impl LaneWork {
+    /// Whether a job runs the group's ladders.
+    pub fn ladders(self) -> bool {
+        matches!(self, Self::Ladders | Self::LaddersZc)
+    }
+
+    /// Whether a job runs the constraint sumcheck.
+    pub fn zc(self) -> bool {
+        matches!(self, Self::Zc | Self::LaddersZc)
+    }
+}
+
+/// The environment variable that sets phase A's probe ([`CsProbe::mode`]).
+#[doc(hidden)]
+pub const CS_PROBE_ENV: &str = "LAMBDA_VM_PHASE_A_CS_PROBE";
+/// The environment variable that sets phase B's merge probe ([`CsProbe::merge`]).
+#[doc(hidden)]
+pub const MERGE_PROBE_ENV: &str = "LAMBDA_VM_PHASE_B_MERGE_PROBE";
+
+impl CsProbe {
+    /// [`CsProbe`] as `LAMBDA_VM_PHASE_A_CS_PROBE` and
+    /// `LAMBDA_VM_PHASE_B_MERGE_PROBE` ask ([`Self::from_values`]).
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_values(
+            std::env::var(CS_PROBE_ENV).ok().as_deref(),
+            std::env::var(MERGE_PROBE_ENV).ok().as_deref(),
+        )
+    }
+
+    /// [`Self::from_env`]'s reading of its variables: phase A's unset, empty
+    /// or `0` off, `1` [`CsProbeMode::AfterCommit`], `queue`, `ladders` and
+    /// `ladders+zc` [`CsProbeMode::Lane`] with [`LaneWork::Zc`],
+    /// [`LaneWork::Ladders`] and [`LaneWork::LaddersZc`]; phase B's unset,
+    /// empty or `0` off, `1` on. Anything else is refused.
+    pub fn from_values(phase_a: Option<&str>, merge: Option<&str>) -> Result<Self, String> {
+        let mode = match phase_a.map(str::trim) {
+            None | Some("" | "0") => CsProbeMode::Off,
+            Some("1") => CsProbeMode::AfterCommit,
+            Some("queue") => CsProbeMode::Lane(LaneWork::Zc),
+            Some("ladders") => CsProbeMode::Lane(LaneWork::Ladders),
+            Some("ladders+zc") => CsProbeMode::Lane(LaneWork::LaddersZc),
+            Some(v) => {
+                return Err(format!(
+                    "{CS_PROBE_ENV}={v}: 0 (off, the default), 1 (after each commit), or a lane \
+                     beside phase A: queue (the constraint sumcheck), ladders (the GKR ladders) \
+                     or ladders+zc (both)"
+                ));
+            }
+        };
+        let merge = match merge.map(str::trim) {
+            None | Some("" | "0") => false,
+            Some("1") => true,
+            Some(v) => {
+                return Err(format!(
+                    "{MERGE_PROBE_ENV}={v}: 0 (off, the default) or 1 (on)"
+                ));
+            }
+        };
+        Ok(Self {
+            mode,
+            merge,
+            ..Self::default()
+        })
+    }
+
+    /// Whether anything is on.
+    pub fn any(&self) -> bool {
+        self.mode != CsProbeMode::Off || self.merge
+    }
+}
+
+/// What became of a group's probe ([`CsProbe`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CsProbeState {
+    /// The probe is off, or does not apply to this phase A.
+    #[default]
+    Off,
+    /// It ran to its end.
+    Ran,
+    /// The next group had arrived when the commit ended: not run.
+    Waiting,
+    /// The card declined the group or one of its tables: not run (or stopped
+    /// before its rounds).
+    Declined,
+    /// It failed otherwise; the prove goes on.
+    Failed,
+}
+
+/// A group's probe ([`CsProbe`]), in seconds.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CsProbeStamp {
+    pub state: CsProbeState,
+    pub tables: usize,
+    pub on_card: usize,
+    /// On the committer's thread from the commit's end to the probe's: its
+    /// set-up and rounds (of them, the host's later rounds), and the rest.
+    pub secs: f64,
+    pub setup: f64,
+    pub rounds: f64,
+    pub host_tail: f64,
+    /// When the group's commit ended and when the probe did, seconds since
+    /// phase A started.
+    pub committed_at: f64,
+    pub ended_at: f64,
+    /// What the next group's commit (or, after the last group, phase A's
+    /// end) waited for it: `max(probe end, ready) − max(commit end, ready)`,
+    /// where `ready` is when the next group's columns were up (or when the
+    /// producer said there were no more). `secs − held` ran in time the
+    /// committer had nothing else to do.
+    pub held: f64,
+}
+
+/// The probe's lines for the block's readout ([`CsProbe`]): a summary, then
+/// each group's `index:state:seconds:held`. Empty when no group's probe was
+/// on.
+#[doc(hidden)]
+pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
+    if stamps.iter().all(|g| g.cs_probe.state == CsProbeState::Off) {
+        return String::new();
+    }
+    let count = |state: CsProbeState| stamps.iter().filter(|g| g.cs_probe.state == state).count();
+    let ran: Vec<&CsProbeStamp> = stamps
+        .iter()
+        .map(|g| &g.cs_probe)
+        .filter(|p| p.state == CsProbeState::Ran)
+        .collect();
+    let sum = |f: &dyn Fn(&CsProbeStamp) -> f64| ran.iter().map(|p| f(p)).sum::<f64>();
+    let held_all: f64 = stamps.iter().map(|g| g.cs_probe.held).sum();
+    let secs = sum(&|p| p.secs);
+    let peak = stamps.iter().map(|g| g.commit_reserved).max().unwrap_or(0) >> 20;
+    let per_group: Vec<String> = stamps
+        .iter()
+        .enumerate()
+        .map(|(g, s)| {
+            let p = &s.cs_probe;
+            let state = match p.state {
+                CsProbeState::Off => "off",
+                CsProbeState::Ran => "ran",
+                CsProbeState::Waiting => "wait",
+                CsProbeState::Declined => "declined",
+                CsProbeState::Failed => "failed",
+            };
+            format!("{g}:{state}:{:.4}:{:.4}", p.secs, p.held)
+        })
+        .collect();
+    format!(
+        "BLOCK CS PROBE: groups {} · ran {} · skipped with a group waiting {} · declined {} · \
+         failed {} · tables {} ({} on the card) · sumcheck {:.3}s (setup {:.3}, rounds {:.3}, \
+         host tail {:.3}) · hidden {:.3}s · held the next commit {:.3}s · last ran ended at \
+         {:.3}s · phase-A ledger peak {} MiB\nBLOCK CS PROBE GROUPS (group:state:s:held): {}\n",
+        stamps.len(),
+        ran.len(),
+        count(CsProbeState::Waiting),
+        count(CsProbeState::Declined),
+        count(CsProbeState::Failed),
+        ran.iter().map(|p| p.tables).sum::<usize>(),
+        ran.iter().map(|p| p.on_card).sum::<usize>(),
+        secs,
+        sum(&|p| p.setup),
+        sum(&|p| p.rounds),
+        sum(&|p| p.host_tail),
+        secs - sum(&|p| p.held),
+        held_all,
+        ran.iter().map(|p| p.ended_at).fold(0.0, f64::max),
+        peak,
+        per_group.join(" "),
+    )
+}
+
+mod phase_a_lanes;
+mod zc_lane;
+#[cfg(test)]
+pub(crate) use zc_lane::{RetryEvent, RetryTest};
+
+pub use phase_a_lanes::{LanePolicy, PhaseALanes};
+#[doc(hidden)]
+pub use zc_lane::{
+    LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, local_lane_lines, merge_probe_lines,
+    zc_lane_lines,
+};
+
+/// The label that opens a group's probe transcript ([`CsProbe`]): no proof's
+/// transcript opens with it.
+const CS_PROBE_LABEL: &[u8; 32] = b"LAMBDAVM_PHASE_A_CS_PROBE_ONLY_1";
+
+/// A group's probe ([`CsProbe`]) on the committer's thread, right after its
+/// commit: the group's constraint sumcheck on a transcript of its own (the
+/// label, the group's index and its roots), its result dropped.
+fn run_cs_probe<F, E, T>(
+    group: usize,
+    tables: &[CommittedTable<'_, F, E>],
+    roots: &[Commitment],
+    config: &ChainConfig,
+    on_card: bool,
+    host: bool,
+) -> CsProbeStamp
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let ArgueFormat::Batched {
+        bin_log_cells,
+        pack,
+        ..
+    } = config.format.argue
+    else {
+        return CsProbeStamp::default();
+    };
+    if !on_card && !host {
+        return CsProbeStamp {
+            state: CsProbeState::Declined,
+            ..Default::default()
+        };
+    }
+    // Behind the commits: every stream this thread draws is a background one.
+    let _background = multilinear::gpu::background_streams();
+    let mut transcript = T::default();
+    transcript.append_bytes(CS_PROBE_LABEL);
+    transcript.append_bytes(&(group as u64).to_le_bytes());
+    for root in roots {
+        transcript.append_bytes(root);
+    }
+    let at = if on_card { Where::Device } else { Where::Host };
+    match batched::probe_constraint_sumcheck(
+        tables,
+        bin_log_cells,
+        pack,
+        at,
+        host,
+        false,
+        &mut transcript,
+    ) {
+        Ok(probe) => CsProbeStamp {
+            state: CsProbeState::Ran,
+            tables: probe.tables,
+            on_card: probe.on_card,
+            setup: probe.setup,
+            rounds: probe.rounds,
+            host_tail: probe.host_tail,
+            ..Default::default()
+        },
+        Err(MlError::DeviceFailed {
+            stage: batched::PROBE_DECLINED,
+        }) => CsProbeStamp {
+            state: CsProbeState::Declined,
+            ..Default::default()
+        },
+        Err(error) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("BLOCK CS PROBE: group {group} failed: {error:?}"));
+            CsProbeStamp {
+                state: CsProbeState::Failed,
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// The label that opens a group's commit-time out-of-domain transcript
+/// ([`commit_ood_point`]). 32 bytes, so the prefix ends on a felt boundary.
+pub const COMMIT_OOD_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_COMMIT_OOD_1";
+
+/// The bytes a group's commit-time out-of-domain transcript opens with, in
+/// ONE append: [`COMMIT_OOD_LABEL`], then the group's index, its stack's
+/// variables, its polynomial count, the code's `log_blowup` and the chain's
+/// fold word ([`ChainConfig::fold_word`]), each a little-endian `u64` — 72
+/// bytes, nine whole felts. The index separates the groups; the rest fixes the
+/// code a root is read under, so no root is read under another code with the
+/// same point. The in-guest leaf absorbs the same bytes as program constants.
+pub fn commit_ood_prefix(group: usize, layout: &StackedLayout, config: &ChainConfig) -> Vec<u8> {
+    let mut bytes = COMMIT_OOD_LABEL.to_vec();
+    for word in [
+        group as u64,
+        layout.n_stack() as u64,
+        layout.num_polys() as u64,
+        config.log_blowup as u64,
+        config.fold_word(),
+    ] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+/// ★★ WHERE GROUP `g`'s COMMIT-TIME OUT-OF-DOMAIN POINT COMES FROM — the only
+/// place, called by phase A and by the verifier.
+///
+/// A fresh transcript over [`commit_ood_prefix`] and the group's roots, in
+/// order; the point is its first draw, refused inside the group's evaluation
+/// domain (`2^(n_stack + log_blowup)`; every smaller subgroup lies inside it).
+///
+/// # Why the group's own transcript, and not the main one
+///
+/// The answers must come after the group's roots and before `(z, α, β)`. This
+/// point exists the moment the group's commit ends, while its columns are on
+/// the card: phase A answers there, at the cost of one evaluation, instead of
+/// a second pass over every column once phase A is over. What the answer
+/// rules out — two codewords near one committed word agreeing at the point —
+/// depends only on that word and its code, both fixed by this input; the main
+/// transcript binds the statement, every root and every answer before
+/// `(z, α, β)`, where every equation that spans groups is drawn.
+pub fn commit_ood_point<E, T>(
+    group: usize,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    config: &ChainConfig,
+) -> Result<FieldElement<E>, MlError>
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    commit_ood_transcript::<E, T>(group, layout, roots, config).map(|(z0, _)| z0)
+}
+
+/// [`commit_ood_point`] and the transcript it was drawn from, which a group's
+/// local transcript continues ([`local_challenges`]).
+pub fn commit_ood_transcript<E, T>(
+    group: usize,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    config: &ChainConfig,
+) -> Result<(FieldElement<E>, T), MlError>
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    // One root a round-0 tree: a polynomial's, or a joint run's.
+    let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+    if roots.len() != trees {
+        return Err(MlError::QueryCountMismatch {
+            expected: trees,
+            got: roots.len(),
+        });
+    }
+    let mut transcript = T::default();
+    transcript.append_bytes(&commit_ood_prefix(group, layout, config));
+    for root in roots {
+        transcript.append_bytes(root);
+    }
+    let z0: FieldElement<E> = transcript.sample_field_element();
+    multilinear::whir_chain::require_out_of_domain_of_size(
+        &z0,
+        layout.n_stack() + config.log_blowup,
+    )?;
+    Ok((z0, transcript))
+}
+
+/// The label of a group's local lookups in its local transcript, absorbed
+/// before its tables' digests.
+/// 32 bytes, so what follows starts on a felt boundary.
+pub const LOCAL_LOGUP_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_LOCAL_LOGUP1";
+
+/// The label that opens a table's digest ([`table_digest`]). 32 bytes.
+pub const TABLE_DIGEST_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_TABLE_DIGEST";
+
+/// WHERE GROUP `g`'s LOCAL CHALLENGES `(z_g, α_g)` COME FROM — the only
+/// place, called by the prover and the verifier.
+///
+/// The group's commit-time out-of-domain transcript ([`commit_ood_transcript`]:
+/// the prefix, its roots, `z0` drawn and refused inside the domain),
+/// continued: every commit-time answer of the group in polynomial order, then
+/// [`LOCAL_LOGUP_LABEL`] and every table's digest in the group's order
+/// ([`table_digest`]), then `z_g` and `α_g`. The transcript is returned for
+/// the group's local ladders, whose final state the group's fork absorbs
+/// before anything else.
+///
+/// # Why the group's own challenges argue its local lookups
+///
+/// A local lookup is an equation over the group's columns and the table
+/// definitions it reads, and nothing else: every column it reads is in the
+/// group's stack (the roots), each committed word stands for one codeword
+/// (the answers, as the roots block binds them before the block's own challenges), and every
+/// definition it reads — tuples, multiplicities, constants, heights, widths
+/// — is in a digest. Everything that spans groups (the global buses, every
+/// statement-dependent expected value) is still drawn from the main
+/// transcript after the statement.
+///
+/// `binding` is [`LocalBinding::ALL`] but in the tests that drop one part on
+/// both sides to show what it refuses.
+#[allow(clippy::too_many_arguments)]
+pub fn local_challenges<E, T>(
+    group: usize,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    answers: &[FieldElement<E>],
+    digests: &[[u8; 32]],
+    config: &ChainConfig,
+    binding: LocalBinding,
+) -> Result<(FieldElement<E>, FieldElement<E>, T), MlError>
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    if answers.len() != layout.num_polys() {
+        return Err(MlError::CommitOodCount {
+            expected: layout.num_polys(),
+            got: answers.len(),
+        });
+    }
+    let mut transcript = if binding.roots {
+        commit_ood_transcript::<E, T>(group, layout, roots, config)?.1
+    } else {
+        // A mutant's transcript: the prefix, no roots, the draw made.
+        let mut transcript = T::default();
+        transcript.append_bytes(&commit_ood_prefix(group, layout, config));
+        let _: FieldElement<E> = transcript.sample_field_element();
+        transcript
+    };
+    if binding.answers {
+        for answer in answers {
+            transcript.append_field_element(answer);
+        }
+    }
+    if binding.digests {
+        transcript.append_bytes(LOCAL_LOGUP_LABEL);
+        for digest in digests {
+            transcript.append_bytes(digest);
+        }
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    Ok((z, alpha, transcript))
+}
+
+/// A table's digest: everything a group's local lookups read of its
+/// definition, hashed with the block's transcript hash — [`TABLE_DIGEST_LABEL`],
+/// then as little-endian `u64` words its height in variables, its committed
+/// width, its preprocessed count and its interaction count, then per
+/// interaction its bus id, its side (1 a sender), its multiplicity and its
+/// values, each enum by an explicit tag (an exhaustive match: a new variant
+/// is a compile error here).
+///
+/// Computed by each side from its own tables, never read from a proof.
+pub fn table_digest<E, T>(
+    num_vars: usize,
+    width: usize,
+    num_preprocessed: usize,
+    interactions: &[BusInteraction],
+) -> [u8; 32]
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    table_digest_with::<E, T>(num_vars, width, num_preprocessed, interactions, true)
+}
+
+/// [`table_digest`], with every constant of every interaction left out when
+/// `constants` is false: a mutant digest that lets a prover choose a constant
+/// after the group's challenges, for the test that shows the real one does
+/// not.
+#[doc(hidden)]
+pub fn table_digest_with<E, T>(
+    num_vars: usize,
+    width: usize,
+    num_preprocessed: usize,
+    interactions: &[BusInteraction],
+    constants: bool,
+) -> [u8; 32]
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let mut words: Vec<u64> = vec![
+        num_vars as u64,
+        width as u64,
+        num_preprocessed as u64,
+        interactions.len() as u64,
+    ];
+    let term = |words: &mut Vec<u64>, term: &LinearTerm| match term {
+        LinearTerm::Column {
+            coefficient,
+            column,
+        } => words.extend([0, *coefficient as u64, *column as u64]),
+        LinearTerm::ColumnUnsigned {
+            coefficient,
+            column,
+        } => words.extend([1, *coefficient, *column as u64]),
+        LinearTerm::Constant(value) => words.extend([2, if constants { *value as u64 } else { 0 }]),
+    };
+    for interaction in interactions {
+        let BusInteraction {
+            bus_id,
+            multiplicity,
+            values,
+            is_sender,
+        } = interaction;
+        words.extend([*bus_id, u64::from(*is_sender)]);
+        match multiplicity {
+            Multiplicity::One => words.push(0),
+            Multiplicity::Column(a) => words.extend([1, *a as u64]),
+            Multiplicity::Sum(a, b) => words.extend([2, *a as u64, *b as u64]),
+            Multiplicity::Negated(a) => words.extend([3, *a as u64]),
+            Multiplicity::Diff(a, b) => words.extend([4, *a as u64, *b as u64]),
+            Multiplicity::Sum3(a, b, c) => words.extend([5, *a as u64, *b as u64, *c as u64]),
+            Multiplicity::Linear(terms) => {
+                words.extend([6, terms.len() as u64]);
+                for t in terms {
+                    term(&mut words, t);
+                }
+            }
+        }
+        words.push(values.len() as u64);
+        for value in values {
+            match value {
+                BusValue::Packed {
+                    start_column,
+                    packing,
+                } => words.extend([0, *start_column as u64, packing_tag(*packing)]),
+                BusValue::Linear(terms) => {
+                    words.extend([1, terms.len() as u64]);
+                    for t in terms {
+                        term(&mut words, t);
+                    }
+                }
+            }
+        }
+    }
+    let mut bytes = TABLE_DIGEST_LABEL.to_vec();
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut transcript = T::default();
+    transcript.append_bytes(&bytes);
+    transcript.state()
+}
+
+/// A table's digest ([`table_digest`]) from its own layout: its height, its
+/// committed width, its AIR's preprocessed count
+/// ([`TableLayout::with_preprocessed_count`]) and its interactions. The
+/// prover computes the digests it absorbs at commit time with this; the
+/// verifier computes its own from its AIRs, never from a proof.
+pub fn table_digest_of<F, E, T>(table: &CommittedTable<'_, F, E>) -> [u8; 32]
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let layout = table.layout();
+    table_digest::<E, T>(
+        layout.num_vars(),
+        layout.slot_of().len(),
+        layout.preprocessed_count(),
+        layout.interactions(),
+    )
+}
+
+/// A packing's tag in [`table_digest`]: explicit, never its discriminant.
+fn packing_tag(packing: BusPacking) -> u64 {
+    match packing {
+        BusPacking::Direct => 0,
+        BusPacking::Word2L => 1,
+        BusPacking::Word4L => 2,
+        BusPacking::DWordWL => 3,
+        BusPacking::DWordHHW => 4,
+        BusPacking::DWordWHH => 5,
+        BusPacking::DWordHL => 6,
+        BusPacking::DWordBL => 7,
+        BusPacking::QuadHL => 8,
+        BusPacking::QuadWL => 9,
+    }
+}
+
+/// Local lookups argued per group, on the prover's side
+/// ([`BlockCommitted::with_local_lookups`]): the format's local buses and
+/// every table's digest ([`table_digest`]), in table order.
+#[derive(Clone, Debug)]
+pub struct BlockLocal {
+    pub buses: Vec<u64>,
+    pub digests: Vec<[u8; 32]>,
+}
+
+/// Local lookups from phase A on ([`BlockCommitted::commit_groups_probed`]):
+/// the format's local buses, and whether the lane runs each local group's
+/// local argue beside the commits (`lane`; its bins left run at the group's
+/// turn in phase B either way). Each table's digest ([`table_digest_of`])
+/// and each local group's challenges ([`local_challenges`]) are taken right
+/// after the group's commit. The proof is the same whether the lane runs or
+/// not.
+#[derive(Clone, Debug)]
+pub struct LocalPhaseA {
+    pub buses: Vec<u64>,
+    pub lane: bool,
+    /// Retry local jobs deferred for memory in gaps on a single commit lane.
+    /// The block prover enables this by default. This requires `lane` and
+    /// applies only through `commit_groups_probed`.
+    pub retry: bool,
+    #[cfg(test)]
+    pub(crate) retry_test: Option<zc_lane::RetryTest>,
+    /// What each local transcript binds before its challenges:
+    /// [`LocalBinding::ALL`] but in a test's mutant phase A.
+    #[doc(hidden)]
+    pub binding: LocalBinding,
+}
+
+/// A local group's argue begun at commit time: `(z_g, α_g)` and the group's
+/// local transcript, drawn right after the group's commit
+/// ([`local_challenges`]), and its prover once the lane made it, with the
+/// bins it ran ([`batched::LocalProver`]). The transcript goes with the
+/// prover: together they resume where they stopped.
+struct LocalStarted<E: IsField, T> {
+    transcript: T,
+    z: FieldElement<E>,
+    alpha: FieldElement<E>,
+    prover: Option<batched::LocalProver<E>>,
+}
+
+/// Group `group`'s tables' digests ([`table_digest_of`]; zeros for a group
+/// with no local interaction, never read) and, for a local group, its local
+/// argue begun ([`LocalStarted`]), right after its commit `done`. A group
+/// whose challenges cannot be drawn begins nothing: phase B draws them again
+/// and meets the same refusal.
+fn begin_local<F, E, T>(
+    group: usize,
+    tables: &[CommittedTable<'_, F, E>],
+    done: &CommittedGroup<F, E>,
+    config: &ChainConfig,
+    local: &LocalPhaseA,
+) -> (Vec<[u8; 32]>, Option<Box<dyn std::any::Any + Send>>)
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+{
+    let statements: Vec<TableStatement<'_, F, E>> =
+        tables.iter().map(CommittedTable::statement).collect();
+    if !group_is_local(&statements, &local.buses) {
+        return (vec![[0u8; 32]; tables.len()], None);
+    }
+    // Tables of one AIR and shape share a digest: hashed once.
+    type Key = (usize, usize, usize, usize, usize);
+    let mut seen: Vec<(Key, [u8; 32])> = Vec::new();
+    let digests: Vec<[u8; 32]> = tables
+        .iter()
+        .map(|table| {
+            let layout = table.layout();
+            let key = (
+                layout.interactions().as_ptr() as usize,
+                layout.interactions().len(),
+                layout.num_vars(),
+                layout.slot_of().len(),
+                layout.preprocessed_count(),
+            );
+            match seen.iter().find(|(k, _)| *k == key) {
+                Some((_, digest)) => *digest,
+                None => {
+                    let digest = table_digest_of::<F, E, T>(table);
+                    seen.push((key, digest));
+                    digest
+                }
+            }
+        })
+        .collect();
+    let started = local_challenges::<E, T>(
+        group,
+        done.retired.layout(),
+        &done.roots,
+        &done.ood.answers,
+        &digests,
+        config,
+        // The group's roots and answers are in before the draw: the commit
+        // has ended (`done`).
+        local.binding,
+    )
+    .ok()
+    .map(|(z, alpha, transcript)| {
+        Box::new(LocalStarted {
+            transcript,
+            z,
+            alpha,
+            prover: None,
+        }) as Box<dyn std::any::Any + Send>
+    });
+    (digests, started)
+}
+
+/// Local lookups on the verifier's side ([`block_verify_with`]): the
+/// format's local buses and every table's digest — both the verifier's own
+/// — and the proof's local argues, one a group (empty for a group with no
+/// local interaction).
+pub struct BlockLocalCheck<'a, E: IsField> {
+    pub buses: &'a [u64],
+    pub digests: &'a [[u8; 32]],
+    pub argues: &'a [LocalArgue<E>],
+}
+
+/// Every field is a reference, so copying is free — spelled out rather than
+/// derived, which would demand `E: Copy` of the field marker.
+impl<E: IsField> Clone for BlockLocalCheck<'_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E: IsField> Copy for BlockLocalCheck<'_, E> {}
+
+/// Whether a group argues local lookups: any of its tables has an interaction
+/// on a local bus. One function for both sides, of the statements alone.
+pub fn group_is_local<F, E>(statements: &[TableStatement<'_, F, E>], buses: &[u64]) -> bool
+where
+    F: IsFFTField + IsPrimeField,
+    E: IsField,
+{
+    statements.iter().any(|statement| {
+        statement
+            .interactions
+            .iter()
+            .any(|interaction| buses.contains(&interaction.bus_id))
+    })
+}
+
+/// ★ The block's roots block: [`absorb_roots_and_answers`], then `(z, α, β)`.
+pub fn absorb_roots_answers_and_challenge<E, T>(
+    transcript: &mut T,
+    carried: &[Commitment],
+    derived: &[Commitment],
+    answers: &[FieldElement<E>],
+) -> (FieldElement<E>, FieldElement<E>, FieldElement<E>)
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    absorb_roots_and_answers::<E, T>(transcript, carried, derived, answers);
+    (
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+    )
+}
+
+/// The block's roots, then every carried polynomial's commit-time answer in
+/// root order: everything a challenge drawn next is bound to. The prover, the
+/// verifier and every replay of the roots block (the COMMIT bus's probe) call
+/// this, and the in-guest leaf's front mirrors it.
+///
+/// ⚠ The answers go AFTER every root — derived ones included — and BEFORE any
+/// draw. An answer absorbed after `z` binds nothing, and no round trip can see
+/// that: prover and verifier would agree on the wrong order.
+/// `the_roots_block_binds_every_answer_before_the_first_draw` checks the
+/// order against a transcript spelled out by hand.
+pub fn absorb_roots_and_answers<E, T>(
+    transcript: &mut T,
+    carried: &[Commitment],
+    derived: &[Commitment],
+    answers: &[FieldElement<E>],
+) where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    absorb_roots::<E, T>(transcript, carried, derived);
+    for answer in answers {
+        transcript.append_field_element(answer);
+    }
+}
+
+/// How a block holds its committed columns between phase A and phase B.
+///
+/// The proof is the same byte for byte under every choice: a narrow table
+/// keeps its raw words, each column at the bytes its largest needs (1, 2, 4 or
+/// 8), and the card widens them back into the store phase B reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Narrowing {
+    /// As field elements, eight bytes a cell.
+    #[default]
+    Wide,
+    /// Packed on the card from the group's columns there, after the group's
+    /// commit; only the packed bytes come back. A table of fewer than
+    /// `min_cells` cells, or one the card did not hold, stays wide.
+    Card { min_cells: usize },
+    /// Packed on the host after the group's commit, every table: a test's, or
+    /// a host without a card. The same packed bytes as [`Self::Card`].
+    Host,
+}
+
+impl Narrowing {
+    /// Production: on the card, every table of [`NARROW_MIN_CELLS`] or more.
+    pub const CARD: Self = Self::Card {
+        min_cells: NARROW_MIN_CELLS,
+    };
+}
+
+/// Production's smallest table packed narrow: under it a table's eight bytes
+/// a cell are little, and packing it costs the card two round trips.
+pub const NARROW_MIN_CELLS: usize = 1 << 16;
+
+/// Where a block's committed columns are on the host as they move, in bytes:
+/// a memory log's terms (the block prover's `LAMBDA_VM_BLOCK_MEMLOG`), read
+/// by its sampler while the block proves. It counts and changes nothing.
+pub struct BlockMem {
+    /// The group phase A is uploading and committing, eight bytes a cell.
+    pub committing: AtomicUsize,
+    /// The next group, taken and uploaded beside that commit (uploading
+    /// ahead), eight bytes a cell.
+    pub ahead: AtomicUsize,
+    /// Committed groups still held wide while their packers run, until their
+    /// packed tables are installed.
+    pub packing_wide: AtomicUsize,
+    /// What finished packers hold and nothing installed yet.
+    pub packed_ready: AtomicUsize,
+    /// Committed tables as held: packed, and eight bytes a cell.
+    pub held_narrow: AtomicUsize,
+    pub held_wide: AtomicUsize,
+    /// The groups' kept tree tops.
+    pub tree_tops: AtomicUsize,
+    mark: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl BlockMem {
+    /// Every term at zero; `mark` is called at each event: a group committed,
+    /// a group's packed tables installed, a phase-B group's end.
+    pub fn new(mark: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            committing: AtomicUsize::new(0),
+            ahead: AtomicUsize::new(0),
+            packing_wide: AtomicUsize::new(0),
+            packed_ready: AtomicUsize::new(0),
+            held_narrow: AtomicUsize::new(0),
+            held_wide: AtomicUsize::new(0),
+            tree_tops: AtomicUsize::new(0),
+            mark: Box::new(mark),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        (self.mark)(label);
+    }
+
+    /// Counts `tables` as held from here on, packed or wide.
+    fn hold<'t, 'a: 't, F, E>(&self, tables: impl IntoIterator<Item = &'t CommittedTable<'a, F, E>>)
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+    {
+        for table in tables.into_iter().filter(|t| !t.is_spilled()) {
+            match table.compact_bytes() {
+                Some(bytes) => self.held_narrow.fetch_add(bytes, Relaxed),
+                None => self.held_wide.fetch_add(wide_bytes(table), Relaxed),
+            };
+        }
+    }
+
+    /// Stops counting `tables` as held ([`Self::hold`]'s inverse).
+    fn release<'t, 'a: 't, F, E>(
+        &self,
+        tables: impl IntoIterator<Item = &'t CommittedTable<'a, F, E>>,
+    ) where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+    {
+        // A table whose columns are out left the count when they went: a
+        // drop, or phase B letting them go after its group.
+        for table in tables.into_iter().filter(|t| !t.is_spilled()) {
+            match table.compact_bytes() {
+                Some(bytes) => self.held_narrow.fetch_sub(bytes, Relaxed),
+                None => self.held_wide.fetch_sub(wide_bytes(table), Relaxed),
+            };
+        }
+    }
+}
+
+/// Whether a committed table of `bytes` packed bytes is to leave the host,
+/// given the packed bytes kept so far and the main cells committed so far
+/// (this table's included): `(kept, cells, bytes)` ([`BlockSpill::new`]).
+pub type SpillWanted = dyn Fn(u64, u64, u64) -> bool + Send + Sync;
+
+/// What a block moves off the host while phase A holds its committed tables.
+/// With live regeneration ([`Self::with_regen`]) a table phase B can rebuild
+/// is parked as its group is installed, and leaves the host as a drop
+/// ([`BlockRegen`]) once the policy (`wanted`) first wants a table out; every
+/// other table stays in its group. Phase B brings each group's parked and
+/// dropped tables back before their upload, and lets each group's packed
+/// columns go after its opening.
+#[derive(Clone)]
+pub struct BlockSpill {
+    /// The policy's choice for one table.
+    pub wanted: Arc<SpillWanted>,
+    /// Live regeneration, when it is on.
+    pub regen: Option<BlockRegen>,
+    /// Packed bytes of the committed tables kept, and main cells committed.
+    kept: Arc<std::sync::atomic::AtomicU64>,
+    cells: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A committed table's packed columns parked for live regeneration: held here
+/// until it drops them, and read back from the host or from their
+/// regeneration slot before the group's upload (`restore_group`).
+struct Parked {
+    len: u64,
+    /// The main cells committed once it was, its own included
+    /// ([`BlockRegen::keep_cells`]).
+    cells: u64,
+    /// Its class and rank when phase B can rebuild it ([`BlockRegen`]).
+    rank: Option<(usize, u64)>,
+    state: std::sync::Mutex<ParkedState>,
+}
+
+enum ParkedState {
+    Resident(multilinear::narrow::NarrowColumns),
+    /// A table held as the records its rows come from
+    /// ([`multilinear::records`]): live regeneration drops it as them, into a
+    /// records slot ([`RegenWindow::slot_for_records`]).
+    ResidentRecords(multilinear::records::Records),
+    /// Dropped after its digest: phase B's regenerator deposits it again.
+    Dropped(RegenSlot),
+    /// Taken and not put back: phase B refuses the table.
+    Lost,
+}
+
+impl Parked {
+    /// The slot it was dropped into, once dropped.
+    fn dropped(&self) -> Option<RegenSlot> {
+        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
+            ParkedState::Dropped(slot) => Some(slot.clone()),
+            _ => None,
+        }
+    }
+
+    /// The class the columns were dropped in, when they were.
+    fn dropped_class(&self) -> Option<usize> {
+        self.dropped()
+            .and_then(|_| self.rank.map(|(class, _)| class))
+    }
+}
+
+impl BlockSpill {
+    /// Deciding with `wanted`; nothing leaves the host until live
+    /// regeneration is on ([`Self::with_regen`]).
+    pub fn new(wanted: Arc<SpillWanted>) -> Self {
+        Self {
+            wanted,
+            regen: None,
+            kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cells: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Live regeneration on: a table `regen` can rebuild leaves the host as a
+    /// drop ([`BlockRegen`]).
+    pub fn with_regen(mut self, regen: BlockRegen) -> Self {
+        self.regen = Some(regen);
+        self
+    }
+
+    /// The walk's hand-off: arms live regeneration ([`BlockRegen::arm`]), so
+    /// every parked table phase B can rebuild is dropped. Partial drops
+    /// ([`BlockRegen::partial`]) drop back parked tables, in rank order, only
+    /// until `need` bytes are on their way. `false` without live regeneration.
+    pub fn hand_off(&self, need: u64) -> bool {
+        let Some(regen) = &self.regen else {
+            return false;
+        };
+        regen.arm_at(self.cells.load(Relaxed));
+        // Partial drops hand back only what the hand-off asks for.
+        if regen.is_partial() {
+            regen.drop_back(need);
+        }
+        true
+    }
+
+    /// Phase A's end: joins live regeneration's drops.
+    fn close_hand_off(&self) {
+        if let Some(regen) = &self.regen {
+            regen.close_drops();
+        }
+    }
+}
+
+/// Live regeneration on a block (D-WHIR-NODISK §2.1). `droppable(p)` is the
+/// rank of the table at place `p` in phase A's order of tables (the groups'
+/// tables one after another, as they are committed) when phase B can rebuild
+/// its columns (a streamed chunk: its place in the hand-out), `None`
+/// otherwise. A place is not always the table's block index (under local
+/// lookups each local group's LOCAL_BYTES table sits in its group but after
+/// every other table in the block): the caller maps one to the other. Phase A
+/// drops such a table instead of keeping it: its packed columns
+/// leave the host after their digest, on a thread of their own, and a
+/// [`RegenSlot`] in `window` stands for them; phase B waits on the slot before
+/// the table's group needs it (`restore_group`), and a deposit that is not
+/// the dropped columns refuses the table there, before any device work, with
+/// the kept tree top's check behind the digest.
+///
+/// Under `always` every droppable table is dropped (the byte-identity test
+/// mode). Otherwise nothing drops until the policy first moves a table off
+/// the host (or the walk's hand-off): that arms it, every parked droppable
+/// table is dropped back in rank order, and every later one is dropped. A
+/// block that never arms drops nothing.
+#[derive(Clone)]
+pub struct BlockRegen {
+    droppable: Arc<dyn Fn(usize) -> Option<(usize, u64)> + Send + Sync>,
+    /// One window a class: each class's regenerator deposits, and phase B
+    /// takes, in that class's rank order.
+    windows: Vec<Arc<RegenWindow>>,
+    always: bool,
+    /// Each table is dropped only when the policy wants it out, armed or not
+    /// ([`Self::partial`]).
+    partial: bool,
+    /// Partial drops' keep budget at arming, in main cells committed
+    /// ([`Self::keep_cells`]).
+    keep_cells: Option<u64>,
+    /// Partial drops' keep budget relative to the arming point: this many main
+    /// cells below those committed at arming ([`Self::keep_below`]).
+    keep_below: Option<u64>,
+    started: Instant,
+    inner: Arc<std::sync::Mutex<RegenState>>,
+    /// Wakes [`Self::await_rank`] at each decision and when the decisions
+    /// close.
+    decided: Arc<std::sync::Condvar>,
+}
+
+/// A droppable table's fate, as a regenerator started before phase A's end
+/// needs it ([`BlockRegen::await_rank`]).
+#[derive(Clone)]
+pub enum RankDecision {
+    /// Dropped: its slot, which the regenerator fills.
+    Dropped(RegenSlot),
+    /// Not dropped, and never will be: held by its group's class
+    /// ([`drop_one_class`]), no longer on the host, or phase A ended without
+    /// dropping it.
+    Kept,
+    /// Its class's window closed (the prove ended or failed) before the table
+    /// was decided.
+    Stopped,
+}
+
+#[derive(Default)]
+struct RegenState {
+    /// When it armed, seconds after it was made.
+    armed: Option<f64>,
+    /// At arming: the main cells committed, when known; and the candidates
+    /// parked by then (tables, bytes), before the keep budget's drop-back.
+    armed_cells: Option<u64>,
+    armed_kept: (usize, u64),
+    /// What the keep budget dropped back at arming (tables, bytes).
+    keep_back: (usize, u64),
+    /// The budget arming used, in main cells committed, when it had one.
+    budget: Option<u64>,
+    /// Each window's first producer, kept for its regenerator.
+    producers: Vec<Option<RegenProducer>>,
+    /// Parked droppable tables, for drop-back at arming.
+    candidates: Vec<Arc<Parked>>,
+    tx: Option<std::sync::mpsc::Sender<DropJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Every drop, in the order made: its class and rank, its slot, its bytes
+    /// and whether drop-back made it.
+    dropped: Vec<((usize, u64), RegenSlot, u64, bool)>,
+    /// Drops that found their table no longer held on the host.
+    refused_late: usize,
+    /// Partial drops: the candidates were settled ([`BlockRegen::settle`]),
+    /// and a table not dropped from now on is kept at once.
+    settled: bool,
+    /// Tables phase B could rebuild that stay, their group dropping another
+    /// class ([`drop_one_class`]).
+    held: usize,
+    /// A memory log, which counts each drop out of the held bytes.
+    mem: Option<Arc<BlockMem>>,
+    /// Each decided table by class and rank: its slot when dropped; the
+    /// ranks decided to stay; and whether the decisions are over (phase A's
+    /// end: an undecided table then stays).
+    slots: std::collections::HashMap<(usize, u64), RegenSlot>,
+    kept: std::collections::HashSet<(usize, u64)>,
+    decisions_closed: bool,
+    /// Test only: a pause before each drop of this class, so a regenerator
+    /// started early meets undecided tables.
+    drop_delay: Option<(usize, std::time::Duration)>,
+}
+
+/// A table for the drop thread, and whether drop-back sent it.
+struct DropJob {
+    parked: Arc<Parked>,
+    back: bool,
+}
+
+/// What live regeneration dropped ([`BlockRegen::report`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DropReport {
+    pub armed: Option<f64>,
+    pub tables: usize,
+    pub bytes: u64,
+    pub back_tables: usize,
+    pub back_bytes: u64,
+    pub refused_late: usize,
+    /// By class: the tables and bytes dropped.
+    pub by_class: Vec<(usize, u64)>,
+    /// Tables phase B could rebuild kept on the host because their group
+    /// dropped another class ([`drop_one_class`]).
+    pub held: usize,
+    /// At arming: the main cells committed, when known, and the candidates
+    /// parked by then (tables, bytes) before the keep budget's drop-back.
+    pub armed_cells: Option<u64>,
+    pub armed_kept: (usize, u64),
+    /// The keep budget ([`BlockRegen::keep_cells`]) and what it dropped back
+    /// at arming (tables, bytes).
+    pub keep_cells: Option<u64>,
+    pub keep_back: (usize, u64),
+    /// The budget relative to the arming point ([`BlockRegen::keep_below`]),
+    /// and the budget arming used, in main cells committed.
+    pub keep_below: Option<u64>,
+    pub budget: Option<u64>,
+    /// Of `tables` and `bytes`, those dropped as the records their rows come
+    /// from (their records' bytes).
+    pub records: (usize, u64),
+}
+
+/// One class's regeneration for phase B ([`BlockRegen::into_plan`]): its
+/// window, its dropped tables' ranks and slots in the window's order, and the
+/// window's first producer for its regenerator.
+pub struct ClassPlan {
+    pub window: Arc<RegenWindow>,
+    pub dropped: Vec<(u64, RegenSlot)>,
+    pub producer: Option<RegenProducer>,
+}
+
+impl BlockRegen {
+    /// Live regeneration over `droppable` (a table's class and rank, when
+    /// phase B can rebuild it), a class's slots paced by a window of its
+    /// `aheads` bytes ([`RegenWindow::new`]). Its drop thread starts here;
+    /// phase A's end joins it.
+    pub fn new(
+        droppable: Arc<dyn Fn(usize) -> Option<(usize, u64)> + Send + Sync>,
+        aheads: &[u64],
+        always: bool,
+    ) -> Self {
+        let (windows, producers): (Vec<_>, Vec<_>) = aheads
+            .iter()
+            .map(|&ahead| {
+                let (window, producer) = RegenWindow::new(ahead);
+                (window, Some(producer))
+            })
+            .unzip();
+        let inner = Arc::new(std::sync::Mutex::new(RegenState {
+            producers,
+            ..RegenState::default()
+        }));
+        let (tx, rx) = std::sync::mpsc::channel::<DropJob>();
+        let decided = Arc::new(std::sync::Condvar::new());
+        let (windows_in, inner_in, decided_in) =
+            (windows.clone(), Arc::clone(&inner), Arc::clone(&decided));
+        let thread = std::thread::Builder::new()
+            .name("block-regen-drop".to_string())
+            .spawn(move || {
+                for job in rx {
+                    let rank = job.parked.rank;
+                    let (mem, delay) = {
+                        let state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
+                        (state.mem.clone(), state.drop_delay)
+                    };
+                    if let (Some((class, pause)), Some((c, _))) = (delay, rank)
+                        && class == c
+                    {
+                        std::thread::sleep(pause);
+                    }
+                    let dropped = rank.and_then(|(class, rank)| {
+                        let window = windows_in.get(class)?;
+                        drop_parked(window, &job.parked, rank, mem.as_deref())
+                    });
+                    let mut state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
+                    match (dropped, rank) {
+                        (Some(slot), Some(rank)) => {
+                            state.slots.insert(rank, slot.clone());
+                            state.dropped.push((rank, slot, job.parked.len, job.back))
+                        }
+                        (None, Some(rank)) => {
+                            state.kept.insert(rank);
+                            state.refused_late += 1
+                        }
+                        _ => state.refused_late += 1,
+                    }
+                    decided_in.notify_all();
+                }
+            });
+        {
+            let mut state = inner.lock().unwrap_or_else(|e| e.into_inner());
+            match thread {
+                Ok(thread) => {
+                    state.tx = Some(tx);
+                    state.thread = Some(thread);
+                }
+                // No drop thread: nothing drops, and every table stays as the
+                // policy leaves it.
+                Err(_) => drop(tx),
+            }
+        }
+        Self {
+            droppable,
+            windows,
+            always,
+            partial: false,
+            keep_cells: None,
+            keep_below: None,
+            started: Instant::now(),
+            inner,
+            decided,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegenState> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The class and rank of the table at place `index` in phase A's order of
+    /// tables, when it may be dropped (a class with no window may not).
+    pub fn rank_of(&self, index: usize) -> Option<(usize, u64)> {
+        (self.droppable)(index).filter(|&(class, _)| class < self.windows.len())
+    }
+
+    /// Each class's window, the dropped tables' slots in it.
+    pub fn windows(&self) -> &[Arc<RegenWindow>] {
+        &self.windows
+    }
+
+    /// Whether it armed.
+    pub fn is_armed(&self) -> bool {
+        self.lock().armed.is_some()
+    }
+
+    /// Whether every droppable table is dropped.
+    pub fn always(&self) -> bool {
+        self.always
+    }
+
+    /// Partial drops: arming drops back nothing and does not make later tables
+    /// drop. Each committed table is dropped only when the policy wants it out
+    /// as it is installed ([`Self::drop_one`]), and the parked ones only as far
+    /// as a hand-off asks ([`Self::drop_back`]). The rest stay on the host.
+    pub fn partial(mut self) -> Self {
+        self.partial = true;
+        self
+    }
+
+    /// Whether drops are partial ([`Self::partial`]).
+    pub fn is_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// Partial drops' keep budget: at arming, the candidates committed past
+    /// `cells` main cells (the block's cells committed once each was, its own
+    /// included) are dropped back, in rank order, and only those; the others
+    /// stay candidates as before. What arming keeps then no longer follows how
+    /// far phase A got when the policy first wanted a table out. `None` (the
+    /// default): arming drops back nothing. Nothing for drops that are not
+    /// partial.
+    pub fn keep_cells(mut self, cells: Option<u64>) -> Self {
+        self.keep_cells = cells;
+        self
+    }
+
+    /// Partial drops' keep budget relative to the arming point: `cells` main
+    /// cells below those committed when it arms ([`Self::arm_at`]), so the
+    /// candidates committed in the last `cells` before arming are dropped
+    /// back, in rank order. Where the arming point moves (the host's reading at
+    /// the forecast's crossing), the budget moves with it. With
+    /// [`Self::keep_cells`] too, the lower of the two holds. Arming without the
+    /// cells committed ([`Self::arm`]) uses only the absolute budget. `None`
+    /// (the default): no relative budget. Nothing for drops that are not
+    /// partial.
+    pub fn keep_below(mut self, cells: Option<u64>) -> Self {
+        self.keep_below = cells;
+        self
+    }
+
+    /// Arm: from now on every droppable table is dropped, and every parked one
+    /// is dropped back, in rank order; partial drops ([`Self::partial`]) note
+    /// when, and drop back only what their keep budget asks
+    /// ([`Self::keep_cells`]). Returns whether this call armed.
+    pub fn arm(&self) -> bool {
+        self.arm_with(None)
+    }
+
+    /// [`Self::arm`] with the main cells committed by then, which the drop
+    /// report keeps.
+    pub fn arm_at(&self, cells: u64) -> bool {
+        self.arm_with(Some(cells))
+    }
+
+    fn arm_with(&self, cells: Option<u64>) -> bool {
+        let mut state = self.lock();
+        if state.armed.is_some() {
+            return false;
+        }
+        state.armed = Some(self.started.elapsed().as_secs_f64());
+        state.armed_cells = cells;
+        if self.partial {
+            state.armed_kept = (
+                state.candidates.len(),
+                state.candidates.iter().map(|p| p.len).sum(),
+            );
+            let below = self
+                .keep_below
+                .zip(cells)
+                .map(|(below, at)| at.saturating_sub(below));
+            state.budget = match (self.keep_cells, below) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(budget) = state.budget {
+                let (mut past, within): (Vec<_>, Vec<_>) = std::mem::take(&mut state.candidates)
+                    .into_iter()
+                    .partition(|p| p.cells > budget);
+                past.sort_by_key(|p| p.rank);
+                state.keep_back = (past.len(), past.iter().map(|p| p.len).sum());
+                state.candidates = within;
+                for parked in past {
+                    Self::queue(&state, parked, true);
+                }
+            }
+            return true;
+        }
+        let mut candidates = std::mem::take(&mut state.candidates);
+        candidates.sort_by_key(|p| p.rank);
+        for parked in candidates {
+            Self::queue(&state, parked, true);
+        }
+        true
+    }
+
+    /// A memory log for the drops to count in.
+    fn set_mem(&self, mem: Option<Arc<BlockMem>>) {
+        self.lock().mem = mem;
+    }
+
+    /// A parked droppable table: dropped now when armed (not partial) or
+    /// `always`, else a drop-back candidate.
+    fn parked(&self, parked: Arc<Parked>) {
+        let mut state = self.lock();
+        if self.always || (state.armed.is_some() && !self.partial) {
+            Self::queue(&state, parked, false);
+        } else if self.partial && state.settled {
+            if let Some(rank) = parked.rank {
+                state.kept.insert(rank);
+            }
+            drop(state);
+            self.decided.notify_all();
+        } else {
+            state.candidates.push(parked);
+        }
+    }
+
+    /// Partial drops: every parked candidate kept from now on, and every table
+    /// not dropped later kept as it is parked, so a regenerator started before
+    /// phase A's end learns each table's fate as it comes
+    /// ([`Self::drops_all_from_now`]). Called once the last drop-back is past
+    /// (the walk's end, after its hand-off). Nothing for drops that are not
+    /// partial.
+    pub fn settle(&self) {
+        if !self.partial {
+            return;
+        }
+        let mut state = self.lock();
+        let candidates = std::mem::take(&mut state.candidates);
+        for parked in candidates {
+            if let Some(rank) = parked.rank {
+                state.kept.insert(rank);
+            }
+        }
+        state.settled = true;
+        drop(state);
+        self.decided.notify_all();
+    }
+
+    /// A parked droppable table the policy wants out: dropped now.
+    fn drop_one(&self, parked: Arc<Parked>) {
+        Self::queue(&self.lock(), parked, false);
+    }
+
+    /// Partial drops: the parked candidates dropped back, in rank order, until
+    /// `need` bytes are on their way (all of them for `u64::MAX`). Returns the
+    /// bytes it sent.
+    pub fn drop_back(&self, need: u64) -> u64 {
+        let mut state = self.lock();
+        let mut candidates = std::mem::take(&mut state.candidates);
+        candidates.sort_by_key(|p| p.rank);
+        let mut sent = 0u64;
+        let mut rest = Vec::new();
+        for parked in candidates {
+            if sent < need {
+                sent = sent.saturating_add(parked.len);
+                Self::queue(&state, parked, true);
+            } else {
+                rest.push(parked);
+            }
+        }
+        state.candidates = rest;
+        sent
+    }
+
+    fn queue(state: &RegenState, parked: Arc<Parked>, back: bool) {
+        if let Some(tx) = &state.tx {
+            let _ = tx.send(DropJob { parked, back });
+        }
+    }
+
+    /// No more drops: the drop thread finishes what is queued and ends, and
+    /// every table not dropped by then stays ([`RankDecision::Kept`]).
+    fn close_drops(&self) {
+        let thread = {
+            let mut state = self.lock();
+            state.tx = None;
+            state.thread.take()
+        };
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+        self.lock().decisions_closed = true;
+        self.decided.notify_all();
+    }
+
+    /// Tables kept because their group dropped another class.
+    fn held(&self, ranks: &[(usize, u64)]) {
+        let mut state = self.lock();
+        state.held += ranks.len();
+        state.kept.extend(ranks.iter().copied());
+        drop(state);
+        self.decided.notify_all();
+    }
+
+    /// Whether the fate of every table phase B can rebuild that phase A still
+    /// commits is known as it is installed: dropped (armed, or `always`), or
+    /// under partial drops once settled ([`Self::settle`]), dropped or kept. A
+    /// regenerator may then start before phase A's end and take each table's
+    /// fate from [`Self::await_rank`].
+    pub fn drops_all_from_now(&self) -> bool {
+        let state = self.lock();
+        self.always || (state.armed.is_some() && !self.partial) || (self.partial && state.settled)
+    }
+
+    /// Class `class`'s first producer, for a regenerator that starts before
+    /// phase A's end ([`Self::into_plan`] then hands out none for the class).
+    pub fn take_producer(&self, class: usize) -> Option<RegenProducer> {
+        self.lock().producers.get_mut(class).and_then(Option::take)
+    }
+
+    /// The fate of class `class`'s table of rank `rank`, waiting for it:
+    /// dropped (its slot), kept, or `Stopped` once the class's window
+    /// closes. Returns too how long it waited. A table phase A never dropped
+    /// is kept once phase A's end closes the decisions; nothing is taken as
+    /// kept before that, so a regenerator never skips a table that drops
+    /// later.
+    pub fn await_rank(&self, class: usize, rank: u64) -> (RankDecision, std::time::Duration) {
+        let started = Instant::now();
+        let window = self.windows.get(class).cloned();
+        let mut state = self.lock();
+        loop {
+            if let Some(slot) = state.slots.get(&(class, rank)) {
+                return (RankDecision::Dropped(slot.clone()), started.elapsed());
+            }
+            if state.kept.contains(&(class, rank)) || state.decisions_closed {
+                return (RankDecision::Kept, started.elapsed());
+            }
+            if window.as_ref().is_none_or(|w| w.is_closed()) {
+                return (RankDecision::Stopped, started.elapsed());
+            }
+            // A closed window does not wake this condvar: poll for it.
+            state = self
+                .decided
+                .wait_timeout(state, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Whether phase A's end has closed the decisions.
+    pub fn decisions_closed(&self) -> bool {
+        self.lock().decisions_closed
+    }
+
+    /// Test only: pause before each drop of class `class`, so a regenerator
+    /// started early meets undecided tables.
+    #[doc(hidden)]
+    pub fn delay_drops(&self, class: usize, pause: std::time::Duration) {
+        self.lock().drop_delay = Some((class, pause));
+    }
+
+    /// What it dropped.
+    pub fn report(&self) -> DropReport {
+        let state = self.lock();
+        let back = state.dropped.iter().filter(|d| d.3);
+        let mut by_class = vec![(0usize, 0u64); self.windows.len()];
+        for ((class, _), _, bytes, _) in &state.dropped {
+            if let Some(c) = by_class.get_mut(*class) {
+                c.0 += 1;
+                c.1 += bytes;
+            }
+        }
+        let records = state.dropped.iter().filter(|d| d.1.is_records());
+        DropReport {
+            armed: state.armed,
+            tables: state.dropped.len(),
+            bytes: state.dropped.iter().map(|d| d.2).sum(),
+            back_tables: back.clone().count(),
+            back_bytes: back.map(|d| d.2).sum(),
+            refused_late: state.refused_late,
+            by_class,
+            held: state.held,
+            armed_cells: state.armed_cells,
+            armed_kept: state.armed_kept,
+            keep_cells: self.keep_cells.filter(|_| self.partial),
+            keep_back: state.keep_back,
+            keep_below: self.keep_below.filter(|_| self.partial),
+            budget: state.budget,
+            records: (records.clone().count(), records.map(|d| d.2).sum()),
+        }
+    }
+
+    /// Phase B's regeneration, a class each ([`ClassPlan`]): a class that
+    /// dropped nothing has no dropped tables and no producer (it went with
+    /// the plan, so its window's slots, none, need no regenerator).
+    pub fn into_plan(self) -> Vec<ClassPlan> {
+        let mut state = self.lock();
+        let producers = std::mem::take(&mut state.producers);
+        let mut plans: Vec<ClassPlan> = self
+            .windows
+            .iter()
+            .zip(producers)
+            .map(|(window, producer)| ClassPlan {
+                window: Arc::clone(window),
+                dropped: Vec::new(),
+                producer,
+            })
+            .collect();
+        for ((class, rank), slot, _, _) in &state.dropped {
+            if let Some(plan) = plans.get_mut(*class) {
+                plan.dropped.push((*rank, slot.clone()));
+            }
+        }
+        for plan in &mut plans {
+            plan.dropped.sort_by_key(|(_, slot)| slot.order_key());
+            if plan.dropped.is_empty() {
+                plan.producer = None;
+            }
+        }
+        plans
+    }
+}
+
+/// Drops a parked table's packed columns: they leave `parked` under its lock,
+/// are digested into a slot of `window` outside it, are freed, and the slot
+/// takes their place. `None`, and nothing changed, when the table is no
+/// longer held on the host.
+fn drop_parked(
+    window: &Arc<RegenWindow>,
+    parked: &Parked,
+    rank: u64,
+    mem: Option<&BlockMem>,
+) -> Option<RegenSlot> {
+    let held = {
+        let mut state = parked.state.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *state, ParkedState::Lost) {
+            held @ (ParkedState::Resident(_) | ParkedState::ResidentRecords(_)) => held,
+            other => {
+                *state = other;
+                return None;
+            }
+        }
+    };
+    // Records are digested as they lie; their slot takes the packed columns
+    // the regenerator makes from records it rebuilt.
+    let (slot, len) = match &held {
+        ParkedState::Resident(packed) => (window.slot(packed, rank), packed.data().len()),
+        ParkedState::ResidentRecords(records) => {
+            (window.slot_for_records(records, rank), records.bytes())
+        }
+        _ => return None,
+    };
+    drop(held);
+    *parked.state.lock().unwrap_or_else(|e| e.into_inner()) = ParkedState::Dropped(slot.clone());
+    if let Some(mem) = mem {
+        mem.held_narrow.fetch_sub(len, Relaxed);
+    }
+    Some(slot)
+}
+
+/// Considers a group's narrow tables for the spill, `first` being the
+/// first's index; where each table taken out of its group went goes in `out`.
+/// Every table counts toward the cells committed. A table phase B can rebuild
+/// is parked ([`Parked`]) and dropped ([`BlockRegen`]): at once under
+/// `always`, once the policy first wants a table out (which arms it), and back
+/// at arming while parked; it counts toward the bytes kept only while it is
+/// not dropped. Every other table stays in its group and counts toward the
+/// bytes kept.
+fn spill_group<F, E>(
+    spill: &BlockSpill,
+    first: usize,
+    tables: &mut [CommittedTable<'_, F, E>],
+    out: &mut [Option<Arc<Parked>>],
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    // A group's tables drop in one class only ([`drop_one_class`]). A table
+    // held as its records drops as them, and is kept where it has no rank.
+    let mut ranks: Vec<Option<(usize, u64)>> = (0..tables.len())
+        .map(|k| {
+            tables[k].compact_bytes()?;
+            spill.regen.as_ref()?.rank_of(first + k)
+        })
+        .collect();
+    let before = ranks.clone();
+    drop_one_class(&mut ranks);
+    if let Some(regen) = &spill.regen {
+        let held: Vec<(usize, u64)> = before
+            .iter()
+            .zip(&ranks)
+            .filter_map(|(b, a)| b.filter(|_| a.is_none()))
+            .collect();
+        if !held.is_empty() {
+            regen.held(&held);
+        }
+    }
+    for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
+        let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
+        let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
+        let Some(len) = table.compact_bytes() else {
+            continue;
+        };
+        let rank = ranks[k];
+        // Only a table phase B can rebuild leaves its group.
+        let (Some(regen), Some(_)) = (&spill.regen, rank) else {
+            spill.kept.fetch_add(len as u64, Relaxed);
+            continue;
+        };
+        let failed = || MlError::SpillFailed {
+            table: first + k,
+            reason: "its packed parts did not move out of the table",
+        };
+        let held = if table.records().is_some() {
+            ParkedState::ResidentRecords(table.take_records_for_spill().ok_or_else(failed)?)
+        } else {
+            ParkedState::Resident(table.take_narrow_for_spill().ok_or_else(failed)?)
+        };
+        let parked = Arc::new(Parked {
+            len: len as u64,
+            cells,
+            rank,
+            state: std::sync::Mutex::new(held),
+        });
+        *slot = Some(Arc::clone(&parked));
+        let wanted = !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64);
+        if wanted {
+            regen.arm_at(cells);
+        }
+        if regen.is_partial() && !regen.always() {
+            // Out only while the policy wants it out; else kept, and a
+            // candidate for a hand-off's drop-back.
+            if wanted {
+                regen.drop_one(parked);
+            } else {
+                spill.kept.fetch_add(len as u64, Relaxed);
+                regen.parked(parked);
+            }
+            continue;
+        }
+        if !regen.always() && !regen.is_armed() {
+            spill.kept.fetch_add(len as u64, Relaxed);
+        }
+        regen.parked(parked);
+    }
+    Ok(())
+}
+
+/// Brings `tables`' columns back before their upload, `first` being the
+/// first's index: a parked table's from the host, a dropped table's from its
+/// regeneration slot, waiting for its deposit. Refused when a deposit is not
+/// what was dropped.
+fn restore_group<F, E>(
+    first: usize,
+    tables: &mut [CommittedTable<'_, F, E>],
+    out: &mut [Option<Arc<Parked>>],
+    mem: Option<&BlockMem>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
+        let Some(parked) = slot.take() else {
+            continue;
+        };
+        let index = first + k;
+        let state = std::mem::replace(
+            &mut *parked.state.lock().unwrap_or_else(|e| e.into_inner()),
+            ParkedState::Lost,
+        );
+        match state {
+            ParkedState::Resident(packed) => {
+                if !table.restore_narrow(packed) {
+                    return Err(MlError::SpillFailed {
+                        table: index,
+                        reason: "the parked columns do not have the table's shape",
+                    });
+                }
+            }
+            ParkedState::ResidentRecords(records) => {
+                if !table.restore_records(records) {
+                    return Err(MlError::SpillFailed {
+                        table: index,
+                        reason: "the parked records do not have the table's shape",
+                    });
+                }
+            }
+            ParkedState::Dropped(regen) => {
+                regen.wait();
+                let packed = regen.take().map_err(|e| MlError::SpillFailed {
+                    table: index,
+                    reason: match e {
+                        RegenError::Mismatch => "the regenerated columns are not the ones dropped",
+                        RegenError::Failed(_) => "the regenerator did not bring its columns back",
+                        RegenError::Closed(_) => {
+                            "the regeneration window closed before its columns came back"
+                        }
+                    },
+                })?;
+                let len = packed.data().len();
+                if !table.restore_narrow(packed) {
+                    return Err(MlError::SpillFailed {
+                        table: index,
+                        reason: "the regenerated columns do not have the table's shape",
+                    });
+                }
+                if let Some(mem) = mem {
+                    mem.held_narrow.fetch_add(len, Relaxed);
+                }
+            }
+            // The table stays out, and the group's check refuses it.
+            ParkedState::Lost => {}
+        }
+    }
+    Ok(())
+}
+
+/// A table's committed columns as held on the host: packed, as records, or
+/// eight bytes a cell.
+fn held_bytes<F, E>(table: &CommittedTable<'_, F, E>) -> usize
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    table.compact_bytes().unwrap_or_else(|| wide_bytes(table))
+}
+
+/// A group's columns put on the card for its commit: a group of wide tables
+/// as their field elements, one with a table held narrow (built packed) or as
+/// records as [`upload_group`] puts it — packed and widened on the card, or
+/// filled there from the records.
+fn upload_for_commit<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    if group.iter().any(|t| t.compact_bytes().is_some()) {
+        return upload_group(group);
+    }
+    let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+    multilinear::gpu::upload_columns(&columns).map(Arc::new)
+}
+
+/// A table's committed columns at eight bytes a cell.
+fn wide_bytes<F, E>(table: &CommittedTable<'_, F, E>) -> usize
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    (table.num_committed_columns() << table.num_vars()) * core::mem::size_of::<FieldElement<F>>()
+}
+
+/// A group's PREPARED opening in a block: one commitment, which both sides
+/// derive from the program, over the leading preprocessed columns of the
+/// group's prepared tables, opened on the group's fork after the group's own
+/// opening — each table's columns at that table's point.
+///
+/// It is the epoch's prepared opening ([`crate::multilinear_table::Prepared`])
+/// per group: its roots are DERIVED by the verifier and absorbed after the group
+/// roots, before `z`; the columns stay in the group's stack too, and the opening
+/// proves the derived commitment takes the values each table's own argument
+/// settled on, at that table's point. One stack a group pays one chain for all
+/// of its prepared tables.
+pub struct BlockPrepared<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// The group whose fork opens it.
+    pub group: usize,
+    /// The tables it settles, in stack order: each table's position in the
+    /// proof's table order and the length of its leading prefix.
+    pub tables: Vec<(usize, usize)>,
+    pub commitment: PreparedCommitment<'a, F, H>,
+    /// The tables' prefixes, concatenated in `tables`' order.
+    pub columns: &'a [&'a Mle<F>],
+    /// `columns` packed narrow when the stack was committed
+    /// (`multilinear::gpu::pack_store`): under
+    /// [`BlockCommitted::with_prepared_store_narrow`] a retired stack's store
+    /// sends these bytes instead of packing again. `None` packs there.
+    pub packed: Option<&'a multilinear::gpu::PackedStore>,
+    /// The card a held commitment lives on (0, or 1 for a recursion level's
+    /// stack committed on the second card): phase B argues and opens its
+    /// group there. Ignored for a retired stack, which is revived where its
+    /// group runs.
+    pub card: u8,
+}
+
+/// Where a [`BlockPrepared`] stack's commitment is when its group opens it.
+pub enum PreparedCommitment<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// Committed and held (its codewords on the card or the host): opened as
+    /// it is.
+    Held(&'a StackedCommitment<F, H>),
+    /// Committed and let go, its roots and tree tops kept
+    /// ([`StackedCommitment::retire`]): revived from [`BlockPrepared::columns`]
+    /// at its group's opening and let go after it, so the card holds a
+    /// prepared stack only while its own group opens it. The opening is the
+    /// held one's byte for byte: a revived tree serves the same paths, its
+    /// dropped levels re-hashed and checked against the kept nodes.
+    Retired(&'a RetiredStack<F>),
+}
+
+impl<F, H> PreparedCommitment<'_, F, H>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// The commitment's roots, held or retired alike.
+    pub fn roots(&self) -> Vec<Commitment> {
+        match self {
+            Self::Held(c) => c.roots(),
+            Self::Retired(r) => r.roots(),
+        }
+    }
+}
+
+impl<'a, F, H> From<&'a StackedCommitment<F, H>> for PreparedCommitment<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    fn from(c: &'a StackedCommitment<F, H>) -> Self {
+        Self::Held(c)
+    }
+}
+
+/// What the verifier settles a [`BlockPrepared`] opening against.
+pub struct BlockPreparedCheck<'a, F>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+{
+    pub group: usize,
+    /// As [`BlockPrepared::tables`]: the prefixes `check_preprocessed` skips.
+    pub tables: Vec<(usize, usize)>,
+    /// Derived from the program by the verifier, never read from the proof.
+    pub roots: &'a [Commitment],
+    pub layout: &'a StackedLayout,
+    pub domain: &'a Domain<F>,
+}
+
+/// The prepared openings' shape, checked the same way by both sides: at most one
+/// per group, in group order; each settles distinct tables of its own group in
+/// increasing order, each prefix at least one column and at most `max_prefix` of
+/// the table's; and the stack holds exactly those columns (`columns`, when the
+/// caller knows them).
+/// One prepared opening's shape: its group, its `(table, prefix)` list, and the
+/// stack's column count when the caller knows it.
+type PreparedEntry<'a> = (usize, &'a [(usize, usize)], Option<usize>);
+
+fn prepared_shape(
+    entries: &[PreparedEntry<'_>],
+    starts: &[usize],
+    num_tables: usize,
+    max_prefix: &dyn Fn(usize) -> usize,
+) -> Result<(), MlError> {
+    let mut last_group: Option<usize> = None;
+    for &(group, tables, columns) in entries {
+        let range = starts
+            .get(group)
+            .copied()
+            .zip(starts.get(group + 1).copied().or(Some(num_tables)))
+            .ok_or(MlError::UnknownPolynomial {
+                index: group,
+                len: starts.len(),
+            })?;
+        if last_group.is_some_and(|l| group <= l) || tables.is_empty() {
+            return Err(MlError::UnknownPolynomial {
+                index: group,
+                len: starts.len(),
+            });
+        }
+        last_group = Some(group);
+        let mut last: Option<usize> = None;
+        for &(table, n) in tables {
+            if table < range.0 || table >= range.1 || last.is_some_and(|l| table <= l) {
+                return Err(MlError::UnknownPolynomial {
+                    index: table,
+                    len: num_tables,
+                });
+            }
+            if n == 0 || n > max_prefix(table) {
+                return Err(MlError::QueryCountMismatch {
+                    expected: max_prefix(table),
+                    got: n,
+                });
+            }
+            last = Some(table);
+        }
+        let total: usize = tables.iter().map(|&(_, n)| n).sum();
+        if columns.is_some_and(|c| c != total) {
+            return Err(MlError::QueryCountMismatch {
+                expected: total,
+                got: columns.unwrap_or(0),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A group's prepared claims: per table of `tables`, its prefix's columns at the
+/// table's point (one point per column) and the values its argument settled on.
+/// `firsts` are the group's tables' first columns, `start` its first table.
+#[allow(clippy::type_complexity)]
+fn prepared_claims<E: IsField>(
+    tables: &[(usize, usize)],
+    start: usize,
+    firsts: &[usize],
+    points: &[Vec<FieldElement<E>>],
+    values: &[FieldElement<E>],
+) -> (Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>) {
+    let mut at_points = Vec::new();
+    let mut at_values = Vec::new();
+    for &(table, n) in tables {
+        let first = firsts[table - start];
+        at_points.extend_from_slice(&points[first..first + n]);
+        at_values.extend_from_slice(&values[first..first + n]);
+    }
+    (at_points, at_values)
+}
+
+/// How a test makes the prover open a group's prepared stack wrongly, for the
+/// verifier to refuse.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct PreparedDeviation {
+    /// Which opening, by its index in the `prepared` list.
+    pub open: usize,
+    /// `(table, other)`: open `table`'s block at `other`'s point (both positions
+    /// in the proof's table order, in the opening's group).
+    pub at_point_of: Vec<(usize, usize)>,
+    /// Claim every value as the committed column evaluated at its claimed point,
+    /// so the opening is internally consistent and only the verifier's binding
+    /// of it to the tables (and to its derived roots) refuses it.
+    pub consistent: bool,
+}
+
+/// How a test makes the prover argue a group wrongly under the batched argue,
+/// or argue every group on the host, for the card-vs-host byte gate. The
+/// production prover takes [`ArgueDeviation::default`]: no fault, the card.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ArgueDeviation {
+    /// The group whose batched argue takes `faults`.
+    pub group: Option<usize>,
+    pub faults: ProverFaults,
+    /// Where every group's batched argue runs.
+    pub at: Where,
+}
+
+impl Default for ArgueDeviation {
+    fn default() -> Self {
+        Self {
+            group: None,
+            faults: ProverFaults::default(),
+            at: Where::Device,
+        }
+    }
+}
+
+/// Whether phase B opens each group beside the next group's argue
+/// ([`BlockCommitted::with_phase_b_overlap`]). The proof is the same byte for
+/// byte either way: each group proves on its own fork `S_post ‖ g`, so only
+/// when its openings run moves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PhaseBOverlap {
+    /// One group at a time: its argue, then its openings.
+    #[default]
+    Off,
+    /// A group's openings on a thread of their own, drawing the card's
+    /// background streams, while the driver argues the next group; at most one
+    /// group's openings in flight, the last group's opened alone. After a
+    /// transition in which the card refused a promise, the rest of phase B goes
+    /// one group at a time.
+    On,
+    /// As [`Self::On`], and the openings' thread reads back from the card
+    /// through a pinned buffer with a blocking-sync event wait
+    /// ([`multilinear::gpu::pinned_readbacks`]): its read-backs leave the
+    /// driver's pageable path, where the argument's waited on them. The
+    /// argument's own read-backs are unchanged.
+    Pinned,
+}
+
+/// How a test disturbs phase B's overlap ([`PhaseBOverlap::On`]): each failure
+/// must come back as the prove's error — never a panic, never another proof —
+/// and a refusal must turn the rest of phase B serial. Places are positions in
+/// phase B's order. The production prover takes the default: none.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OverlapFaults {
+    /// The openings of the group at this place fail, on whichever thread.
+    pub open_fails: Option<usize>,
+    /// The argue of the group at this place fails.
+    pub argue_fails: Option<usize>,
+    /// The opening thread of the group at this place panics (test builds).
+    pub open_panics: Option<usize>,
+    /// The opening thread waits this long before each group's openings.
+    pub open_stall: Option<std::time::Duration>,
+    /// The transition that argues the group at this place reads as one in
+    /// which the card refused a promise.
+    pub refusal_at: Option<usize>,
+    /// Under the planned overlap: the plan refuses to open the group at this
+    /// place beside the next group's argue (it opens alone).
+    pub overlap_refused_at: Option<usize>,
+    /// Under the upload once: the plan refuses the store of the group at this
+    /// place (it copies its prepared columns twice, as without the knob).
+    pub upload_once_refused_at: Option<usize>,
+    /// Under the upload once: the margin its plan keeps free, in place of
+    /// 1 GiB (a test's way to make the real plan say no).
+    pub upload_once_margin: Option<u64>,
+    /// Under the upload once: the card refuses the store of the group at this
+    /// place once its plan has said yes (on a card only: the plan is a card's).
+    pub upload_once_card_refuses_at: Option<usize>,
+    /// Under resident pricing: the card refuses the store's promise the plan
+    /// asks for when it admits the group at this place beside the next argue
+    /// (on a card only: without one no promise is asked for).
+    pub store_promise_refused_at: Option<usize>,
+}
+
+/// Every count of a promise the card refused, or of a wait on every stream at
+/// once, summed: a transition of phase B's overlap in which it rose turns the
+/// rest of phase B serial. The revive's room and an opening's turn refused,
+/// the GKR trees and other argue work the card refused, and drain-and-trims.
+/// Openings whose factors were built on the host are not among them: a small
+/// stack declines the card by policy, with no refusal behind it. Each is 0
+/// without a device.
+fn phase_b_refusals() -> u64 {
+    use multilinear::gpu;
+    [
+        gpu::room_revive_refusals(),
+        gpu::room_turn_refusals(),
+        gpu::gkr_tree_refusals(),
+        gpu::argue_device_fallbacks(),
+        gpu::device_trims(),
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
+}
+
+/// What phase B proves: the [`MultiProof`] (its `tables` empty under the
+/// batched argue), the groups' batched argues (one per group under the batched
+/// argue, none under the per-table one), the prepared openings in the
+/// `prepared` list's order, and every group's stamps.
+///
+/// The fifth element is every carried polynomial's commit-time out-of-domain
+/// answer, in root order ([`commit_ood_point`]); the last, under local
+/// lookups ([`BlockCommitted::with_local_lookups`]), every group's local argue
+/// in group order (empty for a group with no local interaction), and nothing
+/// otherwise.
+pub type BlockProved<F, E> = (
+    MultiProof<F, E>,
+    Vec<BatchedArgue<E>>,
+    Vec<StackedProof<F, E>>,
+    Vec<GroupStamps>,
+    Vec<FieldElement<E>>,
+    Vec<LocalArgue<E>>,
+);
+
+/// The block after phase A: every table, the groups' roots and the tops of
+/// their trees. The codewords are gone.
+pub struct BlockCommitted<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    tables: Vec<CommittedTable<'a, F, E>>,
+    sizes: Vec<usize>,
+    groups: Vec<RetiredStack<F>>,
+    roots: Vec<Commitment>,
+    stamps: Vec<GroupStamps>,
+    /// A memory log's terms, counted through phase B as well.
+    mem: Option<Arc<BlockMem>>,
+    /// The spill, when one is on, and each table's slot in it.
+    spill: Option<BlockSpill>,
+    /// Each table taken out of its group in phase A: parked, or dropped.
+    spilled: Vec<Option<Arc<Parked>>>,
+    /// Phase B's overlap ([`Self::with_phase_b_overlap`]), and a test's faults
+    /// in it.
+    overlap: PhaseBOverlap,
+    overlap_faults: OverlapFaults,
+    /// Phase B puts the next group's columns on the card beside this group's
+    /// argue ([`Self::with_phase_b_upload_beside`]); `true` unless set.
+    upload_beside: bool,
+    /// Under [`PhaseBOverlap::Off`], phase B still opens a group beside the
+    /// next group's argue where its plan says the card holds both
+    /// ([`Self::with_phase_b_overlap_planned`]); `false` unless set.
+    overlap_planned: bool,
+    /// Phase B puts a retired prepared stack's columns on the card once, for
+    /// both its revive and its opening ([`Self::with_prepared_upload_once`]);
+    /// `false` unless set.
+    upload_once: bool,
+    /// Under [`Self::with_prepared_upload_once`], the planned overlap prices a
+    /// retired prepared stack's revive over its store
+    /// ([`Self::with_overlap_priced_resident`]); `false` unless set.
+    overlap_resident: bool,
+    /// Under [`Self::with_prepared_upload_once`], the store goes up narrow
+    /// ([`Self::with_prepared_store_narrow`]); `false` unless set.
+    store_narrow: bool,
+    /// The planned overlap prices the next group's columns when they go up at
+    /// that group's own turn ([`Self::with_overlap_next_columns_priced`]);
+    /// `false` unless set.
+    overlap_next_columns: bool,
+    /// Phase B stamps its driver thread's schedstat a group turn
+    /// ([`Self::with_sched_stamps`]).
+    sched: bool,
+    /// Each group's commit-time out-of-domain claims, from its commit.
+    ood: Vec<OodClaims<E>>,
+    /// A test's fault ([`Self::fault_commit_ood`]): no chain carries the
+    /// answers.
+    ood_unbound: bool,
+    /// Phase B runs the merge probe after each group's argue
+    /// ([`CsProbe::merge`]), the host taking a table the card declines when
+    /// `Some(true)`.
+    merge_probe: Option<bool>,
+    /// Local lookups argued per group ([`Self::with_local_lookups`], or
+    /// from phase A on: [`LocalPhaseA`]), or none: today's format.
+    local: Option<BlockLocal>,
+    /// Under [`LocalPhaseA`], by group: the local argue begun in phase A
+    /// ([`LocalStarted`]), for the group's turn to finish.
+    local_started: Vec<Option<Box<dyn std::any::Any + Send>>>,
+    /// The caller lets phase B split its groups over two cards under
+    /// `LAMBDA_VM_TWO_CARD_SPLIT` ([`Self::with_two_card_split`]), each group
+    /// marked `true` kept on card 0; `None` unless set here: one card.
+    two_card_split: Option<Vec<bool>>,
+    /// For levels whose stack placement also assigned the phase-A lanes,
+    /// phase B uses that same assignment.
+    phase_b_commit_cards: bool,
+    /// The knob that lets [`Self::two_card_split`] act: the base's
+    /// (`LAMBDA_VM_TWO_CARD_SPLIT`) unless a level opted in under its own
+    /// ([`Self::with_two_card_levels`]).
+    two_card_knob: TwoCardKnob,
+    /// A test's: the split runs its two drivers on the host, no second card
+    /// needed ([`Self::set_two_card_split`]).
+    split_on_host: bool,
+}
+
+/// Which two-card knob lets a block's phase B split ([`BlockCommitted`]): the
+/// base's or the recursion levels'. Each prints its own line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TwoCardKnob {
+    /// `LAMBDA_VM_TWO_CARD_SPLIT`: the base's phase B
+    /// ([`BlockCommitted::with_two_card_split`]).
+    #[default]
+    Split,
+    /// `LAMBDA_VM_TWO_CARD_LEVELS`: a recursion level's phase B
+    /// ([`BlockCommitted::with_two_card_levels`]).
+    Levels,
+}
+
+impl TwoCardKnob {
+    /// Whether this knob is on in the process (its own second driver placed).
+    fn on(self) -> bool {
+        match self {
+            Self::Split => multilinear::gpu::two_card_split_on(),
+            Self::Levels => multilinear::gpu::two_card_levels_on(),
+        }
+    }
+}
+
+/// A test's fault in a block's commit-time answers
+/// ([`BlockCommitted::fault_commit_ood`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OodFault {
+    /// The first answer made false, and carried by its chain as given.
+    False,
+    /// The first answer made false, and no chain carrying any answer: a
+    /// prover whose answers bind nothing.
+    FalseUnbound,
+}
+
+impl<'a, F, E> BlockCommitted<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    /// Phase A: commits each group in turn and lets its codewords go, keeping
+    /// each tree but its bottom `drop_levels` levels on the host.
+    ///
+    /// `sizes` must be [`block_groups`]'s over the same shapes and the
+    /// config's stack cap, or the verifier rebuilds other stacks.
+    ///
+    /// `T` is the block's transcript: each group's commit-time point is drawn
+    /// from a fresh one ([`commit_ood_point`]), as its commit ends.
+    pub fn commit<H, T>(
+        tables: Vec<CommittedTable<'a, F, E>>,
+        sizes: &[usize],
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        if sizes.iter().sum::<usize>() != tables.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: tables.len(),
+                got: sizes.iter().sum(),
+            });
+        }
+        let mut tables = tables.into_iter();
+        let groups = sizes
+            .iter()
+            .map(|&size| tables.by_ref().take(size).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        Self::commit_streamed::<H, T>(groups, sizes, config, drop_levels, narrow, upload_ahead)
+    }
+
+    /// [`Self::commit`] over groups handed over one at a time, in group order —
+    /// by a producer still preparing the later ones while the card commits
+    /// the earlier. Each group's wait for its tables is stamped (`wait_a`). A
+    /// producer that stops early leaves fewer groups than `sizes` names, which
+    /// is refused.
+    pub fn commit_streamed<H, T>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        sizes: &[usize],
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        let block = Self::commit_groups::<H, T>(
+            groups.into_iter().take(sizes.len()),
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+        )?;
+        if block.sizes != sizes {
+            return Err(MlError::QueryCountMismatch {
+                expected: sizes.len(),
+                got: block.sizes.len(),
+            });
+        }
+        Ok(block)
+    }
+
+    /// Phase A over whatever groups arrive, in arrival order, until the
+    /// producer stops: the groups (and so their sizes) are the prover's, and the
+    /// statement carries them. Each group's wait for its tables is stamped, and
+    /// each group is held as `narrow` says once committed.
+    ///
+    /// `upload_ahead`: the next group is taken, and its columns put on the card,
+    /// while this group commits (on a thread of its own) — once the commit has
+    /// asked the card for its room, so the upload only takes what is left; a
+    /// store the ledger refuses is uploaded after the commit, as without it.
+    /// The commits, their order and their bytes are the same either way.
+    pub fn commit_groups<H, T>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        Self::commit_groups_logged::<H, T>(
+            groups,
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::commit_groups`], counting where the columns are in `mem` (a
+    /// memory log, through phase B too) as they move. The commits are the same.
+    pub fn commit_groups_logged<H, T>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+        mem: Option<Arc<BlockMem>>,
+        spill: Option<BlockSpill>,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        Self::commit_groups_probed::<H, T>(
+            groups,
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+            mem,
+            spill,
+            CsProbe::default(),
+            None,
+        )
+    }
+
+    /// [`Self::commit_groups_logged`] with the constraint-sumcheck probe
+    /// ([`CsProbe`]) after each group's commit, when it is on, and phase B's
+    /// merge probe set as it asks. A measurement: the commits, the roots and
+    /// the proof are the same either way.
+    ///
+    /// Under [`CsProbeMode::Lane`] the lane's thread ([`zc_lane`]) runs beside
+    /// the commits, and phase A ends once its job under way has.
+    ///
+    /// `local`: local lookups argued per group ([`LocalPhaseA`]), or none
+    /// (today's format). Each group's digests and, for a local group, its
+    /// local challenges are taken right after its commit; with
+    /// [`LocalPhaseA::lane`] and `upload_ahead` the lane runs the local
+    /// groups' bins beside the commits (its limits, and a test's host lane,
+    /// are `probe`'s). [`LocalPhaseA::retry`] lets the lane retry jobs deferred
+    /// for memory between commits. Phase B runs the bins left. Placement
+    /// preserves the proof bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_groups_probed<H, T>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+        mem: Option<Arc<BlockMem>>,
+        spill: Option<BlockSpill>,
+        probe: CsProbe,
+        local: Option<LocalPhaseA>,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        let local_lane = local.as_ref().filter(|local| local.lane);
+        let lane = ((matches!(probe.mode, CsProbeMode::Lane(_)) || local_lane.is_some())
+            && upload_ahead)
+            .then(|| zc_lane::ZcLane::<F, E>::new(&probe, config, local_lane))
+            .flatten();
+        let Some(lane) = lane else {
+            return Self::commit_groups_with::<H, T>(
+                groups.into_iter().enumerate(),
+                config,
+                drop_levels,
+                narrow,
+                upload_ahead,
+                mem,
+                spill,
+                &probe,
+                None,
+                local.as_ref(),
+                None,
+            )
+            .map(|(block, _)| block);
+        };
+        let (block, close_wait) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| lane.run::<T>());
+            let block = Self::commit_groups_with::<H, T>(
+                groups.into_iter().enumerate(),
+                config,
+                drop_levels,
+                narrow,
+                upload_ahead,
+                mem,
+                spill,
+                &probe,
+                Some(&lane),
+                local.as_ref(),
+                None,
+            )
+            .map(|(block, _)| block);
+            // Phase A's loop ended: the job under way finishes, the rest go.
+            let closing = Instant::now();
+            lane.close();
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+            (block, closing.elapsed().as_secs_f64())
+        });
+        let mut block = block?;
+        let (stamps, started, idle) = lane.into_parts();
+        for (g, stamp) in stamps {
+            if let Some(stamps) = block.stamps.get_mut(g) {
+                stamps.zc_lane = stamp;
+            }
+        }
+        for (g, started) in started {
+            if let Some(slot) = block.local_started.get_mut(g) {
+                *slot = Some(started);
+            }
+        }
+        if let Some(last) = block.stamps.last_mut() {
+            last.zc_lane.close_wait = close_wait;
+            last.zc_lane.idle = idle;
+            last.zc_lane.retry_enabled = local_lane.is_some_and(|local| local.retry);
+        }
+        Ok(block)
+    }
+
+    /// [`Self::commit_groups_probed`]'s phase A, with the lane's handle when
+    /// it runs, over groups fed with their indexes (each group's place in the
+    /// block, which its commit-time point is drawn for); returns the block of
+    /// the groups committed here and their indexes, in the order committed.
+    ///
+    /// `commit_lane`: one of phase A's commit lanes
+    /// ([`Self::commit_on_lanes`]) and its number. A lane reads its counters
+    /// on its own card, prints no phase-A line of its own, and the second
+    /// lane hands every group it holds back to the feed when it fails.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_groups_with<H, T>(
+        groups: impl IntoIterator<Item = (usize, Vec<CommittedTable<'a, F, E>>)>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+        mem: Option<Arc<BlockMem>>,
+        spill: Option<BlockSpill>,
+        probe: &CsProbe,
+        lane: Option<&zc_lane::ZcLane<'a, F, E>>,
+        local: Option<&LocalPhaseA>,
+        commit_lane: Option<(&phase_a_lanes::LaneFeed<'a, F, E>, u8)>,
+    ) -> Result<(Self, Vec<usize>), MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        let batched = matches!(config.format.argue, ArgueFormat::Batched { .. });
+        // The probe runs only where the next group is taken beside a commit,
+        // and over a batched argue's constraint sumcheck.
+        let probing = probe.mode == CsProbeMode::AfterCommit && upload_ahead && batched;
+        // What this phase A commits of joint runs, and streams of them, and
+        // how many commits fell back to the host.
+        let runs_from = multilinear::gpu::joint_runs();
+        let host_from = multilinear::gpu::host_fallbacks();
+        // A commit lane brackets each commit with its own card's counters: the
+        // process-wide ones would count the other lane's commits beside it.
+        let on_card = commit_lane.is_some();
+        let joint_runs = || match on_card {
+            true => multilinear::gpu::joint_runs_here(),
+            false => multilinear::gpu::joint_runs(),
+        };
+        let streamed_not_held = || match on_card {
+            true => multilinear::gpu::streamed_not_held_here(),
+            false => multilinear::gpu::streamed_not_held(),
+        };
+        let host_fallbacks = || match on_card {
+            true => multilinear::gpu::host_fallbacks_here(),
+            false => multilinear::gpu::host_fallbacks(),
+        };
+        // The thread's device role, handed on to the committer and packer
+        // threads it starts (a no-op in the main role).
+        let here = multilinear::gpu::card_here();
+        // Each group's index, in the order committed here.
+        let mut indexes: Vec<usize> = Vec::new();
+        let mut tables = Vec::new();
+        let mut ood = Vec::new();
+        let mut spilled: Vec<Option<Arc<Parked>>> = Vec::new();
+        let mut sizes = Vec::new();
+        let mut retired_groups = Vec::new();
+        if let Some(regen) = spill.as_ref().and_then(|spill| spill.regen.as_ref()) {
+            regen.set_mem(mem.clone());
+        }
+        let mut roots = Vec::new();
+        let mut stamps = Vec::new();
+        // Under local lookups: every table's digest, and each group's local
+        // argue begun (when the lane did not take it).
+        let mut local_digests: Vec<[u8; 32]> = Vec::new();
+        let mut local_started: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
+        let mut incoming = groups.into_iter();
+        let started = Instant::now();
+        // The previous group's pack on the card, running beside this group's
+        // upload (or, uploading ahead, beside this group's commit).
+        let mut packing: Option<Packing> = None;
+        // The next group, taken and uploaded beside this group's commit.
+        let mut ahead: Option<Ahead<'a, F, E>> = None;
+        let mut exhausted = false;
+        // The second commit lane fails (R4 of the lanes): every group it holds
+        // goes back to the feed with its index (the group in hand, the group
+        // taken ahead, every group committed here, a pack under way joined
+        // first), for card 0 to commit; then the error. Any other caller
+        // returns the error as it is.
+        macro_rules! fail {
+            ($err:expr, $in_hand:expr) => {{
+                let err = $err;
+                if let Some((feed, 1)) = commit_lane {
+                    let mut back: Vec<(usize, Vec<CommittedTable<'a, F, E>>)> = $in_hand;
+                    if let Some(next) = ahead.take() {
+                        back.push((next.index, next.group));
+                    }
+                    if let Some(packed) = packing.take() {
+                        packed.install(&mut tables, &mut stamps, None);
+                    }
+                    let mut held = std::mem::take(&mut tables).into_iter();
+                    for (&g, &size) in indexes.iter().zip(&sizes).take(stamps.len()) {
+                        back.push((g, held.by_ref().take(size).collect()));
+                    }
+                    feed.hand_back(back);
+                }
+                return Err(err);
+            }};
+        }
+        loop {
+            let (index, mut group, mut stamp, store, wide) = match ahead.take() {
+                Some(next) => {
+                    // A memory log: the group taken ahead is now the one in
+                    // its commit.
+                    if let Some(mem) = &mem {
+                        mem.ahead.fetch_sub(next.wide, Relaxed);
+                        mem.committing.fetch_add(next.wide, Relaxed);
+                    }
+                    let mut stamp = GroupStamps {
+                        tables: next.group.len(),
+                        wait_a: next.wait_paid,
+                        upload_a: next.upload,
+                        upload_paid: next.upload_paid,
+                        ..Default::default()
+                    };
+                    let store = match next.store {
+                        Some(store) => Some(store),
+                        None => {
+                            // Refused beside the commit (or no card): up now,
+                            // with the commit's room given back.
+                            stamp.ahead_refused = multilinear::gpu::reserve_budget() > 0;
+                            let t = Instant::now();
+                            let store = upload_for_commit(&next.group);
+                            let secs = t.elapsed().as_secs_f64();
+                            stamp.upload_a += secs;
+                            stamp.upload_paid += secs;
+                            store
+                        }
+                    };
+                    (next.index, next.group, stamp, store, next.wide)
+                }
+                None => {
+                    if exhausted {
+                        break;
+                    }
+                    let waited = Instant::now();
+                    let Some((index, group)) = incoming.next() else {
+                        if let Some(lane) = lane {
+                            lane.input_ended();
+                        }
+                        break;
+                    };
+                    if let Some(lane) = lane {
+                        lane.group_arrived(&group);
+                    }
+                    let mut stamp = GroupStamps {
+                        tables: group.len(),
+                        wait_a: waited.elapsed().as_secs_f64(),
+                        ..Default::default()
+                    };
+                    let wide = mem.as_ref().map_or(0, |mem| {
+                        let held = group.iter().map(held_bytes).sum();
+                        mem.committing.fetch_add(held, Relaxed);
+                        held
+                    });
+                    let t = Instant::now();
+                    // Held in an `Arc` like phase B's: once the tree tops are
+                    // home it goes to the group's packer, or is dropped.
+                    let store = upload_for_commit(&group);
+                    stamp.upload_a = t.elapsed().as_secs_f64();
+                    stamp.upload_paid = stamp.upload_a;
+                    (index, group, stamp, store, wide)
+                }
+            };
+            let size = group.len();
+            if size == 0 {
+                fail!(
+                    MlError::QueryCountMismatch {
+                        expected: 1,
+                        got: 0,
+                    },
+                    vec![(index, group)]
+                );
+            }
+            sizes.push(size);
+            indexes.push(index);
+            // The index the group was fed with: its place in the block,
+            // whichever lane commits it.
+            let group_index = index;
+            stamp.commit_card = commit_lane.map_or(0, |(_, lane)| lane);
+            if !upload_ahead && let Some(packed) = packing.take() {
+                install_and_spill(
+                    packed,
+                    &mut tables,
+                    &mut spilled,
+                    &mut stamps,
+                    &sizes,
+                    mem.as_deref(),
+                    spill.as_ref(),
+                )?;
+            }
+            let shapes: Vec<(usize, usize)> = group
+                .iter()
+                .map(|t| (t.num_committed_columns(), t.num_vars()))
+                .collect();
+            stamp.cells = shapes.iter().map(|&(w, n)| w << n).sum();
+            let layout = match global_layout(&shapes, config.format.stack) {
+                Ok(layout) => layout,
+                Err(e) => fail!(e, vec![(index, group)]),
+            };
+            stamp.polys = layout.num_polys();
+            // A test's fault: the second lane fails before its k-th commit.
+            if let Some((feed, 1)) = commit_lane
+                && feed.fault_at(stamps.len())
+            {
+                fail!(
+                    MlError::DeviceFailed {
+                        stage: "a test's fault in the second commit lane"
+                    },
+                    vec![(index, group)]
+                );
+            }
+            let retry_wait = lane.map_or(0.0, |lane| lane.wait_for_retry());
+            stamp.commit_base = multilinear::gpu::ledger_reserved();
+            stamp.commit_pool_before = multilinear::gpu::pool_reserved_now();
+            let runs_before = joint_runs();
+            let not_held_before = streamed_not_held();
+            stamp.commit_priced = multilinear::stacked_eval::commit_card_bytes(&layout, config);
+            let fallbacks_before = host_fallbacks();
+            multilinear::gpu::reset_reserved_window();
+            // The probe reads the group's columns where the commit read them:
+            // its tables point at the store until the commit's scope ends.
+            let probe_on_card = (probing || lane.is_some()) && store.is_some();
+            if probe_on_card && let Some(store) = &store {
+                let mut first = 0usize;
+                for table in group.iter_mut() {
+                    table.set_resident(store.clone(), first);
+                    first += table.num_committed_columns();
+                }
+            }
+            // Handles, not field elements: a table held narrow is read on the
+            // host only by a host fallback.
+            let handles = group_columns(&group);
+            let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
+            let resident = store.as_ref().map(|store| (&**store, 0));
+            let mut probed: Option<CsProbeStamp> = None;
+            let committed = if upload_ahead {
+                // Whether the next group (or the producer's end) has come.
+                let next_came = std::sync::atomic::AtomicBool::new(false);
+                let (committed, next) = std::thread::scope(|scope| {
+                    let (room_tx, room_rx) = std::sync::mpsc::channel::<()>();
+                    let columns = &columns;
+                    let (group_ref, next_came) = (&group, &next_came);
+                    let committer = scope.spawn(move || {
+                        let _card = here.enter();
+                        let signal = move || {
+                            let _ = room_tx.send(());
+                        };
+                        if let Some(lane) = lane {
+                            lane.commit_begins(group_index, retry_wait);
+                        }
+                        let committed = commit_and_retire::<F, E, H, T, _>(
+                            group_index,
+                            layout,
+                            columns,
+                            resident,
+                            config,
+                            drop_levels,
+                            &signal,
+                        );
+                        let commit_end = Instant::now();
+                        // Under local lookups: the group's digests, and its
+                        // local challenges drawn now, right after its roots
+                        // and answers.
+                        let (digests, mut started) = match (&committed, local) {
+                            (Ok(done), Some(local)) => {
+                                begin_local::<F, E, T>(group_index, group_ref, done, config, local)
+                            }
+                            _ => (Vec::new(), None),
+                        };
+                        // The lane's job: the group's columns held for it.
+                        if let Some(lane) = lane {
+                            if let Ok(done) = &committed {
+                                lane.submit(
+                                    group_index,
+                                    group_ref,
+                                    &done.roots,
+                                    probe_on_card,
+                                    commit_end,
+                                    if lane.runs_local() {
+                                        started.take()
+                                    } else {
+                                        None
+                                    },
+                                );
+                            }
+                            lane.commit_ends();
+                        }
+                        // The probe, when nothing waits to be committed.
+                        let probed = match (&committed, probing) {
+                            (Ok(done), true) => {
+                                let mut stamp =
+                                    if next_came.load(std::sync::atomic::Ordering::SeqCst) {
+                                        CsProbeStamp {
+                                            state: CsProbeState::Waiting,
+                                            ..Default::default()
+                                        }
+                                    } else {
+                                        run_cs_probe::<F, E, T>(
+                                            group_index,
+                                            group_ref,
+                                            &done.roots,
+                                            config,
+                                            probe_on_card,
+                                            probe.host,
+                                        )
+                                    };
+                                stamp.secs = commit_end.elapsed().as_secs_f64();
+                                if let Some(decided) = &probe.decided {
+                                    decided.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                Some(stamp)
+                            }
+                            _ => None,
+                        };
+                        (
+                            committed,
+                            commit_end,
+                            probed,
+                            Instant::now(),
+                            (digests, started),
+                        )
+                    });
+                    // Beside the commit: the next group, then its columns once
+                    // the commit has asked for its room (or ended).
+                    let next = incoming.next();
+                    let arrived = Instant::now();
+                    next_came.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if next.is_none()
+                        && let Some(lane) = lane
+                    {
+                        lane.input_ended();
+                    }
+                    let next = next.map(|(index, group)| {
+                        if let Some(lane) = lane {
+                            lane.group_arrived(&group);
+                        }
+                        let wide = mem.as_ref().map_or(0, |mem| {
+                            let held = group.iter().map(held_bytes).sum();
+                            mem.ahead.fetch_add(held, Relaxed);
+                            held
+                        });
+                        let _ = room_rx.recv();
+                        let t = Instant::now();
+                        let store = upload_for_commit(&group);
+                        (
+                            group,
+                            store,
+                            wide,
+                            t.elapsed().as_secs_f64(),
+                            Instant::now(),
+                            index,
+                        )
+                    });
+                    let (committed, commit_end, probe_stamp, probe_end, begun) = committer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    let (digests, begun_local) = begun;
+                    local_digests.extend(digests);
+                    local_started.push(begun_local);
+                    // What the probe held back: the next commit once the next
+                    // group's columns were up, or phase A's end once the
+                    // producer had none.
+                    probed = probe_stamp.map(|mut stamp| {
+                        let ready = next.as_ref().map_or(arrived, |next| next.4);
+                        stamp.held = probe_end
+                            .max(ready)
+                            .saturating_duration_since(commit_end.max(ready))
+                            .as_secs_f64();
+                        stamp.ended_at = probe_end.saturating_duration_since(started).as_secs_f64();
+                        stamp.committed_at =
+                            commit_end.saturating_duration_since(started).as_secs_f64();
+                        stamp
+                    });
+                    let next = next.map(|(group, store, wide, upload, uploaded, index)| {
+                        // What the committer waited for once its commit ended:
+                        // the group's arrival, then the rest of its upload —
+                        // never more than the upload (a commit that ended before
+                        // the upload began paid all of it, and no more).
+                        let ready = arrived.max(commit_end);
+                        Ahead {
+                            index,
+                            group,
+                            store,
+                            wide,
+                            upload,
+                            wait_paid: arrived.saturating_duration_since(commit_end).as_secs_f64(),
+                            upload_paid: uploaded
+                                .saturating_duration_since(ready)
+                                .as_secs_f64()
+                                .min(upload),
+                        }
+                    });
+                    (committed, next)
+                });
+                exhausted = next.is_none();
+                ahead = next;
+                committed
+            } else {
+                let committed = commit_and_retire::<F, E, H, T, _>(
+                    group_index,
+                    layout,
+                    &columns,
+                    resident,
+                    config,
+                    drop_levels,
+                    &|| {},
+                );
+                if let (Ok(done), Some(local)) = (&committed, local) {
+                    let (digests, started) =
+                        begin_local::<F, E, T>(group_index, &group, done, config, local);
+                    local_digests.extend(digests);
+                    local_started.push(started);
+                }
+                committed
+            };
+            drop(columns);
+            drop(handles);
+            if probe_on_card {
+                for table in group.iter_mut() {
+                    table.clear_resident();
+                }
+            }
+            let committed = match committed {
+                Ok(committed) => committed,
+                Err(e) => fail!(e, vec![(index, group)]),
+            };
+            roots.extend(committed.roots);
+            let retired = committed.retired;
+            stamp.commit = committed.commit;
+            stamp.retire = committed.retire;
+            stamp.ood = committed.ood_secs;
+            stamp.ood_counts = committed.ood_counts;
+            ood.push(committed.ood);
+            stamp.commit_reserved = lane
+                .map_or_else(multilinear::gpu::reserved_window_peak, |lane| {
+                    lane.commit_peak()
+                });
+            stamp.commit_pool_after = multilinear::gpu::pool_reserved_now();
+            let runs = joint_runs();
+            stamp.joint_runs = [
+                runs.0.saturating_sub(runs_before.0),
+                runs.1.saturating_sub(runs_before.1),
+                runs.2.saturating_sub(runs_before.2),
+            ];
+            stamp.commit_streamed_not_held = streamed_not_held()
+                .since(not_held_before)
+                .add_back(multilinear::stacked_eval::round0_trees(stamp.polys, config).len());
+            stamp.commit_host_fallbacks = host_fallbacks().saturating_sub(fallbacks_before);
+            if let Some(lane) = lane {
+                lane.note_growth(stamp.commit_reserved.saturating_sub(stamp.commit_base));
+            }
+            stamp.tree_bytes = retired.tree_bytes();
+            stamp.committed_at = started.elapsed().as_secs_f64();
+            if let Some(probed) = probed {
+                // The commit's own end, not the probe's.
+                stamp.committed_at = probed.committed_at;
+                stamp.cs_probe = probed;
+            }
+            if upload_ahead && let Some(packed) = packing.take() {
+                install_and_spill(
+                    packed,
+                    &mut tables,
+                    &mut spilled,
+                    &mut stamps,
+                    &sizes,
+                    mem.as_deref(),
+                    spill.as_ref(),
+                )?;
+            }
+            // Which tables were committed wide (a packer's, from here on).
+            let was_wide: Vec<bool> = group.iter().map(|t| t.compact_bytes().is_none()).collect();
+            packing = narrow_group(&mut group, store, narrow, &mut stamp, mem.clone(), here).map(
+                |handle| Packing {
+                    first_table: tables.len(),
+                    group: stamps.len(),
+                    wide: group
+                        .iter()
+                        .zip(&was_wide)
+                        .filter(|&(_, &w)| w)
+                        .map(|(t, _)| wide_bytes(t))
+                        .sum(),
+                    was_wide: was_wide.clone(),
+                    handle,
+                },
+            );
+            if let Some(mem) = &mem {
+                mem.committing.fetch_sub(wide, Relaxed);
+                mem.tree_tops.fetch_add(stamp.tree_bytes, Relaxed);
+                match &packing {
+                    Some(packed) => {
+                        mem.packing_wide.fetch_add(packed.wide, Relaxed);
+                        // The tables committed narrow are held as they are.
+                        mem.hold(
+                            group
+                                .iter()
+                                .zip(&was_wide)
+                                .filter(|&(_, &w)| !w)
+                                .map(|(t, _)| t),
+                        );
+                    }
+                    None => mem.hold(group.iter()),
+                }
+                mem.mark(&format!("group {} committed", stamps.len()));
+            }
+            retired_groups.push(retired);
+            stamps.push(stamp);
+            let first = tables.len();
+            tables.extend(group);
+            spilled.resize(tables.len(), None);
+            // A group no packer took is held as it is from here on.
+            if packing.is_none()
+                && let Some(spill) = &spill
+            {
+                spill_group(spill, first, &mut tables[first..], &mut spilled[first..])?;
+            }
+        }
+        if let Some(packed) = packing.take() {
+            install_and_spill(
+                packed,
+                &mut tables,
+                &mut spilled,
+                &mut stamps,
+                &sizes,
+                mem.as_deref(),
+                spill.as_ref(),
+            )?;
+        }
+        // Phase A's end: live regeneration's drops are joined.
+        if let Some(spill) = &spill {
+            spill.close_hand_off();
+        }
+        // `host commits`: `multilinear::gpu::host_fallbacks` over phase A, a
+        // process-wide counter (another commit made meanwhile counts too, and
+        // without a card every commit is a host commit). A commit lane's
+        // phase A prints it once for both lanes.
+        if commit_lane.is_none() {
+            print_leaves_streamed(runs_from, host_from);
+        }
+        let block = Self {
+            tables,
+            sizes,
+            groups: retired_groups,
+            roots,
+            stamps,
+            mem,
+            spill,
+            spilled,
+            overlap: PhaseBOverlap::Off,
+            overlap_faults: OverlapFaults::default(),
+            upload_beside: true,
+            overlap_planned: false,
+            upload_once: false,
+            overlap_resident: false,
+            store_narrow: false,
+            overlap_next_columns: false,
+            sched: false,
+            ood,
+            ood_unbound: false,
+            merge_probe: (probe.merge && batched).then_some(probe.host),
+            local: local.map(|local| BlockLocal {
+                buses: local.buses.clone(),
+                digests: local_digests,
+            }),
+            local_started,
+            two_card_split: None,
+            phase_b_commit_cards: false,
+            two_card_knob: TwoCardKnob::Split,
+            split_on_host: false,
+        };
+        Ok((block, indexes))
+    }
+
+    /// Phase B argues each group's local lookups on the group's own
+    /// transcript ([`local_challenges`], [`batched::prove_local`]) and its
+    /// global class on its fork, the local state absorbed first; `None`
+    /// unless set here (today's format, every byte). The batched argue only.
+    pub fn with_local_lookups(mut self, local: BlockLocal) -> Self {
+        self.local = Some(local);
+        self
+    }
+
+    /// Every table's digest under local lookups, taken in phase A
+    /// ([`LocalPhaseA`]) or set with [`Self::with_local_lookups`]; `None` in
+    /// today's format.
+    pub fn local_digests(&self) -> Option<&[[u8; 32]]> {
+        self.local.as_ref().map(|local| local.digests.as_slice())
+    }
+
+    /// Phase B may split its groups over two cards, each card arguing and
+    /// opening its own groups, when `LAMBDA_VM_TWO_CARD_SPLIT` is on and a
+    /// second card is ready ([`phase_b_split`]); groups marked `true` in
+    /// `keep_on_card_0` (one per group; a missing one is kept) stay on card 0.
+    /// Off unless set here. The proof is the same.
+    pub fn with_two_card_split(mut self, keep_on_card_0: Vec<bool>) -> Self {
+        self.two_card_split = Some(keep_on_card_0);
+        self.two_card_knob = TwoCardKnob::Split;
+        self
+    }
+
+    /// A recursion level's phase B may split its groups over two cards, as
+    /// [`Self::with_two_card_split`] lets the base's, under the levels' own
+    /// knob `LAMBDA_VM_TWO_CARD_LEVELS` (the base's knob plays no part). A
+    /// group with a held prepared stack stays on its card. Off unless set here.
+    /// The proof is the same.
+    pub fn with_two_card_levels(mut self, keep_on_card_0: Vec<bool>) -> Self {
+        self.two_card_split = Some(keep_on_card_0);
+        self.two_card_knob = TwoCardKnob::Levels;
+        self
+    }
+
+    /// Reuse phase A's card assignments in phase B while both cards are active.
+    pub fn with_phase_b_commit_cards(mut self, on: bool) -> Self {
+        self.phase_b_commit_cards = on;
+        self
+    }
+
+    /// Test only: [`Self::with_two_card_split`] in place, and with `on_host`
+    /// the two drivers run without a second card (both on the host, or both
+    /// on card 0): the split's schedule, transcript and assembly without its
+    /// device. The proof is the same.
+    #[doc(hidden)]
+    pub fn set_two_card_split(&mut self, keep_on_card_0: Option<Vec<bool>>, on_host: bool) {
+        self.two_card_split = keep_on_card_0;
+        self.split_on_host = on_host;
+    }
+
+    /// Phase B reads its driver thread's CPU time and run-queue delay from
+    /// `/proc/thread-self/schedstat` at each group turn ([`GroupStamps::sched_b`]);
+    /// off unless set here. A report: the proof is the same.
+    pub fn with_sched_stamps(mut self, on: bool) -> Self {
+        self.sched = on;
+        self
+    }
+
+    /// Phase B opens each group beside the next group's argue, or not
+    /// ([`PhaseBOverlap`]); `Off` unless set here. The proof is the same.
+    pub fn with_phase_b_overlap(mut self, overlap: PhaseBOverlap) -> Self {
+        self.overlap = overlap;
+        self
+    }
+
+    /// Phase B uploads the next group's columns beside this group's argue
+    /// (`true`, the default), or at the next group's own turn, after this
+    /// group's argue and openings (`false`): the argue then has the card's
+    /// room to itself. The proof is the same.
+    pub fn with_phase_b_upload_beside(mut self, beside: bool) -> Self {
+        self.set_phase_b_upload_beside(beside);
+        self
+    }
+
+    /// [`Self::with_phase_b_upload_beside`] in place.
+    pub fn set_phase_b_upload_beside(&mut self, beside: bool) {
+        self.upload_beside = beside;
+    }
+
+    /// Under [`PhaseBOverlap::Off`] (a prove with retired prepared stacks),
+    /// phase B opens a group beside the next group's argue anyway, transition
+    /// by transition, where the plan says the card holds both
+    /// ([`overlap_fits`]: what the ledger holds once the group has argued, the
+    /// group's openings' planned bytes, and the next group's argue bounded by
+    /// its own phase-A commit), and alone where it does not (`planned`, `false`
+    /// by default: every group alone, as before). A transition in which the card
+    /// refused a promise turns the rest of phase B serial, as under
+    /// [`PhaseBOverlap::On`]. The overlap moves no byte.
+    pub fn with_phase_b_overlap_planned(mut self, planned: bool) -> Self {
+        self.overlap_planned = planned;
+        self
+    }
+
+    /// Phase B puts each retired prepared stack's columns on the card ONCE, at
+    /// its revive, and both the revive and the prepared opening read them
+    /// there (`true`), instead of the revive copying them in for its encode and
+    /// the opening copying them in again for its message (`false`, the
+    /// default). Where the plan says the card does not hold the store beside
+    /// the opening's own promises ([`UploadOnce`]), or the card refuses it, the
+    /// group copies twice as before. The same columns read: the same proof.
+    pub fn with_prepared_upload_once(mut self, on: bool) -> Self {
+        self.upload_once = on;
+        self
+    }
+
+    /// Under [`Self::with_prepared_upload_once`], the planned overlap prices a
+    /// group's retired prepared stack as the upload once revives it: its store
+    /// (the columns' bytes) and the revive's promises over a resident stack
+    /// ([`RetiredStack::revive_card_bytes`] with `resident`; on coset leaves no
+    /// codeword), instead of a revive that copies the columns in and encodes
+    /// whole codewords (`false`, the default). Where it now fits, the group
+    /// opens beside the next argue, and the admission takes the store's
+    /// promise then (refused, the group opens alone), so the store goes up
+    /// into it and the ledger cannot refuse it inside the overlap. Without the
+    /// upload once it changes nothing. The same proof.
+    pub fn with_overlap_priced_resident(mut self, on: bool) -> Self {
+        self.overlap_resident = on;
+        self
+    }
+
+    /// Under [`Self::with_prepared_upload_once`], each store crosses the bus
+    /// at the bytes its words need: packed on the host a run of one height at
+    /// a time and widened on the card into the same words at the same places
+    /// (`multilinear::gpu::upload_store_columns_narrow`), instead of at 8 bytes
+    /// a cell (`false`, the default). Its plan adds the largest run's packed
+    /// bytes at most ([`narrow_store_staging`]). Without the upload once it
+    /// changes nothing. The same columns read: the same proof.
+    pub fn with_prepared_store_narrow(mut self, on: bool) -> Self {
+        self.store_narrow = on;
+        self
+    }
+
+    /// The planned overlap adds the next group's columns to a transition's
+    /// need when they are not on the card yet ([`next_columns_bytes`]): with
+    /// the upload beside off (retired stacks) they go up at that group's own
+    /// turn, after the plan and before the openings start beside its argue,
+    /// so neither the ledger nor the commit's growth holds them when the plan
+    /// reads (`false`, the default: today's plan, which covers them only with
+    /// its slack). Only the plan moves: where they no longer fit, the group
+    /// opens alone. The same proof.
+    pub fn with_overlap_next_columns_priced(mut self, on: bool) -> Self {
+        self.overlap_next_columns = on;
+        self
+    }
+
+    /// [`Self::with_phase_b_overlap_planned`] in place.
+    pub fn set_phase_b_overlap_planned(&mut self, planned: bool) {
+        self.overlap_planned = planned;
+    }
+
+    /// A test's faults in phase B's overlap ([`OverlapFaults`]).
+    #[doc(hidden)]
+    pub fn with_overlap_faults(mut self, faults: OverlapFaults) -> Self {
+        self.overlap_faults = faults;
+        self
+    }
+
+    /// Every group's roots, in group order — what the transcript absorbs.
+    pub fn roots(&self) -> &[Commitment] {
+        &self.roots
+    }
+
+    pub fn sizes(&self) -> &[usize] {
+        &self.sizes
+    }
+
+    /// Each group's commit-time point, in group order: drawn from the group's
+    /// own transcript over its index, layout and roots ([`commit_ood_point`]).
+    #[doc(hidden)]
+    pub fn commit_points(&self) -> Vec<FieldElement<E>> {
+        self.ood.iter().map(|claims| claims.z0.clone()).collect()
+    }
+
+    pub fn tables(&self) -> &[CommittedTable<'a, F, E>] {
+        &self.tables
+    }
+
+    /// Phase A's stamps, one per group.
+    pub fn stamps(&self) -> &[GroupStamps] {
+        &self.stamps
+    }
+
+    /// By group, the class of the tables it dropped for phase B to rebuild
+    /// ([`BlockRegen`]), or `None`: what [`interleaved_order`] orders by.
+    /// Refused with the first group that dropped tables of two classes
+    /// ([`one_class`]): phase B could not take it in both classes' orders.
+    pub fn rebuilt_classes(&self) -> Result<Vec<Option<usize>>, usize> {
+        let mut at = 0usize;
+        self.sizes
+            .iter()
+            .enumerate()
+            .map(|(g, &size)| {
+                let classes = self.spilled[at..at + size]
+                    .iter()
+                    .flatten()
+                    .map(|parked| parked.dropped_class());
+                at += size;
+                one_class(classes).ok_or(g)
+            })
+            .collect()
+    }
+
+    /// Live regeneration, when phase A ran with it.
+    pub fn regen(&self) -> Option<&BlockRegen> {
+        self.spill.as_ref().and_then(|spill| spill.regen.as_ref())
+    }
+
+    /// A test's fault in the commit-time answers ([`OodFault`]): the first
+    /// group's first answer made false — absorbed and sent as it is — and,
+    /// under [`OodFault::FalseUnbound`], every group's answers left out of its
+    /// chains. A false answer its chain carries is refused by the chain; one
+    /// no chain carries only by a verifier that batches the answers
+    /// (`VerifierChecks::commit_ood`). Returns whether there was an answer.
+    #[doc(hidden)]
+    pub fn fault_commit_ood(&mut self, fault: OodFault) -> bool {
+        self.fault_commit_ood_at(fault, 0, 0)
+    }
+
+    /// [`Self::fault_commit_ood`] on group `group`'s answer `poly` instead of
+    /// the first group's first. Returns whether there was that answer.
+    #[doc(hidden)]
+    pub fn fault_commit_ood_at(&mut self, fault: OodFault, group: usize, poly: usize) -> bool {
+        let Some(answer) = self
+            .ood
+            .get_mut(group)
+            .and_then(|claims| claims.answers.get_mut(poly))
+        else {
+            return false;
+        };
+        *answer += FieldElement::<E>::one();
+        self.ood_unbound = fault == OodFault::FalseUnbound;
+        true
+    }
+
+    /// A test's fault: the first narrow table's width map made wrong
+    /// ([`multilinear::narrow::NarrowColumns::fault_width_map`]), so phase B
+    /// widens other words than were committed. Returns whether a table was
+    /// there to break.
+    #[doc(hidden)]
+    pub fn fault_narrow_width_map(&mut self) -> bool {
+        self.tables
+            .iter_mut()
+            .filter_map(|table| table.narrow_mut())
+            .any(|packed| packed.fault_width_map())
+    }
+}
+
+/// The next group, taken and uploaded beside the current group's commit
+/// ([`BlockCommitted::commit_groups`]'s `upload_ahead`): its tables, its store
+/// (`None` when the ledger refused it, or there is no card), the upload's
+/// seconds, and what of the wait and of the upload outlasted the commit.
+struct Ahead<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    /// The group's index, as it was fed.
+    index: usize,
+    group: Vec<CommittedTable<'a, F, E>>,
+    store: Store,
+    /// Its columns at eight bytes a cell (counted only for a memory log).
+    wide: usize,
+    upload: f64,
+    wait_paid: f64,
+    upload_paid: f64,
+}
+
+/// Phase A's line after its last commit: the joint runs committed, streamed
+/// into their leaves and committed to be retired, and the host commits, since
+/// `runs_from` and `host_from` (process-wide counters).
+fn print_leaves_streamed(runs_from: (u64, u64, u64), host_from: u64) {
+    let runs = multilinear::gpu::joint_runs();
+    eprintln!(
+        "BLOCK COMMIT LEAVES STREAMED: {} of {} joint runs committed to be retired ({} joint runs committed) · host commits {}",
+        runs.2.saturating_sub(runs_from.2),
+        runs.1.saturating_sub(runs_from.1),
+        runs.0.saturating_sub(runs_from.0),
+        multilinear::gpu::host_fallbacks().saturating_sub(host_from),
+    );
+}
+
+/// A group committed and retired ([`commit_and_retire`]).
+struct CommittedGroup<F: IsFFTField + IsPrimeField + 'static, E: IsField> {
+    roots: Vec<Commitment>,
+    retired: RetiredStack<F>,
+    /// The commit's and the retire's seconds.
+    commit: f64,
+    retire: f64,
+    /// Its commit-time out-of-domain claims, their seconds and where their
+    /// columns were evaluated.
+    ood: OodClaims<E>,
+    ood_secs: f64,
+    ood_counts: OodCounts,
+}
+
+/// Group `group` committed and retired, and its commit-time out-of-domain
+/// point answered ([`commit_ood_point`]) from its columns while they are still
+/// where the commit read them — on the card, in place, when `resident` holds
+/// them: after the retire, so the codewords' room is back, and before the
+/// store goes to the packer. `on_room` as
+/// [`StackedCommitment::commit_signalled`].
+#[allow(clippy::too_many_arguments)]
+fn commit_and_retire<F, E, H, T, C>(
+    group: usize,
+    layout: StackedLayout,
+    columns: &[&C],
+    resident: Option<(&multilinear::gpu::ResidentColumns, usize)>,
+    config: &ChainConfig,
+    drop_levels: multilinear::whir_commit::TreeDrop,
+    on_room: &dyn Fn(),
+) -> Result<CommittedGroup<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+    C: multilinear::narrow::HostColumn<F>,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: Send + Sync,
+{
+    let t = Instant::now();
+    // Phase A commits each group's pairs of polynomials on the committer's own
+    // threads, not the global rayon pool: the roots are the same either way,
+    // but the committer is not a pool thread, so on the pool its pair waits in
+    // the injector behind every job the finish's generators queue (rayon-core's
+    // `find_work`: own deque, then stealing, then injected jobs), and the card
+    // waits with it: at the median block one commit took 2.7–2.9 s against
+    // 0.68 s off the pool.
+    // Retired right below, so a joint run may be streamed into its tree
+    // (`multilinear::gpu::streamed_joint_leaves`).
+    let stacked = multilinear::stacked_eval::with_pairs_off_pool(true, || {
+        StackedCommitment::<F, H>::commit_to_retire(
+            layout,
+            columns,
+            resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+            config,
+            on_room,
+        )
+    })?;
+    let roots = stacked.roots();
+    let commit = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let retired = stacked.retire(drop_levels, config)?;
+    let retire = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let z0 = commit_ood_point::<E, T>(group, retired.layout(), &roots, config)?;
+    let (ood, ood_counts) = stacked_eval::ood_claims::<F, E, C>(
+        retired.layout(),
+        columns,
+        resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+        &z0,
+    )?;
+    Ok(CommittedGroup {
+        roots,
+        retired,
+        commit,
+        retire,
+        ood,
+        ood_secs: t.elapsed().as_secs_f64(),
+        ood_counts,
+    })
+}
+
+/// The calling thread's CPU time and run-queue delay so far, in ns, from
+/// `/proc/thread-self/schedstat` (Linux); `None` where the file does not read.
+/// A kernel without scheduler statistics prints zeros.
+fn thread_schedstat() -> Option<(u64, u64)> {
+    parse_schedstat(&std::fs::read_to_string("/proc/thread-self/schedstat").ok()?)
+}
+
+/// A schedstat line's first two fields: CPU ns and run-queue delay ns.
+fn parse_schedstat(text: &str) -> Option<(u64, u64)> {
+    let mut fields = text.split_whitespace().map(|w| w.parse::<u64>().ok());
+    Some((fields.next()??, fields.next()??))
+}
+
+/// What a packer hands back: one packed table or none per table of its group,
+/// and its own seconds.
+type Packed = (Vec<Option<multilinear::narrow::NarrowColumns>>, f64);
+
+/// A group's tables being packed on the card, on a thread of their own:
+/// where the group's tables start in the block, its stamp, and the packer.
+struct Packing {
+    first_table: usize,
+    group: usize,
+    /// The group's columns committed wide, at eight bytes a cell, and which
+    /// tables those are (counted only for a memory log).
+    wide: usize,
+    was_wide: Vec<bool>,
+    handle: std::thread::JoinHandle<Packed>,
+}
+
+impl Packing {
+    /// Waits for the packer and holds each table it packed narrow from here
+    /// on. A packer that failed leaves its tables wide.
+    fn install<F, E>(
+        self,
+        tables: &mut [CommittedTable<'_, F, E>],
+        stamps: &mut [GroupStamps],
+        mem: Option<&BlockMem>,
+    ) where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+    {
+        let t = Instant::now();
+        let joined = self.handle.join();
+        let stamp = &mut stamps[self.group];
+        stamp.pack += t.elapsed().as_secs_f64();
+        let installed = match joined {
+            Ok((packed, busy)) => {
+                stamp.pack_busy = busy;
+                let ready: usize = packed.iter().flatten().map(|p| p.data().len()).sum();
+                for (table, packed) in tables[self.first_table..].iter_mut().zip(packed) {
+                    let Some(packed) = packed else {
+                        continue;
+                    };
+                    let bytes = packed.data().len();
+                    if table.install_narrow(packed) {
+                        stamp.packed_tables += 1;
+                        stamp.packed_cells += table.num_committed_columns() << table.num_vars();
+                        stamp.packed_bytes += bytes;
+                    }
+                }
+                ready
+            }
+            Err(_) => 0,
+        };
+        if let Some(mem) = mem {
+            mem.packed_ready.fetch_sub(installed, Relaxed);
+            mem.packing_wide.fetch_sub(self.wide, Relaxed);
+            mem.hold(
+                tables[self.first_table..]
+                    .iter()
+                    .zip(&self.was_wide)
+                    .filter(|&(_, &w)| w)
+                    .map(|(t, _)| t),
+            );
+            mem.mark(&format!("group {} installed", self.group));
+        }
+    }
+}
+
+/// Installs a packer's tables ([`Packing::install`]), then hands its group to
+/// the spill when one is on.
+fn install_and_spill<F, E>(
+    packed: Packing,
+    tables: &mut [CommittedTable<'_, F, E>],
+    spilled: &mut [Option<Arc<Parked>>],
+    stamps: &mut [GroupStamps],
+    sizes: &[usize],
+    mem: Option<&BlockMem>,
+    spill: Option<&BlockSpill>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let (g, first) = (packed.group, packed.first_table);
+    packed.install(tables, stamps, mem);
+    let Some(spill) = spill else {
+        return Ok(());
+    };
+    let end = first + sizes[g];
+    spill_group(
+        spill,
+        first,
+        &mut tables[first..end],
+        &mut spilled[first..end],
+    )
+}
+
+/// Holds a just-committed group's tables as `narrow` says. On the card, each
+/// table of at least `min_cells` cells is packed from its run in `store` by a
+/// thread of its own, returned for the caller to [`Packing::install`] once the
+/// next group's columns are up: the committer is phase A's critical path, and
+/// the pack's download overlaps that upload. On the host, every table is packed
+/// here. A table that cannot be packed stays as it is.
+fn narrow_group<F, E>(
+    group: &mut [CommittedTable<'_, F, E>],
+    store: Store,
+    narrow: Narrowing,
+    stamp: &mut GroupStamps,
+    mem: Option<Arc<BlockMem>>,
+    here: multilinear::gpu::CardHere,
+) -> Option<std::thread::JoinHandle<Packed>>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    match (narrow, store) {
+        (Narrowing::Wide, _) | (Narrowing::Card { .. }, None) => None,
+        (Narrowing::Card { min_cells }, Some(store)) => {
+            // Each table's run in the store, if it is to be packed.
+            let mut first = 0usize;
+            let runs: Vec<Option<(usize, usize)>> = group
+                .iter()
+                .map(|table| {
+                    let width = table.num_committed_columns();
+                    // A table built packed is held narrow already, and one
+                    // held as records keeps them.
+                    let run = (table.compact_bytes().is_none()
+                        && (width << table.num_vars()) >= min_cells)
+                        .then_some((first, width));
+                    first += width;
+                    run
+                })
+                .collect();
+            // The packer reads the store on its card: in the committer's role.
+            Some(std::thread::spawn(move || {
+                let _card = here.enter();
+                let t = Instant::now();
+                let packed: Vec<Option<multilinear::narrow::NarrowColumns>> = runs
+                    .into_iter()
+                    .map(|run| {
+                        run.and_then(|(first, width)| {
+                            multilinear::gpu::pack_resident(&store, first, width)
+                        })
+                    })
+                    .collect();
+                if let Some(mem) = mem {
+                    let ready = packed.iter().flatten().map(|p| p.data().len()).sum();
+                    mem.packed_ready.fetch_add(ready, Relaxed);
+                }
+                (packed, t.elapsed().as_secs_f64())
+            }))
+        }
+        (Narrowing::Host, _) => {
+            let t = Instant::now();
+            for table in group.iter_mut() {
+                if table.pack_on_host() {
+                    stamp.packed_tables += 1;
+                    stamp.packed_cells += table.num_committed_columns() << table.num_vars();
+                    stamp.packed_bytes += table.narrow().map_or(0, |packed| packed.data().len());
+                }
+            }
+            stamp.pack = t.elapsed().as_secs_f64();
+            stamp.pack_busy = stamp.pack;
+            None
+        }
+    }
+}
+
+/// A group's columns on the card, shared by its tables.
+type Store = Option<Arc<multilinear::gpu::ResidentColumns>>;
+
+/// Uploads a group's columns, in table order — a narrow table's packed, and
+/// widened on the card; `None` when the card declines (every reader then takes
+/// the host copy, widening a narrow table's there).
+fn upload_group<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let tables: Vec<multilinear::gpu::TableColumns<'_, F>> =
+        group.iter().map(|t| t.upload_view()).collect();
+    multilinear::gpu::upload_tables(&tables).map(Arc::new)
+}
+
+/// A group's columns in table order, each read on the host only by a path
+/// that asks ([`multilinear::narrow::HostColumn`]): the revive and the opening take them so, and
+/// the card holds them.
+fn group_columns<'t, F, E>(
+    group: &'t [CommittedTable<'_, F, E>],
+) -> Vec<ColumnOf<'t, multilinear::constraint_argument::TraceData<F, E>>>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    group
+        .iter()
+        .flat_map(|table| {
+            (0..table.num_committed_columns()).map(move |index| ColumnOf {
+                columns: table.trace(),
+                index,
+            })
+        })
+        .collect()
+}
+
+/// The fork a group proves on: `S_post` then the group's index.
+fn group_fork<E, T>(transcript: &T, group: usize) -> T
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Clone,
+{
+    let mut fork = transcript.clone();
+    fork.append_bytes(&(group as u64).to_le_bytes());
+    fork
+}
+
+/// Phase B and the proof: the roots block on `transcript`, then each group on
+/// its own fork. Consumes the block — each group's host columns and kept tree
+/// top are released as its opening ends. Returns the proof and every group's
+/// stamps (phase A's, completed by phase B's).
+///
+/// The proof is a [`MultiProof`] — the roots, a table proof per table in
+/// order, an opening per group — read under the forked schedule by
+/// [`block_verify`] and by nothing else.
+pub fn block_prove<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(MultiProof<F, E>, Vec<GroupStamps>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Send
+        + Default
+        + 'static,
+{
+    // The batched argue's messages are not a `MultiProof`'s: its callers take
+    // them from `block_prove_on_forks`.
+    if config.format.argue != ArgueFormat::PerTable {
+        return Err(MlError::ArgueFormatMismatch);
+    }
+    let (proof, _, _, stamps, _, _) = block_prove_on_forks::<F, E, T, H>(
+        committed,
+        config,
+        transcript,
+        &[],
+        &[],
+        &|g| g,
+        &ArgueDeviation::default(),
+    )?;
+    Ok((proof, stamps))
+}
+
+/// [`block_prove`] with the tables' prepared openings, and group `g` proved on
+/// the fork of index `fork_of(g)`, under the config's argue format
+/// ([`BlockProved`]).
+///
+/// Only a test proves on a fork map other than the identity, or with an
+/// [`ArgueDeviation`] other than the default: it is how a proof whose groups
+/// sit on the wrong forks, or argue wrongly, is built, for the verifier to
+/// refuse.
+#[doc(hidden)]
+pub fn block_prove_on_forks<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    fork_of: &dyn Fn(usize) -> usize,
+    argue: &ArgueDeviation,
+) -> Result<BlockProved<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Send
+        + Default
+        + 'static,
+{
+    block_prove_on_forks_observed::<F, E, T, H>(
+        committed,
+        config,
+        transcript,
+        prepared,
+        deviations,
+        fork_of,
+        argue,
+        &|_| {},
+    )
+}
+
+/// One group's share of the proof, the moment its opening is done: what a
+/// consumer of the finished groups (the block tree's first leaf) reads before
+/// the rest of phase B ends. Every field is a part of the proof as
+/// [`block_prove_on_forks`] returns it.
+pub struct GroupOpened<'a, F: IsField, E: IsField> {
+    pub group: usize,
+    /// Every group's root, as the proof carries them.
+    pub roots: &'a [Commitment],
+    /// Every carried polynomial's commit-time out-of-domain answer, in root
+    /// order, as the proof carries them.
+    pub commit_ood: &'a [FieldElement<E>],
+    /// The group's batched argue (the batched format), or `None`.
+    pub argue: Option<&'a BatchedArgue<E>>,
+    /// The group's local argue under local lookups (empty for a group with
+    /// no local interaction), or `None`.
+    pub local: Option<&'a LocalArgue<E>>,
+    /// The group's tables' proofs, in table order (the per-table format;
+    /// empty under the batched one).
+    pub tables: &'a [TableProof<E>],
+    /// The group's opening.
+    pub opening: &'a StackedProof<F, E>,
+    /// The group's prepared opening, when the group carries one.
+    pub prepared: Option<&'a StackedProof<F, E>>,
+}
+
+/// [`block_prove_on_forks`], calling `on_group` after each group's opening
+/// with that group's share of the proof ([`GroupOpened`]). The observer reads;
+/// the proof is the same with any observer.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn block_prove_on_forks_observed<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    fork_of: &dyn Fn(usize) -> usize,
+    argue: &ArgueDeviation,
+    on_group: &(dyn Fn(GroupOpened<'_, F, E>) + Sync),
+) -> Result<BlockProved<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Send
+        + Default
+        + 'static,
+{
+    let order: Vec<usize> = (0..committed.sizes.len()).collect();
+    block_prove_in_order::<F, E, T, H>(
+        committed, config, transcript, prepared, deviations, fork_of, argue, on_group, &order, None,
+    )
+}
+
+/// Phase B's re-ranking hook ([`block_prove_in_order`]): at each group's turn
+/// `p` it is handed phase B's whole order as it stands (`order[p]` is the group
+/// whose turn it is) and may return the groups after it, `order[p + 1..]`, in
+/// another order; `None` keeps them. The proof is the same in any order, so a
+/// caller may decide the rest of the order from what it learns while phase B
+/// runs (the recursion's leaves, led by the early leaf).
+pub type PhaseBReorder<'a> = dyn Fn(usize, &[usize]) -> Option<Vec<usize>> + Sync + 'a;
+
+/// The groups that hold a table whose columns phase B rebuilds rather than
+/// reads back (`rebuilt`, by group) last, each set in group order: an order
+/// for [`block_prove_in_order`] that gives the rebuilding the other groups'
+/// phase B as a head start. With nothing rebuilt it is the group order.
+pub fn rebuilt_last(rebuilt: &[bool]) -> Vec<usize> {
+    (0..rebuilt.len())
+        .filter(|&g| !rebuilt[g])
+        .chain((0..rebuilt.len()).filter(|&g| rebuilt[g]))
+        .collect()
+}
+
+/// The ranks of a group's tables that drop, `ranks` holding each table's rank
+/// in its class (`None` for one no regenerator rebuilds): those of the class of
+/// its first droppable table only. Phase B takes each class's groups in that
+/// class's rank order, and a group of two classes would have to come last in
+/// one and first in the other; the other class's tables in it stay.
+fn drop_one_class(ranks: &mut [Option<(usize, u64)>]) {
+    let class = ranks.iter().flatten().next().map(|&(class, _)| class);
+    for rank in ranks {
+        if rank.is_some_and(|(c, _)| Some(c) != class) {
+            *rank = None;
+        }
+    }
+}
+
+/// The one class among a group's tables' dropped classes (`None` for a table
+/// not dropped), `Some(None)` when none dropped, `None` when two classes did.
+fn one_class(classes: impl IntoIterator<Item = Option<usize>>) -> Option<Option<usize>> {
+    let mut one = None;
+    for class in classes.into_iter().flatten() {
+        match one {
+            Some(c) if c != class => return None,
+            _ => one = Some(class),
+        }
+    }
+    Some(one)
+}
+
+/// Phase B's order with two classes rebuilt (D-WHIR-NODISK N3): the groups
+/// with nothing dropped first, in group order (they need no regenerator, and
+/// give every regenerator a head start); then the rebuilt groups, each class
+/// in group order (its rank order), the classes interleaved so each class's
+/// share of the `weights` taken so far stays at its share of the whole. Each
+/// regenerator then has to keep up with only its share of phase B's pace. With
+/// one class it is [`rebuilt_last`].
+pub fn interleaved_order(classes: &[Option<usize>], weights: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..classes.len())
+        .filter(|&g| classes[g].is_none())
+        .collect();
+    let n = classes.iter().flatten().max().map_or(0, |&c| c + 1);
+    let lists: Vec<Vec<usize>> = (0..n)
+        .map(|c| {
+            (0..classes.len())
+                .filter(|&g| classes[g] == Some(c))
+                .collect()
+        })
+        .collect();
+    let weight = |g: usize| weights.get(g).copied().unwrap_or(0).max(1) as u128;
+    let totals: Vec<u128> = lists
+        .iter()
+        .map(|l| l.iter().map(|&g| weight(g)).sum())
+        .collect();
+    let mut next = vec![0usize; n];
+    let mut taken = vec![0u128; n];
+    while (0..n).any(|c| next[c] < lists[c].len()) {
+        // The class furthest behind its share: taken_c / total_c the least
+        // (compared without division), ties to the lower class.
+        let Some(c) = (0..n)
+            .filter(|&c| next[c] < lists[c].len())
+            .min_by(|&a, &b| (taken[a] * totals[b]).cmp(&(taken[b] * totals[a])))
+        else {
+            break;
+        };
+        let g = lists[c][next[c]];
+        next[c] += 1;
+        taken[c] += weight(g);
+        order.push(g);
+    }
+    order
+}
+
+/// A group argued and not yet opened: what its openings read, all of it its
+/// own — its fork, its kept tree tops, its columns on the card and the claims
+/// its argue settled on — and its share of the proof so far.
+struct Argued<F, E, T>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    E: IsField,
+{
+    group: usize,
+    /// Its place in phase B's order.
+    place: usize,
+    /// Its first table (its tables are its card's slice of the group,
+    /// [`lane_ref`]).
+    at: usize,
+    fork: T,
+    /// Taken by its openings.
+    retired: Option<RetiredStack<F>>,
+    store: Store,
+    tree_tops: usize,
+    points: Vec<Vec<FieldElement<E>>>,
+    values: Vec<FieldElement<E>>,
+    proofs: Vec<TableProof<E>>,
+    argue: Option<BatchedArgue<E>>,
+    /// Its local argue under local lookups.
+    local: Option<LocalArgue<E>>,
+    /// Its commit-time out-of-domain claims, batched into its opening
+    /// (`None` only under a test's [`OodFault::FalseUnbound`]).
+    ood: Option<OodClaims<E>>,
+    /// Its retired prepared stack's columns on the card once
+    /// ([`BlockCommitted::with_prepared_upload_once`]), and a test's refusal of
+    /// that store's plan.
+    upload_once: bool,
+    upload_once_refused: bool,
+    upload_once_margin: u64,
+    upload_once_card_refuses: bool,
+    /// Its store goes up narrow ([`BlockCommitted::with_prepared_store_narrow`]).
+    upload_once_narrow: bool,
+    /// The planned overlap prices its prepared revive over the upload once's
+    /// store ([`BlockCommitted::with_overlap_priced_resident`]).
+    overlap_resident: bool,
+    /// The promise of its prepared store taken when the plan admitted its
+    /// openings beside the next argue on the store's price: the store goes up
+    /// into it, so the ledger cannot refuse it after the admission.
+    store_promise: Option<multilinear::gpu::DeviceRoom>,
+}
+
+/// A group's openings done: its opening, its prepared one when it has one,
+/// and what they cost.
+struct Opened<F: IsField, E: IsField> {
+    opening: StackedProof<F, E>,
+    prepared: Option<StackedProof<F, E>>,
+    encode: f64,
+    open: f64,
+    /// Of `open`, the seconds a retired prepared stack took to come back.
+    prepared_revive: f64,
+    /// Its prepared stack's store under the upload once ([`UploadOnce`]).
+    upload_once: UploadOnce,
+    /// What the revive added to the ledger, and the ledger's peak through the
+    /// openings: read only when the openings had the ledger's window to
+    /// themselves (0 and `None` otherwise).
+    open_room: u64,
+    open_reserved: Option<u64>,
+    /// Stream draws while they ran, `(foreground pool, background pool)`.
+    draws: (u64, u64),
+}
+
+/// A group's openings on its own fork: its stack revived over its columns (on
+/// the card when its store holds them), opened at the points and values its
+/// argue settled on, then its prepared stack when it has one. Returns them,
+/// and the revived stack for the caller to let go.
+///
+/// It reads the group's own tables, fork, claims and kept tree tops, nothing
+/// another group proves, so phase B may run it on a thread of its own beside
+/// the next group's argue ([`PhaseBOverlap::On`]): nothing it calls may read a
+/// setting the driver's thread holds per thread. `own_window`: the ledger's
+/// window is the openings' alone (one group at a time), so it is opened here
+/// and its peak read. `fails`: a test's failed opening.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn open_group<F, E, T, H>(
+    argued: &mut Argued<F, E, T>,
+    group: &[CommittedTable<'_, F, E>],
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    config: &ChainConfig,
+    own_window: bool,
+    fails: bool,
+) -> Result<(Opened<F, E>, Option<StackedCommitment<F, H>>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    let own = open_own::<F, E, T, H>(argued, group, prepared, config, own_window, fails)?;
+    open_prepared::<F, E, T, H>(argued, group, prepared, deviations, config, own_window, own)
+}
+
+/// A group's own opening done ([`open_own`]), for its prepared opening
+/// ([`open_prepared`]) to finish.
+struct OwnOpened<F, E, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    E: IsField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    opening: StackedProof<F, E>,
+    /// The revived stack for the caller to let go; `None` when the group's
+    /// prepared stack is retired (its codewords went right after the
+    /// opening).
+    stacked: Option<StackedCommitment<F, H>>,
+    encode: f64,
+    open_room: u64,
+    /// When the opening began, and the stream draws when the openings began.
+    started: Instant,
+    draws: (u64, u64),
+}
+
+/// Under the planned overlap, a group's argue is planned to promise at most
+/// this share (numerator, denominator) of what the ledger grew by through the
+/// same group's phase-A commit as the batched commit holds it
+/// (`commit_reserved − commit_base`, plus the codewords a streamed run did not
+/// hold, `commit_streamed_not_held`): on the levels' real median the argue
+/// grew by 0.6–1.19 of it (level 1's group 1: 14.34 GiB against 12.0), so
+/// 5/4. The streamed bytes are added back so the plan reads the group's size,
+/// not how its commit held its codewords. Under the two-layer ladder the same
+/// block's level 1 (held there, so this plan is not read) grew its argue by
+/// 0.60–1.13 of its commit over 12 runs, counting only argues no opening ran
+/// beside (group 2: 11.41 GiB against 10.08): 5/4 still bounds them, with
+/// 0.12 of the commit to spare at the widest. The retired large's ratio, where
+/// the plan is read, is still to be re-read.
+const OVERLAP_ARGUE_OVER_COMMIT: (u64, u64) = (5, 4);
+
+/// The planned argue of the group stamped `next`: [`OVERLAP_ARGUE_OVER_COMMIT`]
+/// of its phase-A commit's growth as the batched commit holds it — the
+/// ledger's growth plus what a streamed commit did not hold
+/// ([`GroupStamps::commit_streamed_not_held`]).
+/// The plan itself reads the growth ([`overlap_plan`]); a test reads this.
+#[cfg(test)]
+pub(crate) fn overlap_argue_bytes(next: &GroupStamps) -> u64 {
+    let (num, den) = OVERLAP_ARGUE_OVER_COMMIT;
+    overlap_commit_growth(next).saturating_mul(num) / den
+}
+
+/// The phase-A commit's growth of the group stamped `next` as the batched
+/// commit holds it: the ledger's growth plus what a streamed commit did not
+/// hold ([`GroupStamps::commit_streamed_not_held`]).
+fn overlap_commit_growth(next: &GroupStamps) -> u64 {
+    next.commit_reserved
+        .saturating_sub(next.commit_base)
+        .saturating_add(next.commit_streamed_not_held)
+}
+
+/// Under the planned overlap, the card kept free beside the plan.
+const OVERLAP_MARGIN_BYTES: u64 = 1 << 30;
+
+/// Whether the card holds `argued`'s openings beside the argue of the group
+/// stamped `next`, and the plan's bytes `(need, free)`: the group's openings'
+/// planned bytes (the larger of its own stack's revive over its resident
+/// columns and its retired prepared stack's revive, over the host's columns,
+/// or over the upload once's store and that store's bytes when the overlap is
+/// priced resident, [`RetiredStack::revive_card_bytes`]; the two run one after
+/// the other), the
+/// next group's argue bounded by [`OVERLAP_ARGUE_OVER_COMMIT`] of its phase-A
+/// commit's growth, the next group's columns when they are not on the card yet
+/// (`next_columns`, [`next_columns_bytes`]), and a margin, against what the
+/// ledger's budget has free now (the group's columns still on the card); the
+/// sum is [`overlap_plan`]'s. Without a card (no budget) the openings are the
+/// host's and always fit.
+fn overlap_fits<F, E, T, H>(
+    argued: &Argued<F, E, T>,
+    prepared: &[BlockPrepared<'_, F, H>],
+    next: &GroupStamps,
+    next_columns: u64,
+    config: &ChainConfig,
+) -> (bool, u64, u64)
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    E: IsField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let budget = multilinear::gpu::reserve_budget();
+    if budget == 0 {
+        return (true, 0, 0);
+    }
+    let own = argued
+        .retired
+        .as_ref()
+        .map_or(0, |r| r.revive_card_bytes(config, argued.store.is_some()));
+    let theirs = prepared
+        .iter()
+        .find_map(|q| match q.commitment {
+            PreparedCommitment::Retired(r) if q.group == argued.group => {
+                Some(prepared_revive_price(
+                    argued.overlap_resident,
+                    prepared_store_bytes(q.columns),
+                    r.revive_over_store_card_bytes(config),
+                    r.revive_whole_card_bytes(config),
+                ))
+            }
+            _ => None,
+        })
+        .unwrap_or(0);
+    overlap_plan(
+        own.max(theirs),
+        planned_commit_growth(
+            overlap_commit_growth(next),
+            next.commit_priced,
+            next.commit_host_fallbacks,
+        ),
+        next_columns,
+        budget,
+        multilinear::gpu::ledger_reserved(),
+    )
+}
+
+/// The planned overlap's sum for one transition, `(fits, need, free)`: the
+/// opened group's `openings`, the next group's argue as
+/// [`OVERLAP_ARGUE_OVER_COMMIT`] of its phase-A commit's growth
+/// (`next_commit_growth`, stamped after that group's columns went up, so it
+/// never holds them), the next group's columns not yet on the card
+/// (`next_columns`), and [`OVERLAP_MARGIN_BYTES`], against the budget less
+/// what the ledger holds now (`reserved`). No budget (no card): always fits.
+fn overlap_plan(
+    openings: u64,
+    next_commit_growth: u64,
+    next_columns: u64,
+    budget: u64,
+    reserved: u64,
+) -> (bool, u64, u64) {
+    if budget == 0 {
+        return (true, 0, 0);
+    }
+    let (num, den) = OVERLAP_ARGUE_OVER_COMMIT;
+    let argue = next_commit_growth.saturating_mul(num) / den;
+    let need = openings
+        .saturating_add(argue)
+        .saturating_add(next_columns)
+        .saturating_add(OVERLAP_MARGIN_BYTES);
+    let free = budget.saturating_sub(reserved);
+    (need <= free, need, free)
+}
+
+/// The next group's commit growth as the planned overlap reads it: the growth
+/// the ledger measured, unless a commit fell back to the host while the group
+/// committed (`host_fallbacks`). Such a commit grew the ledger by almost
+/// nothing, which would plan its argue at almost nothing; it is read as at
+/// least a card commit of the group (`priced`) instead. Measured ≥ priced
+/// keeps the measured.
+fn planned_commit_growth(measured: u64, priced: u64, host_fallbacks: u64) -> u64 {
+    if host_fallbacks > 0 {
+        measured.max(priced)
+    } else {
+        measured
+    }
+}
+
+/// The card's bytes a cell of a group's store: one 8-byte word, whatever the
+/// table's width on the host (a narrow or record table is widened on the
+/// card; the upload promises `cells × 8`, plus a staging that is gone before
+/// the openings start).
+const STORE_WORD_BYTES: u64 = 8;
+
+/// What the next group's columns (`cells`, [`GroupStamps::cells`]) add to a
+/// transition's plan ([`overlap_plan`]): their store when they go up at that
+/// group's own turn, after the plan and before the openings start beside its
+/// argue; nothing when they are `up` already (the ledger holds them, or the
+/// card refused them beside the argue and they stay on the host), or when the
+/// plan does not price them (`priced` off: today's plan).
+fn next_columns_bytes(cells: usize, up: bool, priced: bool) -> u64 {
+    if up || !priced {
+        0
+    } else {
+        (cells as u64).saturating_mul(STORE_WORD_BYTES)
+    }
+}
+
+/// The planned overlap's price of a retired prepared stack's revive: under
+/// resident pricing, its store's bytes and a revive over the store
+/// (`over_store`); otherwise a revive that encodes whole codewords (`whole`).
+fn prepared_revive_price(resident: bool, store: u64, over_store: u64, whole: u64) -> u64 {
+    if resident {
+        store.saturating_add(over_store)
+    } else {
+        whole
+    }
+}
+
+/// What a narrow store adds to its plan ([`store_plan_need`]): the largest
+/// run's packed bytes while it widens, bounded by its words when it has yet
+/// to be packed; nothing for a wide store.
+fn narrow_store_staging(
+    narrow: bool,
+    lens: &[usize],
+    packed: Option<&multilinear::gpu::PackedStore>,
+) -> u64 {
+    match (narrow, packed) {
+        (false, _) => 0,
+        (true, Some(packed)) => packed.staging_bytes(),
+        (true, None) => {
+            multilinear::narrow::store_staging_bound(lens, multilinear::narrow::STORE_RUN_CELLS)
+        }
+    }
+}
+
+/// The promise a group's prepared store takes when the planned overlap admits
+/// its openings on the store's price: the store's words, and under the narrow
+/// store the largest run's packed bytes, which sit on the card while it
+/// widens ([`narrow_store_staging`]).
+fn store_promise_bytes(
+    words: u64,
+    narrow: bool,
+    lens: &[usize],
+    packed: Option<&multilinear::gpu::PackedStore>,
+) -> u64 {
+    words.saturating_add(narrow_store_staging(narrow, lens, packed))
+}
+
+/// What the admission asks of `argued`'s retired prepared stack's store:
+/// `(promise, need)`, the promise it takes ([`store_promise_bytes`]) and the
+/// store's own plan ([`store_plan_need`]: the promise, a revive over the
+/// store and the upload once's margin), which must fit what the ledger has
+/// free for the promise to be taken, as the store's plan at the opening
+/// would ask. Under resident pricing (which needs the upload once), on a card
+/// that keeps column stores; `None` otherwise (nothing to promise, the
+/// admission stands as planned).
+fn admission_store_bytes<F, E, T, H>(
+    argued: &Argued<F, E, T>,
+    prepared: &[BlockPrepared<'_, F, H>],
+    config: &ChainConfig,
+) -> Option<(u64, u64)>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    E: IsField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    if !argued.overlap_resident
+        || multilinear::gpu::reserve_budget() == 0
+        || multilinear::gpu::columns_disabled()
+    {
+        return None;
+    }
+    let (q, retired) = prepared.iter().find_map(|q| match q.commitment {
+        PreparedCommitment::Retired(r) if q.group == argued.group => Some((q, r)),
+        _ => None,
+    })?;
+    let lens: Vec<usize> = q.columns.iter().map(|c| c.len()).collect();
+    let promise = store_promise_bytes(
+        prepared_store_bytes(q.columns),
+        argued.upload_once_narrow,
+        &lens,
+        q.packed.filter(|p| p.fits(q.columns)),
+    );
+    let need = store_plan_need(
+        promise,
+        retired.revive_over_store_card_bytes(config),
+        argued.upload_once_margin,
+    );
+    Some((promise, need))
+}
+
+/// What the upload once's store plans to hold: the store, a revive over it,
+/// and a margin.
+fn store_plan_need(store: u64, over_store: u64, margin: u64) -> u64 {
+    store.saturating_add(over_store).saturating_add(margin)
+}
+
+/// Whether the planned overlap prices a retired prepared stack's revive over
+/// its store: only with the upload once on, which is what makes the store
+/// ([`BlockCommitted::with_overlap_priced_resident`]).
+fn priced_resident(upload_once: bool, overlap_resident: bool) -> bool {
+    upload_once && overlap_resident
+}
+
+/// The bytes the upload once's store of `columns` takes on the card.
+fn prepared_store_bytes<F>(columns: &[&multilinear::mle::Mle<F>]) -> u64
+where
+    F: IsField + 'static,
+{
+    columns
+        .iter()
+        .map(|c| (c.len() * core::mem::size_of::<FieldElement<F>>()) as u64)
+        .sum()
+}
+
+/// Under the upload once, the margin kept free beside a store's plan.
+const UPLOAD_ONCE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// How a group asks for its upload once's store: a test's refusal of its plan,
+/// the margin its plan keeps, a test's refusal by the card, and whether it goes
+/// up narrow ([`BlockCommitted::with_prepared_store_narrow`]).
+#[derive(Clone, Copy, Debug)]
+struct StoreAsk {
+    refused_by_test: bool,
+    margin: u64,
+    card_refuses_by_test: bool,
+    narrow: bool,
+}
+
+/// Under the upload once, `columns` (a retired prepared stack's) put on the
+/// card for its revive and its opening, where the plan says the ledger holds
+/// them and the revive's own promises (the store's bytes,
+/// [`RetiredStack::revive_card_bytes`] over a resident stack, and a margin,
+/// against what the budget has free now); `None` (two copies, as without the
+/// knob) when the plan or the card says no, or there is no card, with `upload`
+/// saying which.
+fn upload_once_store<F>(
+    retired: &RetiredStack<F>,
+    columns: &[&multilinear::mle::Mle<F>],
+    config: &ChainConfig,
+    ask: StoreAsk,
+    packed: Option<&multilinear::gpu::PackedStore>,
+    promise: Option<multilinear::gpu::DeviceRoom>,
+    upload: &mut UploadOnce,
+) -> Option<multilinear::gpu::ResidentColumns>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let StoreAsk {
+        refused_by_test,
+        margin,
+        card_refuses_by_test,
+        narrow,
+    } = ask;
+    if refused_by_test {
+        upload.planned_out = true;
+        return None;
+    }
+    // No card, or every column store kept off it (`LAMBDA_VM_NO_GPU_COLUMNS`):
+    // two copies, as without the knob, and nothing refused.
+    let budget = multilinear::gpu::reserve_budget();
+    if budget == 0 || multilinear::gpu::columns_disabled() {
+        return None;
+    }
+    let bytes = prepared_store_bytes(columns);
+    let lens: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    let prepacked = packed.filter(|p| narrow && p.fits(columns));
+    upload.need = store_plan_need(
+        store_promise_bytes(bytes, narrow, &lens, prepacked),
+        retired.revive_over_store_card_bytes(config),
+        margin,
+    );
+    upload.free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+    // A promise taken at the overlap's admission is the plan: the store goes
+    // up into it.
+    upload.promised = promise.is_some();
+    if promise.is_none() && upload.need > upload.free {
+        upload.planned_out = true;
+        return None;
+    }
+    let t = Instant::now();
+    let store = match (card_refuses_by_test, narrow) {
+        (true, _) => None,
+        (false, false) => match promise {
+            Some(room) => multilinear::gpu::upload_store_columns_in(columns, room),
+            None => multilinear::gpu::upload_store_columns(columns),
+        },
+        (false, true) => match (prepacked, promise) {
+            (Some(p), Some(room)) => multilinear::gpu::upload_packed_store_in(p, room),
+            (Some(p), None) => multilinear::gpu::upload_packed_store(p),
+            (None, Some(room)) => multilinear::gpu::upload_store_columns_narrow_in(columns, room),
+            (None, None) => multilinear::gpu::upload_store_columns_narrow(columns),
+        }
+        .map(|(store, stamp)| {
+            upload.narrow = true;
+            upload.prepacked = prepacked.is_some();
+            upload.packed_bytes = stamp.packed_bytes;
+            upload.pack_secs = if prepacked.is_some() {
+                0.0
+            } else {
+                stamp.pack_secs
+            };
+            store
+        }),
+    };
+    upload.upload_secs = t.elapsed().as_secs_f64();
+    match store {
+        Some(store) => {
+            upload.used = true;
+            upload.bytes = bytes;
+            upload.after = multilinear::gpu::ledger_reserved();
+            Some(store)
+        }
+        None => {
+            upload.refused = true;
+            None
+        }
+    }
+}
+
+/// Groups whose openings ran on the openings' own card, process-wide: what a
+/// test reads to know the two-card openings ran ([`two_card_opened`]).
+static TWO_CARD_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`TWO_CARD_OPENED`].
+#[doc(hidden)]
+pub fn two_card_opened() -> u64 {
+    TWO_CARD_OPENED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `group` has a prepared stack held as phase A left it (on the card
+/// or the host): the two-card openings leave such a group on card 0.
+fn prepared_is_held<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
+where
+    F: IsFFTField + IsPrimeField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    prepared
+        .iter()
+        .any(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Held(_)))
+}
+
+/// The card `group`'s held prepared stack lives on ([`BlockPrepared::card`]);
+/// `None` when it has none held.
+fn held_on<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> Option<u8>
+where
+    F: IsFFTField + IsPrimeField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    prepared
+        .iter()
+        .find(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Held(_)))
+        .map(|p| p.card.min(1))
+}
+
+/// Whether `group`'s prepared stack was committed and let go: it is revived
+/// at the group's opening ([`open_prepared`]).
+fn prepared_is_retired<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
+where
+    F: IsFFTField + IsPrimeField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    prepared
+        .iter()
+        .any(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Retired(_)))
+}
+
+/// [`open_group`]'s first half: the group's stack revived over its columns
+/// and opened on its fork.
+#[allow(clippy::type_complexity)]
+fn open_own<F, E, T, H>(
+    argued: &mut Argued<F, E, T>,
+    group: &[CommittedTable<'_, F, E>],
+    prepared: &[BlockPrepared<'_, F, H>],
+    config: &ChainConfig,
+    own_window: bool,
+    fails: bool,
+) -> Result<OwnOpened<F, E, H>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    if fails {
+        return Err(MlError::DeviceFailed {
+            stage: "a test's failed opening",
+        });
+    }
+    let retired = argued.retired.take().ok_or(MlError::QueryCountMismatch {
+        expected: 1,
+        got: 0,
+    })?;
+    let draws = multilinear::gpu::stream_draws();
+    let handles = group_columns(group);
+    let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
+    let store = argued.store.as_ref();
+    let t = Instant::now();
+    if own_window {
+        multilinear::gpu::reset_reserved_window();
+    }
+    let before_revive = own_window.then(multilinear::gpu::ledger_reserved);
+    // ★ THE TWO-CARD OPENINGS' SECOND UPLOAD (r4). Under the two-card openings
+    // `store` is the group's second, compact upload on the openings' card
+    // (the first went with the group's card-0 state before its openings
+    // started): the host link's extra bytes a measurement prices. When that
+    // card declined it, `store` is `None` and this revive reads the host's
+    // columns.
+    let stacked = retired.revive::<H, _>(
+        &columns,
+        store.map(|store| (&**store, ColumnsAt::From(0))),
+        config,
+    )?;
+    let encode = t.elapsed().as_secs_f64();
+    let open_room = before_revive.map_or(0, |before| {
+        multilinear::gpu::ledger_reserved().saturating_sub(before)
+    });
+    let t = Instant::now();
+    let opening = stacked_eval::prove_mapped_ood::<F, E, T, H, _>(
+        &stacked,
+        &columns,
+        store.map(|store| (&**store, ColumnsAt::From(0))),
+        &Claimed::PerColumn(&argued.points),
+        &argued.values,
+        argued.ood.as_ref(),
+        config,
+        &mut argued.fork,
+    )?;
+    // A retired prepared stack is revived next: the group's own codewords,
+    // which nothing reads after their opening, and their room go back first,
+    // so the revive has the promise they held (on a level that opens beside
+    // the next group's argue, the ledger otherwise refuses the revive).
+    let retired_prepared = prepared_is_retired(prepared, argued.group);
+    let stacked = (!retired_prepared).then_some(stacked);
+    Ok(OwnOpened {
+        opening,
+        stacked,
+        encode,
+        open_room,
+        started: t,
+        draws,
+    })
+}
+
+/// [`open_group`]'s second half: the group's prepared stack, when it has one,
+/// opened on the same fork after its own opening (revived first when it is
+/// retired: over a store of the prepared columns put on the card once for the
+/// revive and the opening both, under the upload once, else over the host's
+/// columns, copied in by the revive and again by the opening). It reads the group's
+/// tables only for their column counts, so the caller may have let their
+/// columns go off the card between the halves.
+#[allow(clippy::type_complexity)]
+fn open_prepared<F, E, T, H>(
+    argued: &mut Argued<F, E, T>,
+    group: &[CommittedTable<'_, F, E>],
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    config: &ChainConfig,
+    own_window: bool,
+    own: OwnOpened<F, E, H>,
+) -> Result<(Opened<F, E>, Option<StackedCommitment<F, H>>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    let OwnOpened {
+        opening,
+        stacked,
+        encode,
+        open_room,
+        started: t,
+        draws,
+    } = own;
+    // The group's prepared tables, in table order: each opened at its own
+    // point for its own prefix, on this fork.
+    let (at, points, values) = (argued.at, &argued.points, &argued.values);
+    let firsts: Vec<usize> = group
+        .iter()
+        .scan(0usize, |first, table| {
+            let at = *first;
+            *first += table.num_committed_columns();
+            Some(at)
+        })
+        .collect();
+    let mut prepared_revive = 0.0;
+    let mut upload = UploadOnce::default();
+    let prepared_opening = match prepared.iter().position(|p| p.group == argued.group) {
+        Some(k) => {
+            let p = &prepared[k];
+            let (mut at_points, mut at_values) =
+                prepared_claims(&p.tables, at, &firsts, points, values);
+            if let Some(d) = deviations.iter().find(|d| d.open == k) {
+                // Each block's columns sit at its table's place in the stack.
+                let mut column = 0usize;
+                for &(table, n) in &p.tables {
+                    if let Some(&(_, other)) = d.at_point_of.iter().find(|(t, _)| *t == table) {
+                        let local = other.checked_sub(at).filter(|&l| l < firsts.len()).ok_or(
+                            MlError::UnknownPolynomial {
+                                index: other,
+                                len: firsts.len(),
+                            },
+                        )?;
+                        for point in &mut at_points[column..column + n] {
+                            *point = points[firsts[local]].clone();
+                        }
+                    }
+                    column += n;
+                }
+                if d.consistent {
+                    at_values = p
+                        .columns
+                        .iter()
+                        .zip(&at_points)
+                        .map(|(c, point)| c.evaluate_in(point))
+                        .collect::<Result<_, _>>()?;
+                }
+            }
+            // A retired stack comes back for this opening alone, and goes
+            // when it ends.
+            let t_revive = Instant::now();
+            // Under the upload once, the columns go up once, here, for the
+            // revive and the opening both.
+            let store = match &p.commitment {
+                PreparedCommitment::Retired(r) if argued.upload_once => upload_once_store(
+                    r,
+                    p.columns,
+                    config,
+                    StoreAsk {
+                        refused_by_test: argued.upload_once_refused,
+                        margin: argued.upload_once_margin,
+                        card_refuses_by_test: argued.upload_once_card_refuses,
+                        narrow: argued.upload_once_narrow,
+                    },
+                    p.packed,
+                    argued.store_promise.take(),
+                    &mut upload,
+                ),
+                _ => None,
+            };
+            let revived = match &p.commitment {
+                PreparedCommitment::Held(_) => None,
+                // Under the two-card openings (no upload-once store) this
+                // revive uploads the prepared columns to the openings' card:
+                // the second upload's prepared share (r4).
+                PreparedCommitment::Retired(r) => Some((*r).clone().revive::<H, _>(
+                    p.columns,
+                    store.as_ref().map(|s| (s, ColumnsAt::From(0))),
+                    config,
+                )?),
+            };
+            prepared_revive = t_revive.elapsed().as_secs_f64();
+            let commitment = match (&p.commitment, &revived) {
+                (_, Some(revived)) => revived,
+                (PreparedCommitment::Held(c), None) => *c,
+                (PreparedCommitment::Retired(_), None) => {
+                    return Err(MlError::DeviceFailed {
+                        stage: "a retired prepared stack not revived",
+                    });
+                }
+            };
+            Some(stacked_eval::prove::<F, E, T, H, _>(
+                commitment,
+                p.columns,
+                store.as_ref().map(|s| (s, 0)),
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                config,
+                &mut argued.fork,
+            )?)
+        }
+        None => None,
+    };
+    let open = t.elapsed().as_secs_f64();
+    let open_reserved = own_window.then(multilinear::gpu::reserved_window_peak);
+    let after = multilinear::gpu::stream_draws();
+    Ok((
+        Opened {
+            opening,
+            prepared: prepared_opening,
+            encode,
+            open,
+            prepared_revive,
+            upload_once: upload,
+            open_room,
+            open_reserved,
+            draws: (
+                after.0.saturating_sub(draws.0),
+                after.1.saturating_sub(draws.1),
+            ),
+        },
+        stacked,
+    ))
+}
+
+/// Phase B's finished groups' records, let go off the driver thread
+/// ([`release_group`]): one thread of its own hands each table's records'
+/// pages back to the OS ([`multilinear::records::Records::return_pages`]) and
+/// frees them, so phase B neither waits on that nor on the frees. Joined before
+/// phase B returns ([`Self::finish`]), and when dropped, so a prove's time and
+/// its stamps hold all of it.
+struct RecordsReturner {
+    tx: Option<std::sync::mpsc::Sender<(usize, multilinear::records::Records)>>,
+    thread: Option<std::thread::JoinHandle<Vec<(usize, multilinear::records::PagesReturned, f64)>>>,
+}
+
+impl RecordsReturner {
+    /// Its thread, started; without one (the spawn refused) records are
+    /// dropped where they are let go, nothing handed back.
+    fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, multilinear::records::Records)>();
+        let thread = std::thread::Builder::new()
+            .name("records-return".to_string())
+            .spawn(move || {
+                rx.into_iter()
+                    .map(|(g, records)| {
+                        let t = Instant::now();
+                        let pages = records.return_pages();
+                        (g, pages, t.elapsed().as_secs_f64())
+                    })
+                    .collect()
+            })
+            .ok();
+        Self {
+            tx: thread.is_some().then_some(tx),
+            thread,
+        }
+    }
+
+    /// Group `g`'s records, handed to the thread (dropped here without one).
+    fn take(&self, g: usize, records: multilinear::records::Records) {
+        if let Some(tx) = &self.tx {
+            // A thread that is gone hands the records back in the error, and
+            // they drop here.
+            let _ = tx.send((g, records));
+        }
+    }
+
+    /// Waits for the thread to finish what it was handed, and adds what each
+    /// group's records came to to its stamps.
+    fn finish(mut self, stamps: &mut [GroupStamps]) {
+        self.tx = None;
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        for (g, pages, secs) in thread.join().unwrap_or_default() {
+            if let Some(stamp) = stamps.get_mut(g) {
+                stamp.records_pages += pages;
+                stamp.records_return_secs += secs;
+            }
+        }
+    }
+}
+
+impl Drop for RecordsReturner {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Lets a group go once its openings are done: its tables' columns off the
+/// card and out of their widened form — under a spill its packed columns too,
+/// and the records of a table held as them, which nothing reads after its
+/// openings — its store, and its kept tree tops out of the memory log. The
+/// bytes of records let go; the records themselves go to `returner`, which
+/// hands their pages back to the OS off this thread.
+fn release_group<F, E>(
+    group: &mut [CommittedTable<'_, F, E>],
+    g: usize,
+    store: Store,
+    tree_tops: usize,
+    spilling: bool,
+    returner: Option<&RecordsReturner>,
+    mem: Option<&BlockMem>,
+) -> usize
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let mut records_released = 0;
+    for table in group.iter_mut() {
+        table.clear_resident();
+        table.drop_widened();
+        // While a spill is on, a finished group's packed columns go, and so do
+        // the records of a table held as them: nothing reads either after its
+        // opening.
+        if !spilling {
+            continue;
+        }
+        let released = match table.take_narrow_for_spill() {
+            Some(packed) => Some(packed.data().len()),
+            None => table.take_records_for_spill().map(|records| {
+                let bytes = records.bytes();
+                records_released += bytes;
+                match returner {
+                    Some(returner) => returner.take(g, records),
+                    None => drop(records),
+                }
+                bytes
+            }),
+        };
+        if let (Some(bytes), Some(mem)) = (released, mem) {
+            mem.held_narrow.fetch_sub(bytes, Relaxed);
+        }
+    }
+    drop(store);
+    if let Some(mem) = mem {
+        mem.tree_tops.fetch_sub(tree_tops, Relaxed);
+        mem.mark(&format!("phase B group {g} end"));
+    }
+    records_released
+}
+
+/// A card's driver stopped because the other card's failed: never the
+/// answer when the other card's own failure is there.
+const OTHER_CARD_FAILED: &str = "the other card's phase B failed";
+
+/// Groups phase B proved on the second card under the two-card split,
+/// process-wide: what a test reads to know the split ran ([`split_second_groups`]).
+static SPLIT_SECOND_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`SPLIT_SECOND_GROUPS`].
+#[doc(hidden)]
+pub fn split_second_groups() -> u64 {
+    SPLIT_SECOND_GROUPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs `f`, card `lane`'s openings: the second card's inside their own pool
+/// ([`multilinear::gpu::on_second_card_openings`]), card 0's here.
+fn on_lane_openings<R: Send>(lane: usize, f: impl FnOnce() -> R + Send) -> R {
+    if lane == 1 {
+        multilinear::gpu::on_second_card_openings(f)
+    } else {
+        f()
+    }
+}
+
+/// Runs `f`, card `lane`'s upload (no parallel iterator in it): on this thread
+/// in the second card's role ([`multilinear::gpu::in_second_role`]), card 0's
+/// here.
+fn on_lane_upload<R>(lane: usize, f: impl FnOnce() -> R) -> R {
+    if lane == 1 {
+        multilinear::gpu::in_second_role(f)
+    } else {
+        f()
+    }
+}
+
+/// Group `g`'s slice of a card's by-group slices: refused when the group is
+/// not that card's.
+fn lane_ref<'s, X>(by_group: &'s [Option<&mut [X]>], g: usize) -> Result<&'s [X], MlError> {
+    by_group
+        .get(g)
+        .and_then(|s| s.as_deref())
+        .ok_or(MlError::QueryCountMismatch {
+            expected: by_group.len(),
+            got: g,
+        })
+}
+
+/// [`lane_ref`], mutable.
+fn lane_mut<'s, X>(by_group: &'s mut [Option<&mut [X]>], g: usize) -> Result<&'s mut [X], MlError> {
+    let n = by_group.len();
+    by_group
+        .get_mut(g)
+        .and_then(|s| s.as_deref_mut())
+        .ok_or(MlError::QueryCountMismatch {
+            expected: n,
+            got: g,
+        })
+}
+
+/// One card's state for phase B under the two-card split (with one card, all
+/// of it): by group, its groups' tables and spill slots, stamps, retired
+/// stacks, commit-time claims and begun local argues (another card's groups
+/// `None` or default), and its copy of the post-roots transcript.
+struct LaneIn<'t, 'a, F, E, T>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    post: T,
+    tables: Vec<Option<&'t mut [CommittedTable<'a, F, E>]>>,
+    spilled: Vec<Option<&'t mut [Option<Arc<Parked>>]>>,
+    stamps: Vec<GroupStamps>,
+    retired: Vec<Option<RetiredStack<F>>>,
+    ood: Vec<Option<OodClaims<E>>>,
+    local_started: Vec<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+/// One card's phase B done: by group, its groups' stamps and shares of the
+/// proof; its two-card openings' counts; the most its ledger held at a turn's
+/// end.
+struct LaneOut<F, E>
+where
+    F: IsField,
+    E: IsField,
+{
+    stamps: Vec<GroupStamps>,
+    group_tables: Vec<Vec<TableProof<E>>>,
+    group_argue: Vec<Option<BatchedArgue<E>>>,
+    group_local: Vec<Option<LocalArgue<E>>>,
+    group_opening: Vec<Option<StackedProof<F, E>>>,
+    group_prepared: Vec<Option<StackedProof<F, E>>>,
+    two_card: (usize, usize),
+    /// Of the groups opened on the openings' card, those opened over the
+    /// host's columns (their upload there declined).
+    second_declined: usize,
+    ledger_most: u64,
+    /// This card's ledger budget.
+    budget: u64,
+}
+
+/// [`block_prove_on_forks_observed`] with phase B taking the groups in
+/// `order`, a permutation of their indices. Each group proves on its own fork
+/// `S_post ‖ g` and nothing one group proves enters another's transcript, so
+/// the proof — each group's share, assembled in group order — is the same in
+/// any order; only when each group's columns are needed moves. The next
+/// group's columns go up beside this group's argue in `order` too. An `order`
+/// that is not a permutation of the groups is refused.
+///
+/// Under [`PhaseBOverlap::On`] ([`BlockCommitted::with_phase_b_overlap`]) each
+/// group's openings run on a thread of their own beside the next group's
+/// argue, which keeps each fork's own sequence — argue, openings, prepared
+/// opening — so the proof is the same again. `on_group` is then called on that
+/// thread, as each group's openings end, in `order` all the same.
+///
+/// `reorder`, when given, may re-rank the groups still to come at each turn,
+/// before the next group's columns go up ([`PhaseBReorder`]); a re-ranking that
+/// is not a permutation of those groups is refused.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn block_prove_in_order<F, E, T, H>(
+    committed: BlockCommitted<'_, F, E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    fork_of: &dyn Fn(usize) -> usize,
+    argue: &ArgueDeviation,
+    on_group: &(dyn Fn(GroupOpened<'_, F, E>) + Sync),
+    order: &[usize],
+    reorder: Option<&PhaseBReorder<'_>>,
+) -> Result<BlockProved<F, E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Send
+        + Default
+        + 'static,
+{
+    let BlockCommitted {
+        mut tables,
+        sizes,
+        groups,
+        roots,
+        mut stamps,
+        mem,
+        spill,
+        mut spilled,
+        overlap,
+        overlap_faults,
+        upload_beside,
+        overlap_planned,
+        upload_once,
+        overlap_resident,
+        store_narrow,
+        overlap_next_columns,
+        sched,
+        ood,
+        ood_unbound,
+        merge_probe,
+        local,
+        mut local_started,
+        two_card_split,
+        phase_b_commit_cards,
+        two_card_knob,
+        split_on_host,
+    } = committed;
+    let n = sizes.len();
+    let mut seen = vec![false; n];
+    if order.len() != n
+        || !order
+            .iter()
+            .all(|&g| g < n && !std::mem::replace(&mut seen[g], true))
+    {
+        return Err(MlError::QueryCountMismatch {
+            expected: n,
+            got: order.len(),
+        });
+    }
+    let starts: Vec<usize> = sizes
+        .iter()
+        .scan(0usize, |at, &size| {
+            let start = *at;
+            *at += size;
+            Some(start)
+        })
+        .collect();
+    let entries: Vec<PreparedEntry<'_>> = prepared
+        .iter()
+        .map(|p| (p.group, p.tables.as_slice(), Some(p.columns.len())))
+        .collect();
+    prepared_shape(&entries, &starts, tables.len(), &|t| {
+        tables[t].num_committed_columns()
+    })?;
+    if ood.len() != n {
+        return Err(MlError::CommitOodCount {
+            expected: n,
+            got: ood.len(),
+        });
+    }
+    let entered = Instant::now();
+    let derived: Vec<Commitment> = prepared.iter().flat_map(|p| p.commitment.roots()).collect();
+    let answers: Vec<FieldElement<E>> = ood
+        .iter()
+        .flat_map(|claims| claims.answers.iter().cloned())
+        .collect();
+    let (z, alpha, beta) =
+        absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers);
+    // Under local lookups: the batched argue only, a digest a table, and
+    // where each group's roots and answers start.
+    if let Some(local) = &local {
+        if config.format.argue == ArgueFormat::PerTable {
+            return Err(MlError::ArgueFormatMismatch);
+        }
+        if local.digests.len() != tables.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: tables.len(),
+                got: local.digests.len(),
+            });
+        }
+    }
+    let mut root_ranges = Vec::with_capacity(n);
+    let mut answer_starts = Vec::with_capacity(n);
+    let (mut root_at, mut answer_at) = (0usize, 0usize);
+    for (stack, claims) in groups.iter().zip(&ood) {
+        let trees = stacked_eval::round0_trees(stack.layout().num_polys(), config).len();
+        root_ranges.push(root_at..root_at + trees);
+        answer_starts.push(answer_at);
+        root_at += trees;
+        answer_at += claims.answers.len();
+    }
+    let ood: Vec<Option<OodClaims<E>>> = ood.into_iter().map(Some).collect();
+    let retired: Vec<Option<RetiredStack<F>>> = groups.into_iter().map(Some).collect();
+    // The finished groups' records go to a thread of their own (under a spill,
+    // the only time phase B lets them go).
+    let returner = spill.is_some().then(RecordsReturner::start);
+    let spill_on = spill.is_some();
+    // Under the overlap: the group argued last, whose openings run beside the
+    // next group's argue; and whether a transition saw the card refuse a
+    // promise, after which every group opens alone.
+    let overlapping = overlap != PhaseBOverlap::Off;
+    // Under `Pinned`, the openings' thread (a background-class one) reads back
+    // through pinned staging; this thread, the argument's, does not. The
+    // setting is the process's: one guard for both cards' drivers.
+    let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
+    let forks: Vec<usize> = (0..n).map(fork_of).collect();
+
+    // ★ THE TWO-CARD SPLIT (`LAMBDA_VM_TWO_CARD_SPLIT`): each group proves on
+    // its own fork of the post-roots transcript and its share is put back by
+    // group index, so the groups split over two cards prove the same bytes.
+    // Card 0 keeps what is tied to it: the caller's groups (rebuilt in phase
+    // B, each class in its order) and a held prepared stack (its codewords
+    // where phase A left them). One card when the knob is off, the second
+    // card is not ready, or fewer than two groups are free of a pin.
+    // The plan: each group's card, or one card and why. A spill is no reason
+    // for one card (a parked table comes back under its own lock, per group),
+    // nor a local argue begun in phase A (host data). Pinned to card 0: the
+    // caller's groups and a held prepared stack's.
+    // A held stack pins its group to the card it lives on: card 0 but for a
+    // recursion level's stack committed on the second card
+    // (`LAMBDA_VM_LEVELS_STACKS_BY_CARD`), whose group goes to card 1 however
+    // few groups are free ([`phase_b_split::plan_cards`]).
+    let held: Vec<Option<u8>> = (0..n).map(|g| held_on(prepared, g)).collect();
+    let on = if split_on_host {
+        Ok(())
+    } else if !two_card_knob.on() {
+        Err("the knob is off")
+    } else if !multilinear::gpu::two_card_split_ready() {
+        Err("the second card is not ready")
+    } else {
+        Ok(())
+    };
+    let prices: Vec<u64> = (0..n)
+        .map(|g| phase_b_split::split_price(stamps[g].cells as u64, sizes[g]))
+        .collect();
+    let commit_cards =
+        (phase_b_commit_cards && stamps.iter().any(|s| s.commit_card == 1)).then(|| {
+            stamps
+                .iter()
+                .map(|s| Some(s.commit_card))
+                .collect::<Vec<_>>()
+        });
+    let pins = commit_cards.as_deref().unwrap_or(&held);
+    let plan = phase_b_split::plan_cards(two_card_split.as_deref(), on, &prices, pins);
+    // A stack held on card 1 is opened there or nowhere: from card 0's
+    // driver it cannot be read.
+    if plan.is_err() && held.contains(&Some(1)) {
+        return Err(MlError::DeviceFailed {
+            stage: "a prepared stack is held on the second card, which is gone",
+        });
+    }
+    let pinned_count = match (&two_card_split, &plan) {
+        (Some(keep), Ok(_)) => {
+            let pin = |g: usize, c: u8| match keep.get(g).copied().unwrap_or(true) {
+                true => c == 0,
+                false => pins[g] == Some(c),
+            };
+            [
+                (0..n).filter(|&g| pin(g, 0)).count(),
+                (0..n).filter(|&g| pin(g, 1)).count(),
+            ]
+        }
+        _ => [0, 0],
+    };
+    if let (Some(_), Err(why)) = (&two_card_split, &plan) {
+        match two_card_knob {
+            TwoCardKnob::Split => eprintln!("BLOCK TWO-CARD PHASE B: off ({why})"),
+            TwoCardKnob::Levels => eprintln!("BLOCK TWO-CARD LEVEL PHASE B: off ({why})"),
+        }
+    }
+    let split_card = plan.ok();
+    let declines_before = multilinear::gpu::cross_card_declines();
+    let lanes = if split_card.is_some() { 2 } else { 1 };
+    let card = split_card.unwrap_or_else(|| vec![0; n]);
+    let queue = std::sync::Mutex::new(phase_b_split::TurnQueue::new(order, card.clone()));
+    let abort = std::sync::atomic::AtomicBool::new(false);
+    // Each driver's place in phase B's order at its latest turn.
+    let places = [
+        std::sync::atomic::AtomicUsize::new(usize::MAX),
+        std::sync::atomic::AtomicUsize::new(usize::MAX),
+    ];
+
+    // Each card's own state: its groups' tables and spill slots, stamps,
+    // retired stacks, claims and begun local argues, by group (another card's
+    // groups `None` or default), and its own copy of the post-roots
+    // transcript to fork from.
+    let mut table_slices: Vec<&mut [CommittedTable<'_, F, E>]> = Vec::with_capacity(n);
+    let mut spill_slices: Vec<&mut [Option<Arc<Parked>>]> = Vec::with_capacity(n);
+    {
+        // Each table's spill slot, or none at all (no spill).
+        let spill_by_table = spilled.len() == tables.len();
+        let mut rest_tables: &mut [CommittedTable<'_, F, E>] = &mut tables;
+        let mut rest_spilled: &mut [Option<Arc<Parked>>] = &mut spilled;
+        for &size in &sizes {
+            let (group, after) = std::mem::take(&mut rest_tables)
+                .split_at_mut_checked(size)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: size,
+                    got: 0,
+                })?;
+            table_slices.push(group);
+            rest_tables = after;
+            if spill_by_table {
+                let (slots, after) = std::mem::take(&mut rest_spilled)
+                    .split_at_mut_checked(size)
+                    .ok_or(MlError::QueryCountMismatch {
+                        expected: size,
+                        got: 0,
+                    })?;
+                spill_slices.push(slots);
+                rest_spilled = after;
+            } else {
+                spill_slices.push(&mut []);
+            }
+        }
+    }
+    let mut lane_ins: Vec<LaneIn<'_, '_, F, E, T>> = (0..lanes)
+        .map(|_| LaneIn {
+            post: transcript.clone(),
+            tables: (0..n).map(|_| None).collect(),
+            spilled: (0..n).map(|_| None).collect(),
+            stamps: vec![GroupStamps::default(); n],
+            retired: (0..n).map(|_| None).collect(),
+            ood: (0..n).map(|_| None).collect(),
+            local_started: (0..n).map(|_| None).collect(),
+        })
+        .collect();
+    {
+        let mut retired = retired;
+        let mut ood = ood;
+        for (g, (tables_g, spilled_g)) in table_slices.into_iter().zip(spill_slices).enumerate() {
+            let lane = &mut lane_ins[usize::from(card[g].min(1)).min(lanes - 1)];
+            lane.tables[g] = Some(tables_g);
+            lane.spilled[g] = Some(spilled_g);
+            lane.stamps[g] = std::mem::take(&mut stamps[g]);
+            lane.retired[g] = retired[g].take();
+            lane.ood[g] = ood[g].take();
+            lane.local_started[g] = local_started.get_mut(g).and_then(Option::take);
+        }
+    }
+
+    // One card's phase B over its own groups, in phase B's order: today's
+    // loop, the only one without the split.
+    let drive = |lane: usize, lane_in: LaneIn<'_, '_, F, E, T>| -> Result<LaneOut<F, E>, MlError> {
+        let LaneIn {
+            post,
+            tables: mut lane_tables,
+            spilled: mut lane_spilled,
+            mut stamps,
+            mut retired,
+            mut ood,
+            mut local_started,
+        } = lane_in;
+        // Each group's share, by group, assembled in group order at the end.
+        let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
+        let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
+        let mut group_local: Vec<Option<LocalArgue<E>>> = (0..n).map(|_| None).collect();
+        let mut group_opening: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+        let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+        // The next group's columns, uploaded during this group's argument — the
+        // card idles through the argument's host glue, and a group's store is a
+        // few GiB beside the argument's working set, not beside its codewords.
+        let mut pre_uploaded: Option<Store> = None;
+        let mut prev: Option<Argued<F, E, T>> = None;
+        // Under the two-card openings (card 0's driver only: the second card's
+        // groups open where they argue): the groups opened on the openings' card
+        // (counted after their openings ran there, a fallback to card 0 not), and
+        // those kept on card 0 (a held prepared stack).
+        let openings_move = lane == 0 && multilinear::gpu::two_card_openings();
+        let mut two_card = (0usize, 0usize);
+        let opened_on_own = std::sync::atomic::AtomicUsize::new(0);
+        // Of those, the groups whose compact upload on the openings' card was
+        // declined (opened over the host's columns).
+        let second_declined = std::sync::atomic::AtomicUsize::new(0);
+        let mut latched = false;
+        // The driver thread's schedstat at the start of the turn under way, and
+        // its group: each turn's share is closed at the next turn's start.
+        let mut turn_sched: Option<((u64, u64), usize)> = None;
+        // The most this card's ledger held at a turn's end.
+        let mut ledger_most = 0u64;
+        loop {
+            // The other card's driver failed: this one stops at its next turn.
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(MlError::DeviceFailed {
+                    stage: OTHER_CARD_FAILED,
+                });
+            }
+            // This card's turn: its group, the turns started before it on both
+            // cards (`p`, each value once; the place the hook reads it at with one
+            // card), and its next group (whose columns go up beside this argue),
+            // claimed now.
+            // The groups still to come are re-ranked before the next one is
+            // chosen (and before its columns go up): only a permutation of them.
+            let (g, p, next_g) = {
+                let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(turn) = queue.begin(lane) else {
+                    break;
+                };
+                if let Some(rest) = reorder.and_then(|reorder| reorder(turn.place, &turn.view)) {
+                    let got = rest.len();
+                    if let Err(expected) = queue.rerank(rest) {
+                        return Err(MlError::QueryCountMismatch { expected, got });
+                    }
+                }
+                (turn.group, turn.turn, queue.claim_next(lane))
+            };
+            // The place this driver is at, for the error of the lower place.
+            places[lane.min(1)].store(p, std::sync::atomic::Ordering::Relaxed);
+            stamps[g].start_b = entered.elapsed().as_secs_f64();
+            stamps[g].card = lane as u8;
+            if sched {
+                let now = thread_schedstat();
+                if let (Some((then, h)), Some(now)) = (turn_sched, now) {
+                    stamps[h].sched_b =
+                        Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
+                }
+                turn_sched = now.map(|now| (now, g));
+            }
+            let (at, size) = (starts[g], sizes[g]);
+            let mut fork = group_fork::<E, T>(&post, forks[g]);
+            if spill_on {
+                // This group's columns and the next's, back before their uploads
+                // (the next one's goes up beside this group's argue).
+                for h in std::iter::once(g).chain(next_g) {
+                    let first = starts[h];
+                    restore_group(
+                        first,
+                        lane_mut(&mut lane_tables, h)?,
+                        lane_mut(&mut lane_spilled, h)?,
+                        mem.as_deref(),
+                    )?;
+                    // No reader of these groups meets a table whose columns are
+                    // still out: one whose slot did not come back is refused here,
+                    // before its upload.
+                    if let Some(k) = lane_ref(&lane_tables, h)?
+                        .iter()
+                        .position(|t| t.is_spilled())
+                    {
+                        return Err(MlError::SpillFailed {
+                            table: first + k,
+                            reason: "its columns are still spilled when its group is read",
+                        });
+                    }
+                }
+            }
+            let retired = retired[g].take().ok_or(MlError::QueryCountMismatch {
+                expected: n,
+                got: n,
+            })?;
+
+            let t = Instant::now();
+            let store = match pre_uploaded.take() {
+                Some(store) => store,
+                None => upload_group(lane_ref(&lane_tables, g)?),
+            };
+            if let Some(store) = &store {
+                let mut first = 0usize;
+                for table in lane_mut(&mut lane_tables, g)?.iter_mut() {
+                    table.set_resident(store.clone(), first);
+                    first += table.num_committed_columns();
+                }
+            }
+            stamps[g].upload_b += t.elapsed().as_secs_f64();
+
+            // Under the two-card openings the previous group's openings run on
+            // their own card beside this argue: its columns and stores on card 0
+            // go first, and the openings revive over the host's columns there
+            // (the same codewords, so the same bytes). A group whose prepared
+            // stack is held (its codewords where phase A left them) opens on card
+            // 0 as before.
+            let prev_on_own_card = match prev.as_mut() {
+                Some(earlier) if openings_move && !prepared_is_held(prepared, earlier.group) => {
+                    for table in lane_mut(&mut lane_tables, earlier.group)?.iter_mut() {
+                        table.clear_resident();
+                    }
+                    earlier.store = None;
+                    earlier.store_promise = None;
+                    earlier.upload_once = false;
+                    earlier.overlap_resident = false;
+                    true
+                }
+                Some(_) if openings_move => {
+                    two_card.1 += 1;
+                    false
+                }
+                _ => false,
+            };
+
+            // The group's tables, one after another, each leaving its columns
+            // claimed at its own point — or, batched, all of them in one argue —
+            // with the next group's upload beside them, and under the overlap the
+            // previous group's openings too.
+            let t = Instant::now();
+            stamps[g].argue_base = multilinear::gpu::ledger_reserved();
+            multilinear::gpu::reset_reserved_window();
+            multilinear::gpu::card_window_start();
+            let refusals_before = prev.as_ref().map(|_| phase_b_refusals());
+            let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+            let mut values: Vec<FieldElement<E>> = Vec::new();
+            let mut proofs: Vec<TableProof<E>> = Vec::new();
+            let mut batched_argue: Option<BatchedArgue<E>> = None;
+            let mut zc_b = 0.0f64;
+            let mut bins_b: Vec<f64> = Vec::new();
+            let mut local_b: Vec<f64> = Vec::new();
+            // Its local argue begun in phase A, if any.
+            let mut started_local = local_started.get_mut(g).and_then(Option::take);
+            let mut merged = MergeStamp::default();
+            let mut local_argue: Option<LocalArgue<E>> = None;
+            let group_layout = retired.layout();
+            let group_roots =
+                roots
+                    .get(root_ranges[g].clone())
+                    .ok_or(MlError::QueryCountMismatch {
+                        expected: root_ranges[g].end,
+                        got: roots.len(),
+                    })?;
+            let group_answers =
+                &answers[answer_starts[g]..answer_starts[g] + group_layout.num_polys()];
+            let group_ref = lane_ref(&lane_tables, g)?;
+            // Under `upload_beside` off the next group's columns go up at its own
+            // turn instead (`pre_uploaded` stays empty).
+            let next = match next_g.filter(|_| upload_beside) {
+                Some(next) => Some(lane_ref(&lane_tables, next)?),
+                None => None,
+            };
+            let prev_tables = match prev.as_ref() {
+                Some(earlier) => Some(lane_ref(&lane_tables, earlier.group)?),
+                None => None,
+            };
+            let roots_ref = &roots;
+            let answers_ref = &answers;
+            let opened_on_own_ref = &opened_on_own;
+            let second_declined_ref = &second_declined;
+            let (argue_result, argue_end, next_store, joined, opened, open_paid) =
+                std::thread::scope(|scope| {
+                    let uploader = next.map(|next| {
+                        scope.spawn(move || on_lane_upload(lane, move || upload_group(next)))
+                    });
+                    let (opening_done, opening_release) = if prev.is_some() && !prev_on_own_card {
+                        let (done, release) = std::sync::mpsc::channel();
+                        (Some(done), Some(release))
+                    } else {
+                        (None, None)
+                    };
+                    let opener = prev.as_mut().zip(prev_tables).map(|(earlier, its_tables)| {
+                        scope.spawn(move || {
+                            on_lane_openings(lane, move || -> Result<Opened<F, E>, MlError> {
+                                // Every stream this thread draws is a background one,
+                                // so the argue's kernels are dispatched first.
+                                let _background = multilinear::gpu::background_streams();
+                                if let Some(stall) = overlap_faults.open_stall {
+                                    std::thread::sleep(stall);
+                                }
+                                #[cfg(any(test, feature = "test-utils"))]
+                                if overlap_faults.open_panics == Some(earlier.place) {
+                                    panic!("a test's opening thread panics");
+                                }
+                                let fails = overlap_faults.open_fails == Some(earlier.place);
+                                let (opened, stacked) = if prev_on_own_card {
+                                    let opened = multilinear::gpu::on_openings_card(|| {
+                                        // The group's columns once more, compact
+                                        // (records filled and narrow columns
+                                        // widened on the openings' card, into its
+                                        // ledger), so its openings open from the
+                                        // stack as on card 0. A card that declines
+                                        // leaves the host's columns: the same
+                                        // bytes, slower, and counted.
+                                        earlier.store = upload_group(its_tables);
+                                        if earlier.store.is_none() {
+                                            second_declined_ref
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        open_group::<F, E, T, H>(
+                                            earlier, its_tables, prepared, deviations, config,
+                                            false, fails,
+                                        )
+                                    });
+                                    if opened.is_ok() && multilinear::gpu::openings_on_own_backend()
+                                    {
+                                        opened_on_own_ref
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        TWO_CARD_OPENED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    opened
+                                } else {
+                                    open_group::<F, E, T, H>(
+                                        earlier, its_tables, prepared, deviations, config, false,
+                                        fails,
+                                    )
+                                }?;
+                                // Wake the zerocheck after the opening releases
+                                // its room, before running the caller's observer.
+                                drop(stacked);
+                                drop(opening_done);
+                                on_group(GroupOpened {
+                                    group: earlier.group,
+                                    roots: roots_ref,
+                                    commit_ood: answers_ref,
+                                    argue: earlier.argue.as_ref(),
+                                    local: earlier.local.as_ref(),
+                                    tables: &earlier.proofs,
+                                    opening: &opened.opening,
+                                    prepared: opened.prepared.as_ref(),
+                                });
+                                Ok(opened)
+                            })
+                        })
+                    });
+                    let run_argue = || -> Result<(), MlError> {
+                        if overlap_faults.argue_fails == Some(p) {
+                            return Err(MlError::DeviceFailed {
+                                stage: "a test's failed argue",
+                            });
+                        }
+                        match config.format.argue {
+                            ArgueFormat::PerTable => {
+                                for table in group_ref.iter() {
+                                    let (proof, point) =
+                                        prove(table, &z, &alpha, &beta, &mut fork, None)?;
+                                    for _ in 0..table.num_committed_columns() {
+                                        points.push(point.clone());
+                                    }
+                                    values.extend(
+                                        proof.constraint.reduce.column_values.iter().cloned(),
+                                    );
+                                    proofs.push(proof);
+                                }
+                            }
+                            ArgueFormat::Batched {
+                                bin_log_cells,
+                                pack,
+                                ladder,
+                            } => {
+                                let faults = match argue.group {
+                                    Some(faulty) if faulty == g => argue.faults,
+                                    _ => ProverFaults::default(),
+                                };
+                                let statements: Vec<TableStatement<'_, F, E>> =
+                                    group_ref.iter().map(CommittedTable::statement).collect();
+                                let local = local
+                                    .as_ref()
+                                    .filter(|local| group_is_local(&statements, &local.buses));
+                                let (proof, reduced) = match local {
+                                    None => batched::prove_argue(
+                                        group_ref,
+                                        &z,
+                                        &alpha,
+                                        &beta,
+                                        bin_log_cells,
+                                        pack,
+                                        ladder,
+                                        &mut fork,
+                                        faults,
+                                        argue.at,
+                                    )?,
+                                    Some(local) => {
+                                        // The local challenges and ladders on
+                                        // the group's own transcript, then its
+                                        // state into the fork before anything else.
+                                        // Phase A drew the challenges right after
+                                        // the group's commit, and the lane may
+                                        // have run some bins: the rest run here
+                                        // on the same transcript. A faulted
+                                        // argue (or a mutant binding, which is
+                                        // every group's) starts over here.
+                                        let resumed = started_local
+                                            .take()
+                                            .filter(|_| {
+                                                faults.is_none()
+                                                    && argue.faults.local_binding.is_none()
+                                            })
+                                            .and_then(|started| {
+                                                started.downcast::<LocalStarted<E, T>>().ok()
+                                            });
+                                        let (mut own, prover) = match resumed {
+                                            Some(started) => {
+                                                let LocalStarted {
+                                                    transcript,
+                                                    z,
+                                                    alpha,
+                                                    prover,
+                                                } = *started;
+                                                let prover = match prover {
+                                                    Some(prover) => prover,
+                                                    None => batched::LocalProver::new(
+                                                        group_ref,
+                                                        &local.buses,
+                                                        &z,
+                                                        &alpha,
+                                                        bin_log_cells,
+                                                        pack,
+                                                        ladder,
+                                                        faults,
+                                                    )?,
+                                                };
+                                                (transcript, prover)
+                                            }
+                                            None => {
+                                                let (z_g, alpha_g, own) = local_challenges::<E, T>(
+                                                    g,
+                                                    group_layout,
+                                                    group_roots,
+                                                    group_answers,
+                                                    &local.digests[at..at + size],
+                                                    config,
+                                                    // A mutant binding is the format's,
+                                                    // so every group's, as the verifier's.
+                                                    argue
+                                                        .faults
+                                                        .local_binding
+                                                        .unwrap_or(LocalBinding::ALL),
+                                                )?;
+                                                let prover = batched::LocalProver::new(
+                                                    group_ref,
+                                                    &local.buses,
+                                                    &z_g,
+                                                    &alpha_g,
+                                                    bin_log_cells,
+                                                    pack,
+                                                    ladder,
+                                                    faults,
+                                                )?;
+                                                (own, prover)
+                                            }
+                                        };
+                                        let mut prover = prover;
+                                        let ran_before = prover.bins_run();
+                                        while !prover.done() {
+                                            prover.step(group_ref, &mut own, argue.at)?;
+                                        }
+                                        local_b = prover.bin_secs()[ran_before..].to_vec();
+                                        let (local_proof, claims) = prover.finish()?;
+                                        fork.append_bytes(&own.state());
+                                        local_argue = Some(local_proof);
+                                        let global =
+                                            ClassTables::split(&statements, &local.buses, false);
+                                        batched::prove_argue_classed(
+                                            group_ref,
+                                            &global,
+                                            Some(&claims),
+                                            &z,
+                                            &alpha,
+                                            &beta,
+                                            bin_log_cells,
+                                            pack,
+                                            ladder,
+                                            &mut fork,
+                                            faults,
+                                            argue.at,
+                                        )?
+                                    }
+                                };
+                                zc_b = batched::take_last_zc_secs();
+                                bins_b = batched::take_last_bin_secs();
+                                if let Some(host) = merge_probe {
+                                    // A measurement on a throwaway copy of the
+                                    // fork: the proof is the same.
+                                    merged = zc_lane::run_merge_probe(
+                                        group_ref,
+                                        &z,
+                                        &alpha,
+                                        bin_log_cells,
+                                        pack,
+                                        argue.at,
+                                        host,
+                                        fork.clone(),
+                                    );
+                                }
+                                for (table, claim) in group_ref.iter().zip(reduced) {
+                                    for _ in 0..table.num_committed_columns() {
+                                        points.push(claim.point.clone());
+                                    }
+                                    values.extend(claim.column_values);
+                                }
+                                batched_argue = Some(proof);
+                            }
+                        }
+                        Ok(())
+                    };
+                    let argue_result =
+                        multilinear::gpu_fused::with_opening_release(opening_release, run_argue);
+                    let argue_end = Instant::now();
+                    let next_store = uploader.map(|handle| handle.join());
+                    let joined = argue_end.elapsed().as_secs_f64();
+                    // What of the previous group's openings outlasted the argue
+                    // and the upload: the overlap's cost on this thread.
+                    let waited = Instant::now();
+                    let opened = opener.map(|handle| handle.join());
+                    (
+                        argue_result,
+                        argue_end,
+                        next_store,
+                        joined,
+                        opened,
+                        waited.elapsed().as_secs_f64(),
+                    )
+                });
+            // The previous group's openings answer first: their error is the one
+            // one group at a time would have met first. A panic on their thread
+            // is refused, never resumed.
+            let opened = match opened {
+                None => None,
+                Some(Ok(Ok(opened))) => Some(opened),
+                Some(Ok(Err(e))) => return Err(e),
+                Some(Err(_)) => {
+                    return Err(MlError::DeviceFailed {
+                        stage: "the previous group's openings",
+                    });
+                }
+            };
+            argue_result?;
+            stamps[g].zc_b = zc_b;
+            stamps[g].bins_b = bins_b;
+            stamps[g].local_b = local_b;
+            stamps[g].merge = merged;
+            stamps[g].argue = argue_end.saturating_duration_since(t).as_secs_f64();
+            stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
+            stamps[g].argue_card = multilinear::gpu::card_window_end();
+            if let (Some(next_store), Some(next)) = (next_store, next_g) {
+                // The wait for the upload after the argument ended is the next
+                // group's upload cost; the rest of it hid behind this argument.
+                stamps[next].upload_b += joined;
+                pre_uploaded = Some(next_store.map_err(|_| MlError::DeviceFailed {
+                    stage: "uploading the next group's columns",
+                })?);
+            }
+            if let (Some(opened), Some(earlier)) = (opened, prev.take()) {
+                // The previous group's openings ran beside this argue: one window
+                // on the ledger for both.
+                let h = earlier.group;
+                let window = stamps[g].argue_reserved;
+                stamps[g].transition_reserved = window;
+                let s = &mut stamps[h];
+                s.encode = opened.encode;
+                s.prepared_revive = opened.prepared_revive;
+                s.upload_once = opened.upload_once;
+                s.open = opened.open;
+                s.open_room = opened.open_room;
+                s.open_reserved = window;
+                s.open_paid = open_paid;
+                s.overlapped = true;
+                s.open_draws = opened.draws;
+                group_tables[h] = earlier.proofs;
+                group_argue[h] = earlier.argue;
+                group_local[h] = earlier.local;
+                group_opening[h] = Some(opened.opening);
+                group_prepared[h] = opened.prepared;
+                stamps[h].records_released = release_group(
+                    lane_mut(&mut lane_tables, h)?,
+                    h,
+                    earlier.store,
+                    earlier.tree_tops,
+                    spill_on,
+                    returner.as_ref(),
+                    mem.as_deref(),
+                );
+                stamps[h].end_b = entered.elapsed().as_secs_f64();
+                ledger_most = ledger_most.max(multilinear::gpu::ledger_reserved());
+                // A transition in which the card refused a promise turns the rest
+                // of phase B serial: the work went where it goes without the
+                // overlap, and no later transition risks it again.
+                if refusals_before.is_some_and(|before| phase_b_refusals() > before)
+                    || overlap_faults.refusal_at == Some(p)
+                {
+                    latched = true;
+                }
+            }
+
+            let tree_tops = retired.tree_bytes();
+            let mut argued = Argued {
+                group: g,
+                place: p,
+                at,
+                fork,
+                retired: Some(retired),
+                store,
+                tree_tops,
+                points,
+                values,
+                proofs,
+                argue: batched_argue,
+                local: local_argue,
+                ood: Some(ood[g].take().ok_or(MlError::QueryCountMismatch {
+                    expected: n,
+                    got: n,
+                })?)
+                .filter(|_| !ood_unbound),
+                upload_once,
+                upload_once_refused: overlap_faults.upload_once_refused_at == Some(p),
+                upload_once_margin: overlap_faults
+                    .upload_once_margin
+                    .unwrap_or(UPLOAD_ONCE_MARGIN_BYTES),
+                upload_once_card_refuses: overlap_faults.upload_once_card_refuses_at == Some(p),
+                upload_once_narrow: store_narrow,
+                overlap_resident: priced_resident(upload_once, overlap_resident),
+                store_promise: None,
+            };
+            // Under the planned overlap (retired stacks, the overlap otherwise off),
+            // each transition by its own plan.
+            let planned_beside = !overlapping
+                && overlap_planned
+                && !latched
+                && next_g.is_some_and(|next| {
+                    // The next group's columns are on the card now when they went
+                    // up beside this argue (`pre_uploaded`, or refused there and
+                    // left on the host); otherwise they go up at its own turn.
+                    let next_columns = next_columns_bytes(
+                        stamps[next].cells,
+                        pre_uploaded.is_some(),
+                        overlap_next_columns,
+                    );
+                    let (fits, need, free) =
+                        overlap_fits(&argued, prepared, &stamps[next], next_columns, config);
+                    let fits = fits && overlap_faults.overlap_refused_at != Some(p);
+                    stamps[g].overlap_planned_out = !fits;
+                    stamps[g].overlap_plan_need = need;
+                    stamps[g].overlap_plan_free = free;
+                    fits
+                });
+            // Admitted on the store's price: the store's promise is taken now, so
+            // the ledger cannot refuse the store once the openings run beside the
+            // next argue. Refused, the group opens alone.
+            // The store's own plan must fit too (a store the plan at the opening
+            // would refuse is not promised, and the overlap priced on it is not
+            // taken: the group opens alone and its store's plan says no there).
+            let planned_beside = planned_beside
+                && match admission_store_bytes(&argued, prepared, config) {
+                    None => true,
+                    Some((bytes, need)) => {
+                        let free = multilinear::gpu::reserve_budget()
+                            .saturating_sub(multilinear::gpu::ledger_reserved());
+                        let room = match overlap_faults.store_promise_refused_at == Some(p)
+                            || need > free
+                        {
+                            true => None,
+                            false => multilinear::gpu::reserve_room(bytes),
+                        };
+                        stamps[g].store_promised = room.is_some();
+                        stamps[g].store_promise_refused = room.is_none();
+                        stamps[g].overlap_planned_out |= room.is_none();
+                        argued.store_promise = room;
+                        argued.store_promise.is_some()
+                    }
+                };
+            if (overlapping || planned_beside) && !latched && next_g.is_some() {
+                // Opened beside the next group's argue.
+                prev = Some(argued);
+                continue;
+            }
+            stamps[g].serial_after_refusal = overlapping && latched && next_g.is_some();
+            let paid = Instant::now();
+            let own = open_own::<F, E, T, H>(
+                &mut argued,
+                lane_ref(&lane_tables, g)?,
+                prepared,
+                config,
+                true,
+                overlap_faults.open_fails == Some(p),
+            )?;
+            // A retired prepared stack is revived next, over its own columns (a
+            // store of them on the card under the upload once, else the host's):
+            // the group's columns go off the card first (nothing reads them after
+            // the group's own opening), so the revive has their room as well as
+            // its store's or its codewords'.
+            if prepared_is_retired(prepared, g) {
+                for table in lane_mut(&mut lane_tables, g)?.iter_mut() {
+                    table.clear_resident();
+                }
+                argued.store = None;
+                stamps[g].columns_gone_before_revive = true;
+            }
+            let (opened, stacked) = open_prepared::<F, E, T, H>(
+                &mut argued,
+                lane_ref(&lane_tables, g)?,
+                prepared,
+                deviations,
+                config,
+                true,
+                own,
+            )?;
+            stamps[g].encode = opened.encode;
+            stamps[g].prepared_revive = opened.prepared_revive;
+            stamps[g].upload_once = opened.upload_once;
+            stamps[g].open_room = opened.open_room;
+            stamps[g].open = opened.open;
+            stamps[g].open_reserved = opened.open_reserved.unwrap_or(0);
+            stamps[g].open_paid = paid.elapsed().as_secs_f64();
+            stamps[g].open_draws = opened.draws;
+            on_group(GroupOpened {
+                group: g,
+                roots: &roots,
+                commit_ood: &answers,
+                argue: argued.argue.as_ref(),
+                local: argued.local.as_ref(),
+                tables: &argued.proofs,
+                opening: &opened.opening,
+                prepared: opened.prepared.as_ref(),
+            });
+            group_tables[g] = argued.proofs;
+            group_argue[g] = argued.argue;
+            group_local[g] = argued.local;
+            group_opening[g] = Some(opened.opening);
+            group_prepared[g] = opened.prepared;
+            drop(stacked);
+            stamps[g].records_released = release_group(
+                lane_mut(&mut lane_tables, g)?,
+                g,
+                argued.store,
+                argued.tree_tops,
+                spill_on,
+                returner.as_ref(),
+                mem.as_deref(),
+            );
+            stamps[g].end_b = entered.elapsed().as_secs_f64();
+            ledger_most = ledger_most.max(multilinear::gpu::ledger_reserved());
+        }
+        if sched && let (Some((then, h)), Some(now)) = (turn_sched, thread_schedstat()) {
+            stamps[h].sched_b = Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
+        }
+        two_card.0 = opened_on_own.into_inner();
+        let second_declined = second_declined.into_inner();
+        Ok(LaneOut {
+            stamps,
+            group_tables,
+            group_argue,
+            group_local,
+            group_opening,
+            group_prepared,
+            two_card,
+            second_declined,
+            ledger_most,
+            budget: multilinear::gpu::reserve_budget(),
+        })
+    };
+
+    // Card 0's driver on this thread; the second card's, under the split, on
+    // a thread of its own inside the second card's pool. A failed driver
+    // stops the other at its next turn; the failure itself is the answer.
+    let mut lane_ins = lane_ins.into_iter();
+    let first = lane_ins.next().ok_or(MlError::QueryCountMismatch {
+        expected: lanes,
+        got: 0,
+    })?;
+    let second = lane_ins.next();
+    let (out0, out1) = std::thread::scope(|scope| {
+        let drive = &drive;
+        let abort = &abort;
+        let other = second.map(|lane_in| {
+            scope.spawn(move || {
+                let out = multilinear::gpu::on_second_card(move || drive(1, lane_in));
+                if out.is_err() {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                out
+            })
+        });
+        let out0 = drive(0, first);
+        if out0.is_err() {
+            abort.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let out1 = other.map(|handle| {
+            handle.join().unwrap_or(Err(MlError::DeviceFailed {
+                stage: "the second card's phase B",
+            }))
+        });
+        (out0, out1)
+    });
+    let is_abort =
+        |e: &MlError| matches!(e, MlError::DeviceFailed { stage } if *stage == OTHER_CARD_FAILED);
+    let outs: Vec<LaneOut<F, E>> = match (out0, out1) {
+        (Ok(a), None) => vec![a],
+        (Ok(a), Some(Ok(b))) => vec![a, b],
+        (Err(e), None) => return Err(e),
+        (Err(e), Some(Ok(_))) => return Err(e),
+        (Ok(_), Some(Err(e))) => {
+            if !split_on_host && matches!(e, MlError::DeviceFailed { .. }) && !is_abort(&e) {
+                multilinear::gpu::mark_second_failed("its phase-B driver failed");
+            }
+            return Err(e);
+        }
+        (Err(e0), Some(Err(e1))) => {
+            // A driver's own failure over the other's stop; of two failures,
+            // the one at the lower place in phase B's order.
+            if !split_on_host && matches!(e1, MlError::DeviceFailed { .. }) && !is_abort(&e1) {
+                multilinear::gpu::mark_second_failed("its phase-B driver failed");
+            }
+            let (p0, p1) = (
+                places[0].load(std::sync::atomic::Ordering::Relaxed),
+                places[1].load(std::sync::atomic::Ordering::Relaxed),
+            );
+            return Err(match (is_abort(&e0), is_abort(&e1)) {
+                (true, false) => e1,
+                (false, true) => e0,
+                _ if p1 < p0 => e1,
+                _ => e0,
+            });
+        }
+    };
+
+    // Each group's share and stamps back from the card that proved it.
+    let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
+    let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
+    let mut group_local: Vec<Option<LocalArgue<E>>> = (0..n).map(|_| None).collect();
+    let mut group_opening: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+    let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
+    let mut two_card = (0usize, 0usize);
+    let mut second_declined = 0usize;
+    // Per card: (groups, cells, argue seconds, span from its first group's
+    // start to its last group's end, its ledger's most at a turn's end, its
+    // budget).
+    let mut lane_summary: Vec<(usize, usize, f64, f64, u64, u64)> = Vec::with_capacity(outs.len());
+    for (lane, mut out) in outs.into_iter().enumerate() {
+        let mine: Vec<usize> = (0..n)
+            .filter(|&g| usize::from(card[g].min(1)).min(lanes - 1) == lane)
+            .collect();
+        let (mut argue_s, mut cells) = (0.0f64, 0usize);
+        let (mut first, mut last) = (f64::INFINITY, 0.0f64);
+        for &g in &mine {
+            stamps[g] = std::mem::take(&mut out.stamps[g]);
+            argue_s += stamps[g].argue;
+            cells += stamps[g].cells;
+            first = first.min(stamps[g].start_b);
+            last = last.max(stamps[g].end_b);
+            group_tables[g] = std::mem::take(&mut out.group_tables[g]);
+            group_argue[g] = out.group_argue[g].take();
+            group_local[g] = out.group_local[g].take();
+            group_opening[g] = out.group_opening[g].take();
+            group_prepared[g] = out.group_prepared[g].take();
+        }
+        two_card.0 += out.two_card.0;
+        two_card.1 += out.two_card.1;
+        second_declined += out.second_declined;
+        let span = if mine.is_empty() {
+            0.0
+        } else {
+            (last - first).max(0.0)
+        };
+        lane_summary.push((
+            mine.len(),
+            cells,
+            argue_s,
+            span,
+            out.ledger_most,
+            out.budget,
+        ));
+    }
+    if lanes == 2 {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let card = |c: usize| {
+            lane_summary.get(c).map_or(String::new(), |&(groups, cells, argue, span, most, budget)| {
+                format!(
+                    "card {c}: {groups} groups, {:.3} G cells, argue {argue:.3} s, span {span:.3} s, ledger peak \
+                     {:.2} of {:.2} GiB",
+                    cells as f64 / 1e9,
+                    gib(most),
+                    gib(budget)
+                )
+            })
+        };
+        let gap = match (lane_summary.first(), lane_summary.get(1)) {
+            (Some(a), Some(b)) => (a.2 - b.2).abs(),
+            _ => 0.0,
+        };
+        let tail = format!(
+            "{} · {} · argue gap {gap:.3} s · pinned to card 0 {}{} · cross-card declines {} · second \
+             upload {}",
+            card(0),
+            card(1),
+            pinned_count[0],
+            if pinned_count[1] > 0 {
+                format!(" · to card 1 {}", pinned_count[1])
+            } else {
+                String::new()
+            },
+            multilinear::gpu::cross_card_declines().saturating_sub(declines_before),
+            if two_card.0 == 0 {
+                "none".to_string()
+            } else {
+                format!("{} groups (the two-card openings, card 0's)", two_card.0)
+            },
+        );
+        match two_card_knob {
+            TwoCardKnob::Split => {
+                eprintln!("BLOCK TWO-CARD PHASE B: on (LAMBDA_VM_TWO_CARD_SPLIT) · {tail}")
+            }
+            TwoCardKnob::Levels => {
+                eprintln!("BLOCK TWO-CARD LEVEL PHASE B: on (LAMBDA_VM_TWO_CARD_LEVELS) · {tail}")
+            }
+        }
+        SPLIT_SECOND_GROUPS.fetch_add(
+            lane_summary.get(1).map_or(0, |s| s.0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    if multilinear::gpu::two_card_openings() {
+        eprintln!(
+            "BLOCK TWO-CARD OPENINGS: on (LAMBDA_VM_TWO_CARD_OPENINGS) · {} of {n} groups opened on the \
+             openings' card beside an argue · {} kept on card 0 (a held prepared stack) · the rest \
+             opened alone on card 0 · {} opened there over the host's columns (their upload declined)",
+            two_card.0, two_card.1, second_declined
+        );
+    }
+    // Every finished group's records handed back before phase B returns.
+    if let Some(returner) = returner {
+        returner.finish(&mut stamps);
+    }
+    // The tables go with this function: a memory log stops holding them.
+    if let Some(mem) = &mem {
+        mem.release(tables.iter());
+    }
+    let openings = group_opening
+        .into_iter()
+        .map(|opening| {
+            opening.ok_or(MlError::QueryCountMismatch {
+                expected: n,
+                got: order.len(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        MultiProof {
+            roots,
+            tables: group_tables.into_iter().flatten().collect(),
+            columns: openings,
+            preprocessed: None,
+        },
+        group_argue.into_iter().flatten().collect(),
+        group_prepared.into_iter().flatten().collect(),
+        stamps,
+        answers,
+        match local {
+            Some(_) => group_local
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect(),
+            None => Vec::new(),
+        },
+    ))
+}
+
+/// Verifies a [`block_prove`] proof: the roots block, each group on its fork,
+/// and the bus balance over every table of the block against `expected`.
+///
+/// `layouts`/`domains` are one per group, rebuilt by the caller from the
+/// shapes and `sizes` ([`block_groups`]) — never from the proof. `prepared` are
+/// the tables' prepared checks the caller derived from the program, and
+/// `prepared_openings` the proof's openings of them, one each, in that order.
+/// `commit_ood` is the proof's commit-time answers ([`block_verify_with`]).
+#[allow(clippy::too_many_arguments)]
+pub fn block_verify<F, E, T, H>(
+    proof: &MultiProof<F, E>,
+    commit_ood: &[FieldElement<E>],
+    prepared_openings: &[StackedProof<F, E>],
+    prepared: &[BlockPreparedCheck<'_, F>],
+    statements: &[TableStatement<'_, F, E>],
+    layouts: &[StackedLayout],
+    domains: &[Domain<F>],
+    sizes: &[usize],
+    expected: &FieldElement<E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Default,
+{
+    block_verify_with::<F, E, T, H>(
+        proof,
+        commit_ood,
+        &[],
+        prepared_openings,
+        prepared,
+        statements,
+        layouts,
+        domains,
+        sizes,
+        expected,
+        config,
+        transcript,
+        false,
+        VerifierChecks::ALL,
+        None,
+    )
+}
+
+/// [`block_verify`] under either argue format, the config's: per table, the
+/// proof's `tables`; batched, `argues`, one per group, each read on its
+/// group's fork ([`batched::verify_argue`]). The other format's messages must
+/// be absent.
+///
+/// The prepared openings are left unchecked when `skip_prepared` — their
+/// prefixes still skipped by `check_preprocessed` — and the batched argue's
+/// checks and the bus balance are switched by `checks`. Both are mutations: a
+/// test shows each check is what refuses its forgery. Production passes
+/// `false` and [`VerifierChecks::ALL`].
+///
+/// `commit_ood` is every carried polynomial's commit-time out-of-domain
+/// answer, in root order: exactly one per root — none missing, none extra —
+/// absorbed after the roots and before `(z, α, β)`, and each batched into its
+/// chain against its group's point, which the verifier draws from the proof's
+/// roots and its own layout ([`commit_ood_point`]). There is no format without
+/// them.
+///
+/// `local` is the verifier's own local-lookups format ([`BlockLocalCheck`]: its
+/// local buses and every table's digest) with the proof's local argues, or
+/// `None` for today's format. Under it, before anything else every receiver
+/// on a local bus must read verifier-fixed columns only
+/// ([`batched::check_local_receivers`]); then each group with a local
+/// interaction rebuilds its local transcript ([`local_challenges`]), checks
+/// its local argue and local balance ([`batched::verify_local`]), absorbs the
+/// local state into its fork, and argues its global class with the local
+/// pairs ([`batched::verify_argue_classed`]); a group with none carries an
+/// empty local argue and argues as today.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn block_verify_with<F, E, T, H>(
+    proof: &MultiProof<F, E>,
+    commit_ood: &[FieldElement<E>],
+    argues: &[BatchedArgue<E>],
+    prepared_openings: &[StackedProof<F, E>],
+    prepared: &[BlockPreparedCheck<'_, F>],
+    statements: &[TableStatement<'_, F, E>],
+    layouts: &[StackedLayout],
+    domains: &[Domain<F>],
+    sizes: &[usize],
+    expected: &FieldElement<E>,
+    config: &ChainConfig,
+    transcript: &mut T,
+    skip_prepared: bool,
+    checks: VerifierChecks,
+    local: Option<BlockLocalCheck<'_, E>>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
+        + Clone
+        + Default,
+{
+    // The format is the verifier's config's, never the proof's: that format's
+    // messages present in full, the other's absent.
+    let (table_proofs, group_argues) = match config.format.argue {
+        ArgueFormat::PerTable => (statements.len(), 0),
+        ArgueFormat::Batched { .. } => (0, sizes.len()),
+    };
+    if proof.tables.len() != table_proofs || argues.len() != group_argues {
+        return Err(MlError::ArgueFormatMismatch);
+    }
+    // Local lookups: the batched argue only, one local argue a group, a
+    // digest a table, and every local receiver a fixed table.
+    if let Some(local) = &local {
+        if config.format.argue == ArgueFormat::PerTable || local.argues.len() != sizes.len() {
+            return Err(MlError::ArgueFormatMismatch);
+        }
+        if local.digests.len() != statements.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: statements.len(),
+                got: local.digests.len(),
+            });
+        }
+        if checks.local_receivers {
+            batched::check_local_receivers(statements, local.buses)?;
+        }
+    }
+    if layouts.len() != sizes.len()
+        || domains.len() != sizes.len()
+        || proof.columns.len() != sizes.len()
+        || sizes.iter().sum::<usize>() != statements.len()
+    {
+        return Err(MlError::QueryCountMismatch {
+            expected: sizes.len(),
+            got: proof.columns.len(),
+        });
+    }
+    // Every root the proof carries is one some group opens: a root no layout
+    // claims would be absorbed and bound to nothing. One a round-0 tree, by
+    // the verifier's own layouts and config.
+    let polys: usize = layouts.iter().map(StackedLayout::num_polys).sum();
+    let trees: usize = layouts
+        .iter()
+        .map(|layout| stacked_eval::round0_trees(layout.num_polys(), config).len())
+        .sum();
+    if trees != proof.roots.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: trees,
+            got: proof.roots.len(),
+        });
+    }
+    // One commit-time answer per carried root, by the verifier's own layouts.
+    if commit_ood.len() != polys {
+        return Err(MlError::CommitOodCount {
+            expected: polys,
+            got: commit_ood.len(),
+        });
+    }
+    if proof.preprocessed.is_some() {
+        return Err(MlError::QueryCountMismatch {
+            expected: 0,
+            got: 1,
+        });
+    }
+    // One opening per group with a prepared stack, each table settled at most
+    // once and by its own group, each prefix within the table's preprocessed
+    // columns — never more than it has, which would skip a check nothing
+    // replaced — and the stack holding exactly those columns.
+    if prepared_openings.len() != prepared.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: prepared.len(),
+            got: prepared_openings.len(),
+        });
+    }
+    let starts: Vec<usize> = sizes
+        .iter()
+        .scan(0usize, |at, &size| {
+            let start = *at;
+            *at += size;
+            Some(start)
+        })
+        .collect();
+    let entries: Vec<PreparedEntry<'_>> = prepared
+        .iter()
+        .map(|p| {
+            (
+                p.group,
+                p.tables.as_slice(),
+                Some(p.layout.placements().len()),
+            )
+        })
+        .collect();
+    prepared_shape(&entries, &starts, statements.len(), &|t| {
+        statements[t].num_preprocessed
+    })?;
+    let mut settled = vec![0usize; statements.len()];
+    for p in prepared {
+        for &(table, n) in &p.tables {
+            settled[table] = n;
+        }
+    }
+    let derived: Vec<Commitment> = prepared
+        .iter()
+        .flat_map(|p| p.roots.iter().copied())
+        .collect();
+    let (z, alpha, beta) =
+        absorb_roots_answers_and_challenge::<E, T>(transcript, &proof.roots, &derived, commit_ood);
+
+    let mut balance = FieldElement::<E>::zero();
+    let mut statement_at = 0usize;
+    let mut root_at = 0usize;
+    let mut answer_at = 0usize;
+    for (g, (((opening, layout), domain), &size)) in proof
+        .columns
+        .iter()
+        .zip(layouts)
+        .zip(domains)
+        .zip(sizes)
+        .enumerate()
+    {
+        let mut fork = group_fork::<E, T>(transcript, g);
+        let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+        let mut values: Vec<FieldElement<E>> = Vec::new();
+        let group_statements = &statements[statement_at..statement_at + size];
+        let group_settled = &settled[statement_at..statement_at + size];
+        match config.format.argue {
+            ArgueFormat::PerTable => {
+                for ((table, statement), &settled) in proof.tables
+                    [statement_at..statement_at + size]
+                    .iter()
+                    .zip(group_statements)
+                    .zip(group_settled)
+                {
+                    let (output, reduced) =
+                        verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)?;
+                    balance += contribution(&output).ok_or(MlError::BusImbalance)?;
+                    for _ in 0..statement.slot_of.len() {
+                        points.push(reduced.point.clone());
+                    }
+                    values.extend(reduced.column_values);
+                }
+            }
+            ArgueFormat::Batched {
+                bin_log_cells,
+                pack,
+                ladder,
+            } => {
+                // The group's bins and trees come from its statements and the
+                // verifier's cap, packing and ladder, never from the proof.
+                let argue = &argues[g];
+                let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+                let reduced = match local {
+                    Some(local) if group_is_local(group_statements, local.buses) => {
+                        // The local challenges from the proof's roots and
+                        // answers and the verifier's own layout and digests;
+                        // the local ladders and the local balance; then the
+                        // local state into the fork and the global class.
+                        let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
+                            g,
+                            layout,
+                            &proof.roots[root_at..root_at + trees],
+                            &commit_ood[answer_at..answer_at + layout.num_polys()],
+                            &local.digests[statement_at..statement_at + size],
+                            config,
+                            checks.local_binding,
+                        )?;
+                        let claims = batched::verify_local(
+                            &local.argues[g],
+                            group_statements,
+                            local.buses,
+                            &z_g,
+                            &alpha_g,
+                            bin_log_cells,
+                            pack,
+                            ladder,
+                            &mut own,
+                            checks,
+                            g,
+                        )?;
+                        if checks.local_state {
+                            fork.append_bytes(&own.state());
+                        }
+                        let global = ClassTables::split(group_statements, local.buses, false);
+                        batched::verify_argue_classed(
+                            argue,
+                            group_statements,
+                            &global,
+                            Some(&claims),
+                            bin_log_cells,
+                            pack,
+                            ladder,
+                            &z,
+                            &alpha,
+                            &beta,
+                            &mut fork,
+                            checks,
+                        )?
+                    }
+                    _ => {
+                        // A group with no local interaction carries no local
+                        // argue.
+                        if local.is_some_and(|local| !local.argues[g].is_empty()) {
+                            return Err(MlError::ArgueShapeMismatch {
+                                part: "local argue",
+                            });
+                        }
+                        batched::verify_argue(
+                            argue,
+                            group_statements,
+                            bin_log_cells,
+                            pack,
+                            ladder,
+                            &z,
+                            &alpha,
+                            &beta,
+                            &mut fork,
+                            checks,
+                        )?
+                    }
+                };
+                for output in &argue.bus_outputs {
+                    balance += contribution(output).ok_or(MlError::BusImbalance)?;
+                }
+                for ((statement, reduced), &settled) in
+                    group_statements.iter().zip(reduced).zip(group_settled)
+                {
+                    if checks.preprocessed {
+                        check_preprocessed(*statement, &reduced, settled)?;
+                    }
+                    for _ in 0..statement.slot_of.len() {
+                        points.push(reduced.point.clone());
+                    }
+                    values.extend(reduced.column_values);
+                }
+            }
+        }
+        let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+        let roots = &proof.roots[root_at..root_at + trees];
+        // The group's point, from its own roots and the verifier's layout.
+        let z0 = commit_ood_point::<E, T>(g, layout, roots, config)?;
+        let ood = checks.commit_ood.then_some(CommitOod {
+            z0: &z0,
+            answers: &commit_ood[answer_at..answer_at + layout.num_polys()],
+        });
+        stacked_eval::verify_ood::<F, E, T, H>(
+            opening,
+            layout,
+            roots,
+            &Claimed::PerColumn(&points),
+            &values,
+            ood,
+            domain,
+            config,
+            &mut fork,
+        )?;
+        // The group's prepared stack, on this fork: the derived commitment must
+        // take the values each table settled on, at that table's point.
+        if let Some(k) = prepared
+            .iter()
+            .position(|p| p.group == g)
+            .filter(|_| !skip_prepared)
+        {
+            let firsts: Vec<usize> = statements[statement_at..statement_at + size]
+                .iter()
+                .scan(0usize, |first, s| {
+                    let at = *first;
+                    *first += s.slot_of.len();
+                    Some(at)
+                })
+                .collect();
+            let p = &prepared[k];
+            let (at_points, at_values) =
+                prepared_claims(&p.tables, statement_at, &firsts, &points, &values);
+            stacked_eval::verify::<F, E, T, H>(
+                &prepared_openings[k],
+                p.layout,
+                p.roots,
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                p.domain,
+                config,
+                &mut fork,
+            )?;
+        }
+        statement_at += size;
+        root_at += trees;
+        answer_at += layout.num_polys();
+    }
+    if checks.balance && balance != *expected {
+        return Err(MlError::BusImbalance);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod commit_ood_point_tests {
+    use super::{
+        COMMIT_OOD_LABEL, absorb_roots_answers_and_challenge, commit_ood_point, commit_ood_prefix,
+    };
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use math::field::{
+        element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+    };
+    use multilinear::{
+        stacking::StackedLayout,
+        whir_chain::{ChainConfig, ChainFormat, GrindBits, GroupFold},
+        whir_hash::{P1Whir, WhirHash},
+    };
+
+    type T = <P1Whir as WhirHash>::Sponge;
+    type EE = FieldElement<Ext>;
+
+    fn config(log_blowup: usize, group: GroupFold) -> ChainConfig {
+        ChainConfig {
+            log_blowup,
+            log_folding: 2,
+            num_queries: 3,
+            grind: GrindBits::default(),
+            format: ChainFormat {
+                group,
+                ..ChainFormat::DEFAULT
+            },
+        }
+    }
+
+    /// The prefix is nine whole felts: the label, then five little-endian
+    /// words, in the order the in-guest leaf absorbs them as constants.
+    #[test]
+    fn the_prefix_is_the_label_and_five_words() {
+        let layout = StackedLayout::build(&[4, 4, 4], 5).unwrap();
+        let config = config(1, GroupFold::Indexed);
+        let prefix = commit_ood_prefix(3, &layout, &config);
+        assert_eq!(prefix.len(), 72);
+        assert_eq!(&prefix[..32], COMMIT_OOD_LABEL);
+        let word =
+            |i: usize| u64::from_le_bytes(prefix[32 + 8 * i..40 + 8 * i].try_into().unwrap());
+        assert_eq!(
+            [word(0), word(1), word(2), word(3), word(4)],
+            [3, 5, layout.num_polys() as u64, 1, config.fold_word()]
+        );
+    }
+
+    /// ★ The point is a function of the group's index, its stack's shape, the
+    /// code and every one of its roots.
+    #[test]
+    fn the_point_moves_with_the_group_its_code_and_each_root() {
+        let layout = StackedLayout::build(&[4, 4, 4], 5).unwrap();
+        assert_eq!(layout.num_polys(), 2);
+        let roots = [[7u8; 32], [9u8; 32]];
+        let base_config = config(1, GroupFold::Indexed);
+        let at = |g: usize, layout: &StackedLayout, roots: &[[u8; 32]], config: &ChainConfig| {
+            commit_ood_point::<Ext, T>(g, layout, roots, config).unwrap()
+        };
+        let base: EE = at(0, &layout, &roots, &base_config);
+        assert_eq!(base, at(0, &layout, &roots, &base_config), "deterministic");
+        assert_ne!(
+            base,
+            at(1, &layout, &roots, &base_config),
+            "the group's index"
+        );
+        let wider = StackedLayout::build(&[4, 4, 4, 4, 4], 6).unwrap();
+        assert_eq!(wider.num_polys(), 2);
+        assert_ne!(
+            base,
+            at(0, &wider, &roots, &base_config),
+            "the stack's variables"
+        );
+        assert_ne!(
+            base,
+            at(0, &layout, &roots, &config(2, GroupFold::Indexed)),
+            "the blowup"
+        );
+        assert_ne!(
+            base,
+            at(0, &layout, &roots, &config(1, GroupFold::PerPoly)),
+            "the fold word"
+        );
+        for k in 0..roots.len() {
+            let mut moved = roots;
+            moved[k][31] ^= 1;
+            assert_ne!(base, at(0, &layout, &moved, &base_config), "root {k}");
+        }
+        assert!(
+            commit_ood_point::<Ext, T>(0, &layout, &roots[..1], &base_config).is_err(),
+            "a root per polynomial"
+        );
+    }
+
+    /// ★ The roots block, spelled out: every carried root, every derived root,
+    /// every answer, THEN the three draws. Each answer moves the first draw,
+    /// and an answer absorbed after the draws would not — the placement no
+    /// round trip can see, since both sides would share it.
+    #[test]
+    fn the_roots_block_binds_every_answer_before_the_first_draw() {
+        let carried = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        let derived = [[4u8; 32]];
+        let answers: Vec<EE> = (0..carried.len() as u64)
+            .map(|i| EE::from(1000 + i))
+            .collect();
+        let draws = |answers: &[EE]| {
+            let mut transcript = T::default();
+            absorb_roots_answers_and_challenge::<Ext, T>(
+                &mut transcript,
+                &carried,
+                &derived,
+                answers,
+            )
+        };
+        let (z, alpha, beta) = draws(&answers);
+
+        let mut by_hand = T::default();
+        for root in carried.iter().chain(&derived) {
+            by_hand.append_bytes(root);
+        }
+        for answer in &answers {
+            by_hand.append_field_element(answer);
+        }
+        let spelled: [EE; 3] = core::array::from_fn(|_| by_hand.sample_field_element());
+        assert_eq!([z, alpha, beta], spelled);
+
+        for k in 0..answers.len() {
+            let mut moved = answers.clone();
+            moved[k] += EE::one();
+            assert_ne!(draws(&moved).0, z, "answer {k} moves z");
+        }
+        let mut late = T::default();
+        for root in carried.iter().chain(&derived) {
+            late.append_bytes(root);
+        }
+        let late_z: EE = late.sample_field_element();
+        assert_ne!(late_z, z, "answers absorbed after the draw bind nothing");
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use multilinear::narrow::NarrowColumns;
+
+    /// ★ Under a spill, a finished group lets go of its tables' records as it
+    /// does of their packed columns: the table is out (spilled), the records'
+    /// last handle is gone, and the bytes come back as the group's records
+    /// released; packed columns go too but are not records. With a returner the
+    /// records go to its thread, which hands their pages back and frees them
+    /// before it finishes, and what they came to lands in the group's stamps.
+    /// With no spill, nothing is taken and nothing counts.
+    #[test]
+    fn a_finished_group_lets_go_of_its_records_under_a_spill() {
+        use super::{GroupStamps, RecordsReturner, release_group};
+        use crate::examples::multi_table_lookup::new_cpu_air_with_lookup;
+        use crate::multilinear_air::Uniforms;
+        use crate::multilinear_table::{CommittedTable, TableLayout};
+        use crate::proof::options::ProofOptions;
+        use crate::traits::AIR;
+        use math::field::{
+            element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+            goldilocks::GoldilocksField as Fp,
+        };
+        use multilinear::records::{
+            KeccakRndOp, PagesReturned, Records, RecordsFill, TableRecords,
+        };
+        use std::sync::Arc;
+
+        // What these records say they handed back.
+        const RETURNED: PagesReturned = PagesReturned {
+            buffers: 1,
+            shared: 2,
+            bytes: 4096,
+            failed: 0,
+        };
+        // Records freed so far (a handle kept to watch them would keep the
+        // returner from being their last holder).
+        static FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        #[derive(Debug)]
+        struct Ops(Vec<KeccakRndOp>);
+        impl Drop for Ops {
+            fn drop(&mut self) {
+                FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        impl TableRecords for Ops {
+            fn rows(&self) -> usize {
+                8
+            }
+            fn cols(&self) -> usize {
+                5
+            }
+            fn fill(&self) -> RecordsFill<'_> {
+                RecordsFill::KeccakRnd {
+                    ops: &self.0,
+                    skip: 0,
+                }
+            }
+            fn host_fill(&self) -> Option<NarrowColumns> {
+                None
+            }
+            fn return_pages(&mut self) -> PagesReturned {
+                RETURNED
+            }
+        }
+        let air = new_cpu_air_with_lookup(&ProofOptions::default_test_options());
+        let layout = || {
+            TableLayout::<Fp, Ext>::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                5,
+                3,
+                Uniforms::default(),
+            )
+            .expect("a layout")
+        };
+        let ops = || {
+            Records(Arc::new(Ops(vec![
+                KeccakRndOp {
+                    timestamp: 3,
+                    input: [7; 25],
+                };
+                2
+            ])))
+        };
+        let bytes = ops().bytes();
+        assert!(bytes > 0);
+        let held = || CommittedTable::from_records(layout(), ops()).expect("a table");
+        let packed = || {
+            let mut table = CommittedTable::<Fp, Ext>::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                5,
+                3,
+                Uniforms::default(),
+                |col| {
+                    (0..8u64)
+                        .map(|r| FieldElement::from(r * 5 + u64::from(col)))
+                        .collect()
+                },
+            )
+            .expect("a table");
+            assert!(table.pack_on_host(), "packs");
+            table
+        };
+
+        // No spill: the records stay where they are.
+        let mut group = vec![held()];
+        assert_eq!(release_group(&mut group, 0, None, 0, false, None, None), 0);
+        assert!(group[0].records().is_some() && !group[0].is_spilled());
+        drop(group);
+
+        // A spill with no returner: the records go here, with their last
+        // handle, and are counted; the packed table goes uncounted.
+        let mut group = vec![packed(), held()];
+        let freed = FREED.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            release_group(&mut group, 0, None, 0, true, None, None),
+            bytes
+        );
+        assert!(group.iter().all(|t| t.is_spilled()), "both tables let go");
+        assert_eq!(
+            FREED.load(std::sync::atomic::Ordering::SeqCst),
+            freed + 1,
+            "freed here"
+        );
+
+        // With a returner: its thread takes them, the last handle, and hands
+        // their pages back and frees them before it finishes; the group's
+        // stamps say so.
+        let mut group = vec![packed(), held()];
+        let freed = FREED.load(std::sync::atomic::Ordering::SeqCst);
+        let returner = RecordsReturner::start();
+        assert_eq!(
+            release_group(&mut group, 1, None, 0, true, Some(&returner), None),
+            bytes
+        );
+        assert!(group.iter().all(|t| t.is_spilled()), "both tables let go");
+        let mut stamps = vec![GroupStamps::default(); 2];
+        returner.finish(&mut stamps);
+        assert_eq!(
+            FREED.load(std::sync::atomic::Ordering::SeqCst),
+            freed + 1,
+            "freed there"
+        );
+        assert_eq!(stamps[1].records_pages, RETURNED, "group 1's records");
+        assert_eq!(stamps[0].records_pages, PagesReturned::default());
+    }
+
+    /// A schedstat line reads as its CPU and run-queue delay nanoseconds; a
+    /// line that is not one reads as nothing.
+    #[test]
+    fn a_schedstat_line_reads_as_cpu_and_run_queue_delay() {
+        use super::parse_schedstat;
+        assert_eq!(parse_schedstat("123456 7890 42\n"), Some((123456, 7890)));
+        assert_eq!(parse_schedstat("0 0 0\n"), Some((0, 0)));
+        assert_eq!(parse_schedstat("123456\n"), None);
+        assert_eq!(parse_schedstat("cpu wait\n"), None);
+        assert_eq!(parse_schedstat(""), None);
+    }
+
+    /// Two classes rebuilt (N3): the plain groups first, then each class in
+    /// group order, interleaved by its share of the weights; one class is
+    /// `rebuilt_last`.
+    #[test]
+    fn interleaved_classes_keep_their_share_and_their_order() {
+        use super::interleaved_order;
+        let classes = [None, Some(0), Some(0), Some(1), None, Some(1), Some(0)];
+        assert_eq!(
+            interleaved_order(&classes, &[1; 7]),
+            vec![0, 4, 1, 3, 2, 5, 6]
+        );
+        // A heavy rest group waits until the streamed class has caught up.
+        assert_eq!(
+            interleaved_order(&[Some(0), Some(0), Some(1), Some(0)], &[1, 1, 3, 1]),
+            vec![0, 2, 1, 3]
+        );
+        // One class: the groups with nothing dropped, then it (rebuilt_last).
+        let one = [true, true, false, true, false];
+        let as_classes: Vec<Option<usize>> = one.iter().map(|&r| r.then_some(0)).collect();
+        assert_eq!(
+            interleaved_order(&as_classes, &[5; 5]),
+            super::rebuilt_last(&one)
+        );
+        assert_eq!(interleaved_order(&[None; 3], &[]), vec![0, 1, 2]);
+        // Any mix: a permutation, the plain groups first, each class ascending.
+        let mut seed = 0x9e37_79b9_u64;
+        for _ in 0..200 {
+            let n = 1 + (seed % 40) as usize;
+            let classes: Vec<Option<usize>> = (0..n)
+                .map(|i| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    match (seed >> 33) % 3 {
+                        0 => None,
+                        c => Some(c as usize - 1),
+                    }
+                    .filter(|_| i < n)
+                })
+                .collect();
+            let weights: Vec<u64> = (0..n).map(|i| 1 + (i as u64 * 7919) % 13).collect();
+            let order = interleaved_order(&classes, &weights);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            let plain = classes.iter().filter(|c| c.is_none()).count();
+            assert!(order[..plain].iter().all(|&g| classes[g].is_none()));
+            for c in 0..2 {
+                let seq: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|&g| classes[g] == Some(c))
+                    .collect();
+                assert!(seq.windows(2).all(|w| w[0] < w[1]), "class {c} ascending");
+            }
+        }
+    }
+
+    /// One class a group (N3): a group's tables drop in the class of its first
+    /// droppable one only, and phase B refuses a group that dropped two.
+    #[test]
+    fn a_group_drops_in_the_class_of_its_first_droppable_table() {
+        use super::{drop_one_class, one_class};
+        let mut ranks = [None, Some((0, 7)), Some((1, 0)), Some((0, 8)), Some((1, 1))];
+        drop_one_class(&mut ranks);
+        assert_eq!(ranks, [None, Some((0, 7)), None, Some((0, 8)), None]);
+        let mut ranks = [Some((1, 3)), None, Some((0, 9)), Some((1, 4))];
+        drop_one_class(&mut ranks);
+        assert_eq!(ranks, [Some((1, 3)), None, None, Some((1, 4))]);
+        let mut ranks = [None, None];
+        drop_one_class(&mut ranks);
+        assert_eq!(ranks, [None, None]);
+
+        assert_eq!(one_class([None, Some(1), None, Some(1)]), Some(Some(1)));
+        assert_eq!(one_class([None, None]), Some(None));
+        assert_eq!(one_class([]), Some(None));
+        assert_eq!(one_class([Some(0), None, Some(1)]), None);
+    }
+
+    /// The decision feed a regenerator started before phase A's end reads
+    /// (N4c): a table dropped after the wait began is handed over with its
+    /// slot; a held table is kept; a table never dropped is kept only once
+    /// phase A's end closes the decisions; and a waiter on an undecided table
+    /// returns `Stopped` as soon as its class's window closes (a failed or
+    /// ended prove), never hanging.
+    #[test]
+    fn a_regenerator_started_early_waits_for_each_tables_fate() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let parked = |class: usize, rank: u64| {
+            Arc::new(Parked {
+                len: packed().data().len() as u64,
+                cells: 0,
+                rank: Some((class, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30, 1 << 30], true);
+        let _producers = (regen.take_producer(0), regen.take_producer(1));
+        assert!(regen.drops_all_from_now());
+        // Dropped after the wait began: handed over with its slot.
+        regen.delay_drops(1, Duration::from_millis(300));
+        let waiter = {
+            let regen = regen.clone();
+            std::thread::spawn(move || regen.await_rank(1, 7))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        regen.parked(parked(1, 7));
+        let (decision, waited) = waiter.join().expect("joins");
+        assert!(matches!(decision, RankDecision::Dropped(ref slot) if slot.rank() == 7));
+        assert!(waited >= Duration::from_millis(200), "waited {waited:?}");
+        // Held by its group's class: kept at once.
+        regen.held(&[(1, 9)]);
+        assert!(matches!(regen.await_rank(1, 9).0, RankDecision::Kept));
+        // Never dropped: undecided while phase A runs, kept once it ends.
+        let waiter = {
+            let regen = regen.clone();
+            std::thread::spawn(move || regen.await_rank(1, 11))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "kept before phase A's end");
+        regen.close_drops();
+        assert!(matches!(
+            waiter.join().expect("joins").0,
+            RankDecision::Kept
+        ));
+        assert!(regen.decisions_closed());
+        // Liveness: a waiter on an undecided table of a class whose window
+        // closes (the prove failed) returns at once, Stopped.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30, 1 << 30], true);
+        let waiter = {
+            let regen = regen.clone();
+            std::thread::spawn(move || regen.await_rank(1, 3))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        regen.windows()[1].close("the prove failed");
+        let (decision, waited) = waiter.join().expect("joins");
+        assert!(matches!(decision, RankDecision::Stopped));
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+    }
+
+    /// Partial drops: arming drops back nothing and later tables are not
+    /// dropped on their own; a table the policy wants out drops, and a
+    /// hand-off's drop-back takes the parked candidates in rank order only
+    /// until its bytes are on their way. Once settled, what stays is kept, so
+    /// a regenerator started early learns every fate as it comes.
+    #[test]
+    fn partial_drops_take_only_what_is_asked() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let len = packed().data().len() as u64;
+        let parked = |rank: u64| {
+            Arc::new(Parked {
+                len,
+                cells: 0,
+                rank: Some((0, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).partial();
+        assert!(regen.is_partial());
+        let _producer = regen.take_producer(0);
+        // Parked before and after arming: candidates either way.
+        regen.parked(parked(0));
+        regen.parked(parked(3));
+        assert!(regen.arm());
+        assert!(!regen.arm(), "arms once");
+        assert!(!regen.drops_all_from_now());
+        regen.parked(parked(1));
+        regen.parked(parked(2));
+        // The policy wants this one out.
+        regen.drop_one(parked(4));
+        // A hand-off asking for one table and a byte: the two lowest ranks.
+        assert_eq!(regen.drop_back(len + 1), 2 * len);
+        regen.close_drops();
+        let report = regen.report();
+        assert_eq!(report.tables, 3, "{report:?}");
+        assert_eq!(report.back_tables, 2, "{report:?}");
+        for rank in [0, 1, 4] {
+            assert!(
+                matches!(regen.await_rank(0, rank).0, RankDecision::Dropped(_)),
+                "rank {rank} dropped"
+            );
+        }
+        for rank in [2, 3] {
+            assert!(
+                matches!(regen.await_rank(0, rank).0, RankDecision::Kept),
+                "rank {rank} kept"
+            );
+        }
+        // Asked for exactly one table's bytes: that table and not the next;
+        // asked for none: nothing.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).partial();
+        let _producer = regen.take_producer(0);
+        regen.parked(parked(0));
+        regen.parked(parked(1));
+        assert!(regen.arm());
+        assert_eq!(regen.drop_back(0), 0, "nothing asked");
+        assert_eq!(regen.drop_back(len), len, "one table's bytes");
+        regen.close_drops();
+        assert!(matches!(regen.await_rank(0, 0).0, RankDecision::Dropped(_)));
+        assert!(matches!(regen.await_rank(0, 1).0, RankDecision::Kept));
+        // Settled: the candidates left are kept, and so is a table parked
+        // after, at once (a waiter returns before phase A's end); their fates
+        // are known from now on.
+        let fate = |regen: &BlockRegen, rank: u64| {
+            let regen = regen.clone();
+            let waiter = std::thread::spawn(move || regen.await_rank(0, rank).0);
+            let t = std::time::Instant::now();
+            while !waiter.is_finished() {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(5),
+                    "rank {rank}'s fate is not known"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            waiter.join().expect("joins")
+        };
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).partial();
+        let _producer = regen.take_producer(0);
+        regen.parked(parked(0));
+        assert!(regen.arm());
+        assert!(!regen.drops_all_from_now(), "not before it settles");
+        regen.settle();
+        assert!(regen.drops_all_from_now());
+        assert!(matches!(fate(&regen, 0), RankDecision::Kept));
+        regen.parked(parked(1));
+        assert!(matches!(fate(&regen, 1), RankDecision::Kept));
+        regen.drop_one(parked(2));
+        assert!(matches!(fate(&regen, 2), RankDecision::Dropped(_)));
+        assert_eq!(regen.drop_back(u64::MAX), 0, "nothing left to drop back");
+        regen.close_drops();
+        // Not partial: arming drops back every candidate and every later one.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false);
+        let _producer = regen.take_producer(0);
+        regen.parked(parked(0));
+        assert!(regen.arm());
+        assert!(regen.drops_all_from_now());
+        regen.parked(parked(1));
+        regen.close_drops();
+        assert_eq!(regen.report().tables, 2);
+    }
+
+    /// The keep budget's two halves at arming ([`super::BlockRegen::keep_cells`]),
+    /// for the same candidates parked out of rank order (cells as committed,
+    /// ranks not): a budget at or above every candidate's cells drops nothing
+    /// more than no budget (same drops, same fates, every kept table's bytes
+    /// still on the host), and a budget below some drops back exactly the
+    /// candidates committed past it, in rank order, at arming only.
+    #[test]
+    fn the_keep_budget_drops_back_only_what_was_committed_past_it() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let len = packed().data().len() as u64;
+        let parked = |rank: u64, cells: u64| {
+            Arc::new(Parked {
+                len,
+                cells,
+                rank: Some((0, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        // (rank, cells committed once it was): committed in cells order,
+        // ranks shuffled.
+        let committed = [(5, 10), (1, 20), (7, 30), (3, 40), (0, 50), (6, 60)];
+        // Parks them, arms at 60 cells, parks one more past every budget
+        // below, lets the policy drop one and a hand-off drop back one table's
+        // bytes; returns the regen, the parked tables and the drop thread's
+        // order.
+        let run = |budget: Option<u64>| {
+            let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false)
+                .partial()
+                .keep_cells(budget);
+            let _producer = regen.take_producer(0);
+            let tables: Vec<_> = committed.iter().map(|&(r, c)| parked(r, c)).collect();
+            for table in &tables {
+                regen.parked(Arc::clone(table));
+            }
+            assert!(regen.arm_at(60));
+            let late = parked(2, 70);
+            regen.parked(Arc::clone(&late));
+            regen.drop_one(parked(9, 80));
+            let back = regen.drop_back(1);
+            regen.close_drops();
+            let order: Vec<(u64, bool)> = regen
+                .lock()
+                .dropped
+                .iter()
+                .map(|((_, rank), _, _, back)| (*rank, *back))
+                .collect();
+            (regen, tables, late, back, order)
+        };
+        let fates = |regen: &BlockRegen| -> Vec<bool> {
+            (0..10)
+                .map(|rank| matches!(regen.await_rank(0, rank).0, RankDecision::Dropped(_)))
+                .collect()
+        };
+
+        // No budget, and budgets at and above the last candidate's cells: the
+        // same drops (the policy's rank 9, the hand-off's lowest rank 0), the
+        // same fates, nothing dropped back at arming, and every kept table's
+        // columns still the ones parked.
+        let (none, _, _, none_back, none_order) = run(None);
+        assert_eq!(none_order, vec![(9, false), (0, true)]);
+        for budget in [60, 61, u64::MAX] {
+            let (regen, tables, late, back, order) = run(Some(budget));
+            assert_eq!(order, none_order, "budget {budget}");
+            assert_eq!(back, none_back, "budget {budget}");
+            assert_eq!(fates(&regen), fates(&none), "budget {budget}");
+            let (report, plain) = (regen.report(), none.report());
+            assert_eq!(report.keep_back, (0, 0), "budget {budget}");
+            assert_eq!(report.keep_cells, Some(budget));
+            assert_eq!(
+                (
+                    report.tables,
+                    report.bytes,
+                    report.back_tables,
+                    report.back_bytes
+                ),
+                (
+                    plain.tables,
+                    plain.bytes,
+                    plain.back_tables,
+                    plain.back_bytes
+                ),
+                "budget {budget}"
+            );
+            assert_eq!(
+                (report.armed_cells, report.armed_kept),
+                (Some(60), (6, 6 * len))
+            );
+            for table in tables.iter().chain([&late]) {
+                if table.rank == Some((0, 0)) {
+                    continue;
+                }
+                let state = table.state.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    matches!(&*state, ParkedState::Resident(p) if p.data() == packed().data()),
+                    "budget {budget}: rank {:?} left the host",
+                    table.rank
+                );
+            }
+        }
+        assert_eq!(none.report().keep_back, (0, 0));
+        assert_eq!(none.report().keep_cells, None);
+
+        // A budget of 30 cells: the candidates committed past it (cells 40, 50,
+        // 60: ranks 3, 0, 6) are dropped back at arming in rank order, before
+        // anything else; the one at the budget (rank 7, cells 30) stays, and so
+        // does the late one parked after arming, past the budget (rank 2). The
+        // hand-off then takes the lowest rank left (1).
+        let (regen, tables, late, back, order) = run(Some(30));
+        assert_eq!(
+            order,
+            vec![(0, true), (3, true), (6, true), (9, false), (1, true)]
+        );
+        assert_eq!(back, len);
+        let report = regen.report();
+        assert_eq!(report.keep_back, (3, 3 * len), "{report:?}");
+        assert_eq!(report.armed_kept, (6, 6 * len));
+        let dropped: Vec<u64> = (0..10)
+            .filter(|&rank| matches!(regen.await_rank(0, rank).0, RankDecision::Dropped(_)))
+            .collect();
+        assert_eq!(dropped, vec![0, 1, 3, 6, 9]);
+        for table in tables.iter().chain([&late]) {
+            let kept = matches!(
+                &*table.state.lock().unwrap_or_else(|e| e.into_inner()),
+                ParkedState::Resident(_)
+            );
+            let rank = table.rank.map(|(_, r)| r).unwrap_or_default();
+            assert_eq!(kept, !dropped.contains(&rank), "rank {rank}");
+        }
+
+        // Not partial: the budget is not used, and arming drops back every
+        // candidate as before.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).keep_cells(Some(30));
+        let _producer = regen.take_producer(0);
+        for &(r, c) in &committed {
+            regen.parked(parked(r, c));
+        }
+        assert!(regen.arm_at(60));
+        regen.close_drops();
+        let report = regen.report();
+        assert_eq!(
+            (report.tables, report.keep_back, report.keep_cells),
+            (6, (0, 0), None)
+        );
+    }
+
+    /// The keep budget relative to the arming point
+    /// ([`super::BlockRegen::keep_below`]): arming at 60 cells with 25 below
+    /// drops back exactly the candidates committed past 35, in rank order, and
+    /// only at arming; with an absolute budget too the lower one holds; a
+    /// margin past the arming point drops back every candidate; arming without
+    /// the cells committed uses only the absolute budget; and none is today's.
+    #[test]
+    fn the_relative_keep_budget_drops_back_what_was_committed_in_its_last_cells() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let len = packed().data().len() as u64;
+        let parked = |rank: u64, cells: u64| {
+            Arc::new(Parked {
+                len,
+                cells,
+                rank: Some((0, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        let committed = [(5, 10), (1, 20), (7, 30), (3, 40), (0, 50), (6, 60)];
+        // Parks them, arms (at 60 cells when `at` is set, else without the
+        // cells), parks one more past every budget; returns the drop thread's
+        // order and the report.
+        let run = |absolute: Option<u64>, below: Option<u64>, at: bool| {
+            let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false)
+                .partial()
+                .keep_cells(absolute)
+                .keep_below(below);
+            let _producer = regen.take_producer(0);
+            for &(r, c) in &committed {
+                regen.parked(parked(r, c));
+            }
+            assert!(if at { regen.arm_at(60) } else { regen.arm() });
+            regen.parked(parked(2, 70));
+            regen.close_drops();
+            let order: Vec<u64> = regen
+                .lock()
+                .dropped
+                .iter()
+                .map(|((_, rank), _, _, back)| {
+                    assert!(*back, "a drop-back");
+                    *rank
+                })
+                .collect();
+            let kept: Vec<u64> = (0..10)
+                .filter(|&r| matches!(regen.await_rank(0, r).0, RankDecision::Kept))
+                .collect();
+            (order, kept, regen.report())
+        };
+        // 25 below 60: past 35 are cells 40, 50, 60 (ranks 3, 0, 6), in rank
+        // order; cells 30 stays, and so does the table parked after arming.
+        let (order, kept, report) = run(None, Some(25), true);
+        assert_eq!(order, vec![0, 3, 6]);
+        assert_eq!(kept, vec![1, 2, 4, 5, 7, 8, 9]);
+        assert_eq!(
+            (report.budget, report.keep_below, report.keep_back),
+            (Some(35), Some(25), (3, 3 * len))
+        );
+        // With an absolute 45 too, the lower (35) holds; with an absolute 25,
+        // that one does (past 25: cells 30 as well).
+        assert_eq!(run(Some(45), Some(25), true).0, vec![0, 3, 6]);
+        assert_eq!(run(Some(25), Some(25), true).0, vec![0, 3, 6, 7]);
+        // A margin at or past the arming point drops back every candidate.
+        assert_eq!(run(None, Some(60), true).0, vec![0, 1, 3, 5, 6, 7]);
+        assert_eq!(run(None, Some(1_000), true).0, vec![0, 1, 3, 5, 6, 7]);
+        // Without the cells committed, only the absolute budget.
+        assert_eq!(run(None, Some(25), false).0, Vec::<u64>::new());
+        assert_eq!(run(Some(45), Some(25), false).0, vec![0, 6]);
+        // None: arming drops back nothing.
+        let (order, _, report) = run(None, None, true);
+        assert!(order.is_empty());
+        assert_eq!((report.budget, report.keep_below), (None, None));
+    }
+
+    /// ★ A parked table held as its records drops as them: its slot keeps the
+    /// records' digest and shape and takes only a checked deposit, the drop
+    /// report counts it among the records, and a records table not dropped
+    /// leaves its parking as it came.
+    #[test]
+    fn a_parked_records_table_drops_as_its_records() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision, drop_parked};
+        use multilinear::records::{KeccakRndOp, Records, RecordsFill, TableRecords};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Ops(Vec<KeccakRndOp>);
+        impl TableRecords for Ops {
+            fn rows(&self) -> usize {
+                1024
+            }
+            fn cols(&self) -> usize {
+                2
+            }
+            fn fill(&self) -> RecordsFill<'_> {
+                RecordsFill::KeccakRnd {
+                    ops: &self.0,
+                    skip: 0,
+                }
+            }
+            fn host_fill(&self) -> Option<NarrowColumns> {
+                None
+            }
+        }
+        let records = |seed: u64| {
+            Records(Arc::new(Ops(vec![
+                KeccakRndOp {
+                    timestamp: seed,
+                    input: [seed; 25],
+                };
+                3
+            ])))
+        };
+        let held = records(5);
+        let parked = Arc::new(Parked {
+            len: held.bytes() as u64,
+            cells: 0,
+            rank: Some((0, 4)),
+            state: std::sync::Mutex::new(ParkedState::ResidentRecords(held.clone())),
+        });
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], true);
+        let _producer = regen.take_producer(0);
+        regen.parked(Arc::clone(&parked));
+        let RankDecision::Dropped(slot) = regen.await_rank(0, 4).0 else {
+            panic!("dropped");
+        };
+        assert!(slot.is_records());
+        assert_eq!(
+            (slot.digest(), slot.rows(), slot.cols()),
+            (held.digest(), 1024, 2)
+        );
+        assert!(parked.dropped().is_some(), "its slot in its place");
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        slot.deposit_checked(packed, records(5).digest())
+            .expect("columns from the same records");
+        regen.close_drops();
+        let report = regen.report();
+        assert_eq!(
+            (report.tables, report.records),
+            (1, (1, held.bytes() as u64))
+        );
+        // Not dropped: a second drop of the same parking finds nothing held.
+        let window = &regen.windows()[0];
+        assert!(
+            drop_parked(window, &parked, 4, None).is_none(),
+            "dropped once"
+        );
+    }
+
+    /// The rebuilt groups go last, each set in group order; nothing rebuilt is
+    /// the group order.
+    #[test]
+    fn rebuilt_groups_go_last() {
+        assert_eq!(
+            super::rebuilt_last(&[true, true, false, true, false]),
+            vec![2, 4, 0, 1, 3]
+        );
+        assert_eq!(super::rebuilt_last(&[false; 4]), vec![0, 1, 2, 3]);
+        assert_eq!(super::rebuilt_last(&[true; 3]), vec![0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod upload_once_rule_tests {
+    /// Resident pricing prices a retired prepared stack as its store plus a
+    /// revive over the store, and nothing of the whole-codeword price; off,
+    /// the whole-codeword price alone.
+    #[test]
+    fn the_resident_price_is_the_store_and_a_revive_over_it() {
+        let (store, over, whole) = (2_480 << 20, 600 << 20, 9_000 << 20);
+        assert_eq!(
+            super::prepared_revive_price(true, store, over, whole),
+            store + over
+        );
+        assert_eq!(
+            super::prepared_revive_price(false, store, over, whole),
+            whole
+        );
+        assert_eq!(
+            super::prepared_revive_price(true, u64::MAX, over, whole),
+            u64::MAX
+        );
+        assert_eq!(
+            super::store_plan_need(store, over, 1 << 30),
+            store + over + (1 << 30)
+        );
+        assert_eq!(super::store_plan_need(u64::MAX, over, 1), u64::MAX);
+    }
+
+    /// The planned overlap prices a prepared revive over the store only with
+    /// the upload once on: with it off there is no store to price.
+    #[test]
+    fn the_overlap_is_priced_resident_only_under_the_upload_once() {
+        assert!(super::priced_resident(true, true));
+        assert!(!super::priced_resident(false, true));
+        assert!(!super::priced_resident(true, false));
+        assert!(!super::priced_resident(false, false));
+    }
+
+    /// The promise an admission takes for a group's store: its words, and
+    /// under the narrow store the largest run's words at 8 bytes besides.
+    #[test]
+    fn a_stores_promise_is_its_words_and_a_narrow_runs_staging() {
+        let run = multilinear::narrow::STORE_RUN_CELLS;
+        let lens = vec![run / 4; 6];
+        let words: u64 = lens.iter().map(|&n| n as u64 * 8).sum();
+        assert_eq!(super::store_promise_bytes(words, false, &lens, None), words);
+        assert_eq!(
+            super::store_promise_bytes(words, true, &lens, None),
+            words + run as u64 * 8
+        );
+        assert_eq!(
+            super::store_promise_bytes(u64::MAX, true, &lens, None),
+            u64::MAX
+        );
+    }
+
+    /// A narrow store's plan adds its largest run's packed bytes, or the
+    /// bound in words when there is no pack yet. A wide store adds nothing.
+    #[test]
+    fn a_narrow_stores_plan_holds_its_largest_run_while_it_widens() {
+        use math::field::{element::FieldElement, goldilocks::GoldilocksField};
+
+        let run = multilinear::narrow::STORE_RUN_CELLS;
+        // A short height, then a tall one cut into a full run and a part.
+        let mut lens = vec![1usize << 10; 3];
+        lens.extend(std::iter::repeat_n(run / 4, 6));
+        assert_eq!(super::narrow_store_staging(false, &lens, None), 0);
+        assert_eq!(
+            super::narrow_store_staging(true, &lens, None),
+            run as u64 * 8
+        );
+        assert_eq!(
+            super::narrow_store_staging(true, &lens[..3], None),
+            3 * (1 << 10) * 8
+        );
+        assert_eq!(super::narrow_store_staging(true, &[], None), 0);
+
+        // The second run has fewer cells but takes more packed bytes.
+        let tall = [FieldElement::<GoldilocksField>::from(1); 16];
+        let short = [FieldElement::<GoldilocksField>::from(1 << 16); 8];
+        let lens = [tall.len(), short.len()];
+        let packed = multilinear::gpu::pack_store_fields(&[&tall, &short]).expect("packs");
+        assert_eq!(super::narrow_store_staging(false, &lens, Some(&packed)), 0);
+        assert_eq!(super::narrow_store_staging(true, &lens, Some(&packed)), 32);
+        assert_eq!(
+            super::store_promise_bytes(192, true, &lens, Some(&packed)),
+            224
+        );
+    }
+}
+
+#[cfg(test)]
+mod overlap_plan_tests {
+    use super::{OVERLAP_MARGIN_BYTES, next_columns_bytes, overlap_plan, planned_commit_growth};
+
+    const GIB: u64 = 1 << 30;
+    /// Level 1's group 1 on a real median block (397 410 304 cells, its
+    /// stamps): 2.96 GiB of columns on the card.
+    const MEDIAN_GROUP_CELLS: usize = 397_410_304;
+
+    /// The next group's columns cost their store, one 8-byte word a cell, only
+    /// when they go up at that group's own turn and the plan prices them.
+    #[test]
+    fn the_next_groups_columns_are_priced_only_when_they_go_up_at_its_turn() {
+        let cells = MEDIAN_GROUP_CELLS;
+        assert_eq!(next_columns_bytes(cells, false, true), cells as u64 * 8);
+        assert_eq!(next_columns_bytes(cells, true, true), 0, "already up");
+        assert_eq!(next_columns_bytes(cells, false, false), 0, "today's plan");
+        assert_eq!(next_columns_bytes(cells, true, false), 0);
+        assert_eq!(next_columns_bytes(0, false, true), 0);
+        assert_eq!(next_columns_bytes(usize::MAX, false, true), u64::MAX);
+    }
+
+    /// The plan's need is the openings, 5/4 of the next commit's growth, the
+    /// next group's columns and the margin, each once; free is the budget less
+    /// the ledger; it fits up to equality, and without a card always.
+    #[test]
+    fn the_overlap_plan_adds_the_next_groups_columns_to_its_need() {
+        let columns = next_columns_bytes(MEDIAN_GROUP_CELLS, false, true);
+        let (_, without, free) = overlap_plan(3 * GIB, 12 * GIB, 0, 26 * GIB, 6 * GIB);
+        let (_, with, free_with) = overlap_plan(3 * GIB, 12 * GIB, columns, 26 * GIB, 6 * GIB);
+        assert_eq!(without, 3 * GIB + 15 * GIB + OVERLAP_MARGIN_BYTES);
+        assert_eq!(
+            with - without,
+            columns,
+            "the term is added once, outside the 5/4"
+        );
+        assert_eq!(
+            (free, free_with),
+            (20 * GIB, 20 * GIB),
+            "free reads the ledger alone"
+        );
+        let exact = 3 * GIB + 15 * GIB + columns + OVERLAP_MARGIN_BYTES;
+        assert_eq!(
+            overlap_plan(3 * GIB, 12 * GIB, columns, exact + 6 * GIB, 6 * GIB),
+            (true, exact, exact),
+            "need equal to free fits"
+        );
+        assert_eq!(
+            overlap_plan(3 * GIB, 12 * GIB, columns, exact + 6 * GIB - 1, 6 * GIB),
+            (false, exact, exact - 1)
+        );
+        assert_eq!(
+            overlap_plan(3 * GIB, 12 * GIB, columns, 0, 6 * GIB),
+            (true, 0, 0)
+        );
+        assert_eq!(
+            overlap_plan(u64::MAX, u64::MAX, u64::MAX, 26 * GIB, 6 * GIB),
+            (false, u64::MAX, 20 * GIB),
+            "saturates, never wraps into a fit"
+        );
+    }
+
+    /// The review's shape: with resident pricing the opened group's prepared
+    /// revive is its store and room only, and the slack of 5/4 over a real
+    /// ratio of 1.19 on 12 GiB of growth (1.7 GiB with the margin) does not
+    /// cover the median group's 2.96 GiB of columns. Today's plan admits the
+    /// transition; priced, it opens alone.
+    #[test]
+    fn the_next_groups_columns_turn_a_transition_the_slack_admitted_into_one_alone() {
+        let columns = next_columns_bytes(MEDIAN_GROUP_CELLS, false, true);
+        let (openings, growth, budget, ledger) = (3 * GIB, 12 * GIB, 26 * GIB, 6 * GIB);
+        let (today, need, free) = overlap_plan(openings, growth, 0, budget, ledger);
+        assert!(today && need == 19 * GIB && free == 20 * GIB);
+        // What the card holds through the transition at a real ratio of 1.19:
+        // the openings, the argue's growth, the columns and the ledger now.
+        let held = openings + growth * 119 / 100 + columns + ledger;
+        assert!(held > budget, "today's admission overruns the budget");
+        let (priced, _, _) = overlap_plan(openings, growth, columns, budget, ledger);
+        assert!(!priced, "priced, the transition opens alone");
+        // Up beside the argue already (the upload beside on), nothing changes.
+        let (up, _, _) = overlap_plan(
+            openings,
+            growth,
+            next_columns_bytes(MEDIAN_GROUP_CELLS, true, true),
+            budget,
+            ledger,
+        );
+        assert!(up);
+    }
+
+    /// A group whose commit fell back to the host is planned as a card commit
+    /// of it, not at the almost nothing it grew the ledger by; a card commit's
+    /// own growth is read as measured, whatever the price.
+    #[test]
+    fn a_commit_that_fell_back_to_the_host_is_planned_as_a_card_commit() {
+        let priced = 12 * GIB;
+        assert_eq!(planned_commit_growth(64 << 20, priced, 1), priced);
+        assert_eq!(planned_commit_growth(64 << 20, priced, 3), priced);
+        assert_eq!(
+            planned_commit_growth(13 * GIB, priced, 1),
+            13 * GIB,
+            "measured above the price"
+        );
+        assert_eq!(
+            planned_commit_growth(64 << 20, priced, 0),
+            64 << 20,
+            "a card commit: measured"
+        );
+        assert_eq!(planned_commit_growth(9 * GIB, priced, 0), 9 * GIB);
+        // Through the plan: the fallen-back group's argue is 5/4 of the price.
+        let (_, need, _) = overlap_plan(
+            3 * GIB,
+            planned_commit_growth(64 << 20, priced, 1),
+            0,
+            26 * GIB,
+            6 * GIB,
+        );
+        assert_eq!(need, 3 * GIB + 15 * GIB + OVERLAP_MARGIN_BYTES);
+    }
+}

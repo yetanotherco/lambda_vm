@@ -20,6 +20,14 @@ https://github.com/lambdaclass/ethrex.git
 Five manifests carry that pin, not one. `scripts/set_ethrex_rev.sh --show` prints
 it and fails if they ever disagree.
 
+The guest builds its ethrex crates from a fork of that commit: a `[patch]` in
+`executor/programs/rust/ethrex/Cargo.toml` points them at yetanotherco/ethrex, branch
+`lambda-vm/jumpmap` (the pinned commit plus two that keep jump destinations as a bitmap).
+`ProgramInput` is the same in both, so the fixtures and the native reference stay on the
+pin and also check the forked guest against unpatched ethrex. `--show` fails unless the
+fork's recorded base (`# ethrex-fork-base:` in that manifest) is the pin, and a re-pin to
+another commit refuses until the fork is rebased onto it.
+
 ### Generation
 
 These blobs are generated reproducibly by the in-repo tool `tooling/ethrex-fixtures`

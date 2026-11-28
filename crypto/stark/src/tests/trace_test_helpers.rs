@@ -19,8 +19,7 @@ use math::polynomial::Polynomial;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 /// Builds a valid 2-row `SimpleAddition` proof. Shared base for the
-/// proof-tamper / rejection tests in `small_trace_tests` and
-/// `row_pair_opening_tests`.
+/// proof-tamper cases in `small_trace_tests`.
 pub fn make_valid_simple_proof() -> (
     SimpleAdditionAIR<GoldilocksField>,
     crate::proof::stark::StarkProof<

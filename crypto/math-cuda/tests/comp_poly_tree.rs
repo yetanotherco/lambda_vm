@@ -167,6 +167,7 @@ fn run_parity(log_n: u32, blowup: usize, num_parts: usize, seed: u64) {
 
     math_cuda::lde::evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
         &coefs_slices,
+        math_cuda::DeviceHash::Keccak256,
         n,
         blowup,
         &weights,

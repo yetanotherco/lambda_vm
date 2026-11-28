@@ -25,7 +25,9 @@
 #![cfg(feature = "cuda")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
-use lambda_vm_prover::{prove, verify};
+mod common;
+
+use common::{prove, verify};
 use stark::gpu_lde::{gpu_comp_h_slabs_calls, reset_all_gpu_call_counters};
 
 /// The fixture whose DECODE ROM crosses the lowered threshold: 66 executable
@@ -62,10 +64,10 @@ fn gpu_num_parts_1_decode_path_fires_and_verifies() {
     let elf = asm_elf_bytes(FIXTURE);
     // Warm-up amortises PTX load + pool warm-up so the measured prove reflects
     // steady state (mirrors cuda_path_integration.rs).
-    let _ = prove(&elf).expect("warm-up prove");
+    let _ = prove(&elf, &[]).expect("warm-up prove");
     reset_all_gpu_call_counters();
 
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
 
     assert!(
         gpu_comp_h_slabs_calls() > 0,

@@ -11,12 +11,14 @@
 #![cfg(feature = "cuda")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
-use lambda_vm_prover::{prove, verify};
+mod common;
+
+use common::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
-    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_grind_calls,
-    gpu_lde_calls, gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls,
-    reset_all_gpu_call_counters,
+    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls,
+    gpu_fused_deep_calls, gpu_grind_calls, gpu_lde_calls, gpu_logup_calls,
+    gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 /// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
@@ -25,9 +27,9 @@ use stark::gpu_lde::{
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_composition_path_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_composition_calls() > 0,
         "GPU composition path did not fire (tables below threshold or gate fell back to CPU)"
@@ -42,9 +44,9 @@ fn gpu_composition_path_fires_and_verifies() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_logup_aux_build_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_logup_calls() > 0,
         "GPU LogUp aux-build path did not fire (tables below threshold or fell back)"
@@ -60,15 +62,15 @@ fn gpu_logup_aux_build_fires_and_verifies() {
 fn gpu_path_fires_end_to_end() {
     // Warm-up amortises PTX load + pool warm-up + first-call pinned alloc
     // so the profiled-pass counter assertions reflect only steady-state work.
-    let elf = asm_elf_bytes("fib_iterative_1M");
-    let _ = prove(&elf).expect("warm-up prove");
+    let elf = asm_elf_bytes("fib_iterative_160k");
+    let _ = lambda_vm_prover::prove(&elf).expect("warm-up prove");
 
     reset_all_gpu_call_counters();
 
-    let proof = prove(&elf).expect("prove");
+    let proof = lambda_vm_prover::prove(&elf).expect("prove");
 
     // R1 main + aux fused LDE+Merkle. Fires for every table above the LDE
-    // threshold; fib_iterative_1M has plenty.
+    // threshold; fib_iterative_160k has plenty.
     assert!(gpu_lde_calls() > 0, "R1 GPU LDE path did not fire");
 
     // R3 OOD barycentric reads the R1 main + aux device handles. Fires once
@@ -82,7 +84,7 @@ fn gpu_path_fires_end_to_end() {
     // the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`), or the
     // d=1 de-interleave (`== 1`, counted by `gpu_comp_h_slabs_calls` — covered
     // separately by `cuda_d1_path.rs`, since no d=1 table here crosses the
-    // default LDE threshold). fib_iterative_1M only exercises the degree-2 path,
+    // default LDE threshold). fib_iterative_160k only exercises the degree-2 path,
     // so assert on either of the two counted here.
     assert!(
         gpu_extend_halves_calls() + gpu_parts_lde_calls() > 0,
@@ -101,29 +103,54 @@ fn gpu_path_fires_end_to_end() {
     // DEEP fires once per table that took the R1 GPU path.
     assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");
 
+    // The resident DEEP's default kernel inverts each row's denominators
+    // itself (`math_cuda::deep_inv`); the legacy path keeps the buffered
+    // kernel and its inverse buffer. A table that silently fell back
+    // to the buffered kernel would still verify, so this counter is what
+    // guards the fused dispatch.
+    assert!(
+        gpu_fused_deep_calls() > 0,
+        "the fused R4 DEEP kernel did not fire at the default"
+    );
+
     // FRI commit fires once per table (commit_phase_from_evaluations).
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
 
-    // GPU batch-invert dispatch fires for the R3 OOD and R4 DEEP
-    // inv_denoms pipelines. A regression where either silently fell back
-    // to host inv_denoms would drop this to zero.
+    // GPU batch-invert dispatch fires for the R3 OOD inv_denoms, and for R4's
+    // on its buffered DEEP path (on the legacy path, or for a
+    // table the fused kernel declines). A regression where R3 silently fell
+    // back to host inv_denoms would drop this to zero.
     assert!(
         gpu_batch_invert_calls() > 0,
-        "GPU batch-invert dispatch did not fire on R3 + R4"
+        "GPU batch-invert dispatch did not fire on R3"
     );
 
     // R4 proof-of-work grind: with_blowup(2) grinds at factor 20 (above the
-    // GPU min-factor gate), so the device search fires for every table and a
-    // valid nonce is served. A silent CPU fallback (or an invalid kernel result
-    // rejected by the host check) would drop this to zero.
-    assert!(
-        gpu_grind_calls() > 0,
-        "R4 GPU proof-of-work grind did not fire"
-    );
+    // GPU min-factor gate). The device search implements the keccak digest
+    // only, and the grinding seed is the transcript's — so under the BLAKE3
+    // default configuration the grind runs on host by design and the counter
+    // stays zero, while a keccak configuration must take the device path.
+    match stark::config::COMMITMENT_HASH {
+        stark::config::CommitmentHash::Keccak256 => assert!(
+            gpu_grind_calls() > 0,
+            "R4 GPU proof-of-work grind did not fire"
+        ),
+        // Every non-keccak digest takes another arm than the keccak kernel
+        // (grinding.rs routes on the concrete digest), so this counter must
+        // stay at zero for all of them.
+        stark::config::CommitmentHash::Blake3
+        | stark::config::CommitmentHash::Rpx256
+        | stark::config::CommitmentHash::Poseidon1 => assert_eq!(
+            gpu_grind_calls(),
+            0,
+            "the device grind implements the keccak digest only; a nonzero \
+             counter under a non-keccak digest means it ran on the wrong digest"
+        ),
+    }
 
     // Counters only prove the dispatches ran; this checks the GPU proof
     // actually satisfies the verifier.
-    let ok = verify(&proof, &elf).expect("verify");
+    let ok = lambda_vm_prover::verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
 
@@ -135,12 +162,12 @@ fn gpu_path_fires_end_to_end() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_fri_commit_produces_verifiable_proof() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_fri_calls() > 0,
-        "GPU FRI commit path did not fire on a 1M-row trace"
+        "GPU FRI commit path did not fire on the Fibonacci trace"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),
@@ -156,9 +183,9 @@ fn gpu_fri_commit_produces_verifiable_proof() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_proof_verifies_row_pair_commitment() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_lde_calls() > 0,
         "GPU LDE path did not fire (silent CPU fallback would not test the GPU commit)"
@@ -179,9 +206,9 @@ fn gpu_proof_verifies_row_pair_commitment() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_opening_gather_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_opening_gather_calls() > 0,
         "device-resident opening gather did not fire (openings fell back to the host LDE)"
@@ -207,9 +234,9 @@ fn gpu_opening_gather_fires_and_verifies() {
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
+    let elf = asm_elf_bytes("fib_iterative_160k");
     reset_all_gpu_call_counters();
-    let proof = prove(&elf).expect("prove");
+    let proof = prove(&elf, &[]).expect("prove");
     assert!(
         gpu_device_only_calls() > 0,
         "device-only residency path did not fire (every table kept its host trace)"

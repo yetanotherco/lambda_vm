@@ -79,6 +79,68 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 Returns exit code `0` on successful verification, `1` on failure. `--blowup` must
 match the value used during proving.
 
+### Prove a block
+
+Prove a whole block with a BLAKE3 WHIR base and two BLAKE3 recursion levels.
+The first level verifies the base and the second verifies the first level.
+The output file contains the block statement and the second level's proof.
+For GPU proving, build with `cargo build --release -p cli --features cuda`.
+
+```sh
+cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof [--time] [--digest]
+```
+
+| Flag | Description |
+|---|---|
+| `--input <FILE>` | The block's private input (the guest reads it with `get_private_input()`). |
+| `-o, --output <FILE>` | Output path for the block proof. Required. |
+| `--time` | Print the wall time through the final proof. |
+| `--digest` | Print the BLAKE3 digest of the final proof's bytes. |
+| `--pipeline tree` | Use the recursion tree at the build's pinned base hash. |
+| `--tree-file` | With `--pipeline tree`, write the tree's uncompressed top proof. |
+
+stdout carries the public output and the requested numbers; the run's progress lines go to stderr.
+
+With `--pipeline tree`, the command runs the tree's production posture. Every knob in `POSTURE`
+(`prover/src/lfm/whir_block_tree.rs`) that the
+environment leaves unset is set to its posture value: the table parallelism, the WHIR retention, the tree cache cap,
+the executor schedule and the grind search. The `BLOCK POSTURE` lines on stderr
+say what was set and what came from the environment. The binary compiles in jemalloc's never-purge posture. The tree's
+leaf count, fan-in and argue format are the block verifier's; `W3_LEAVES`, `W3_FAN_IN` and `BLOCK_WHIR_ARGUE`
+(harness arms) are refused.
+
+The compressed file's format is the CLI's constant (`whir_block_tree::DEFAULT_SHIPPED`), and it is proved at the
+pinned format only (every format flag at its default). The compression knobs (`LAMBDA_VM_BLOCK_COMPRESS*`,
+`prover/src/lfm/compress.rs`) default to that format; a knob that makes another file is refused. To ship the top's
+file, use `--pipeline tree --tree-file` on both commands with the same format flags.
+
+#### Running on a smaller machine
+
+`prove-block` sizes its host memory to a target: by default the smaller of the cgroup's memory limit and the
+machine's `MemTotal`, less 10 GiB. When the trace it holds would pass that target, it drops tables after committing
+them and rebuilds them for the openings (live regeneration), so the same proof comes out with less memory held. To
+run on a machine with less memory than it reports, or to leave room for other processes, set the target yourself:
+
+```sh
+LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB=24 cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof
+```
+
+The value is in GiB (fractions allowed); the proof's bytes do not depend on it, only the peak memory and the time.
+The `BLOCK DROPS` and `BLOCK REGEN` lines on stderr say whether regeneration armed and how much it dropped. The old
+name `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` is refused.
+
+### Verify a block
+
+```sh
+cli verify-block <block.proof> <PROGRAM.elf> [--time]
+```
+
+Derives both recursion programs from the trusted ELF and the claimed block
+statement under the CLI's fixed BLAKE3 format. It verifies the last proof
+against the derived program, checks the statement's claim, and prints the
+public output. Returns exit code `0` on success and `1` on failure.
+Use `--pipeline tree` for a proof made with the tree pipeline.
+
 ### Count Elements
 
 Build traces and print main-trace and aux-trace field element counts **without** running the proof step. Useful for sizing.

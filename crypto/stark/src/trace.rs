@@ -3,8 +3,6 @@ use crate::table::Table;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::field::{element::FieldElement, traits::IsFFTField};
 use math::polynomial::barycentric_inv_denoms;
-#[cfg(feature = "disk-spill")]
-use math::spill_safe::SpillSafe;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
@@ -35,8 +33,8 @@ where
     /// round-trip. None on the CPU / download path.
     #[cfg(feature = "cuda")]
     pub(crate) aux_resident: Option<math_cuda::logup::ResidentAux>,
-    /// Whether the GPU-resident aux build is allowed (false under disk-spill,
-    /// which needs the aux columns in the host trace to spill them).
+    /// Whether the GPU-resident aux build is allowed (false under
+    /// `RecomputeLde`, which keeps the aux build on the host).
     #[cfg(feature = "cuda")]
     pub(crate) resident_aux_ok: bool,
     /// Trace-domain main columns kept resident on device from the R1 main LDE
@@ -51,6 +49,113 @@ where
     /// instead of paying the H2D inside its chain.
     #[cfg(feature = "cuda")]
     pub(crate) main_rowmajor_dev: Option<PreUploadedMainTrace>,
+    /// Builds the row-major main trace on the device from fewer bytes than the
+    /// whole trace (see [`MainDevProducer`]); the R1 main commit calls it, inside
+    /// the prove, when nothing was pre-uploaded.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_dev_producer: Option<MainDevProducer>,
+    /// The main trace packed at the bytes its columns need
+    /// ([`Self::pack_main_narrow`]), column by column: `main_table` then holds
+    /// no data, only its width and height. Only the WHIR block prover packs a
+    /// trace, and it takes the packed columns as they are.
+    pub(crate) narrow_main: Option<multilinear::narrow::NarrowColumns>,
+    /// The main trace held as the records its rows come from
+    /// ([`Self::from_records_main`]): `main_table` then holds no data, only
+    /// its width and height. Only the WHIR block prover takes such a trace;
+    /// the card fills its columns from the records.
+    pub(crate) records_main: Option<multilinear::records::Records>,
+}
+
+/// A table's row-major main trace built on the device, called with the host
+/// row-major words and the trace's `(rows, columns)`: returns the whole trace on
+/// the card, word for word what the host buffer holds, or `None` (the commit
+/// then uploads the host buffer as before). It exists so a table whose columns
+/// are mostly a function of a few can upload the few and derive the rest on
+/// the card; the host trace stays complete, so every host reader is unchanged.
+/// The returned buffer must be ready for any stream (its producing stream
+/// synchronized).
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub struct MainDevProducer(
+    #[allow(clippy::type_complexity)]
+    pub  std::sync::Arc<
+        dyn Fn(&[u64], usize, usize) -> Option<math_cuda::CudaSlice<u64>> + Send + Sync,
+    >,
+);
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for MainDevProducer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MainDevProducer").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl MainDevProducer {
+    /// The producer for a table whose row is one width-16 Poseidon1
+    /// permutation's witness: `prep_w` preprocessed words, the sixteen input
+    /// lanes, then from `rounds_off` the `x³`/`x⁷` of every S-boxed lane of every
+    /// round, for the first `real_rows` rows (padding rows hold zeros past their
+    /// inputs). It uploads the leading `prep_w + 16` words of each row and
+    /// derives the rest on the card (`math_cuda::fill::lfm_p1w16_socket_rows`),
+    /// word for word the host fill's. Declines (`None`) a trace of another
+    /// width or with more real rows than rows.
+    pub fn poseidon1_w16_rows(
+        real_rows: usize,
+        prep_w: usize,
+        width: usize,
+        rounds_off: usize,
+    ) -> Self {
+        Self(std::sync::Arc::new(
+            move |words: &[u64], rows: usize, cols: usize| {
+                const LANES: usize = 16;
+                let narrow_w = prep_w + LANES;
+                if cols != width || real_rows > rows || narrow_w > width || rounds_off < narrow_w {
+                    return None;
+                }
+                let mut narrow = vec![0u64; rows * narrow_w];
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::{ParallelSlice, ParallelSliceMut};
+                    narrow
+                        .par_chunks_mut(narrow_w)
+                        .zip(words.par_chunks(width))
+                        .for_each(|(n, w)| n.copy_from_slice(&w[..narrow_w]));
+                }
+                #[cfg(not(feature = "parallel"))]
+                for (n, w) in narrow.chunks_mut(narrow_w).zip(words.chunks(width)) {
+                    n.copy_from_slice(&w[..narrow_w]);
+                }
+                math_cuda::fill::lfm_p1w16_socket_rows(
+                    &narrow, rows, real_rows, prep_w, width, rounds_off,
+                )
+                .ok()
+            },
+        ))
+    }
+}
+
+/// Excluded from logical trace equality, like [`PreUploadedMainTrace`]: it
+/// produces data the host trace already holds.
+#[cfg(feature = "cuda")]
+impl PartialEq for MainDevProducer {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for MainDevProducer {}
+
+/// Tables whose R1 main commit took its trace from a [`MainDevProducer`].
+#[cfg(feature = "cuda")]
+pub(crate) static MAIN_DEV_PRODUCER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many R1 main commits so far took their trace from a device producer.
+#[cfg(feature = "cuda")]
+pub fn main_dev_producer_calls() -> u64 {
+    MAIN_DEV_PRODUCER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -188,6 +293,10 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            #[cfg(feature = "cuda")]
+            main_dev_producer: None,
+            narrow_main: None,
+            records_main: None,
         }
     }
 
@@ -218,6 +327,10 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            #[cfg(feature = "cuda")]
+            main_dev_producer: None,
+            narrow_main: None,
+            records_main: None,
         }
     }
 
@@ -241,11 +354,119 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            #[cfg(feature = "cuda")]
+            main_dev_producer: None,
+            narrow_main: None,
+            records_main: None,
         }
     }
 
     pub fn num_rows(&self) -> usize {
         self.main_table.height
+    }
+
+    /// Packs the main trace at the bytes its columns need
+    /// ([`multilinear::narrow::NarrowColumns::pack_row_major`]) and frees the
+    /// 64-bit copy; the raw words come back bit for bit. Only a Goldilocks
+    /// trace held whole in memory packs: `false` leaves the trace as it was.
+    pub fn pack_main_narrow(&mut self) -> bool
+    where
+        F: 'static,
+    {
+        if self.narrow_main.is_some() {
+            return true;
+        }
+        let table = &self.main_table;
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || table.width == 0
+            || table.data.len() != table.width * table.height
+        {
+            return false;
+        }
+        // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+        let words = unsafe {
+            core::slice::from_raw_parts(table.data.as_ptr() as *const u64, table.data.len())
+        };
+        let Some(packed) = multilinear::narrow::NarrowColumns::pack_row_major(words, table.width)
+        else {
+            return false;
+        };
+        self.main_table.data = Vec::new();
+        self.narrow_main = Some(packed);
+        true
+    }
+
+    /// A trace held packed from the start: `packed`'s rows and columns, with
+    /// no 64-bit copy ever made (the prover's G-pack). `Err` gives `packed`
+    /// back where a trace cannot be held packed, as [`Self::pack_main_narrow`]
+    /// refuses it: not Goldilocks, or no columns.
+    pub fn try_from_narrow_main(
+        packed: multilinear::narrow::NarrowColumns,
+        step_size: usize,
+    ) -> Result<Self, multilinear::narrow::NarrowColumns>
+    where
+        F: 'static,
+    {
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || packed.cols() == 0
+        {
+            return Err(packed);
+        }
+        let mut trace = Self::new_main(Vec::new(), packed.cols(), step_size);
+        trace.main_table.height = packed.rows();
+        trace.narrow_main = Some(packed);
+        Ok(trace)
+    }
+
+    /// A trace held as the records its rows come from: `records`' rows and
+    /// columns, with no column of words made on the host. `Err` gives
+    /// `records` back where a trace cannot be held so: not Goldilocks, or no
+    /// columns.
+    pub fn try_from_records_main(
+        records: multilinear::records::Records,
+        step_size: usize,
+    ) -> Result<Self, multilinear::records::Records>
+    where
+        F: 'static,
+    {
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || records.cols() == 0
+        {
+            return Err(records);
+        }
+        let mut trace = Self::new_main(Vec::new(), records.cols(), step_size);
+        trace.main_table.height = records.rows();
+        trace.records_main = Some(records);
+        Ok(trace)
+    }
+
+    /// The records the main trace is held as, when it is.
+    pub fn records_main(&self) -> Option<&multilinear::records::Records> {
+        self.records_main.as_ref()
+    }
+
+    /// Takes the records out, leaving the table's shape.
+    pub fn take_records_main(&mut self) -> Option<multilinear::records::Records> {
+        self.records_main.take()
+    }
+
+    /// The packed main trace, when [`Self::pack_main_narrow`] packed it.
+    pub fn narrow_main(&self) -> Option<&multilinear::narrow::NarrowColumns> {
+        self.narrow_main.as_ref()
+    }
+
+    /// The packed main trace, to edit in place (a cell rewritten within its
+    /// column's width).
+    pub fn narrow_main_mut(&mut self) -> Option<&mut multilinear::narrow::NarrowColumns> {
+        self.narrow_main.as_mut()
+    }
+
+    /// Takes the packed main trace out, leaving the table's shape.
+    pub fn take_narrow_main(&mut self) -> Option<multilinear::narrow::NarrowColumns> {
+        self.narrow_main.take()
     }
 
     /// Store the resident (pre-LDE) LogUp aux columns, threaded to the aux commit.
@@ -260,13 +481,13 @@ where
         self.aux_resident.as_ref()
     }
 
-    /// Whether the GPU-resident aux build is allowed (false under disk-spill).
+    /// Whether the GPU-resident aux build is allowed.
     #[cfg(feature = "cuda")]
     pub fn resident_aux_ok(&self) -> bool {
         self.resident_aux_ok
     }
 
-    /// Disable the GPU-resident aux build (host trace needed, e.g. disk-spill).
+    /// Disable the GPU-resident aux build (host trace needed).
     #[cfg(feature = "cuda")]
     pub fn set_resident_aux_ok(&mut self, ok: bool) {
         self.resident_aux_ok = ok;
@@ -306,12 +527,80 @@ where
         self.main_rowmajor_dev.as_ref().map(|p| p.buf.as_ref())
     }
 
+    /// Attach a [`MainDevProducer`]: the R1 main commit builds this table's
+    /// row-major trace on the card with it instead of uploading the host buffer.
+    #[cfg(feature = "cuda")]
+    pub fn set_main_dev_producer(&mut self, producer: MainDevProducer) {
+        self.main_dev_producer = Some(producer);
+    }
+
+    /// Whether a [`MainDevProducer`] is attached.
+    #[cfg(feature = "cuda")]
+    pub fn has_main_dev_producer(&self) -> bool {
+        self.main_dev_producer.is_some()
+    }
+
+    /// Detach the [`MainDevProducer`]: what a caller that edits the host trace
+    /// after it was built must do, or the card would rebuild the unedited rows.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_dev_producer(&mut self) {
+        self.main_dev_producer = None;
+    }
+
+    /// The row-major main trace on the card from the attached producer, when
+    /// there is one, nothing was pre-uploaded, and the host trace is held whole
+    /// as 64-bit words. `None` means the commit uploads the host buffer.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn produce_main_dev(&self) -> Option<math_cuda::CudaSlice<u64>>
+    where
+        F: 'static,
+    {
+        let producer = self.main_dev_producer.as_ref()?;
+        if self.main_rowmajor_dev.is_some()
+            || std::any::TypeId::of::<F>()
+                != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return None;
+        }
+        let table = &self.main_table;
+        if table.width == 0 || table.data.len() != table.width * table.height {
+            return None;
+        }
+        // SAFETY: `F == GoldilocksField` (checked above), `#[repr(transparent)]`
+        // over `u64`.
+        let words = unsafe {
+            core::slice::from_raw_parts(table.data.as_ptr() as *const u64, table.data.len())
+        };
+        let buf = (producer.0)(words, table.height, table.width)?;
+        if buf.len() != words.len() {
+            return None;
+        }
+        MAIN_DEV_PRODUCER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(buf)
+    }
+
     /// Drop the pre-uploaded row-major trace. Its only consumer is the R1 main
     /// commit, so the prover clears it alongside `clear_main_trace_dev` to
     /// reclaim the VRAM before the aux-commit + DEEP/FRI peak.
     #[cfg(feature = "cuda")]
     pub fn clear_main_rowmajor_dev(&mut self) {
         self.main_rowmajor_dev = None;
+    }
+
+    /// Free the auxiliary columns, keeping the declared aux width.
+    ///
+    /// Called by `multi_prove` under `ResidencyMode::RecomputeLde` once a
+    /// table's proof exists: `allocate_aux_table` writes the LogUp columns into
+    /// this caller-owned trace and nothing reads them afterwards, so under that
+    /// mode they are released rather than carried to the end of the prove.
+    /// Callers that do read a trace's aux columns after proving must use
+    /// `ResidencyMode::Retain`.
+    pub fn release_aux_columns(&mut self) {
+        self.aux_table = Table::new(Vec::new(), self.aux_table.width);
+        #[cfg(feature = "cuda")]
+        {
+            self.aux_resident = None;
+        }
     }
 
     pub fn num_steps(&self) -> usize {
@@ -362,26 +651,6 @@ where
         let aux_data = vec![FieldElement::<E>::zero(); num_rows * num_aux_columns];
         self.aux_table = Table::new(aux_data, num_aux_columns);
         self.num_aux_columns = num_aux_columns;
-    }
-
-    /// Write main trace data to a temp file and free the in-memory vector.
-    /// Accessors read from the mmap after this call.
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()>
-    where
-        F: Copy + 'static,
-        F::BaseType: SpillSafe,
-    {
-        self.main_table.spill_to_disk()
-    }
-
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()>
-    where
-        E: Copy + 'static,
-        E::BaseType: SpillSafe,
-    {
-        self.aux_table.spill_to_disk()
     }
 
     /// Extract main columns as owned vectors, each allocated at `capacity`.
@@ -841,7 +1110,11 @@ where
     E: IsField + 'static,
 {
     let n = domain.interpolation_domain_size;
-    let bf = domain.blowup_factor;
+    // The read stride is the TABLE's own blowup, not the domain's: for every
+    // existing caller the two coincide (the table was expanded at the
+    // domain's blowup), and the batched phase 4 hands a blowup-1 table that
+    // IS the stride subsample already — same values, a quarter the buffer.
+    let bf = lde_trace.blowup_factor;
     let num_main_cols = lde_trace.num_main_cols();
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;

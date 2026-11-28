@@ -55,17 +55,173 @@ fn test_prove_verify_single_row() {
 /// Test STARK prove/verify with a two-row trace.
 /// This exercises the FRI protocol with 0 FRI layers (trace_length=2, number_layers=1).
 #[test_log::test]
-fn test_prove_verify_two_rows() {
-    let (air, proof) = make_valid_simple_proof();
+fn test_two_row_proof_verifies_and_refuses_tampers() {
+    let (air, honest) = make_valid_simple_proof();
 
     assert!(
         Verifier::verify(
-            &proof,
+            &honest,
             &air,
             &mut DefaultTranscript::<GoldilocksField>::new(&[])
         ),
         "Verification failed for two-row trace"
     );
+
+    {
+        // Test that verification fails when using wrong public inputs.
+        // This ensures the boundary constraints are actually enforced.
+        let mut proof = honest.clone();
+        // Tamper with the proof's public inputs
+        proof.public_inputs = SimpleAdditionPublicInputs {
+            a: Felt::from(99u64), // Wrong value - doesn't match trace
+            b: Felt::from(2u64),
+        };
+
+        // Verification should fail because boundary constraint col0[0]=99 doesn't match trace
+        assert!(
+            !Verifier::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<GoldilocksField>::new(&[])
+            ),
+            "Verification should fail with tampered public inputs"
+        );
+    }
+
+    {
+        // A malformed proof that drops entries from
+        // `composition_poly_parts_ood_evaluation` so the verifier indexes past the
+        // end during deep composition. The `.get(j)?` bounds check must cause the
+        // verifier to return `false` instead of panicking.
+        let mut proof = honest.clone();
+        assert!(
+            !proof.composition_poly_parts_ood_evaluation.is_empty(),
+            "test precondition: a valid proof has at least one composition poly part",
+        );
+        // Drop one entry so the per-query opening has more parts than the header.
+        proof.composition_poly_parts_ood_evaluation.pop();
+
+        assert!(
+            !Verifier::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<GoldilocksField>::new(&[])
+            ),
+            "Verifier must reject when composition_poly_parts_ood_evaluation is truncated"
+        );
+    }
+
+    {
+        // A malformed proof whose `deep_poly_openings` Vec is shorter than the FRI
+        // query count. `reconstruct_deep_composition_poly_evaluations_for_all_queries`
+        // indexes `deep_poly_openings[i]` for every query index, and this Vec's length
+        // is not otherwise bound (the `query_list.len()` guard checks a different
+        // field), so a truncated `deep_poly_openings` must make the verifier return
+        // `false` instead of panicking with an out-of-bounds index in release builds.
+        let mut proof = honest.clone();
+        assert!(
+            proof.deep_poly_openings.len() >= 2,
+            "test precondition: a valid proof has one deep-poly opening per FRI query",
+        );
+        // Drop the last opening so the Vec is shorter than `fri_number_of_queries`;
+        // the query loop would then index past the end.
+        proof.deep_poly_openings.pop();
+
+        assert!(
+            !Verifier::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<GoldilocksField>::new(&[])
+            ),
+            "Verifier must reject when deep_poly_openings is shorter than the query count"
+        );
+    }
+
+    {
+        // A malformed proof whose deep-poly opening `evaluations` slice has the
+        // wrong number of columns. The runtime width-mismatch guard added in this
+        // PR must cause the verifier to return `false` instead of indexing past
+        // the end of `lde_trace_aux_evaluations` and panicking in release builds.
+        let mut proof = honest.clone();
+        // Append a phantom extra evaluation column to the first query's
+        // main-trace opening so the (base + aux) count exceeds `ood_evaluations_table_width`.
+        if let Some(opening) = proof.deep_poly_openings.first_mut() {
+            let extra = opening
+                .main_trace_polys
+                .evaluations
+                .last()
+                .cloned()
+                .unwrap_or_else(Felt::zero);
+            opening.main_trace_polys.evaluations.push(extra);
+            opening.main_trace_polys.evaluations_sym.push(extra);
+        } else {
+            panic!("test precondition: a valid proof has at least one deep poly opening");
+        }
+
+        assert!(
+            !Verifier::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<GoldilocksField>::new(&[])
+            ),
+            "Verifier must reject when an opening's column count does not match the OOD table width"
+        );
+    }
+
+    {
+        // Tampering the value at the symmetric LDE position must break verification:
+        // the committed leaf hashed `evaluations ‖ evaluations_sym`, so a perturbed
+        // `evaluations_sym` no longer reconstructs the committed leaf.
+        let mut proof = honest.clone();
+        let opening = proof
+            .deep_poly_openings
+            .first_mut()
+            .expect("test precondition: a valid proof has at least one deep poly opening");
+        assert!(
+            !opening.main_trace_polys.evaluations_sym.is_empty(),
+            "test precondition: the main-trace opening has at least one symmetric evaluation",
+        );
+        // Perturb (not resize) the first symmetric evaluation.
+        opening.main_trace_polys.evaluations_sym[0] =
+            &opening.main_trace_polys.evaluations_sym[0] + Felt::one();
+
+        assert!(
+            !Verifier::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<GoldilocksField>::new(&[])
+            ),
+            "Verifier must reject a tampered symmetric trace evaluation"
+        );
+    }
+
+    {
+        // The row-pair Merkle authentication path itself must be checked. Corrupting a
+        // node in `main_trace_polys.proof.merkle_path` is caught ONLY by
+        // `verify_opening_pair` (the deep-composition reconstruction does not touch the
+        // auth path), so this proves the single row-pair path is actually authenticated
+        // against the committed root rather than ignored.
+        let mut proof = honest.clone();
+        let opening = proof
+            .deep_poly_openings
+            .first_mut()
+            .expect("test precondition: a valid proof has at least one deep poly opening");
+        let path = &mut opening.main_trace_polys.proof.merkle_path;
+        assert!(
+            !path.is_empty(),
+            "test precondition: the row-pair trace tree has a non-trivial authentication path",
+        );
+        path[0][0] ^= 0x01;
+
+        assert!(
+            !Verifier::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<GoldilocksField>::new(&[])
+            ),
+            "Verifier must reject a corrupted main-trace Merkle authentication path"
+        );
+    }
 }
 
 /// Prove + verify with DEFAULT options (K=7) and a trace large enough that FRI
@@ -270,115 +426,6 @@ fn test_prove_verify_blowup4() {
             &mut DefaultTranscript::<GoldilocksField>::new(&[])
         ),
         "blowup_factor=4 proof must verify"
-    );
-}
-
-/// Test that verification fails when using wrong public inputs.
-/// This ensures the boundary constraints are actually enforced.
-#[test_log::test]
-fn test_verify_fails_with_wrong_inputs() {
-    let (air, mut proof) = make_valid_simple_proof();
-
-    // Tamper with the proof's public inputs
-    proof.public_inputs = SimpleAdditionPublicInputs {
-        a: Felt::from(99u64), // Wrong value - doesn't match trace
-        b: Felt::from(2u64),
-    };
-
-    // Verification should fail because boundary constraint col0[0]=99 doesn't match trace
-    assert!(
-        !Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
-        "Verification should fail with tampered public inputs"
-    );
-}
-
-/// A malformed proof that drops entries from
-/// `composition_poly_parts_ood_evaluation` so the verifier indexes past the
-/// end during deep composition. The `.get(j)?` bounds check must cause the
-/// verifier to return `false` instead of panicking.
-#[test_log::test]
-fn test_verify_rejects_truncated_composition_poly_parts_ood() {
-    let (air, mut proof) = make_valid_simple_proof();
-
-    assert!(
-        !proof.composition_poly_parts_ood_evaluation.is_empty(),
-        "test precondition: a valid proof has at least one composition poly part",
-    );
-    // Drop one entry so the per-query opening has more parts than the header.
-    proof.composition_poly_parts_ood_evaluation.pop();
-
-    assert!(
-        !Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
-        "Verifier must reject when composition_poly_parts_ood_evaluation is truncated"
-    );
-}
-
-/// A malformed proof whose `deep_poly_openings` Vec is shorter than the FRI
-/// query count. `reconstruct_deep_composition_poly_evaluations_for_all_queries`
-/// indexes `deep_poly_openings[i]` for every query index, and this Vec's length
-/// is not otherwise bound (the `query_list.len()` guard checks a different
-/// field), so a truncated `deep_poly_openings` must make the verifier return
-/// `false` instead of panicking with an out-of-bounds index in release builds.
-#[test_log::test]
-fn test_verify_rejects_truncated_deep_poly_openings() {
-    let (air, mut proof) = make_valid_simple_proof();
-
-    assert!(
-        proof.deep_poly_openings.len() >= 2,
-        "test precondition: a valid proof has one deep-poly opening per FRI query",
-    );
-    // Drop the last opening so the Vec is shorter than `fri_number_of_queries`;
-    // the query loop would then index past the end.
-    proof.deep_poly_openings.pop();
-
-    assert!(
-        !Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
-        "Verifier must reject when deep_poly_openings is shorter than the query count"
-    );
-}
-
-/// A malformed proof whose deep-poly opening `evaluations` slice has the
-/// wrong number of columns. The runtime width-mismatch guard added in this
-/// PR must cause the verifier to return `false` instead of indexing past
-/// the end of `lde_trace_aux_evaluations` and panicking in release builds.
-#[test_log::test]
-fn test_verify_rejects_opening_column_count_mismatch() {
-    let (air, mut proof) = make_valid_simple_proof();
-
-    // Append a phantom extra evaluation column to the first query's
-    // main-trace opening so the (base + aux) count exceeds `ood_evaluations_table_width`.
-    if let Some(opening) = proof.deep_poly_openings.first_mut() {
-        let extra = opening
-            .main_trace_polys
-            .evaluations
-            .last()
-            .cloned()
-            .unwrap_or_else(Felt::zero);
-        opening.main_trace_polys.evaluations.push(extra);
-        opening.main_trace_polys.evaluations_sym.push(extra);
-    } else {
-        panic!("test precondition: a valid proof has at least one deep poly opening");
-    }
-
-    assert!(
-        !Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
-        "Verifier must reject when an opening's column count does not match the OOD table width"
     );
 }
 
